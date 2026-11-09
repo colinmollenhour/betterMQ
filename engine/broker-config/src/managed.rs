@@ -88,16 +88,52 @@ fn storage_to_view(storage: &StorageConfig) -> StorageConfigView {
 }
 
 /// Apply storage update from panel; preserve secret when client sends redacted placeholder.
-pub fn merge_s3_update(existing: Option<&S3Config>, incoming: S3Config) -> S3Config {
+pub fn merge_s3_update(
+    existing: Option<&S3Config>,
+    incoming: S3Config,
+) -> Result<S3Config, ConfigError> {
     let secret_key = if incoming.secret_key == REDACTED_SECRET {
         existing
+            .filter(|e| !e.secret_key.trim().is_empty() && e.secret_key != REDACTED_SECRET)
             .map(|e| e.secret_key.clone())
-            .unwrap_or(incoming.secret_key)
+            .ok_or_else(|| {
+                ConfigError::Invalid("storage.s3.secretKey is required for first-time setup".into())
+            })?
     } else {
         incoming.secret_key
     };
-    S3Config {
+    Ok(S3Config {
         secret_key,
         ..incoming
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s3(secret: &str) -> S3Config {
+        S3Config {
+            endpoint: "https://s3.example.com".into(),
+            bucket: "wal".into(),
+            payload_bucket: Some("payload".into()),
+            access_key: "access".into(),
+            secret_key: secret.into(),
+            region: "auto".into(),
+        }
+    }
+
+    #[test]
+    fn redaction_requires_an_existing_real_secret() {
+        assert!(merge_s3_update(None, s3(REDACTED_SECRET)).is_err());
+        assert!(merge_s3_update(Some(&s3("")), s3(REDACTED_SECRET)).is_err());
+        assert!(merge_s3_update(Some(&s3(REDACTED_SECRET)), s3(REDACTED_SECRET)).is_err());
+        assert_eq!(
+            merge_s3_update(Some(&s3("real")), s3(REDACTED_SECRET))
+                .unwrap()
+                .secret_key,
+            "real"
+        );
+        assert_eq!(merge_s3_update(None, s3("new")).unwrap().secret_key, "new");
     }
 }

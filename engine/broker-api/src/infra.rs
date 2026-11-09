@@ -561,7 +561,8 @@ pub async fn infra_update_storage(
                 .s3
                 .ok_or_else(|| ApiError::BadRequest("s3 config required for slate mode".into()))?;
             StorageConfig::Slate {
-                s3: merge_s3_update(existing_s3.as_ref(), s3),
+                s3: merge_s3_update(existing_s3.as_ref(), s3)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?,
             }
         }
         other => {

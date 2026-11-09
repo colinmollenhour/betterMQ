@@ -77,6 +77,7 @@ const rfMsg = ref("");
 const infraStatus = ref<Record<string, unknown> | null>(null);
 const joinToken = ref("");
 const hasMembership = ref<boolean | null>(null);
+const hasSavedS3Secret = ref(false);
 
 const createOpen = ref(false);
 const editingCell = ref(false);
@@ -279,6 +280,7 @@ async function loadInfra() {
     nodeForm.publicUrl = cfg.node?.publicUrl || "";
     hasMembership.value = Boolean(cfg.cluster?.id || cfg.cluster?.nodes?.length || session.cluster?.enabled);
     if (cfg.storage?.mode === "slate" && cfg.storage.s3) {
+      hasSavedS3Secret.value = true;
       storage.mode = "slate";
       storage.endpoint = cfg.storage.s3.endpoint || "";
       storage.bucket = cfg.storage.s3.bucket || "";
@@ -286,6 +288,7 @@ async function loadInfra() {
       storage.accessKey = cfg.storage.s3.accessKey || "";
       storage.region = cfg.storage.s3.region || "auto";
     } else {
+      hasSavedS3Secret.value = false;
       storage.mode = "local";
     }
   } catch {
@@ -445,6 +448,7 @@ async function saveNode() {
 async function testS3() {
   storageStatus.reset();
   try {
+    if (!storage.secretKey && !hasSavedS3Secret.value) throw new Error("Secret key is required for first-time S3 setup.");
     const res = await apiPost<{ ok?: boolean; message?: string }>(publicUrl("/v1/infra/storage/test"), {
       endpoint: storage.endpoint,
       bucket: storage.bucket,
@@ -463,6 +467,10 @@ async function testS3() {
 
 async function saveStorage() {
   storageStatus.reset();
+  if (storage.mode === "slate" && !storage.secretKey && !hasSavedS3Secret.value) {
+    storageStatus.fail("Secret key is required for first-time S3 setup.");
+    return;
+  }
   const body: Record<string, unknown> = { mode: storage.mode };
   if (storage.mode === "slate") {
     body.s3 = {
@@ -803,7 +811,7 @@ function openAddNode() {
                 <Field label="Payload bucket"><Input v-model="storage.payloadBucket" class="font-mono" /></Field>
                 <Field label="Access key"><Input v-model="storage.accessKey" class="font-mono" /></Field>
                 <Field label="Secret key">
-                  <Input v-model="storage.secretKey" type="password" placeholder="leave blank to keep" />
+                  <Input v-model="storage.secretKey" type="password" :placeholder="hasSavedS3Secret ? 'leave blank to keep' : 'required for first-time setup'" />
                 </Field>
                 <Field label="Region"><Input v-model="storage.region" class="font-mono" /></Field>
               </template>
