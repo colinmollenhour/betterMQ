@@ -147,10 +147,12 @@ impl MetadataStore {
         let mut opts = Options::default();
         opts.create_if_missing(true);
         let db = DB::open(&opts, path)?;
-        // Shard metadata is a rebuildable WAL-derived index. The shard commit
-        // coordinator owns durability; RocksDB is synced once per checkpoint.
+        // This metadata is not rebuilt from the message WAL. Each successful
+        // mutation must survive a host crash: dedup precedes the enqueue reply,
+        // and dispatch cursors/completions precede their acknowledgement. Batch
+        // callers amortize this barrier across one atomic metadata epoch.
         let mut sync_writes = WriteOptions::default();
-        sync_writes.set_sync(false);
+        sync_writes.set_sync(true);
         Ok(Self {
             backend: MetaBackend::Rocks { db, sync_writes },
         })
@@ -463,7 +465,8 @@ impl MetadataStore {
         }
     }
 
-    /// Flush the RocksDB WAL (epoch barrier). No-op for shared-file / slate.
+    /// Additional RocksDB WAL barrier for shutdown/checkpoints. Normal writes
+    /// are already synchronous. No-op for shared-file / slate.
     pub fn flush_epoch(&self) -> Result<(), IndexError> {
         match &self.backend {
             MetaBackend::Rocks { db, .. } => {
@@ -488,6 +491,70 @@ mod tests {
             offset,
             partition: 2,
         }
+    }
+
+    #[test]
+    fn metadata_survives_exit_without_flush_or_drop() {
+        const CHILD_DIR: &str = "BETTERMQ_TEST_METADATA_CRASH_DIR";
+        if let Some(dir) = std::env::var_os(CHILD_DIR) {
+            let store = MetadataStore::open(dir).unwrap();
+            store.put_dedup("tenant", "individual", &entry(10)).unwrap();
+            store
+                .mark_dispatch_complete("tenant", "queue", 2, 12)
+                .unwrap();
+            store.set_dispatch_offset("tenant", "queue", 2, 7).unwrap();
+            let mut batch = MetadataWriteBatch::default();
+            batch.put_dedup("tenant", "batched", entry(11));
+            batch.set_dispatch_offset("tenant", "batch-queue", 2, 9);
+            batch.mark_dispatch_complete("tenant", "batch-queue", 2, 13);
+            store.write_batch(batch).unwrap();
+            // Deliberately skip destructors and flush_epoch, like a process
+            // crash immediately after successful acknowledgements.
+            std::process::exit(0);
+        }
+        let dir = tempdir().unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "indexes::tests::metadata_survives_exit_without_flush_or_drop",
+            ])
+            .env(CHILD_DIR, dir.path())
+            .env_remove("BETTERMQ_SHARED_META_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let store = MetadataStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store
+                .get_dedup("tenant", "individual")
+                .unwrap()
+                .unwrap()
+                .offset,
+            10
+        );
+        assert_eq!(
+            store
+                .get_dedup("tenant", "batched")
+                .unwrap()
+                .unwrap()
+                .offset,
+            11
+        );
+        assert_eq!(store.dispatch_offset("tenant", "queue", 2).unwrap(), 7);
+        assert_eq!(
+            store.dispatch_offset("tenant", "batch-queue", 2).unwrap(),
+            9
+        );
+        assert!(store
+            .is_dispatch_complete("tenant", "queue", 2, 12)
+            .unwrap());
+        assert!(store
+            .is_dispatch_complete("tenant", "batch-queue", 2, 13)
+            .unwrap());
     }
 
     #[test]

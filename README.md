@@ -43,6 +43,10 @@ Slate storage supports only the legacy V1 shard layout. V2 cells must retain
 local storage: unsupported changes are rejected before configuration is saved,
 and incompatible persisted configurations fail explicitly at startup.
 
+Local idempotency mappings and dispatch cursors are synchronously persisted in
+RocksDB before their metadata operation succeeds; they are not rebuilt from the
+message WAL on startup. Each metadata write/batch incurs a durability barrier.
+
 ---
 
 ## Quick start
