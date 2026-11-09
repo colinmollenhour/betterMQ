@@ -18,6 +18,7 @@ import { errText } from "@/lib/payload";
 const name = ref("alerts");
 const tab = ref("list");
 const selected = ref("");
+let memberGroup = "";
 const members = ref<{ member_id?: string; id?: string; name?: string; url?: string; parallelism?: number; rate?: number }[]>([]);
 const member = reactive({
   name: "primary",
@@ -34,7 +35,7 @@ const memberStatus = useActionStatus();
 const memberListStatus = useActionStatus();
 
 onMounted(() => {
-  void refreshGroups();
+  void refreshGroups().catch(() => {});
 });
 
 const groupOptions = () =>
@@ -57,15 +58,18 @@ async function create() {
 }
 
 async function loadMembers(gid: string) {
+  memberListStatus.reset();
+  if (memberGroup !== gid) members.value = [];
+  memberGroup = gid;
   if (!gid) {
     members.value = [];
     return;
   }
   try {
     const d = await apiGet<{ members?: typeof members.value }>(publicUrl(`/v1/groups/${encodeURIComponent(gid)}`));
-    members.value = d.members || [];
-  } catch {
-    members.value = [];
+    if (selected.value === gid) members.value = d.members || [];
+  } catch (error) {
+    memberListStatus.fail(`Members unavailable: ${errText(error)}. Previously loaded results may be stale.`);
   }
 }
 

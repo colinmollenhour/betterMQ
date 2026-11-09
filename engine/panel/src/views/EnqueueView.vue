@@ -25,7 +25,7 @@ const form = reactive({
 const status = useActionStatus();
 
 onMounted(() => {
-  void refreshQueues();
+  void refreshQueues().catch(() => {});
 });
 
 async function enqueue() {

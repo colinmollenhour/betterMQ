@@ -17,6 +17,8 @@ export const catalog = reactive({
   queues: [] as QueueRow[],
   groups: [] as GroupRow[],
   flows: [] as FlowRow[],
+  errors: { queues: "", groups: "", flows: "" },
+  loaded: { queues: false, groups: false, flows: false },
 });
 
 export function queueId(q: QueueRow): string {
@@ -35,8 +37,11 @@ export async function refreshQueues() {
   try {
     const d = await apiGet<{ queues?: QueueRow[] }>(publicUrl("/v1/queues"));
     catalog.queues = d.queues || [];
-  } catch {
-    catalog.queues = [];
+    catalog.errors.queues = "";
+    catalog.loaded.queues = true;
+  } catch (error) {
+    catalog.errors.queues = String(error);
+    throw error;
   }
 }
 
@@ -44,8 +49,11 @@ export async function refreshGroups() {
   try {
     const d = await apiGet<{ groups?: GroupRow[] }>(publicUrl("/v1/groups"));
     catalog.groups = d.groups || [];
-  } catch {
-    catalog.groups = [];
+    catalog.errors.groups = "";
+    catalog.loaded.groups = true;
+  } catch (error) {
+    catalog.errors.groups = String(error);
+    throw error;
   }
 }
 
@@ -53,7 +61,10 @@ export async function refreshFlows() {
   try {
     const d = await apiGet<{ flows?: FlowRow[] }>(publicUrl("/v1/flows"));
     catalog.flows = d.flows || [];
-  } catch {
-    catalog.flows = [];
+    catalog.errors.flows = "";
+    catalog.loaded.flows = true;
+  } catch (error) {
+    catalog.errors.flows = String(error);
+    throw error;
   }
 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive } from "vue";
+import { computed, onMounted, reactive } from "vue";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -31,10 +31,7 @@ const pub = reactive({
 });
 
 onMounted(async () => {
-  await Promise.all([pollHealth(), pollCluster(), refreshQueues(), refreshGroups(), refreshFlows()]);
-  kpis.queues = String(catalog.queues.length);
-  kpis.groups = String(catalog.groups.length);
-  kpis.flows = String(catalog.flows.length);
+  await Promise.allSettled([pollHealth(), pollCluster(), refreshQueues(), refreshGroups(), refreshFlows()]);
   try {
     const [delayed, crons] = await Promise.all([
       fetchJson("/v1/delayed"),
@@ -82,6 +79,8 @@ async function quickPublish() {
 }
 
 const clusterNodes = () => session.cluster?.nodes || [];
+const queueCount = computed(() => catalog.loaded.queues && !catalog.errors.queues ? String(catalog.queues.length) : "—");
+const groupCount = computed(() => catalog.loaded.groups && !catalog.errors.groups ? String(catalog.groups.length) : "—");
 </script>
 
 <template>
@@ -100,13 +99,13 @@ const clusterNodes = () => session.cluster?.nodes || [];
       <Card size="sm">
         <CardHeader class="pb-1">
           <CardDescription>Queues</CardDescription>
-          <CardTitle class="text-lg">{{ kpis.queues }}</CardTitle>
+          <CardTitle class="text-lg">{{ queueCount }}</CardTitle>
         </CardHeader>
       </Card>
       <Card size="sm">
         <CardHeader class="pb-1">
           <CardDescription>Groups</CardDescription>
-          <CardTitle class="text-lg">{{ kpis.groups }}</CardTitle>
+          <CardTitle class="text-lg">{{ groupCount }}</CardTitle>
         </CardHeader>
       </Card>
       <Card size="sm">

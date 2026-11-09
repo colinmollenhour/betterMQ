@@ -1,6 +1,6 @@
 import { reactive } from "vue";
 import { isExternalAuth, isStandalone } from "@/lib/config";
-import { adminUrl, apiGet, apiPost, isAuthRejection, publicUrl, setBrokerAccessGuard } from "@/lib/api";
+import { adminUrl, apiGet, apiPost, isAuthRejection, onAuthRejected, publicUrl, setBrokerAccessGuard } from "@/lib/api";
 import { isLocalCell } from "@/lib/targets";
 import { refreshFlows, refreshGroups, refreshQueues } from "@/lib/catalog";
 import {
@@ -79,10 +79,13 @@ export const session = reactive({
   joinToken: "",
   gateMessage: "",
   isSeed: false,
+  cellsError: "",
+  clusterError: "",
 });
 
 session.token = loadSavedToken(session.apiBase);
 setBrokerAccessGuard(() => session.phase !== "app" || localBrokerSelected());
+onAuthRejected((error) => handleAuthFailure(error));
 
 export function localBrokerSelected(): boolean {
   return !isStandalone() && isLocalCell(selectedCell()?.id || "local", session.cluster?.cluster_id);
@@ -220,18 +223,18 @@ export function validateSessionToken() {
 export function startApp() {
   retryDelay = 1000;
   session.phase = "app";
-  void refreshCells();
+  void refreshCells().catch(() => {});
   if (localBrokerSelected()) {
-    void refreshQueues();
-    void refreshGroups();
-    void refreshFlows();
+    void refreshQueues().catch(() => {});
+    void refreshGroups().catch(() => {});
+    void refreshFlows().catch(() => {});
   }
   void pollHealth();
-  void pollCluster();
+  void pollCluster().catch(() => {});
   if (healthTimer) clearInterval(healthTimer);
   if (clusterTimer) clearInterval(clusterTimer);
   healthTimer = setInterval(() => void pollHealth(), 15000);
-  clusterTimer = setInterval(() => void pollCluster(), 5000);
+  clusterTimer = setInterval(() => void pollCluster().catch(() => {}), 5000);
 }
 
 export async function refreshCells() {
@@ -239,12 +242,13 @@ export async function refreshCells() {
     const reg = await apiGet<{ cells?: CellRecord[]; members?: CellMember[] }>(adminUrl("/cells"));
     session.cells = reg.cells || [];
     session.members = reg.members || [];
+    session.cellsError = "";
     if (!session.cells.some((c) => c.id === session.selectedCellId)) {
       session.selectedCellId = session.cells[0]?.id || "local";
     }
-  } catch {
-    session.cells = [];
-    session.members = [];
+  } catch (error) {
+    session.cellsError = String(error);
+    throw error;
   }
 }
 
@@ -268,6 +272,7 @@ export async function pollCluster() {
   try {
     const c = await apiGet<ClusterStatus>(publicUrl("/v1/cluster"));
     session.cluster = c;
+    session.clusterError = "";
     if (c && (c.node_count || (c.nodes || []).length)) {
       const n = c.node_count || (c.nodes || []).length;
       const h = c.healthy_count ?? n;
@@ -275,9 +280,10 @@ export async function pollCluster() {
     } else {
       session.clusterLabel = "standalone";
     }
-  } catch {
-    session.cluster = null;
+  } catch (error) {
+    session.clusterError = String(error);
     session.clusterLabel = "—";
+    throw error;
   }
 }
 

@@ -15,7 +15,7 @@ const createStatus = useActionStatus();
 const listStatus = useActionStatus();
 
 onMounted(() => {
-  void refreshFlows();
+  void refreshFlows().catch(() => {});
 });
 
 async function create() {

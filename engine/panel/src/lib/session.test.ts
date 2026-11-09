@@ -73,3 +73,15 @@ it("keeps credentials after network failure but clears definite rejection", asyn
   expect(session.token).toBe("");
   expect(session.phase).toBe("gate");
 });
+
+it("centrally rejects revoked credentials during an active session and stops polling", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 401 })));
+  const { session, setToken } = await import("./session");
+  const { apiGet, adminUrl } = await import("./api");
+  session.phase = "app";
+  setToken("revoked");
+  await expect(apiGet(adminUrl("/cells"))).rejects.toMatchObject({ status: 401 });
+  expect(session.phase).toBe("gate");
+  expect(session.token).toBe("");
+  expect(vi.getTimerCount()).toBe(0);
+});

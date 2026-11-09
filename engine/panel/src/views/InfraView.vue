@@ -223,7 +223,7 @@ onMounted(() => {
 });
 
 async function load() {
-  await refreshCells();
+  try { await refreshCells(); } catch (error) { fedStatus.fail(error); return; }
   await Promise.all([loadFed(), loadInfra()]);
   if (selectedNodeKey.value && !nodeRows.value.some((row) => row.key === selectedNodeKey.value)) {
     selectedNodeKey.value = "";

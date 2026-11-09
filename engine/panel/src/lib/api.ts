@@ -16,6 +16,10 @@ export function isAuthRejection(error: unknown): boolean {
 }
 
 let brokerAccessAllowed = () => true;
+let authRejected = (_error: ApiError) => {};
+export function onAuthRejected(handler: (error: ApiError) => void) {
+  authRejected = handler;
+}
 export function setBrokerAccessGuard(guard: () => boolean) {
   brokerAccessAllowed = guard;
 }
@@ -67,7 +71,10 @@ async function request<T>(url: string, init: RequestInit = {}): Promise<T> {
     if (body && typeof body === "object" && "error" in body) {
       msg = String((body as { error: unknown }).error || msg);
     }
-    throw new ApiError(msg, res.status, body);
+    const error = new ApiError(msg, res.status, body);
+    // Ignore a late rejection for a credential that has already been replaced.
+    if (isAuthRejection(error) && auth.Authorization === authHeaders().Authorization) authRejected(error);
+    throw error;
   }
   return body as T;
 }

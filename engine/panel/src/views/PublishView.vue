@@ -48,8 +48,8 @@ const selectedFlow = computed(() => catalog.flows.find((f) => flowId(f) === form
 const hideRoutingKey = computed(() => form.mode !== "group" && form.pacing === "profile");
 
 onMounted(() => {
-  void refreshGroups();
-  void refreshFlows();
+  void refreshGroups().catch(() => {});
+  void refreshFlows().catch(() => {});
 });
 
 async function publish() {
