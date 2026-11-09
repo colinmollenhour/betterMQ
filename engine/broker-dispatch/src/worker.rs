@@ -1022,7 +1022,7 @@ impl DispatchEngine {
             .filter(|u| !u.is_empty())
             .ok_or(DispatchError::NoDestination)?;
 
-        if self.host_blocker.is_blocked(url) {
+        if self.host_blocker.is_blocked_async(url).await {
             let job = DeliveryJob::live(msg.topic.clone(), msg.partition, msg.offset, msg.id);
             self.defer_job(job, Duration::from_secs(30), "host_blocked");
             return Ok(());
@@ -1118,7 +1118,7 @@ impl DispatchEngine {
 
             match response {
                 Ok(resp) if resp.status().is_success() => {
-                    self.host_blocker.record_success(url);
+                    self.host_blocker.record_success_async(url).await;
                     discard_body_capped(resp).await;
                     self.clear_retry(msg)?;
                     self.commit_dispatch_offset(
@@ -1185,7 +1185,7 @@ impl DispatchEngine {
                     return Ok(());
                 }
                 Err(e) => {
-                    self.host_blocker.record_transport_failure(url);
+                    self.host_blocker.record_transport_failure_async(url).await;
                     last_failure = format!("transport error: {e}");
                     warn!(
                         error = %e,
@@ -1438,7 +1438,7 @@ impl DispatchEngine {
             .as_deref()
             .filter(|u| !u.is_empty())
             .ok_or(DispatchError::NoDestination)?;
-        if self.host_blocker.is_blocked(url) {
+        if self.host_blocker.is_blocked_async(url).await {
             return Err(DispatchError::HostBlocked);
         }
         let outbound = build_outbound(msg);
@@ -1466,7 +1466,7 @@ impl DispatchEngine {
         let retry_after_ms;
         let failure = match response {
             Ok(response) if response.status().is_success() => {
-                self.host_blocker.record_success(url);
+                self.host_blocker.record_success_async(url).await;
                 discard_body_capped(response).await;
                 self.clear_retry(msg)?;
                 return Ok(());
@@ -1484,7 +1484,7 @@ impl DispatchEngine {
                     self.clear_retry(msg)?;
                     return Err(DispatchError::NonRetryable(format!("HTTP {code}")));
                 }
-                self.host_blocker.record_transport_failure(url);
+                self.host_blocker.record_transport_failure_async(url).await;
                 format!("HTTP {code}")
             }
             Err(error) if crate::egress::is_policy_failure(&error) => {
@@ -1494,7 +1494,7 @@ impl DispatchEngine {
             }
             Err(error) => {
                 retry_after_ms = None;
-                self.host_blocker.record_transport_failure(url);
+                self.host_blocker.record_transport_failure_async(url).await;
                 format!("transport error: {error}")
             }
         };

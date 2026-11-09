@@ -29,24 +29,23 @@ impl Default for HostBlockerConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HostState {
     failures: u32,
     /// Wall-clock ms since epoch when block ends (shared-durable).
     blocked_until_ms: Option<i64>,
     cooldown_ms: u64,
+    #[serde(default)]
+    updated_at_ns: u64,
+    #[serde(default)]
+    revision: uuid::Uuid,
+    #[serde(default)]
+    cleared: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct SharedHostFile {
-    hosts: HashMap<String, SharedHostEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SharedHostEntry {
-    failures: u32,
-    blocked_until_ms: Option<i64>,
-    cooldown_ms: u64,
+    hosts: HashMap<String, HostState>,
 }
 
 #[derive(Default)]
@@ -64,12 +63,37 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn touch(state: &mut HostState) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64;
+    state.updated_at_ns = now.max(state.updated_at_ns.saturating_add(1));
+    state.revision = uuid::Uuid::new_v4();
+}
+
+fn merge_hosts(target: &mut HashMap<String, HostState>, incoming: HashMap<String, HostState>) {
+    for (key, state) in incoming {
+        let replace = target.get(&key).is_none_or(|old| {
+            (state.updated_at_ns, state.revision) > (old.updated_at_ns, old.revision)
+        });
+        if replace {
+            target.insert(key, state);
+        }
+    }
+}
+
 impl HostBlocker {
     pub fn new(cfg: HostBlockerConfig) -> Self {
         let shared_path = std::env::var("BETTERMQ_SHARED_META_DIR")
             .ok()
             .filter(|s| !s.trim().is_empty())
             .map(|d| PathBuf::from(d).join("host_breaker.json"));
+        Self::with_shared_path(cfg, shared_path)
+    }
+
+    fn with_shared_path(cfg: HostBlockerConfig, shared_path: Option<PathBuf>) -> Self {
         let hb = Self {
             cfg,
             hosts: Mutex::new(HashMap::new()),
@@ -83,6 +107,9 @@ impl HostBlocker {
     }
 
     fn load_shared(&self, path: &Path) {
+        // Throttle missing/unreadable snapshots too; a healthy new cluster may
+        // not create the first snapshot until its first breaker transition.
+        *self.last_shared_load_ms.lock() = now_ms();
         let Ok(_lock) = broker_storage::FileLock::exclusive(path) else {
             return;
         };
@@ -96,17 +123,7 @@ impl HostBlocker {
         let Ok(file) = serde_json::from_str::<SharedHostFile>(&buf) else {
             return;
         };
-        let mut hosts = self.hosts.lock();
-        for (k, e) in file.hosts {
-            hosts.insert(
-                k,
-                HostState {
-                    failures: e.failures,
-                    blocked_until_ms: e.blocked_until_ms,
-                    cooldown_ms: e.cooldown_ms,
-                },
-            );
-        }
+        merge_hosts(&mut self.hosts.lock(), file.hosts);
         *self.last_shared_load_ms.lock() = now_ms();
     }
 
@@ -131,27 +148,30 @@ impl HostBlocker {
         let Ok(_lock) = broker_storage::FileLock::exclusive(path) else {
             return;
         };
-        let hosts = self.hosts.lock();
-        let file = SharedHostFile {
-            hosts: hosts
-                .iter()
-                .map(|(k, s)| {
-                    (
-                        k.clone(),
-                        SharedHostEntry {
-                            failures: s.failures,
-                            blocked_until_ms: s.blocked_until_ms,
-                            cooldown_ms: s.cooldown_ms,
-                        },
-                    )
-                })
-                .collect(),
+        let mut file = if path.exists() {
+            match std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<SharedHostFile>(&bytes).ok())
+            {
+                Some(file) => file,
+                None => {
+                    tracing::error!(
+                        "cannot read shared host breaker state; refusing to overwrite it"
+                    );
+                    return;
+                }
+            }
+        } else {
+            SharedHostFile::default()
         };
-        drop(hosts);
+        merge_hosts(&mut file.hosts, self.hosts.lock().clone());
+        merge_hosts(&mut self.hosts.lock(), file.hosts.clone());
         let Ok(json) = serde_json::to_vec_pretty(&file) else {
             return;
         };
-        let _ = broker_storage::atomic_write_file(path, &json);
+        if let Err(error) = broker_storage::atomic_write_file(path, &json) {
+            tracing::error!(%error, "cannot persist shared host breaker state");
+        }
     }
 
     pub fn host_key(url: &str) -> Option<String> {
@@ -175,12 +195,26 @@ impl HostBlocker {
         state.blocked_until_ms.is_some_and(|until| now_ms() < until)
     }
 
+    pub async fn is_blocked_async(self: &std::sync::Arc<Self>, url: &str) -> bool {
+        if self.shared_path.is_some()
+            && now_ms().saturating_sub(*self.last_shared_load_ms.lock()) >= 1_000
+        {
+            let this = self.clone();
+            let url = url.to_owned();
+            return tokio::task::spawn_blocking(move || this.is_blocked(&url))
+                .await
+                .unwrap_or(true);
+        }
+        self.is_blocked(url)
+    }
+
     pub fn record_success(&self, url: &str) {
         let Some(key) = Self::host_key(url) else {
             return;
         };
-        self.hosts.lock().remove(&key);
-        self.persist_shared();
+        if self.clear_host(&key) {
+            self.persist_shared();
+        }
     }
 
     pub fn record_transport_failure(&self, url: &str) {
@@ -193,19 +227,26 @@ impl HostBlocker {
                 failures: 0,
                 blocked_until_ms: None,
                 cooldown_ms: self.cfg.initial_cooldown_ms,
+                updated_at_ns: 0,
+                revision: uuid::Uuid::nil(),
+                cleared: false,
             });
-            state.failures += 1;
+            state.cleared = false;
+            state.failures = state.failures.saturating_add(1);
             if state.failures >= self.cfg.failures_before_block {
                 let wait = state.cooldown_ms;
                 state.blocked_until_ms = Some(now_ms() + wait as i64);
                 state.cooldown_ms = ((state.cooldown_ms as f64) * self.cfg.multiplier)
                     .min(self.cfg.max_cooldown_ms as f64)
                     as u64;
+                touch(state);
                 tracing::warn!(
                     destination = %url,
                     cooldown_ms = wait,
                     "host blocked after transport failures"
                 );
+            } else {
+                return;
             }
         }
         self.persist_shared();
@@ -219,14 +260,20 @@ impl HostBlocker {
             host.trim().to_string()
         };
         let wait = duration_ms.max(1_000);
-        self.hosts.lock().insert(
-            key.clone(),
-            HostState {
-                failures: self.cfg.failures_before_block,
-                blocked_until_ms: Some(now_ms() + wait as i64),
-                cooldown_ms: duration_ms,
-            },
-        );
+        let mut state = HostState {
+            failures: self.cfg.failures_before_block,
+            blocked_until_ms: Some(now_ms().saturating_add(wait.min(i64::MAX as u64) as i64)),
+            cooldown_ms: duration_ms,
+            updated_at_ns: self
+                .hosts
+                .lock()
+                .get(&key)
+                .map_or(0, |state| state.updated_at_ns),
+            revision: uuid::Uuid::nil(),
+            cleared: false,
+        };
+        touch(&mut state);
+        self.hosts.lock().insert(key.clone(), state);
         tracing::warn!(host = %key, cooldown_ms = wait, "host manually blocked");
         self.persist_shared();
         key
@@ -238,11 +285,63 @@ impl HostBlocker {
         } else {
             host.to_string()
         };
-        let removed = self.hosts.lock().remove(&key).is_some();
+        self.maybe_reload_shared();
+        let removed = self.clear_host(&key);
         if removed {
             self.persist_shared();
         }
         removed
+    }
+
+    fn clear_host(&self, key: &str) -> bool {
+        let mut hosts = self.hosts.lock();
+        if self.shared_path.is_none() {
+            return hosts.remove(key).is_some();
+        }
+        let Some(state) = hosts.get_mut(key).filter(|state| !state.cleared) else {
+            return false;
+        };
+        state.failures = 0;
+        state.blocked_until_ms = None;
+        state.cooldown_ms = self.cfg.initial_cooldown_ms;
+        state.cleared = true;
+        touch(state);
+        true
+    }
+
+    pub async fn record_success_async(self: &std::sync::Arc<Self>, url: &str) {
+        let changed = Self::host_key(url).is_some_and(|key| {
+            self.hosts
+                .lock()
+                .get(&key)
+                .is_some_and(|state| !state.cleared)
+        });
+        if !changed {
+            return;
+        }
+        if self.shared_path.is_none() {
+            self.record_success(url);
+            return;
+        }
+        let this = self.clone();
+        let url = url.to_owned();
+        if let Err(error) = tokio::task::spawn_blocking(move || this.record_success(&url)).await {
+            tracing::error!(%error, "shared breaker success update failed");
+        }
+    }
+
+    pub async fn record_transport_failure_async(self: &std::sync::Arc<Self>, url: &str) {
+        if self.shared_path.is_none() {
+            self.record_transport_failure(url);
+            return;
+        }
+        let this = self.clone();
+        let url = url.to_owned();
+        if let Err(error) =
+            tokio::task::spawn_blocking(move || this.record_transport_failure(&url)).await
+        {
+            tracing::error!(%error, "shared breaker failure update failed");
+        }
     }
 
     pub fn blocked_hosts(&self) -> Vec<(String, u64)> {
@@ -271,7 +370,7 @@ impl HostBlocker {
         let mut hosts_with_failures = 0u64;
         let mut current_failures = 0u64;
         let mut max_host_failures = 0u64;
-        for state in hosts.values() {
+        for state in hosts.values().filter(|state| !state.cleared) {
             blocked_hosts += u64::from(
                 state
                     .blocked_until_ms
@@ -282,7 +381,7 @@ impl HostBlocker {
             max_host_failures = max_host_failures.max(u64::from(state.failures));
         }
         crate::telemetry::HostPressureSnapshot {
-            tracked_hosts: hosts.len() as u64,
+            tracked_hosts: hosts.values().filter(|state| !state.cleared).count() as u64,
             blocked_hosts,
             hosts_with_failures,
             current_failures,
@@ -294,6 +393,39 @@ impl HostBlocker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_updates_preserve_peer_blocks_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host_breaker.json");
+        let a = HostBlocker::with_shared_path(HostBlockerConfig::default(), Some(path.clone()));
+        let b = HostBlocker::with_shared_path(HostBlockerConfig::default(), Some(path.clone()));
+        a.record_success("https://healthy.example/hook");
+        assert!(
+            !path.exists(),
+            "healthy deliveries must not create shared snapshots"
+        );
+        a.block_manual("https://a.example", 60_000);
+        b.block_manual("https://b.example", 60_000);
+        a.load_shared(&path);
+        assert!(a.is_blocked("https://a.example"));
+        assert!(a.is_blocked("https://b.example"));
+        a.unblock("https://a.example");
+        b.block_manual("https://c.example", 60_000);
+        a.load_shared(&path);
+        b.load_shared(&path);
+        assert!(
+            !b.is_blocked("https://a.example"),
+            "stale peer must not resurrect clears"
+        );
+        assert!(a.is_blocked("https://b.example"));
+        assert!(a.is_blocked("https://c.example"));
+        let bytes = std::fs::read(&path).unwrap();
+        for _ in 0..100 {
+            a.record_success("https://healthy.example/hook");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
 
     #[test]
     fn blocks_after_failures() {
@@ -315,5 +447,22 @@ mod tests {
         assert_eq!(snapshot.current_failures, 2);
         hb.record_success(url);
         assert!(!hb.is_blocked(url));
+        assert!(
+            hb.hosts.lock().is_empty(),
+            "local clears need no retained tombstone"
+        );
+    }
+
+    #[test]
+    fn missing_shared_snapshot_is_reloaded_at_most_once_per_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("host_breaker.json");
+        let blocker = HostBlocker::with_shared_path(HostBlockerConfig::default(), Some(path));
+        let loaded_at = *blocker.last_shared_load_ms.lock();
+        assert!(loaded_at > 0);
+        for _ in 0..100 {
+            assert!(!blocker.is_blocked("https://healthy.example"));
+        }
+        assert_eq!(*blocker.last_shared_load_ms.lock(), loaded_at);
     }
 }

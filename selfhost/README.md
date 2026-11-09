@@ -263,6 +263,8 @@ Retries hold back later work only within the same strict-FIFO flow key. Other ke
 
 Webhook connections use reusable short/long HTTP pools. DNS is policy-checked on each new connection and all allowed answers are available for connection fallback. Redirects and environment HTTP proxies are disabled so outbound connections cannot bypass the egress policy. `BETTERMQ_LONG_WAIT_TIER`, when set, overrides the long-payload pool timeout.
 
+With shared metadata, host-breaker snapshots merge per-host revisions under the shared file lock; clear markers prevent stale peers from resurrecting removed blocks. Only block/clear transitions persist, off the async delivery path. Keep broker clocks synchronized; clear markers are retained in shared metadata.
+
 #### DLQ and group fan-out
 
 Fan-out vars are **group bookkeeping**, not DLQ TTL.
