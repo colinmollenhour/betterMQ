@@ -40,6 +40,7 @@ pub struct ArchiveManifest {
 #[derive(Debug, Clone, Serialize)]
 pub struct ArchiveLagStatus {
     pub enabled: bool,
+    pub initialization_error: Option<String>,
     pub queued_records: u64,
     pub queued_bytes: u64,
     pub failed_records: u64,
@@ -62,6 +63,8 @@ pub struct ArchiveToolReport {
 
 #[derive(Debug, Error)]
 pub enum ArchiveError {
+    #[error("archive configuration: {0}")]
+    Configuration(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("manifest: {0}")]
@@ -101,7 +104,7 @@ struct ArchiveService {
     capacity: usize,
 }
 
-static SERVICE: OnceLock<Option<ArchiveService>> = OnceLock::new();
+static SERVICE: OnceLock<Result<Option<ArchiveService>, String>> = OnceLock::new();
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -127,84 +130,106 @@ fn unix_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
-fn archive_backend() -> Option<ArchiveBackend> {
-    if std::env::var("BETTERMQ_ARCHIVE_BUCKET").is_ok()
-        || std::env::var("S3_ARCHIVE_BUCKET").is_ok()
-        || std::env::var("R2_ARCHIVE_BUCKET").is_ok()
+fn archive_backend() -> Result<Option<ArchiveBackend>, ArchiveError> {
+    if [
+        "BETTERMQ_ARCHIVE_BUCKET",
+        "S3_ARCHIVE_BUCKET",
+        "R2_ARCHIVE_BUCKET",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some())
     {
         #[cfg(feature = "s3")]
         {
-            match crate::open_archive_object_store_from_env() {
-                Ok(store) => {
-                    let prefix = std::env::var("BETTERMQ_ARCHIVE_PREFIX")
-                        .unwrap_or_else(|_| "bettermq-archive".into());
-                    return Some(ArchiveBackend::Object { store, prefix });
-                }
-                Err(error) => {
-                    warn!(%error, "archive object-store configuration invalid");
-                    return None;
-                }
-            }
+            let store = crate::open_archive_object_store_from_env()
+                .map_err(|error| ArchiveError::Configuration(error.to_string()))?;
+            let prefix = std::env::var("BETTERMQ_ARCHIVE_PREFIX")
+                .unwrap_or_else(|_| "bettermq-archive".into());
+            return Ok(Some(ArchiveBackend::Object { store, prefix }));
         }
         #[cfg(not(feature = "s3"))]
         {
-            warn!("archive bucket configured but broker-storage was built without feature `s3`");
-            return None;
+            return Err(ArchiveError::Configuration(
+                "archive bucket configured but broker-storage was built without feature `s3`"
+                    .into(),
+            ));
         }
     }
-    std::env::var("BETTERMQ_ARCHIVE_DIR")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(ArchiveBackend::Local)
+    match std::env::var("BETTERMQ_ARCHIVE_DIR") {
+        Ok(value) if value.trim().is_empty() => Err(ArchiveError::Configuration(
+            "BETTERMQ_ARCHIVE_DIR must not be empty".into(),
+        )),
+        Ok(value) => {
+            let root = PathBuf::from(value.trim());
+            std::fs::create_dir_all(&root)?;
+            let probe = root.join(format!(".archive-probe-{}", uuid::Uuid::new_v4()));
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)?;
+            let result = file.sync_all();
+            drop(file);
+            std::fs::remove_file(probe)?;
+            result?;
+            Ok(Some(ArchiveBackend::Local(root)))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(ArchiveError::Configuration(error.to_string())),
+    }
 }
 
-fn service() -> Option<&'static ArchiveService> {
-    SERVICE
-        .get_or_init(|| {
-            let backend = archive_backend()?;
-            let capacity = env_usize("BETTERMQ_ARCHIVE_QUEUE_CAPACITY", 128);
-            let retries = env_usize("BETTERMQ_ARCHIVE_MAX_RETRIES", 5);
-            let counters = Arc::new(ArchiveCounters::default());
-            let worker_counters = counters.clone();
-            let (sender, receiver) = mpsc::sync_channel(capacity);
-            std::thread::Builder::new()
-                .name("bettermq-archive".into())
-                .spawn(move || archive_worker(receiver, backend, retries, worker_counters))
-                .ok()?;
-            let service = ArchiveService {
-                sender,
-                counters,
-                capacity,
-            };
-            if let Some(root) = std::env::var_os("BETTERMQ_DATA_DIR").map(PathBuf::from) {
-                visit_recovery_segments(&root, &mut |path| {
-                    queue_archive_job(&service, path);
-                });
-            }
-            Some(service)
-        })
-        .as_ref()
+fn service() -> Result<Option<&'static ArchiveService>, ArchiveError> {
+    match SERVICE.get_or_init(|| initialize_service().map_err(|error| error.to_string())) {
+        Ok(service) => Ok(service.as_ref()),
+        Err(error) => Err(ArchiveError::Configuration(error.clone())),
+    }
+}
+
+fn initialize_service() -> Result<Option<ArchiveService>, ArchiveError> {
+    let Some(backend) = archive_backend()? else {
+        return Ok(None);
+    };
+    let capacity = env_usize("BETTERMQ_ARCHIVE_QUEUE_CAPACITY", 128);
+    let retries = env_usize("BETTERMQ_ARCHIVE_MAX_RETRIES", 5);
+    let counters = Arc::new(ArchiveCounters::default());
+    let worker_counters = counters.clone();
+    let (sender, receiver) = mpsc::sync_channel(capacity);
+    std::thread::Builder::new()
+        .name("bettermq-archive".into())
+        .spawn(move || archive_worker(receiver, backend, retries, worker_counters))?;
+    let service = ArchiveService {
+        sender,
+        counters,
+        capacity,
+    };
+    if let Some(root) = std::env::var_os("BETTERMQ_DATA_DIR").map(PathBuf::from) {
+        visit_recovery_segments(&root, &mut |path| {
+            queue_archive_job(&service, path);
+        });
+    }
+    Ok(Some(service))
 }
 
 /// Initialize archive recovery during broker bootstrap so pending sealed
 /// segments are requeued even when no new segment rolls after restart.
-pub fn start_archive_service() {
-    let _ = service();
+pub fn start_archive_service() -> Result<(), ArchiveError> {
+    service().map(|_| ())
 }
 
 pub fn archive_lag_status() -> ArchiveLagStatus {
-    let Some(service) = SERVICE.get().and_then(Option::as_ref) else {
+    let state = SERVICE.get();
+    let Some(Ok(Some(service))) = state else {
+        let error = state.and_then(|state| state.as_ref().err()).cloned();
         return ArchiveLagStatus {
-            enabled: false,
+            enabled: error.is_some(),
+            initialization_error: error.clone(),
             queued_records: 0,
             queued_bytes: 0,
             failed_records: 0,
             failed_bytes: 0,
             oldest_age_ms: 0,
             capacity: 0,
-            admission_blocked: false,
+            admission_blocked: error.is_some(),
         };
     };
     service_lag_status(service)
@@ -226,6 +251,7 @@ fn service_lag_status(service: &ArchiveService) -> ArchiveLagStatus {
     let high_water = ((service.capacity as u64) * 3 / 4).max(1);
     ArchiveLagStatus {
         enabled: true,
+        initialization_error: None,
         queued_records: records,
         queued_bytes: bytes,
         failed_records,
@@ -247,8 +273,13 @@ pub fn archive_admission_blocked() -> bool {
 /// before the queue fills; this final blocking send prevents silently losing an
 /// archive job if already-admitted writes race the high-water mark.
 pub fn enqueue_sealed_segment(path: &Path) {
-    let Some(service) = service() else {
-        return;
+    let service = match service() {
+        Ok(Some(service)) => service,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(%error, "configured archive initialization failed; admission is blocked");
+            return;
+        }
     };
     if pending_marker(path).exists() {
         return;
@@ -883,6 +914,111 @@ pub async fn restore_object_archive_until(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn archive_initialization_configuration() {
+        if let Ok(mode) = std::env::var("BETTERMQ_TEST_ARCHIVE_INIT") {
+            let result = start_archive_service();
+            let status = archive_lag_status();
+            match mode.as_str() {
+                "disabled" => {
+                    result.unwrap();
+                    assert!(!status.enabled);
+                    assert!(!status.admission_blocked);
+                    assert!(status.initialization_error.is_none());
+                }
+                "enabled" => {
+                    result.unwrap();
+                    assert!(status.enabled);
+                    assert!(!status.admission_blocked);
+                    assert!(status.initialization_error.is_none());
+                }
+                "failed" => {
+                    assert!(result.is_err());
+                    assert!(status.enabled);
+                    assert!(status.admission_blocked);
+                    assert!(status.initialization_error.is_some());
+                    assert!(start_archive_service().is_err(), "failure remains visible");
+                }
+                _ => panic!("unknown child mode"),
+            }
+            return;
+        }
+        // Each environment/OnceLock combination gets a separate process. Never
+        // mutate process-wide configuration under parallel unit tests.
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, b"occupied").unwrap();
+        for (mode, variable, value) in [
+            ("disabled", "BETTERMQ_UNUSED", "".to_string()),
+            (
+                "failed",
+                "BETTERMQ_ARCHIVE_BUCKET",
+                "configured".to_string(),
+            ),
+            ("failed", "BETTERMQ_ARCHIVE_DIR", "".to_string()),
+            (
+                "failed",
+                "BETTERMQ_ARCHIVE_DIR",
+                file.to_string_lossy().into_owned(),
+            ),
+            (
+                "enabled",
+                "BETTERMQ_ARCHIVE_DIR",
+                dir.path().join("archive").to_string_lossy().into_owned(),
+            ),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            for (name, _) in std::env::vars_os() {
+                let key = name.to_string_lossy();
+                if key.starts_with("BETTERMQ_")
+                    || key.starts_with("S3_")
+                    || key.starts_with("R2_")
+                    || key.starts_with("AWS_")
+                {
+                    child.env_remove(name);
+                }
+            }
+            let output = child
+                .args([
+                    "--exact",
+                    "archive::tests::archive_initialization_configuration",
+                    "--nocapture",
+                ])
+                .env("BETTERMQ_TEST_ARCHIVE_INIT", mode)
+                .env(variable, value)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "archive::tests::archive_initialization_configuration",
+                ])
+                .env_clear()
+                .env("BETTERMQ_TEST_ARCHIVE_INIT", "failed")
+                .env(
+                    "BETTERMQ_ARCHIVE_BUCKET",
+                    std::ffi::OsString::from_vec(vec![0xff]),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "malformed configured bucket must not silently disable archiving: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
 
     #[test]
     fn exhausted_archive_recovers_without_restart() {

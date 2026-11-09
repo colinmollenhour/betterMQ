@@ -579,6 +579,14 @@ fn append_controller_metrics(
 }
 
 fn append_archive_metrics(out: &mut String, snapshot: &broker_storage::ArchiveLagStatus) {
+    out.push_str(
+        "# HELP bettermq_archive_initialization_failed Configured archive failed initialization\n",
+    );
+    out.push_str("# TYPE bettermq_archive_initialization_failed gauge\n");
+    out.push_str(&format!(
+        "bettermq_archive_initialization_failed {}\n",
+        u8::from(snapshot.initialization_error.is_some())
+    ));
     out.push_str("# HELP bettermq_archive_enabled Whether asynchronous archive is configured\n");
     out.push_str("# TYPE bettermq_archive_enabled gauge\n");
     out.push_str(&format!(
@@ -1080,6 +1088,7 @@ mod tests {
             }),
             archive: broker_storage::ArchiveLagStatus {
                 enabled: true,
+                initialization_error: None,
                 queued_records: 4,
                 queued_bytes: 8192,
                 failed_records: 1,

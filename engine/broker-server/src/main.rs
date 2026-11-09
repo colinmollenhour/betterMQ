@@ -550,7 +550,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&settings.data_dir)
         .with_context(|| format!("create data dir {}", settings.data_dir.display()))?;
-    broker_storage::start_archive_service();
+    broker_storage::start_archive_service().context("initialize sealed-segment archive")?;
 
     if settings.cluster_enabled {
         let cluster_cfg = if let Some(c) = &file_cfg {

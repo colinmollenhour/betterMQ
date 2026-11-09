@@ -4,6 +4,13 @@ The archive worker is bounded and asynchronous from normal WAL commits. It
 streams each sealed segment, retries failures, writes a SHA-256 manifest, and
 blocks new ingest when configured lag limits are exceeded.
 
+Explicit archive configuration is fail-closed: an invalid object-store setup,
+missing `s3` build feature, empty local archive path, unwritable local target, or
+worker startup failure aborts broker startup. An initialization failure is not
+reported as disabled: the status includes `initialization_error`, blocks admission,
+and exports `bettermq_archive_initialization_failed = 1`. Object-store connectivity
+failures after initialization follow the background retry policy below.
+
 Each sealed segment has durable pending/completion markers beside the local
 segment. Normal broker startup initializes the archive worker and streams every
 unfinished segment back through the bounded queue. Failed jobs remain in the
