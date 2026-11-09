@@ -37,6 +37,7 @@ import {
 } from "@/lib/federation";
 import { useActionStatus } from "@/composables/useActionStatus";
 import { errText } from "@/lib/payload";
+import { canRemoveNode } from "@/lib/targets";
 import { refreshCells, selectedCell, session, type CellMember, type CellRecord } from "@/lib/session";
 
 type SectionId = "overview" | "nodes" | "cells" | "cluster" | "this-node" | "storage";
@@ -379,8 +380,14 @@ async function syncCluster() {
   }
 }
 
-async function removeNode(name: string) {
-  if (!confirm(`Remove ${name} from the cluster?`)) return;
+function removable(row: NodeRow) {
+  return canRemoveNode(row, session.isSeed, session.cluster?.cluster_id);
+}
+
+async function removeNode(row: NodeRow) {
+  if (!removable(row)) return;
+  const name = row.broker?.name || row.broker?.addr || row.name;
+  if (!confirm(`Remove ${name} from cell ${row.cellLabel} (${row.cellId})?`)) return;
   detailStatus.reset();
   try {
     const res = await apiPost<{ message?: string; needs_restart?: boolean }>(
@@ -654,14 +661,14 @@ function openAddNode() {
                   </div>
                 </CardContent>
                 <CardFooter
-                  v-if="session.isSeed && selectedRow.broker && !selectedRow.self"
+                  v-if="removable(selectedRow)"
                   class="flex-wrap"
                 >
                   <ActionMessage :error="detailStatus.error" :ok="detailStatus.ok" />
                   <Button
                     variant="destructive"
                     size="sm"
-                    @click="removeNode(selectedRow.broker.name || selectedRow.broker.addr || selectedRow.name)"
+                    @click="removeNode(selectedRow)"
                   >
                     Remove
                   </Button>
