@@ -74,6 +74,10 @@ jobs:
 
   selfhost-compose-validate:
     runs-on: ubuntu-latest
+    env:
+      BETTERMQ_VERSION: ci
+      MINIO_IMAGE: minio/minio:config-validation-only
+      MINIO_MC_IMAGE: minio/mc:config-validation-only
     steps:
       - uses: actions/checkout@v4
         with:

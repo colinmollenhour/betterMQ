@@ -76,6 +76,12 @@ not a substitute for the RF=3 WAL.
 2. Run the new binary's `bettermq doctor` against a copy of the data.
 3. Upgrade one non-leader/dispatch node, wait for `/readyz`, then continue one
    node at a time. Do not upgrade without quorum headroom.
+   For Compose, record the old `.env`, set `BETTERMQ_VERSION` to the tested
+   target tag, and pull without recreating services. Then recreate **one**
+   member with `docker compose -f docker-compose.ha.yml up -d --no-deps broker2`.
+   Wait for its authenticated readiness and healthy ISR/replication metrics
+   before repeating for the next member. Do not run project-wide `up -d`
+   during a rolling upgrade; it may recreate all three members together.
 4. Do not reinterpret or move an existing data directory between V1/V2
    layouts. Use a versioned migration command when one is released.
 5. Roll back by stopping the new binary and restoring the untouched backup

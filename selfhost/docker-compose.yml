@@ -15,7 +15,7 @@
 
 services:
   bettermq:
-    image: ${BETTERMQ_IMAGE:-ghcr.io/colinmollenhour/bettermq}:${BETTERMQ_TAG:-latest}
+    image: ${BETTERMQ_IMAGE:-ghcr.io/colinmollenhour/bettermq}:${BETTERMQ_VERSION:?pin BETTERMQ_VERSION to a release tag}
     build:
       context: ..
       dockerfile: selfhost/Dockerfile

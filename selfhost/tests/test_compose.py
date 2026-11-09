@@ -9,7 +9,8 @@ import unittest
 SELFHOST = Path(__file__).resolve().parents[1]
 ENV = dict(os.environ, BETTERMQ_CLUSTER_SECRET="c" * 64,
            BETTERMQ_METRICS_TOKEN="m" * 64, MINIO_ROOT_USER="ci",
-           MINIO_ROOT_PASSWORD="ci-secret-not-default", BETTERMQ_VERSION="ci")
+           MINIO_ROOT_PASSWORD="ci-secret-not-default", BETTERMQ_VERSION="ci",
+           MINIO_IMAGE="minio/minio:config-test", MINIO_MC_IMAGE="minio/mc:config-test")
 
 
 def config(name):
@@ -19,6 +20,16 @@ def config(name):
 
 
 class ComposeTests(unittest.TestCase):
+    def test_version_selection_is_required(self):
+        env = dict(ENV)
+        env.pop("BETTERMQ_VERSION")
+        result = subprocess.run(["docker", "compose", "-f", str(SELFHOST / "docker-compose.ha.yml"), "config"],
+                                env=env, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        for path in SELFHOST.glob("docker-compose*.yml"):
+            for service in config(path.name)["services"].values():
+                self.assertFalse(service.get("image", "").endswith(":latest"))
+
     def test_default_broker_images_use_this_fork(self):
         for path in SELFHOST.glob("docker-compose*.yml"):
             for service in config(path.name)["services"].values():

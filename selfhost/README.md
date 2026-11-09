@@ -1,5 +1,18 @@
 # BetterMQ self-host
 
+### Pin deployment versions
+
+Before **any** Compose example, export `BETTERMQ_VERSION` to a tested fork
+release tag (for example `0.6.2`, only if published), including source builds.
+Compose deliberately fails when it is unset. Never set it to `latest` in HA.
+Slate examples also require `MINIO_IMAGE` and `MINIO_MC_IMAGE` as complete,
+tested release references, preferably `minio/minio@sha256:<digest>` and
+`minio/mc@sha256:<digest>`. No floating MinIO defaults are supplied. Record these
+values in a protected deployment `.env` and retain them with offline backups.
+Pinning requires deliberate version selection; this is intentional rather than
+silently pulling a new release on the next restart. See [BACKUP.md](BACKUP.md)
+for the per-node upgrade procedure.
+
 ### Shutdown grace
 
 Compose gives broker, fleet and panel services 120 seconds to stop. The broker's
@@ -52,7 +65,7 @@ audit to pass and rejects any difference between generated and committed assets.
 Downloads the latest release binary from GitHub — no Rust toolchain or Docker required.
 Defaults target `colinmollenhour/betterMQ` releases and
 `ghcr.io/colinmollenhour/bettermq`, not upstream. Override `BETTERMQ_REPO` for
-installers or `BETTERMQ_IMAGE` (repository without tag) / `BETTERMQ_TAG` for
+installers or `BETTERMQ_IMAGE` (repository without tag) / `BETTERMQ_VERSION` for
 Compose when mirroring artifacts. A missing fork release is an error, not a
 fallback to upstream. Source builds use the checkout's code with `--build`.
 
