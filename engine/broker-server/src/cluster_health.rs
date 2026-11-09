@@ -6,7 +6,7 @@ use broker_api::{
 };
 use broker_dispatch::DispatchEngine;
 use broker_partition::Broker;
-use broker_raft_meta::NodeConfig;
+use broker_raft_meta::{ClusterRuntime, NodeConfig, DEFAULT_PEER_TTL_MS};
 use broker_replication::{ReplicateCatchUpRange, ReplicateCatchUpRequest};
 use broker_storage::StorageMode;
 use chrono::Utc;
@@ -377,6 +377,128 @@ async fn catch_up_shard(
     Ok(())
 }
 
+const HEALTH_INTERVAL: Duration = Duration::from_secs(2);
+/// Per-request timeout for health probes and gossip.
+const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A health refresh (probes, then gossip) must finish well inside the peer
+/// TTL so a slow or blackholed peer cannot make healthy peers look expired.
+fn health_cycle_deadline() -> Duration {
+    Duration::from_millis((DEFAULT_PEER_TTL_MS / 2).max(1) as u64)
+}
+
+/// Aborts the wrapped task when dropped, tying a helper task's lifetime to
+/// the task that owns the guard.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Probe every peer concurrently, stamp each success when its response
+/// arrives, persist the observations in one write, then gossip the merged view
+/// to the peers that answered.
+async fn refresh_peer_health(runtime: &ClusterRuntime, client: &reqwest::Client) {
+    let node_id = runtime.config().node_id;
+    let peers = runtime.config().peer_nodes();
+    let mut probes = tokio::task::JoinSet::new();
+    for peer in peers.iter().cloned() {
+        let client = client.clone();
+        probes.spawn(async move {
+            let path = if peer.internal_url.is_some() {
+                "/internal/v1/cluster"
+            } else {
+                "/healthz"
+            };
+            let url = format!("{}{path}", peer.internal_base());
+            let result = broker_api::cluster_auth::apply_cluster_secret(client.get(&url))
+                .send()
+                .await
+                .map(|resp| resp.status());
+            (peer, result, Utc::now().timestamp_millis())
+        });
+    }
+    let mut seen = HashMap::from([(node_id, Utc::now().timestamp_millis())]);
+    while let Some(joined) = probes.join_next().await {
+        let Ok((peer, result, seen_at)) = joined else {
+            continue;
+        };
+        match result {
+            Ok(status) if status.is_success() => {
+                seen.insert(peer.id, seen_at);
+            }
+            Ok(status) => warn!(peer = %peer.addr, %status, "peer health check failed"),
+            Err(error) => warn!(peer = %peer.addr, %error, "peer health check unreachable"),
+        }
+    }
+    let healthy: HashSet<Uuid> = seen.keys().copied().collect();
+    let store = runtime.clone();
+    let snapshot = match tokio::task::spawn_blocking(move || {
+        store.merge_peer_health(&seen);
+        store.peer_health_snapshot()
+    })
+    .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            warn!(%error, "persisting peer health observations failed");
+            return;
+        }
+    };
+
+    let gossip = Arc::new(ClusterGossipRequest {
+        observer: node_id,
+        seen: snapshot,
+        controller_vote: None,
+        controller_leader: None,
+    });
+    let mut sends = tokio::task::JoinSet::new();
+    for peer in peers.into_iter().filter(|peer| healthy.contains(&peer.id)) {
+        let client = client.clone();
+        let gossip = Arc::clone(&gossip);
+        sends.spawn(async move {
+            let url = format!("{}/internal/v1/cluster/gossip", peer.internal_base());
+            let result =
+                broker_api::cluster_auth::apply_cluster_secret(client.post(&url).json(&*gossip))
+                    .send()
+                    .await;
+            (peer, result.map(|resp| resp.status()))
+        });
+    }
+    while let Some(joined) = sends.join_next().await {
+        match joined {
+            Ok((_, Ok(status))) if status.is_success() => {}
+            Ok((peer, Ok(status))) => {
+                warn!(peer = %peer.addr, %status, "cluster gossip rejected");
+            }
+            Ok((peer, Err(error))) => warn!(peer = %peer.addr, %error, "cluster gossip failed"),
+            Err(error) => warn!(%error, "cluster gossip task failed"),
+        }
+    }
+}
+
+async fn peer_health_loop(runtime: ClusterRuntime, client: reqwest::Client) {
+    let mut interval = tokio::time::interval(HEALTH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        if tokio::time::timeout(
+            health_cycle_deadline(),
+            refresh_peer_health(&runtime, &client),
+        )
+        .await
+        .is_err()
+        {
+            warn!(
+                deadline_ms = health_cycle_deadline().as_millis() as u64,
+                "peer health refresh exceeded its deadline; abandoned outstanding probes"
+            );
+        }
+    }
+}
+
 pub fn spawn_cluster_health_monitor(
     cluster: Cluster,
     dispatch: DispatchEngine,
@@ -387,7 +509,7 @@ pub fn spawn_cluster_health_monitor(
 
     tokio::spawn(async move {
         let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(3))
+            .timeout(PEER_REQUEST_TIMEOUT)
             .build()
         {
             Ok(c) => c,
@@ -396,40 +518,20 @@ pub fn spawn_cluster_health_monitor(
                 return;
             }
         };
+        // Health refresh runs on its own cadence so catch-up, catalog sync or
+        // placement commits below can never delay liveness observations.
+        let _health = AbortOnDrop(tokio::spawn(peer_health_loop(runtime.clone(), client)));
 
         let mut prev_leaders: HashMap<u32, Uuid> = HashMap::new();
         let mut prev_peer_alive: HashMap<Uuid, bool> = HashMap::new();
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        let mut interval = tokio::time::interval(HEALTH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the immediate tick so the first health refresh lands before
+        // the first placement and recovered-peer decisions.
+        interval.tick().await;
         loop {
             interval.tick().await;
             let now = Utc::now().timestamp_millis();
-            runtime.record_self_alive(now);
-
-            for peer in runtime.config().nodes.iter() {
-                if peer.id == node_id {
-                    continue;
-                }
-                let path = if peer.internal_url.is_some() {
-                    "/internal/v1/cluster"
-                } else {
-                    "/healthz"
-                };
-                let url = format!("{}{path}", peer.internal_base());
-                match broker_api::cluster_auth::apply_cluster_secret(client.get(&url))
-                    .send()
-                    .await
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        runtime.record_peer_alive(peer.id, now);
-                    }
-                    Ok(resp) => {
-                        warn!(peer = %peer.addr, status = %resp.status(), "peer health check failed");
-                    }
-                    Err(e) => {
-                        warn!(peer = %peer.addr, error = %e, "peer health check unreachable");
-                    }
-                }
-            }
 
             for (peer_id, peer_url) in catalog_peer_targets(&state) {
                 let alive = runtime.is_peer_alive(peer_id, now);
@@ -443,29 +545,6 @@ pub fn spawn_cluster_health_monitor(
                 prev_peer_alive.insert(peer_id, alive);
             }
 
-            let gossip = ClusterGossipRequest {
-                observer: node_id,
-                seen: runtime.peer_health_snapshot(),
-                controller_vote: None,
-                controller_leader: None,
-            };
-            for peer in runtime.config().nodes.iter() {
-                if peer.id == node_id {
-                    continue;
-                }
-                let url = format!("{}/internal/v1/cluster/gossip", peer.internal_base());
-                let req =
-                    broker_api::cluster_auth::apply_cluster_secret(client.post(&url)).json(&gossip);
-                match req.send().await {
-                    Ok(response) if response.status().is_success() => {}
-                    Ok(response) => {
-                        warn!(peer = %peer.addr, status = %response.status(), "cluster gossip rejected");
-                    }
-                    Err(error) => {
-                        warn!(peer = %peer.addr, %error, "cluster gossip failed");
-                    }
-                }
-            }
             if !runtime.has_controller_lease() {
                 continue;
             }
@@ -833,5 +912,87 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    async fn health_peer(delay: Duration) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/healthz"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_delay(delay))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/internal/v1/cluster/gossip"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn gossip_requests(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.path() == "/internal/v1/cluster/gossip")
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blackholed_peers_cannot_stretch_a_health_cycle_past_the_peer_ttl() {
+        let healthy = health_peer(Duration::ZERO).await;
+        let blackholed = [
+            health_peer(Duration::from_secs(30)).await,
+            health_peer(Duration::from_secs(30)).await,
+        ];
+        let ids: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        let addrs = [
+            "http://local.invalid".to_string(),
+            healthy.uri(),
+            blackholed[0].uri(),
+            blackholed[1].uri(),
+        ];
+        let runtime = ClusterRuntime::from_config_only(ClusterConfig {
+            cluster_id: Uuid::new_v4(),
+            nodes: ids
+                .iter()
+                .zip(addrs)
+                .map(|(id, addr)| NodeConfig {
+                    id: *id,
+                    addr,
+                    internal_url: None,
+                })
+                .collect(),
+            node_id: ids[0],
+            generation: 1,
+            hash_version: 1,
+        });
+        let client = reqwest::Client::builder()
+            .timeout(PEER_REQUEST_TIMEOUT)
+            .build()
+            .unwrap();
+
+        let started = Utc::now().timestamp_millis();
+        let clock = std::time::Instant::now();
+        refresh_peer_health(&runtime, &client).await;
+        let elapsed = clock.elapsed();
+
+        // Probes run concurrently: two blackholed peers cost one timeout.
+        assert!(
+            elapsed < PEER_REQUEST_TIMEOUT + Duration::from_secs(1),
+            "{elapsed:?}"
+        );
+        assert!(elapsed < health_cycle_deadline());
+        let seen = runtime.peer_health_snapshot();
+        assert!(seen[&ids[1]] >= started, "stamped at response time");
+        assert!(!seen.contains_key(&ids[2]) && !seen.contains_key(&ids[3]));
+        let now = Utc::now().timestamp_millis();
+        assert!(runtime.is_peer_alive(ids[1], now));
+        assert!(!runtime.is_peer_alive(ids[2], now));
+        // Gossip goes only to peers that answered this cycle.
+        assert_eq!(gossip_requests(&healthy).await, 1);
+        assert_eq!(gossip_requests(&blackholed[0]).await, 0);
+        assert_eq!(gossip_requests(&blackholed[1]).await, 0);
     }
 }
