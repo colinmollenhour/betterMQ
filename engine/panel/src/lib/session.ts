@@ -1,6 +1,6 @@
 import { reactive } from "vue";
 import { isExternalAuth, isStandalone } from "@/lib/config";
-import { adminUrl, apiGet, apiPost, publicUrl, setBrokerAccessGuard } from "@/lib/api";
+import { adminUrl, apiGet, apiPost, isAuthRejection, publicUrl, setBrokerAccessGuard } from "@/lib/api";
 import { isLocalCell } from "@/lib/targets";
 import { refreshFlows, refreshGroups, refreshQueues } from "@/lib/catalog";
 import {
@@ -15,7 +15,7 @@ import {
   type ThemeMode,
 } from "@/lib/storage";
 
-export type AuthPhase = "loading" | "setup" | "gate" | "reveal" | "app";
+export type AuthPhase = "loading" | "unavailable" | "setup" | "gate" | "reveal" | "app";
 
 export type CellRecord = {
   id: string;
@@ -90,6 +90,29 @@ export function localBrokerSelected(): boolean {
 
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 let clusterTimer: ReturnType<typeof setInterval> | null = null;
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+let retryDelay = 1000;
+
+export function stopPolling() {
+  if (healthTimer) clearInterval(healthTimer);
+  if (clusterTimer) clearInterval(clusterTimer);
+  if (retryTimer) clearTimeout(retryTimer);
+  healthTimer = clusterTimer = retryTimer = null;
+}
+
+export function handleAuthFailure(error: unknown) {
+  stopPolling();
+  if (isAuthRejection(error)) {
+    setToken("");
+    session.phase = "gate";
+    session.gateMessage = "Authentication rejected. Enter a valid credential.";
+  } else {
+    session.phase = "unavailable";
+    session.gateMessage = "Broker unavailable. Your credential has been kept; retrying automatically.";
+    retryTimer = setTimeout(() => void initAuth(), retryDelay);
+    retryDelay = Math.min(retryDelay * 2, 30000);
+  }
+}
 
 export function selectedCell(): CellRecord | null {
   return session.cells.find((c) => c.id === session.selectedCellId) || session.cells[0] || null;
@@ -118,6 +141,7 @@ export function setTheme(mode: ThemeMode) {
 }
 
 export async function initAuth() {
+  stopPolling();
   applyTheme(session.themeMode);
   session.phase = "loading";
   session.splitAuth = false;
@@ -128,8 +152,8 @@ export async function initAuth() {
       startApp();
       return;
     }
-    const a = await fetch(publicUrl("/v1/auth/config")).then((r) => r.json() as Promise<AuthConfig>);
-    const b = await fetch(publicUrl("/v1/auth/config")).then((r) => r.json() as Promise<AuthConfig>);
+    const a = await apiGet<AuthConfig>(publicUrl("/v1/auth/config"));
+    const b = await apiGet<AuthConfig>(publicUrl("/v1/auth/config"));
     if (a.configured !== b.configured || a.mode !== b.mode) {
       session.splitAuth = true;
       session.phase = "gate";
@@ -156,13 +180,10 @@ export async function initAuth() {
       await validateSessionToken();
       startApp();
     } catch (e) {
-      setToken("");
-      session.phase = "gate";
-      session.gateMessage = e instanceof Error ? e.message : "Invalid API token for this broker.";
+      handleAuthFailure(e);
     }
-  } catch {
-    session.phase = "gate";
-    session.gateMessage = `Cannot reach broker at ${session.apiBase}. Check that BetterMQ is running.`;
+  } catch (e) {
+    handleAuthFailure(e);
   }
 }
 
@@ -197,6 +218,7 @@ export function validateSessionToken() {
 }
 
 export function startApp() {
+  retryDelay = 1000;
   session.phase = "app";
   void refreshCells();
   if (localBrokerSelected()) {

@@ -11,6 +11,10 @@ export class ApiError extends Error {
   }
 }
 
+export function isAuthRejection(error: unknown): boolean {
+  return error instanceof ApiError && (error.status === 401 || error.status === 403);
+}
+
 let brokerAccessAllowed = () => true;
 export function setBrokerAccessGuard(guard: () => boolean) {
   brokerAccessAllowed = guard;

@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { isStandalone } from "@/lib/config";
 import { errText } from "@/lib/payload";
-import { regenerateToken, session, setToken, startApp, submitGateToken, validateSessionToken } from "@/lib/session";
+import { handleAuthFailure, regenerateToken, session, startApp, submitGateToken, validateSessionToken } from "@/lib/session";
 
 const token = ref(session.token);
 const password = ref("");
@@ -17,12 +17,14 @@ const busy = ref(false);
 async function continueWithToken() {
   error.value = "";
   busy.value = true;
+  let submitted = false;
   try {
     submitGateToken(token.value);
+    submitted = true;
     await validateSessionToken();
     startApp();
   } catch (e) {
-    setToken("");
+    if (submitted) handleAuthFailure(e);
     error.value = errText(e);
   } finally {
     busy.value = false;

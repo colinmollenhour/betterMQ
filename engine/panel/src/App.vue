@@ -5,6 +5,7 @@ import AppShell from "@/components/layout/AppShell.vue";
 import GateView from "@/views/GateView.vue";
 import RevealView from "@/views/RevealView.vue";
 import SetupView from "@/views/SetupView.vue";
+import { Button } from "@/components/ui/button";
 import { initAuth, session } from "@/lib/session";
 import { applyTheme } from "@/lib/storage";
 
@@ -22,6 +23,10 @@ onMounted(() => {
       Connecting…
     </div>
     <SetupView v-else-if="session.phase === 'setup'" />
+    <div v-else-if="session.phase === 'unavailable'" class="flex min-h-svh flex-col items-center justify-center gap-3">
+      <p role="alert">{{ session.gateMessage }}</p>
+      <Button @click="initAuth">Retry connection</Button>
+    </div>
     <RevealView v-else-if="session.phase === 'reveal'" />
     <GateView v-else-if="session.phase === 'gate'" />
     <AppShell v-else />

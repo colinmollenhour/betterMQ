@@ -50,3 +50,26 @@ it("blocks local mutations after a remote cell selection before sending HTTP", a
   await expect(apiDelete(publicUrl("/v1/queues/production"))).rejects.toThrow("local broker only");
   expect(fetch).not.toHaveBeenCalled();
 });
+
+it.each([503, 502, 504])("keeps saved credentials after HTTP %s and offers retry", async (status) => {
+  vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status })));
+  const { initAuth, session, setToken } = await import("./session");
+  const { loadSavedToken } = await import("./storage");
+  setToken("still-valid");
+  await initAuth();
+  expect(session.phase).toBe("unavailable");
+  expect(loadSavedToken(session.apiBase)).toBe("still-valid");
+});
+
+it("keeps credentials after network failure but clears definite rejection", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => { throw new TypeError("offline"); }));
+  const { initAuth, session, setToken } = await import("./session");
+  setToken("still-valid");
+  await initAuth();
+  expect(session.token).toBe("still-valid");
+  expect(session.phase).toBe("unavailable");
+  vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 403 })));
+  await initAuth();
+  expect(session.token).toBe("");
+  expect(session.phase).toBe("gate");
+});
