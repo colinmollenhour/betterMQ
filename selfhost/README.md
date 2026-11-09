@@ -176,6 +176,11 @@ Infrastructure's **Create cluster** initializes only an unclustered node and
 requires confirmation. The API returns 409 if saved or active membership already
 exists; it never replaces a cluster. Join an existing cluster instead.
 
+Selecting a remote cell enables federated Infrastructure inspection only.
+Broker-only screens and requests are blocked while a remote cell is selected;
+open that cell's embedded panel to manage queues, schedules or HTTP delivery.
+The console labels the local API target explicitly.
+
 ### `bettermq config`
 
 ```bash

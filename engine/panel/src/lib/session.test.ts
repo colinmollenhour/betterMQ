@@ -36,3 +36,17 @@ it("shows the gate when standalone admin authentication is rejected", async () =
   await initAuth();
   expect(session.phase).toBe("gate");
 });
+
+it("blocks local mutations after a remote cell selection before sending HTTP", async () => {
+  window.__BETTERMQ_PANEL_MODE__ = "embedded";
+  const fetch = vi.fn();
+  vi.stubGlobal("fetch", fetch);
+  const { session, setCellId } = await import("./session");
+  const { apiDelete, publicUrl } = await import("./api");
+  session.phase = "app";
+  session.cluster = { cluster_id: "a" };
+  session.cells = [{ id: "a", region: "a", controllerUrl: "" }, { id: "b", region: "b", controllerUrl: "" }];
+  setCellId("b");
+  await expect(apiDelete(publicUrl("/v1/queues/production"))).rejects.toThrow("local broker only");
+  expect(fetch).not.toHaveBeenCalled();
+});

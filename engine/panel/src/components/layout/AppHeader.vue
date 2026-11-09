@@ -1,13 +1,12 @@
 <script setup lang="ts">
 import { RefreshCw } from "@lucide/vue";
-import { isStandalone } from "@/lib/config";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import ActionMessage from "@/components/form/ActionMessage.vue";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { useActionStatus } from "@/composables/useActionStatus";
 import { refreshFlows, refreshGroups, refreshQueues } from "@/lib/catalog";
-import { pollCluster, pollHealth, refreshCells, session } from "@/lib/session";
+import { localBrokerSelected, pollCluster, pollHealth, refreshCells, session } from "@/lib/session";
 
 const refreshStatus = useActionStatus();
 
@@ -18,7 +17,7 @@ async function refreshAll() {
       pollHealth(),
       pollCluster(),
       refreshCells(),
-      ...(!isStandalone() ? [refreshQueues(), refreshGroups(), refreshFlows()] : []),
+      ...(localBrokerSelected() ? [refreshQueues(), refreshGroups(), refreshFlows()] : []),
     ]);
     refreshStatus.succeed("Refreshed");
   } catch (e) {

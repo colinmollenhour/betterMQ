@@ -40,7 +40,7 @@ import { errText } from "@/lib/payload";
 import { canRemoveNode } from "@/lib/targets";
 import { isStandalone } from "@/lib/config";
 import { cellCredentialError } from "@/lib/cellCredentials";
-import { refreshCells, selectedCell, session, type CellMember, type CellRecord } from "@/lib/session";
+import { localBrokerSelected, refreshCells, selectedCell, session, type CellMember, type CellRecord } from "@/lib/session";
 
 type SectionId = "overview" | "nodes" | "cells" | "cluster" | "this-node" | "storage";
 
@@ -57,14 +57,14 @@ type NodeRow = {
   member?: CellMember;
 };
 
-const sections: { id: SectionId; label: string }[] = [
+const sections = computed(() => ([
   { id: "overview", label: "Overview" },
   { id: "nodes", label: "Nodes" },
   { id: "cells", label: "Cells" },
   { id: "cluster", label: "Cluster" },
   { id: "this-node", label: "This node" },
   { id: "storage", label: "Storage" },
-].filter((item) => !isStandalone() || !["this-node", "storage"].includes(item.id)) as { id: SectionId; label: string }[];
+].filter((item) => localBrokerSelected() || !["this-node", "storage"].includes(item.id)) as { id: SectionId; label: string }[]));
 
 const section = ref<SectionId>("overview");
 const selectedNodeKey = ref("");
@@ -257,7 +257,7 @@ async function loadFed() {
 }
 
 async function loadInfra() {
-  if (isStandalone()) return;
+  if (!localBrokerSelected()) return;
   try {
     const st = await apiGet<Record<string, unknown>>(publicUrl("/v1/infra/status"));
     infraStatus.value = st;
@@ -344,6 +344,10 @@ async function probe() {
 }
 
 async function attachNode() {
+  if (needsToken.value && !localBrokerSelected()) {
+    attach.error = "Broker joins are supported only from the target cell's embedded panel.";
+    return;
+  }
   attach.error = "";
   attachOk.value = "";
   const cell = selectedCell();
@@ -376,7 +380,7 @@ async function attachNode() {
 }
 
 async function createCluster() {
-  if (hasMembership.value !== false || isStandalone()) return;
+  if (hasMembership.value !== false || !localBrokerSelected()) return;
   if (!confirm("Create a new cluster seed on this unclustered node? Existing deployments must be joined, not replaced.")) return;
   clusterStatus.reset();
   try {
@@ -396,6 +400,7 @@ async function createCluster() {
 }
 
 async function syncCluster() {
+  if (!localBrokerSelected()) return;
   clusterStatus.reset();
   try {
     const res = await apiPost<{ nodes?: unknown[] }>(publicUrl("/v1/infra/cluster/sync"), {});
@@ -408,7 +413,7 @@ async function syncCluster() {
 }
 
 function removable(row: NodeRow) {
-  return !isStandalone() && canRemoveNode(row, session.isSeed, session.cluster?.cluster_id);
+  return localBrokerSelected() && canRemoveNode(row, session.isSeed, session.cluster?.cluster_id);
 }
 
 async function removeNode(row: NodeRow) {
@@ -765,7 +770,7 @@ function openAddNode() {
                   · {{ currentCluster.nodeCount || 0 }} nodes · RF {{ currentCluster.replicationFactor || "—" }}
                 </span>
               </p>
-              <div v-if="!isStandalone()" class="flex flex-wrap items-center gap-2">
+              <div v-if="localBrokerSelected()" class="flex flex-wrap items-center gap-2">
                 <Button v-if="hasMembership === false" size="sm" @click="createCluster">Create cluster</Button>
                 <Button size="sm" variant="outline" @click="syncCluster">Re-sync</Button>
                 <ActionMessage :error="clusterStatus.error" :ok="clusterStatus.ok" />
@@ -778,7 +783,7 @@ function openAddNode() {
           </Card>
         </template>
 
-        <template v-else-if="section === 'this-node'">
+        <template v-else-if="section === 'this-node' && localBrokerSelected()">
           <Card>
             <CardHeader>
               <CardTitle>This node</CardTitle>
@@ -797,7 +802,7 @@ function openAddNode() {
           </Card>
         </template>
 
-        <template v-else>
+        <template v-else-if="section === 'storage' && localBrokerSelected()">
           <Card>
             <CardHeader>
               <CardTitle>Storage</CardTitle>

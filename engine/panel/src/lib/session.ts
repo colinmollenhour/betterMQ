@@ -1,6 +1,7 @@
 import { reactive } from "vue";
 import { isExternalAuth, isStandalone } from "@/lib/config";
-import { adminUrl, apiGet, apiPost, publicUrl } from "@/lib/api";
+import { adminUrl, apiGet, apiPost, publicUrl, setBrokerAccessGuard } from "@/lib/api";
+import { isLocalCell } from "@/lib/targets";
 import { refreshFlows, refreshGroups, refreshQueues } from "@/lib/catalog";
 import {
   applyTheme,
@@ -81,6 +82,11 @@ export const session = reactive({
 });
 
 session.token = loadSavedToken(session.apiBase);
+setBrokerAccessGuard(() => session.phase !== "app" || localBrokerSelected());
+
+export function localBrokerSelected(): boolean {
+  return !isStandalone() && isLocalCell(selectedCell()?.id || "local", session.cluster?.cluster_id);
+}
 
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 let clusterTimer: ReturnType<typeof setInterval> | null = null;
@@ -193,7 +199,7 @@ export function validateSessionToken() {
 export function startApp() {
   session.phase = "app";
   void refreshCells();
-  if (!isStandalone()) {
+  if (localBrokerSelected()) {
     void refreshQueues();
     void refreshGroups();
     void refreshFlows();

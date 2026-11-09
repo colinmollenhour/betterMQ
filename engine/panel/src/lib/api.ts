@@ -11,6 +11,11 @@ export class ApiError extends Error {
   }
 }
 
+let brokerAccessAllowed = () => true;
+export function setBrokerAccessGuard(guard: () => boolean) {
+  brokerAccessAllowed = guard;
+}
+
 function apiBase(): string {
   return allowlistedApiBase(loadSavedApiBase());
 }
@@ -41,6 +46,10 @@ async function parseBody(res: Response): Promise<unknown> {
 }
 
 async function request<T>(url: string, init: RequestInit = {}): Promise<T> {
+  const path = new URL(url, apiBase()).pathname;
+  if (path.startsWith("/v1/") && path !== "/v1/cluster" && !path.startsWith("/v1/auth/") && !brokerAccessAllowed()) {
+    throw new Error("Broker operations target the local broker only. Select its local cell to continue.");
+  }
   const headers = new Headers(init.headers);
   const auth = authHeaders();
   Object.entries(auth).forEach(([k, v]) => headers.set(k, v));
