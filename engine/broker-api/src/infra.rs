@@ -59,8 +59,8 @@ pub struct ApplyMembershipResponse {
 pub struct NodeUpdateRequest {
     pub name: String,
     pub public_url: String,
-    #[serde(default = "default_listen")]
-    pub listen: String,
+    #[serde(default)]
+    pub listen: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,10 +79,6 @@ pub struct ClusterMembershipResponse {
 pub struct ClusterNodeUpdateRequest {
     pub node_name: String,
     pub public_url: String,
-}
-
-fn default_listen() -> String {
-    "0.0.0.0:8080".into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -515,7 +511,9 @@ pub async fn infra_update_node(
     let previous_name = cfg.node.name.clone();
     cfg.node.name = body.name.trim().to_string();
     cfg.node.public_url = body.public_url.trim().trim_end_matches('/').to_string();
-    cfg.node.listen = body.listen;
+    if let Some(listen) = body.listen {
+        cfg.node.listen = listen;
+    }
     patch_cluster_node_entry(&mut cfg, &previous_name);
     cfg.validate()
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;

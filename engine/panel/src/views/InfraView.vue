@@ -402,7 +402,6 @@ async function saveNode() {
     const res = await apiPut<{ message?: string; needs_restart?: boolean }>(publicUrl("/v1/infra/node"), {
       name: nodeForm.name,
       public_url: nodeForm.publicUrl,
-      listen: "0.0.0.0:8080",
     });
     nodeStatus.succeed(res.message || "Node settings saved");
     if (res.needs_restart) restartMsg.value = res.message || "Restart required.";

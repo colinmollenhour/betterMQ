@@ -1963,7 +1963,7 @@
           },
           "listen": {
             "type": "string",
-            "default": "0.0.0.0:8080"
+            "description": "Optional. When omitted, preserve the saved listener unchanged."
           }
         }
       },

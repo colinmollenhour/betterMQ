@@ -471,6 +471,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_metadata_update_preserves_saved_listener() {
+        let dir = tempdir().unwrap();
+        let mut cfg = broker_config::BetterMqConfig::template_single_local();
+        cfg.node.listen = "127.0.0.1:9123".into();
+        broker_config::save_managed_config(dir.path(), &cfg).unwrap();
+        let body = serde_json::from_value(serde_json::json!({
+            "name": "renamed", "public_url": "http://localhost:9123"
+        }))
+        .unwrap();
+        let _ = infra::infra_update_node(
+            axum::extract::State(Arc::new(test_state(&dir))),
+            axum::Json(body),
+        )
+        .await
+        .unwrap();
+        let saved = broker_config::load_managed_config(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.node.listen, "127.0.0.1:9123");
+        assert_eq!(saved.node.name, "renamed");
+    }
+
+    #[tokio::test]
     async fn healthz_returns_ok() {
         let dir = tempdir().unwrap();
         let app = router(test_state(&dir));
