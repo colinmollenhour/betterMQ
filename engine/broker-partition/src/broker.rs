@@ -413,6 +413,8 @@ pub struct Broker {
     inner: Arc<BrokerInner>,
 }
 
+type ShardOpenLocks = HashMap<(String, u32), Arc<Mutex<()>>>;
+
 struct BrokerInner {
     config: BrokerConfig,
     metadata: MetadataStore,
@@ -422,6 +424,8 @@ struct BrokerInner {
     blob_store: BlobStore,
     layout: ShardLayout,
     shards: RwLock<HashMap<String, HashMap<u32, Arc<ShardHandle>>>>,
+    // Serialize opens of the same backend without blocking unrelated shards.
+    shard_open_locks: Mutex<ShardOpenLocks>,
     dedup_reservations: Arc<DedupReservations>,
     shard_leader_check: Mutex<Option<ShardFenceFn>>,
     #[cfg(feature = "slate")]
@@ -533,6 +537,7 @@ impl Broker {
                 blob_store,
                 layout,
                 shards: RwLock::new(HashMap::new()),
+                shard_open_locks: Mutex::new(HashMap::new()),
                 dedup_reservations: Arc::new(DedupReservations::default()),
                 shard_leader_check: Mutex::new(None),
                 #[cfg(feature = "slate")]
@@ -625,10 +630,18 @@ impl Broker {
         if self.inner.config.storage == StorageMode::Slate && !partitions.is_empty() {
             #[cfg(feature = "slate")]
             {
-                let mut shards = self.inner.shards.write();
-                for topic_shards in shards.values_mut() {
-                    for &p in partitions {
-                        topic_shards.remove(&p);
+                let opening: Vec<_> = self
+                    .inner
+                    .shard_open_locks
+                    .lock()
+                    .iter()
+                    .filter(|((_, partition), _)| partitions.contains(partition))
+                    .map(|(key, gate)| (key.clone(), gate.clone()))
+                    .collect();
+                for ((namespace, partition), gate) in opening {
+                    let _opening = gate.lock();
+                    if let Some(topic_shards) = self.inner.shards.write().get_mut(&namespace) {
+                        topic_shards.remove(&partition);
                     }
                 }
             }
@@ -1942,8 +1955,18 @@ impl Broker {
             return Ok(handle);
         }
 
-        let mut shards = self.inner.shards.write();
-        if let Some(handle) = shards
+        let gate = self
+            .inner
+            .shard_open_locks
+            .lock()
+            .entry((namespace.clone(), partition))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _opening = gate.lock();
+        if let Some(handle) = self
+            .inner
+            .shards
+            .read()
             .get(&namespace)
             .and_then(|partitions| partitions.get(&partition))
             .cloned()
@@ -2009,7 +2032,9 @@ impl Broker {
             }
         };
         let handle = ShardHandle::new(backend);
-        shards
+        self.inner
+            .shards
+            .write()
             .entry(namespace)
             .or_default()
             .insert(partition, Arc::clone(&handle));
@@ -2041,6 +2066,38 @@ mod tests {
     use super::*;
     use crate::layout::LAYOUT_V2;
     use tempfile::tempdir;
+
+    #[test]
+    fn opening_one_shard_does_not_hold_the_global_map_lock() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let namespace = broker.inner.layout.storage_namespace("orders").to_string();
+        let gate = Arc::new(Mutex::new(()));
+        broker
+            .inner
+            .shard_open_locks
+            .lock()
+            .insert((namespace, 0), gate.clone());
+        let blocked = gate.lock();
+        let other = broker.clone();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            other.partition_high_watermark("orders", 0).unwrap()
+        });
+        waiting.recv().unwrap();
+        let other = broker.clone();
+        let (done, completion) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            done.send(other.partition_high_watermark("orders", 1))
+                .unwrap();
+        });
+        let result = completion.recv_timeout(std::time::Duration::from_secs(5));
+        drop(blocked);
+        assert_eq!(first.join().unwrap(), 0);
+        second.join().unwrap();
+        assert_eq!(result.unwrap().unwrap(), 0);
+    }
 
     #[test]
     fn publish_stores_readable_message() {

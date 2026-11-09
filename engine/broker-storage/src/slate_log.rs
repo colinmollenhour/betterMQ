@@ -129,33 +129,30 @@ impl SlatePartitionLog {
         })
     }
 
-    /// Prefer `meta/next_offset`; scan frame keys so a durable frame is never overwritten after crash.
+    /// The offset and its frame are committed atomically in the same WriteBatch.
+    /// Recovery must not probe historical offsets (which may also be purged).
     fn recover_next_offset(db: Arc<Db>, _partition: u32) -> Result<u64, LogError> {
-        let db_meta = Arc::clone(&db);
-        let from_meta = block_on_slate(async move {
-            match db_meta.get(META_NEXT_OFFSET).await.map_err(slate_err)? {
-                Some(bytes) if bytes.len() >= 8 => {
-                    let mut buf = [0u8; 8];
-                    buf.copy_from_slice(&bytes[..8]);
-                    Ok::<Option<u64>, LogError>(Some(u64::from_be_bytes(buf)))
+        block_on_slate(async move {
+            match db.get(META_NEXT_OFFSET).await.map_err(slate_err)? {
+                Some(bytes) => {
+                    let buf: [u8; 8] = bytes.as_ref().try_into().map_err(|_| {
+                        LogError::Slate("invalid durable next_offset metadata".into())
+                    })?;
+                    Ok(u64::from_be_bytes(buf))
                 }
-                _ => Ok::<Option<u64>, LogError>(None),
+                None => {
+                    // Only an empty database may have no offset. Failing closed
+                    // on inconsistent metadata prevents overwriting old frames.
+                    let mut frames = db.scan_prefix(b"fr/").await.map_err(slate_err)?;
+                    if frames.next().await.map_err(slate_err)?.is_some() {
+                        return Err(LogError::Slate(
+                            "frame data exists without durable next_offset metadata".into(),
+                        ));
+                    }
+                    Ok(0)
+                }
             }
-        })?;
-
-        let mut next = from_meta.unwrap_or(0);
-        let scan_until = next.saturating_add(4096);
-        for off in 0..scan_until {
-            let db_scan = Arc::clone(&db);
-            let key = frame_key(off);
-            let exists = block_on_slate(async move {
-                Ok::<bool, LogError>(db_scan.get(&key).await.map_err(slate_err)?.is_some())
-            })?;
-            if exists {
-                next = next.max(off + 1);
-            }
-        }
-        Ok(next)
+        })
     }
 
     /// Reject stale leaders against the durable generation, not only the in-memory copy.
@@ -388,4 +385,46 @@ fn stored_from_header(
 #[cfg(feature = "slate")]
 fn slate_err(e: slatedb::Error) -> LogError {
     LogError::Slate(e.to_string())
+}
+
+#[cfg(all(test, feature = "slate"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_uses_atomic_offset_independent_of_history_size() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let db = Arc::new(block_on_slate(Db::open("offset-recovery", store)).unwrap());
+        let writer = db.clone();
+        block_on_slate(async move {
+            writer
+                .put(META_NEXT_OFFSET, u64::MAX.to_be_bytes())
+                .await
+                .unwrap();
+        });
+        // A history scan up to this value would never finish. Purged frames do
+        // not affect the monotonically increasing durable offset.
+        assert_eq!(
+            SlatePartitionLog::recover_next_offset(db.clone(), 0).unwrap(),
+            u64::MAX
+        );
+        block_on_slate(async move { db.close().await }).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_missing_or_malformed_metadata_with_frames() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let db = Arc::new(block_on_slate(Db::open("bad-offset", store)).unwrap());
+        assert_eq!(
+            SlatePartitionLog::recover_next_offset(db.clone(), 0).unwrap(),
+            0
+        );
+        let writer = db.clone();
+        block_on_slate(async move { writer.put(frame_key(0), b"frame").await }).unwrap();
+        assert!(SlatePartitionLog::recover_next_offset(db.clone(), 0).is_err());
+        let writer = db.clone();
+        block_on_slate(async move { writer.put(META_NEXT_OFFSET, b"bad").await }).unwrap();
+        assert!(SlatePartitionLog::recover_next_offset(db.clone(), 0).is_err());
+        block_on_slate(async move { db.close().await }).unwrap();
+    }
 }
