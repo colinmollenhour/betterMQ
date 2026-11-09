@@ -261,6 +261,8 @@ DNS lookup failures (including the two-second resolution timeout) use the normal
 
 Retries hold back later work only within the same strict-FIFO flow key. Other keys and unconstrained destinations continue independently; each retry still observes its own durable backoff deadline.
 
+Webhook connections use reusable short/long HTTP pools. DNS is policy-checked on each new connection and all allowed answers are available for connection fallback. Redirects and environment HTTP proxies are disabled so outbound connections cannot bypass the egress policy. `BETTERMQ_LONG_WAIT_TIER`, when set, overrides the long-payload pool timeout.
+
 #### DLQ and group fan-out
 
 Fan-out vars are **group bookkeeping**, not DLQ TTL.

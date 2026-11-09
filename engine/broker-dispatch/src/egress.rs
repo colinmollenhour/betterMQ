@@ -13,6 +13,60 @@ use std::net::{IpAddr, SocketAddr};
 use thiserror::Error;
 use url::Url;
 
+/// Resolve at connection establishment, returning only policy-checked addresses.
+/// The client can safely reuse established connections without resolving per job.
+#[derive(Debug)]
+pub(crate) struct PolicyResolver;
+
+impl reqwest::dns::Resolve for PolicyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let allow_private = allow_private_destinations();
+            if is_blocked_hostname(name.as_str(), allow_private) {
+                return Err(Box::new(EgressError::HostNotAllowed)
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            let addresses: Vec<_> = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tokio::net::lookup_host((name.as_str(), 0)),
+            )
+            .await
+            .map_err(|_| EgressError::ResolveFailed)?
+            .map_err(|_| EgressError::ResolveFailed)?
+            .collect();
+            validate_resolved_addresses(&addresses, allow_private)?;
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn validate_resolved_addresses(
+    addresses: &[SocketAddr],
+    allow_private: bool,
+) -> Result<(), EgressError> {
+    if addresses.is_empty() {
+        return Err(EgressError::ResolveFailed);
+    }
+    if addresses
+        .iter()
+        .any(|address| is_blocked_destination_ip(address.ip(), allow_private))
+    {
+        return Err(EgressError::HostNotAllowed);
+    }
+    Ok(())
+}
+
+pub(crate) fn is_policy_failure(error: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if let Some(egress) = error.downcast_ref::<EgressError>() {
+            return !matches!(egress, EgressError::ResolveFailed);
+        }
+        source = error.source();
+    }
+    false
+}
+
 #[derive(Debug, Error)]
 pub enum EgressError {
     #[error("invalid destination URL")]
@@ -25,6 +79,14 @@ pub enum EgressError {
     HostNotAllowed,
     #[error("destination host could not be resolved")]
     ResolveFailed,
+}
+
+fn normalized_host(parsed: &Url) -> Result<String, EgressError> {
+    Ok(match parsed.host().ok_or(EgressError::MissingHost)? {
+        url::Host::Domain(host) => host.to_ascii_lowercase(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => ip.to_string(),
+    })
 }
 
 /// Validate a webhook / queue destination before enqueue or delivery.
@@ -43,10 +105,7 @@ pub async fn pin_destination_addr(raw: &str) -> Result<Option<(String, SocketAdd
     let allow_private = allow_private_destinations();
     validate_destination_url_with(raw, allow_private)?;
     let parsed = Url::parse(raw.trim()).map_err(|_| EgressError::InvalidUrl)?;
-    let host = parsed
-        .host_str()
-        .ok_or(EgressError::MissingHost)?
-        .to_ascii_lowercase();
+    let host = normalized_host(&parsed)?;
     let port = parsed
         .port_or_known_default()
         .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
@@ -82,10 +141,7 @@ fn validate_destination_url_with(raw: &str, allow_private: bool) -> Result<(), E
         "http" | "https" => {}
         _ => return Err(EgressError::BadScheme),
     }
-    let host = parsed
-        .host_str()
-        .ok_or(EgressError::MissingHost)?
-        .to_ascii_lowercase();
+    let host = normalized_host(&parsed)?;
 
     if is_blocked_hostname(&host, allow_private) {
         return Err(EgressError::HostNotAllowed);
@@ -204,6 +260,8 @@ mod tests {
         assert!(validate_destination_url_with("http://localhost/hook", false).is_err());
         assert!(validate_destination_url_with("http://metadata.google.internal/", false).is_err());
         assert!(validate_destination_url_with("http://instance-data/", false).is_err());
+        assert!(validate_destination_url_with("http://[::1]/", false).is_err());
+        assert!(validate_destination_url_with("http://[fe80::1]/", true).is_err());
     }
 
     #[test]
@@ -236,5 +294,34 @@ mod tests {
         let (host, addr) = pin.expect("ip literal should pin");
         assert_eq!(host, "1.1.1.1");
         assert_eq!(addr.ip().to_string(), "1.1.1.1");
+    }
+
+    #[tokio::test]
+    async fn resolver_policy_errors_remain_distinguishable_from_transport_failures() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(std::sync::Arc::new(PolicyResolver))
+            .build()
+            .unwrap();
+        let error = client
+            .get("http://localhost/hook")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(is_policy_failure(&error));
+    }
+
+    #[test]
+    fn resolver_checks_every_address_and_retains_fallbacks() {
+        let public = ["1.1.1.1:0".parse().unwrap(), "8.8.8.8:0".parse().unwrap()];
+        assert!(validate_resolved_addresses(&public, false).is_ok());
+        assert!(matches!(
+            validate_resolved_addresses(&[], false),
+            Err(EgressError::ResolveFailed)
+        ));
+        assert!(matches!(
+            validate_resolved_addresses(&[public[0], "127.0.0.1:0".parse().unwrap()], false),
+            Err(EgressError::HostNotAllowed)
+        ));
     }
 }

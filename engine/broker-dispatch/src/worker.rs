@@ -272,12 +272,16 @@ impl DispatchEngine {
                 .connect_timeout(Duration::from_secs(2))
                 .timeout(Duration::from_secs(config_clone.http_timeout_secs))
                 .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(Arc::new(crate::egress::PolicyResolver))
+                .no_proxy()
                 .build()
                 .expect("reqwest short client"),
             long_client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(2))
                 .timeout(Duration::from_secs(long_secs))
                 .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(Arc::new(crate::egress::PolicyResolver))
+                .no_proxy()
                 .build()
                 .expect("reqwest long client"),
             high_tx,
@@ -1096,45 +1100,15 @@ impl DispatchEngine {
 
         {
             let long = delivery_msg.payload.len() >= self.config.long_payload_threshold_bytes;
-            let timeout = Duration::from_secs(if long {
-                self.config.long_http_timeout_secs
-            } else {
-                self.config.http_timeout_secs
-            });
-            let pin = match crate::egress::pin_destination_addr(url).await {
-                Ok(p) => p,
-                Err(crate::egress::EgressError::ResolveFailed) => {
-                    self.host_blocker.record_transport_failure(url);
-                    return self
-                        .retry_local_failure(
-                            msg,
-                            attempt,
-                            None,
-                            "destination DNS resolution failed".into(),
-                        )
-                        .await;
-                }
-                Err(e) => {
-                    warn!(destination = %url, error = %e, "delivery blocked by egress pin — moving to DLQ");
-                    self.finalize_dead_letter(
-                        msg,
-                        format!("destination blocked by egress policy: {e}"),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
-            let pinned_client;
-            let http = if let Some((host, addr)) = pin {
-                pinned_client = reqwest::Client::builder()
-                    .connect_timeout(Duration::from_secs(2))
-                    .timeout(timeout)
-                    .redirect(reqwest::redirect::Policy::none())
-                    .resolve(&host, addr)
-                    .build()
-                    .map_err(|e| DispatchError::Failed(e.to_string()))?;
-                &pinned_client
-            } else if long {
+            if let Err(error) = crate::egress::validate_destination_url(url) {
+                self.finalize_dead_letter(
+                    msg,
+                    format!("destination blocked by egress policy: {error}"),
+                )
+                .await?;
+                return Ok(());
+            }
+            let http = if long {
                 &self.long_client
             } else {
                 &self.client
@@ -1204,6 +1178,11 @@ impl DispatchEngine {
                         return Ok(());
                     }
                     requested_retry_after_ms = retry_after_ms;
+                }
+                Err(e) if crate::egress::is_policy_failure(&e) => {
+                    self.finalize_dead_letter(msg, "destination blocked by egress policy")
+                        .await?;
+                    return Ok(());
                 }
                 Err(e) => {
                     self.host_blocker.record_transport_failure(url);
@@ -1464,11 +1443,6 @@ impl DispatchEngine {
         }
         let outbound = build_outbound(msg);
         let long = msg.payload.len() >= self.config.long_payload_threshold_bytes;
-        let timeout = Duration::from_secs(if long {
-            self.config.long_http_timeout_secs
-        } else {
-            self.config.http_timeout_secs
-        });
         let retry_key = Self::retry_key(msg);
         let prior = self.retry_state.get(&retry_key);
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1481,30 +1455,9 @@ impl DispatchEngine {
             }
             self.telemetry.record_retry_due();
         }
-        let pin = match crate::egress::pin_destination_addr(url).await {
-            Ok(pin) => pin,
-            Err(crate::egress::EgressError::ResolveFailed) => {
-                self.host_blocker.record_transport_failure(url);
-                return self.retry_fleet_failure(
-                    msg,
-                    prior,
-                    None,
-                    "destination DNS resolution failed".into(),
-                );
-            }
-            Err(error) => return Err(DispatchError::Egress(error.to_string())),
-        };
-        let pinned_client;
-        let http = if let Some((host, addr)) = pin {
-            pinned_client = reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(2))
-                .timeout(timeout)
-                .redirect(reqwest::redirect::Policy::none())
-                .resolve(&host, addr)
-                .build()
-                .map_err(|e| DispatchError::Failed(e.to_string()))?;
-            &pinned_client
-        } else if long {
+        crate::egress::validate_destination_url(url)
+            .map_err(|error| DispatchError::Egress(error.to_string()))?;
+        let http = if long {
             &self.long_client
         } else {
             &self.client
@@ -1533,6 +1486,11 @@ impl DispatchEngine {
                 }
                 self.host_blocker.record_transport_failure(url);
                 format!("HTTP {code}")
+            }
+            Err(error) if crate::egress::is_policy_failure(&error) => {
+                return Err(DispatchError::Egress(
+                    "destination blocked by egress policy".into(),
+                ));
             }
             Err(error) => {
                 retry_after_ms = None;
@@ -1636,6 +1594,50 @@ mod tests {
                 response.offset.unwrap(),
             )
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn webhook_client_reuses_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for _ in 0..2 {
+                let mut request = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let engine = DispatchEngine::new_broker_only(broker, DispatchConfig::default());
+        for _ in 0..2 {
+            engine
+                .client
+                .get(format!("http://{address}/hook"))
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        engine.shutdown_background().await;
     }
 
     #[tokio::test]
