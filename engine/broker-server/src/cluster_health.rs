@@ -5,6 +5,8 @@ use broker_api::{
     Cluster, ClusterGossipRequest,
 };
 use broker_dispatch::DispatchEngine;
+use broker_partition::Broker;
+use broker_storage::StorageMode;
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -38,6 +40,68 @@ fn discover_topics(state: &AppState) -> HashSet<String> {
         }
     }
     topics
+}
+
+/// How a newly acquired shard regains a trustworthy durable prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShardRecovery {
+    /// Local WAL: copy the committed prefix from replica peers.
+    ReplicaCatchUp,
+    /// Slate: the log already lives on shared object storage. Frame
+    /// replication is disabled there, so reopen it under the new fence.
+    SharedStorage,
+}
+
+impl ShardRecovery {
+    fn for_storage(mode: StorageMode) -> Self {
+        match mode {
+            StorageMode::Local => Self::ReplicaCatchUp,
+            StorageMode::Slate => Self::SharedStorage,
+        }
+    }
+}
+
+async fn recover_gained_shard(
+    cluster: &Cluster,
+    state: &AppState,
+    shard: u32,
+) -> Result<(), String> {
+    match ShardRecovery::for_storage(state.broker.config().storage) {
+        ShardRecovery::ReplicaCatchUp => catch_up_shard(cluster, state, shard).await,
+        ShardRecovery::SharedStorage => {
+            let broker = state.broker.clone();
+            let topics = discover_topics(state);
+            tokio::task::spawn_blocking(move || reopen_shared_shard(&broker, &topics, shard))
+                .await
+                .map_err(|e| format!("shard {shard}: shared-storage reopen task failed: {e}"))?
+        }
+    }
+}
+
+/// Reopen every known topic of `shard` from shared storage. Cached handles
+/// can predate writes made by another leader under a newer term, so they are
+/// dropped first. Opening a handle recovers the durable next offset (and, for
+/// SlateDB, fences the previous writer); a failure keeps the shard fenced.
+fn reopen_shared_shard(
+    broker: &Broker,
+    topics: &HashSet<String>,
+    shard: u32,
+) -> Result<(), String> {
+    broker.evict_slate_partitions(&[shard]);
+    for topic in topics {
+        let leo = broker
+            .partition_high_watermark(topic, shard)
+            .map_err(|e| format!("{topic}/{shard}: reopen shared storage: {e}"))?;
+        let committed = broker
+            .committed_hwm(topic, shard)
+            .map_err(|e| format!("{topic}/{shard}: read durable HWM: {e}"))?;
+        if committed != leo {
+            return Err(format!(
+                "{topic}/{shard}: shared storage reports durable HWM {committed} but next offset {leo}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn catch_up_shard(cluster: &Cluster, state: &AppState, shard: u32) -> Result<(), String> {
@@ -291,7 +355,7 @@ pub fn spawn_cluster_health_monitor(
                 sync_catalog_from_peers(&state).await;
                 let mut caught_up = Vec::new();
                 for shard in gained_shards {
-                    match catch_up_shard(&cluster, &state, shard).await {
+                    match recover_gained_shard(&cluster, &state, shard).await {
                         Ok(()) => {
                             runtime.set_shard_ready(shard, true);
                             caught_up.push(shard);
@@ -342,5 +406,67 @@ mod tests {
         rt.record_peer_alive(ids[0], now);
         // ids[1] stale → shard 1 fails over from preferred ids[1] to ids[2]
         assert!(rt.is_leader_for_shard(1));
+    }
+
+    #[test]
+    fn slate_shards_recover_from_shared_storage_not_replica_frames() {
+        assert_eq!(
+            ShardRecovery::for_storage(StorageMode::Slate),
+            ShardRecovery::SharedStorage
+        );
+        assert_eq!(
+            ShardRecovery::for_storage(StorageMode::Local),
+            ShardRecovery::ReplicaCatchUp
+        );
+    }
+
+    fn direct_publish(payload: &str) -> broker_partition::PublishRequest {
+        broker_partition::PublishRequest {
+            topic: broker_partition::DIRECT_TOPIC.into(),
+            routing_key: "same-shard".into(),
+            payload: payload.into(),
+            payload_encoding: None,
+            idempotency_key: None,
+            delay_ms: None,
+            priority: None,
+            flow_id: None,
+            queue_id: None,
+            group_id: None,
+            group_member_id: None,
+            destination: None,
+            flow: None,
+            parallelism: None,
+            max_retries: None,
+            retry_backoff: None,
+            method: None,
+            headers: None,
+            sign: None,
+            request: None,
+            url: Some("http://example.invalid/hook".into()),
+            secret: Some("s".into()),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shared_storage_reopen_validates_every_topic_without_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(broker_partition::BrokerConfig::new(dir.path().into())).unwrap();
+        let resp = broker.publish(direct_publish("durable")).unwrap();
+        let shard = resp.partition.unwrap();
+        broker
+            .wait_committed(&resp.topic, shard, resp.offset.unwrap())
+            .await
+            .unwrap();
+        let topics = HashSet::from([broker_partition::DIRECT_TOPIC.to_string()]);
+        reopen_shared_shard(&broker, &topics, shard).unwrap();
+        assert_eq!(
+            broker
+                .partition_high_watermark(broker_partition::DIRECT_TOPIC, shard)
+                .unwrap(),
+            1
+        );
+
+        let error = reopen_shared_shard(&broker, &topics, broker.shard_count()).unwrap_err();
+        assert!(error.contains("reopen shared storage"), "{error}");
     }
 }
