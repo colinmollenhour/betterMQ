@@ -196,7 +196,7 @@ dl "$asset_base/$asset.zip" "$zip_path" || die "download failed: $asset_base/$as
 actual=$(sha256 "$zip_path")
 [ -n "$actual" ] || die "sha256sum or shasum is required to verify the download"
 dl "$asset_base/checksums.txt" "$tmp/checksums.txt" || die "checksums.txt missing for $tag ($asset_base/checksums.txt)"
-expected=$(grep "  $asset.zip\$" "$tmp/checksums.txt" | awk '{print $1}' || true)
+expected=$(awk -v asset="$asset.zip" '$2 == asset && length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ { print tolower($1) }' "$tmp/checksums.txt")
 [ -n "$expected" ] || die "no checksum entry for $asset.zip in checksums.txt"
 [ "$expected" = "$actual" ] || die "checksum mismatch for $asset.zip (expected $expected, got $actual)"
 ok "Verified sha256"

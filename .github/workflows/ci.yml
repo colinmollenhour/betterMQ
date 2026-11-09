@@ -17,6 +17,16 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  windows-installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Offline PowerShell checksum failure tests
+        shell: pwsh
+        run: ./selfhost/tests/test_installers.ps1
+
   panel:
     runs-on: ubuntu-latest
     steps:
@@ -111,6 +121,7 @@ jobs:
           BETTERMQ_CLUSTER_SECRET=ci-secret BETTERMQ_METRICS_TOKEN=ci-metrics MINIO_ROOT_USER=ci MINIO_ROOT_PASSWORD=ci-secret-not-default docker compose -f docker-compose.ha-slate-fleet.yml config >/dev/null
           python3 tests/test_compose.py
           python3 tests/test_internal_compose.py
+          python3 tests/test_installers.py
           bash tests/test_backup_restore.sh
 
   release-gates:
