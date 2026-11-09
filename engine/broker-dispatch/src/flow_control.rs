@@ -8,7 +8,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -16,6 +16,14 @@ use crate::memory_guard::MemoryGuard;
 use crate::worker::DispatchEngine;
 
 static ENQUEUE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(not(test))]
+const IDLE_LANE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(test)]
+const IDLE_LANE_TTL: std::time::Duration = std::time::Duration::from_millis(100);
+
+type LaneMap = Arc<Mutex<HashMap<FlowKey, Arc<FlowLane>>>>;
+type Drainers = Arc<parking_lot::Mutex<HashMap<FlowKey, JoinHandle<()>>>>;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct FlowKey {
@@ -52,11 +60,11 @@ struct PinnedLimits {
     period_secs: Option<u64>,
 }
 
-#[derive(Clone)]
 struct FlowWork {
     engine: DispatchEngine,
     msg: Arc<StoredMessage>,
     backfill: bool,
+    _pending_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 struct OrderedWork {
@@ -168,12 +176,13 @@ struct FlowLane {
 
 #[derive(Clone)]
 pub struct FlowController {
-    lanes: Arc<Mutex<HashMap<FlowKey, Arc<FlowLane>>>>,
+    lanes: LaneMap,
     global_max_parallelism: Option<u32>,
     global_active: Arc<AtomicU32>,
     memory_guard: Arc<MemoryGuard>,
     stop: Arc<AtomicBool>,
-    drainers: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
+    drainers: Drainers,
+    pending_capacity: Arc<Semaphore>,
 }
 
 impl FlowController {
@@ -184,13 +193,26 @@ impl FlowController {
             global_active: Arc::new(AtomicU32::new(0)),
             memory_guard,
             stop: Arc::new(AtomicBool::new(false)),
-            drainers: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            drainers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            pending_capacity: Arc::new(Semaphore::new(
+                std::env::var("BETTERMQ_DISPATCH_QUEUE_CAP")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(4096)
+                    .clamp(1, Semaphore::MAX_PERMITS),
+            )),
         }
     }
 
     pub fn take_drainer_tasks(&self) -> Vec<JoinHandle<()>> {
         self.stop.store(true, AtomicOrdering::Release);
         std::mem::take(&mut *self.drainers.lock())
+            .into_values()
+            .collect()
+    }
+
+    pub(crate) async fn discard_pending(&self) {
+        self.lanes.lock().await.clear();
     }
 
     pub async fn submit(
@@ -202,6 +224,12 @@ impl FlowController {
         backfill: bool,
     ) {
         let flow_key = limits.key.clone();
+        // Bound aggregate hydrated flow work, not just each individual key's
+        // waitlist. Reject before allocating a new lane; durable backfill retries.
+        let Ok(pending_permit) = self.pending_capacity.clone().try_acquire_owned() else {
+            engine.record_flow_rejected();
+            return;
+        };
         let key = FlowKey {
             endpoint_id: lane_owner,
             flow_key: flow_key.clone(),
@@ -211,6 +239,7 @@ impl FlowController {
             engine,
             msg: Arc::new(msg),
             backfill,
+            _pending_permit: pending_permit,
         };
         let mut heap = lane.waitlist.lock().await;
         let cap = std::env::var("BETTERMQ_FLOW_WAITLIST_CAP")
@@ -434,6 +463,7 @@ impl FlowController {
         if !self.stop.load(AtomicOrdering::Acquire) {
             spawn_lane_drainer(
                 lane.clone(),
+                (key.clone(), self.lanes.clone()),
                 self.global_max_parallelism,
                 self.global_active.clone(),
                 self.memory_guard.clone(),
@@ -464,12 +494,16 @@ impl FlowController {
 
 fn spawn_lane_drainer(
     lane: Arc<FlowLane>,
+    registry: (FlowKey, LaneMap),
     global_max: Option<u32>,
     global_active: Arc<AtomicU32>,
     memory_guard: Arc<MemoryGuard>,
     stop: Arc<AtomicBool>,
-    drainers: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
+    drainers: Drainers,
 ) {
+    let (key, lanes) = registry;
+    let task_key = key.clone();
+    let task_drainers = drainers.clone();
     let handle = tokio::spawn(async move {
         loop {
             if stop.load(AtomicOrdering::Acquire) {
@@ -521,7 +555,13 @@ fn spawn_lane_drainer(
                 heap.pop(parallelism == 1)
             };
             let Some(ordered) = next else {
-                lane.notify.notified().await;
+                if tokio::time::timeout(IDLE_LANE_TTL, lane.notify.notified())
+                    .await
+                    .is_err()
+                    && evict_idle_lane(&lanes, &task_key, &lane, &task_drainers).await
+                {
+                    break;
+                }
                 continue;
             };
 
@@ -542,8 +582,49 @@ fn spawn_lane_drainer(
                 lane2.notify.notify_one();
             });
         }
+        let map = lanes.lock().await;
+        if map
+            .get(&task_key)
+            .is_some_and(|current| Arc::ptr_eq(current, &lane))
+        {
+            task_drainers.lock().remove(&task_key);
+        }
     });
-    drainers.lock().push(handle);
+    drainers.lock().insert(key, handle);
+}
+
+async fn evict_idle_lane(
+    lanes: &LaneMap,
+    key: &FlowKey,
+    lane: &Arc<FlowLane>,
+    drainers: &Drainers,
+) -> bool {
+    let mut map = lanes.lock().await;
+    // Map + drainer are the only owners: no concurrent submit/control operation
+    // can still enqueue onto this lane after it has been detached from the map.
+    if Arc::strong_count(lane) != 2 || lane.active.load(AtomicOrdering::Acquire) != 0 {
+        return false;
+    }
+    let (Ok(waitlist), Ok(paused), Ok(pinned)) = (
+        lane.waitlist.try_lock(),
+        lane.paused.try_lock(),
+        lane.pinned.try_lock(),
+    ) else {
+        return false;
+    };
+    if waitlist.len() != 0
+        || *paused
+        || pinned.parallelism.is_some()
+        || pinned.rate.is_some()
+        || pinned.period_secs.is_some()
+    {
+        return false;
+    }
+    map.remove(key);
+    // Detach the old handle while still holding the registry lock, before a new
+    // submission can install a replacement lane/drainer with the same key.
+    drainers.lock().remove(key);
+    true
 }
 
 #[cfg(test)]
@@ -551,6 +632,92 @@ mod tests {
     use super::*;
     use crate::memory_guard::MemoryGuardConfig;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn aggregate_flow_capacity_rejects_before_allocating_another_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = broker_partition::Broker::open(broker_partition::BrokerConfig::new(
+            dir.path().to_path_buf(),
+        ))
+        .unwrap();
+        let response = broker
+            .publish(
+                serde_json::from_value(serde_json::json!({
+                    "url": "https://example.com/hook", "secret": "secret", "payload": "test"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        broker.flush_wal().unwrap();
+        let msg = broker
+            .read_message(
+                &response.topic,
+                response.partition.unwrap(),
+                response.offset.unwrap(),
+            )
+            .unwrap();
+        let mut engine = DispatchEngine::new_broker_only(broker, crate::DispatchConfig::default());
+        engine.flow.pending_capacity = Arc::new(Semaphore::new(1));
+        let owner = Uuid::new_v4();
+        let limits = ResolvedFlow {
+            key: "a".into(),
+            parallelism: 1,
+            rate: 0,
+            period_secs: 1,
+        };
+        engine.flow.ensure_lane(owner, "a", limits.clone()).await;
+        engine.flow.pause(owner, "a").await;
+        engine
+            .flow
+            .submit(engine.clone(), owner, msg.clone(), limits.clone(), false)
+            .await;
+        engine
+            .flow
+            .submit(engine.clone(), Uuid::new_v4(), msg, limits, false)
+            .await;
+        assert_eq!(engine.flow.lanes.lock().await.len(), 1);
+        assert_eq!(engine.flow.pending_count().await, 1);
+        assert_eq!(engine.telemetry_snapshot().queue_rejected, 1);
+        engine.shutdown_background().await;
+        assert_eq!(engine.flow.pending_capacity.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_lanes_and_their_drainers_are_reclaimed() {
+        let controller = FlowController::new(
+            None,
+            Arc::new(MemoryGuard::new(MemoryGuardConfig::default())),
+        );
+        let owner = Uuid::new_v4();
+        for i in 0..100 {
+            let key = i.to_string();
+            controller
+                .ensure_lane(
+                    owner,
+                    &key,
+                    ResolvedFlow {
+                        key: key.clone(),
+                        parallelism: 1,
+                        rate: 0,
+                        period_secs: 1,
+                    },
+                )
+                .await;
+        }
+        controller.pause(owner, "0").await;
+        controller.pin(owner, "1", Some(1), None, None).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while controller.lanes.lock().await.len() != 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(controller.drainers.lock().len(), 2);
+        for task in controller.take_drainer_tasks() {
+            task.abort();
+        }
+    }
 
     #[tokio::test]
     async fn operator_controls_do_not_deadlock() {

@@ -484,7 +484,7 @@ fn append_dispatch_metrics(
         snapshot.queue_depth
     );
     metric!(
-        "Delivery jobs rejected by the bounded ready queue",
+        "Delivery jobs rejected by bounded ready or flow admission",
         "counter",
         "bettermq_dispatch_queue_rejected_total",
         snapshot.queue_rejected

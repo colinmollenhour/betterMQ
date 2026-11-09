@@ -245,8 +245,8 @@ The public repo reads **92** `BETTERMQ_*` names used by self-host. **16** are CL
 | Env | Used for |
 |-----|----------|
 | `BETTERMQ_ALLOW_PRIVATE_DESTINATIONS` | Allow loopback/LAN webhook destinations |
-| `BETTERMQ_DISPATCH_MAX_IN_FLIGHT` | Concurrent delivery tasks (default `256`) |
-| `BETTERMQ_DISPATCH_QUEUE_CAP` | Dispatch work-queue capacity (default `4096`) |
+| `BETTERMQ_DISPATCH_MAX_IN_FLIGHT` | Concurrent outbound deliveries across direct, flow-controlled, and fleet paths per process (default `256`) |
+| `BETTERMQ_DISPATCH_QUEUE_CAP` | Ready-channel capacity and separate aggregate flow-work capacity (default `4096` each); overflow remains durable for backfill |
 | `BETTERMQ_DISPATCH_GLOBAL_MAX` | Optional global in-flight delivery cap |
 | `BETTERMQ_DEFAULT_MAX_RETRIES` | Default webhook retries (default `3`) |
 | `BETTERMQ_HTTP_TIMEOUT_SECS` | Webhook HTTP timeout (default `300`; overrides config) |
@@ -254,6 +254,8 @@ The public repo reads **92** `BETTERMQ_*` names used by self-host. **16** are CL
 | `BETTERMQ_FLOW_WAITLIST_CAP` | Per-lane flow waitlist (default `8192`) |
 | `BETTERMQ_MEMORY_LIMIT_MB` | Pause dispatch fetches above this RSS (optional) |
 | `BETTERMQ_FAIRNESS_TENANT_SOFT_LIMIT` | Tenant fairness tracking soft cap (default `1024`) |
+
+Unpaused, unpinned flow lanes are reclaimed after 60 seconds idle (no queued or active deliveries). Paused lanes and operator pins remain until explicitly cleared.
 
 #### DLQ and group fan-out
 

@@ -361,6 +361,7 @@ impl DispatchEngine {
         for handle in handles {
             let _ = handle.await;
         }
+        self.flow.discard_pending().await;
     }
 
     fn active_http_guard(&self) -> ActiveHttpGuard {
@@ -382,6 +383,10 @@ impl DispatchEngine {
 
     pub fn memory_guard(&self) -> Arc<MemoryGuard> {
         self.memory_guard.clone()
+    }
+
+    pub(crate) fn record_flow_rejected(&self) {
+        self.telemetry.record_queue_rejected();
     }
 
     pub fn telemetry_snapshot(&self) -> crate::telemetry::DispatchTelemetrySnapshot {
@@ -601,6 +606,9 @@ impl DispatchEngine {
 impl DispatchEngine {
     fn spawn_workers(&self, mut high_rx: mpsc::Receiver<DeliveryJob>) {
         let this = self.clone();
+        // Bound hydration/admission separately from outbound HTTP. Flow handoff
+        // releases this permit, but not the HTTP permit taken by delivery itself.
+        let admission = Arc::new(Semaphore::new(dispatch_max_in_flight()));
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -612,7 +620,7 @@ impl DispatchEngine {
                             break;
                         }
                         let engine = this.clone();
-                        let permit = match engine.in_flight.clone().acquire_owned().await {
+                        let permit = match admission.clone().acquire_owned().await {
                             Ok(p) => p,
                             Err(_) => {
                                 warn!("dispatch semaphore closed");
@@ -918,6 +926,12 @@ impl DispatchEngine {
     }
 
     pub(crate) async fn deliver_message(&self, msg: &StoredMessage) -> Result<(), DispatchError> {
+        let _permit = self
+            .in_flight
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| DispatchError::Failed("dispatch semaphore closed".into()))?;
         let _active_http = self.active_http_guard();
         let lane_key = broker_partition::flow_lane_owner(msg).to_string();
         if let Some(blocking) =
@@ -1353,6 +1367,12 @@ impl DispatchEngine {
         msg: &StoredMessage,
         committed_hwm: u64,
     ) -> Result<(), DispatchError> {
+        let _permit = self
+            .in_flight
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| DispatchError::Failed("dispatch semaphore closed".into()))?;
         let _active_http = self.active_http_guard();
         self.memory_guard.wait_below_limit().await;
         if msg.offset >= committed_hwm {
@@ -1505,6 +1525,46 @@ async fn discard_body_capped(resp: reqwest::Response) {
 mod tests {
     use super::*;
     use broker_partition::BrokerConfig;
+
+    fn publish_test_message(broker: &Broker, url: &str) -> StoredMessage {
+        let request = serde_json::from_value(serde_json::json!({
+            "url": url, "secret": "secret", "payload": "test", "routing_key": "lane"
+        }))
+        .unwrap();
+        let response = broker.publish(request).unwrap();
+        broker.flush_wal().unwrap();
+        broker
+            .read_message(
+                &response.topic,
+                response.partition.unwrap(),
+                response.offset.unwrap(),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn flow_and_fleet_delivery_wait_for_http_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let msg = publish_test_message(&broker, "https://example.com/hook");
+        let mut engine = DispatchEngine::new_broker_only(broker, DispatchConfig::default());
+        engine.in_flight = Arc::new(Semaphore::new(1));
+        let permit = engine.in_flight.clone().acquire_owned().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), engine.deliver_message(&msg))
+                .await
+                .is_err()
+        );
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            engine.push_http_only(&msg, msg.offset + 1)
+        )
+        .await
+        .is_err());
+        assert_eq!(engine.active_http.load(Ordering::Acquire), 0);
+        drop(permit);
+        engine.shutdown_background().await;
+    }
 
     #[tokio::test]
     async fn commit_cursor_reconstructs_completed_gap_after_restart() {
