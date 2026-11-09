@@ -420,6 +420,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mutation_after_torn_journal_tail_survives_restart() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let registry = SubscriptionRegistry::open(dir.path()).unwrap();
+        let first = registry
+            .create(
+                "tenant",
+                "orders".into(),
+                "https://example.com/a".into(),
+                "s".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("subscriptions.journal"))
+            .unwrap();
+        journal.write_all(br#"{"version":1,"sequ"#).unwrap();
+        drop(journal);
+        drop(registry);
+
+        let registry = SubscriptionRegistry::open(dir.path()).unwrap();
+        let second = registry
+            .create(
+                "tenant",
+                "invoices".into(),
+                "https://example.com/b".into(),
+                "s".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        drop(registry);
+
+        let reopened = SubscriptionRegistry::open(dir.path()).unwrap();
+        assert!(reopened.get_by_id("tenant", first.id).unwrap().is_some());
+        assert!(reopened.get_by_id("tenant", second.id).unwrap().is_some());
+    }
+
+    #[test]
     fn queue_revision_survives_restart_and_newer_version_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let registry = SubscriptionRegistry::open(dir.path()).unwrap();
