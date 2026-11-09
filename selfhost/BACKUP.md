@@ -12,6 +12,9 @@ its RocksDB/checkpoint metadata and is not a supported disaster-recovery image.
 
 # Restore (parent directory that will contain the data folder)
 ./restore.sh /tmp/bettermq-backup.tgz /var/lib
+# Existing directory? Stop the broker and explicitly replace the whole tree:
+./restore.sh /tmp/bettermq-backup.tgz /var/lib --force
+# Previous tree is retained under bettermq.pre-restore-*/data, never overlaid.
 # then: bettermq serve --data-dir /var/lib/bettermq
 ```
 
@@ -64,7 +67,8 @@ not a substitute for the RF=3 WAL.
    node at a time. Do not upgrade without quorum headroom.
 4. Do not reinterpret or move an existing data directory between V1/V2
    layouts. Use a versioned migration command when one is released.
-5. Roll back by stopping the new binary and restoring the untouched backup;
+5. Roll back by stopping the new binary and restoring the untouched backup
+   using `restore.sh backup.tgz /var/lib --force` (retain the moved-aside tree);
    never open a data directory written by a newer incompatible format with an
    older binary.
 
