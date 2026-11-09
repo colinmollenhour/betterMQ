@@ -3,10 +3,12 @@
 use crate::persist::{
     load_json_with_recovery, persist_json_atomic, JsonLoadSource, MetadataLoadError,
 };
+use crate::retry::{self, FireFailure, FireRetry};
 use crate::ScheduledPublishRequest;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -129,6 +131,14 @@ struct CronState {
     file: CronFile,
     sequence: u64,
     journal_ops: usize,
+    /// Failed-fire backoff per job (in memory only).
+    retries: HashMap<Uuid, CronRetry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CronRetry {
+    attempts: u32,
+    not_before_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +247,7 @@ impl CronRegistry {
                 file: loaded.value,
                 sequence,
                 journal_ops,
+                retries: HashMap::new(),
             })),
         })
     }
@@ -372,6 +383,7 @@ impl CronRegistry {
         let removed = state.file.jobs[pos].clone();
         self.append_command(&mut state, CronCommand::Delete { id })?;
         apply_command(&mut state.file, CronCommand::Delete { id });
+        state.retries.remove(&id);
         self.maybe_compact(&mut state);
         Ok(removed)
     }
@@ -394,12 +406,21 @@ impl CronRegistry {
     }
 
     /// Jobs due now — advances next_run only in memory. Call [`Self::commit_fire`]
-    /// after successful publish, or [`Self::revert_fire`] on failure.
+    /// after successful publish, or [`Self::fail_fire`] on failure. Jobs backing
+    /// off after a failed fire are not due until their retry time.
     pub fn pop_due(&self, now_ms: i64) -> Vec<CronJob> {
-        let mut state = self.inner.lock();
+        let mut guard = self.inner.lock();
+        let state = &mut *guard;
         let mut due = Vec::new();
         for job in &mut state.file.jobs {
             if job.paused || job.next_run_at_ms > now_ms {
+                continue;
+            }
+            if state
+                .retries
+                .get(&job.id)
+                .is_some_and(|retry| retry.not_before_ms > now_ms)
+            {
                 continue;
             }
             let previous = job.clone();
@@ -427,12 +448,50 @@ impl CronRegistry {
             .cloned()
             .ok_or(CronError::NotFound(id))?;
         self.append_command(&mut state, CronCommand::Upsert { job })?;
+        state.retries.remove(&id);
         self.maybe_compact(&mut state);
         Ok(())
     }
 
-    /// Revert next_run after a failed publish so the tick retries.
-    pub fn revert_fire(&self, job: &CronJob) -> Result<(), CronError> {
+    /// Record a failed publish of a job returned by [`Self::pop_due`].
+    ///
+    /// On [`FireRetry::Retry`] the occurrence is reverted and retried after
+    /// an exponential backoff. On [`FireRetry::GiveUp`] (a permanent failure
+    /// that kept failing) the occurrence is skipped: the advanced next run is
+    /// committed and the job keeps its schedule.
+    pub fn fail_fire(
+        &self,
+        job: &CronJob,
+        failure: FireFailure,
+        now_ms: i64,
+    ) -> Result<FireRetry, CronError> {
+        let attempt = {
+            let state = self.inner.lock();
+            state
+                .retries
+                .get(&job.id)
+                .map_or(0, |retry| retry.attempts)
+                .saturating_add(1)
+        };
+        let decision = retry::decide(attempt, failure, now_ms);
+        match decision {
+            FireRetry::Retry { retry_at_ms, .. } => {
+                self.revert_fire(job)?;
+                self.inner.lock().retries.insert(
+                    job.id,
+                    CronRetry {
+                        attempts: attempt,
+                        not_before_ms: retry_at_ms,
+                    },
+                );
+            }
+            FireRetry::GiveUp { .. } => self.commit_fire(job.id)?,
+        }
+        Ok(decision)
+    }
+
+    /// Revert next_run after a failed publish so a later tick retries.
+    fn revert_fire(&self, job: &CronJob) -> Result<(), CronError> {
         let mut state = self.inner.lock();
         let mut restored = state
             .file
@@ -784,6 +843,59 @@ mod tests {
             fired.fire_idempotency_key(),
             format!("cron:{}:{}", plain.id, plain.created_at_ms + 10_000)
         );
+    }
+
+    #[test]
+    fn failed_cron_fire_backs_off_then_gives_up_on_permanent_failure() {
+        let dir = temp_dir().join(format!("bettermq-cron-retry-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        let job = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        let slot = job.next_run_at_ms;
+        let now = slot + 1;
+
+        let fired = reg.pop_due(now).pop().unwrap();
+        assert_eq!(
+            reg.fail_fire(&fired, FireFailure::Transient, now).unwrap(),
+            FireRetry::Retry {
+                attempt: 1,
+                retry_at_ms: now + crate::FIRE_RETRY_BASE_MS
+            }
+        );
+        assert_eq!(reg.get(job.id).unwrap().next_run_at_ms, slot);
+        assert!(reg.pop_due(now + crate::FIRE_RETRY_BASE_MS - 1).is_empty());
+
+        let mut at = now + crate::FIRE_RETRY_BASE_MS;
+        let mut outcome = None;
+        for _ in 1..crate::PERMANENT_FAILURE_ATTEMPTS {
+            let fired = reg.pop_due(at).pop().expect("due after backoff");
+            let decision = reg.fail_fire(&fired, FireFailure::Permanent, at).unwrap();
+            if let FireRetry::Retry { retry_at_ms, .. } = decision {
+                at = retry_at_ms;
+            }
+            outcome = Some(decision);
+        }
+        assert_eq!(
+            outcome,
+            Some(FireRetry::GiveUp {
+                attempt: crate::PERMANENT_FAILURE_ATTEMPTS
+            })
+        );
+        // The occurrence is skipped but the cron keeps its schedule.
+        let skipped = reg.get(job.id).unwrap();
+        assert!(skipped.next_run_at_ms > at);
+        assert!(!skipped.paused);
+        let next = reg.pop_due(skipped.next_run_at_ms).pop().unwrap();
+        assert!(matches!(
+            reg.fail_fire(&next, FireFailure::Transient, skipped.next_run_at_ms)
+                .unwrap(),
+            FireRetry::Retry { attempt: 1, .. }
+        ));
     }
 
     #[test]

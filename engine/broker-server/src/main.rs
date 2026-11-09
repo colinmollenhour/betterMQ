@@ -3,7 +3,8 @@ use axum::{response::Redirect, routing::get};
 use broker_api::{
     admin_router, begin_shutdown, data_plane_router_no_spawn, enqueue_dispatch_after_publish,
     gateway_only_router, internal_router, open_setup_window, public_router, publish_with_cluster,
-    spawn_cluster_catalog_sync, AdminState, AppState, CatalogTombstones, Cluster, GatewayOnlyState,
+    spawn_cluster_catalog_sync, AdminState, ApiError, AppState, CatalogTombstones, Cluster,
+    GatewayOnlyState,
 };
 use broker_cli::{
     Cli, ClusterCommands, ClusterInitArgs, ClusterJoinArgs, Commands, ConfigCommands,
@@ -1247,23 +1248,46 @@ fn spawn_schedule_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
 
             let now = Utc::now().timestamp_millis();
 
-            fire_due_schedules(&state, state.schedule.pop_due(now)).await;
+            fire_due_schedules(&state, state.schedule.pop_due(now), now).await;
 
             for job in state.crons.pop_due(now) {
                 tracing::info!(cron_id = %job.id, queue = %job.request.topic, "cron tick");
                 let mut req = job.request.clone();
                 // Per-firing key: a user key alone would dedupe every later tick.
                 req.idempotency_key = Some(job.fire_idempotency_key());
-                let ok = fire_scheduled_publish(&state, req).await;
-                if ok {
-                    if let Err(e) = state.crons.commit_fire(job.id) {
-                        broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
-                        tracing::warn!(error = %e, cron_id = %job.id, "cron commit_fire failed");
+                match fire_scheduled_publish(&state, req).await {
+                    Ok(()) => {
+                        if let Err(e) = state.crons.commit_fire(job.id) {
+                            broker_api::record_scheduler_failure(
+                                broker_api::SchedulerFailure::Persist,
+                            );
+                            tracing::warn!(error = %e, cron_id = %job.id, "cron commit_fire failed");
+                        }
                     }
-                } else {
-                    broker_api::record_scheduler_failure(broker_api::SchedulerFailure::CronFire);
-                    if let Err(e) = state.crons.revert_fire(&job) {
-                        tracing::warn!(error = %e, cron_id = %job.id, "cron revert_fire failed");
+                    Err(failure) => {
+                        broker_api::record_scheduler_failure(broker_api::SchedulerFailure::CronFire);
+                        match state.crons.fail_fire(&job, failure, now) {
+                            Ok(broker_schedule::FireRetry::Retry {
+                                attempt,
+                                retry_at_ms,
+                            }) => tracing::warn!(
+                                cron_id = %job.id,
+                                attempt,
+                                retry_in_ms = retry_at_ms - now,
+                                "cron fire failed; will retry"
+                            ),
+                            Ok(broker_schedule::FireRetry::GiveUp { attempt }) => tracing::error!(
+                                cron_id = %job.id,
+                                attempt,
+                                "cron occurrence skipped: publish failed permanently"
+                            ),
+                            Err(e) => {
+                                broker_api::record_scheduler_failure(
+                                    broker_api::SchedulerFailure::Persist,
+                                );
+                                tracing::warn!(error = %e, cron_id = %job.id, "cron fail_fire failed")
+                            }
+                        }
                     }
                 }
             }
@@ -1279,8 +1303,12 @@ const SCHEDULE_COMPLETE_BATCH: usize = 256;
 
 /// Fire due delayed publishes with bounded concurrency. Each batch's
 /// successes are removed from the schedule journal in one append, on the
-/// blocking pool; failures go back onto the heap for the next tick.
-async fn fire_due_schedules(state: &Arc<AppState>, due: Vec<broker_schedule::ScheduledPublish>) {
+/// blocking pool; failures back off per job (see [`broker_schedule::FireRetry`]).
+async fn fire_due_schedules(
+    state: &Arc<AppState>,
+    due: Vec<broker_schedule::ScheduledPublish>,
+    now: i64,
+) {
     let limit = Arc::new(tokio::sync::Semaphore::new(SCHEDULE_FIRE_CONCURRENCY));
     let mut due = due.into_iter().peekable();
     while due.peek().is_some() {
@@ -1290,18 +1318,45 @@ async fn fire_due_schedules(state: &Arc<AppState>, due: Vec<broker_schedule::Sch
             let limit = limit.clone();
             firing.spawn(async move {
                 let _permit = limit.acquire_owned().await;
-                let ok = fire_scheduled_publish(&state, job.request.clone()).await;
-                (job, ok)
+                let outcome = fire_scheduled_publish(&state, job.request.clone()).await;
+                (job, outcome)
             });
         }
         let mut completed = Vec::new();
         while let Some(joined) = firing.join_next().await {
             match joined {
-                Ok((job, true)) => completed.push(job.id),
-                Ok((job, false)) => {
+                Ok((job, Ok(()))) => completed.push(job.id),
+                Ok((job, Err(failure))) => {
                     broker_api::record_scheduler_failure(broker_api::SchedulerFailure::DelayedFire);
-                    if let Err(e) = state.schedule.requeue(job) {
-                        tracing::warn!(error = %e, "schedule requeue after failed fire failed");
+                    let id = job.id;
+                    let topic = job.request.topic.clone();
+                    match state.schedule.fail(job, failure, now) {
+                        Ok(broker_schedule::FireRetry::Retry {
+                            attempt,
+                            retry_at_ms,
+                        }) => tracing::warn!(
+                            scheduled_id = %id,
+                            queue = %topic,
+                            attempt,
+                            retry_in_ms = retry_at_ms - now,
+                            "delayed job fire failed; will retry"
+                        ),
+                        Ok(broker_schedule::FireRetry::GiveUp { attempt }) => tracing::error!(
+                            scheduled_id = %id,
+                            queue = %topic,
+                            attempt,
+                            "delayed job dropped: publish failed permanently"
+                        ),
+                        Err(e) => {
+                            broker_api::record_scheduler_failure(
+                                broker_api::SchedulerFailure::Persist,
+                            );
+                            tracing::warn!(
+                                error = %e,
+                                scheduled_id = %id,
+                                "schedule retry bookkeeping after failed fire failed"
+                            )
+                        }
                     }
                 }
                 // The job stays in flight; its durable Add makes a restart fire it again.
@@ -1329,11 +1384,11 @@ async fn fire_due_schedules(state: &Arc<AppState>, due: Vec<broker_schedule::Sch
     }
 }
 
-/// Returns true when the publish was accepted (including duplicates).
+/// `Ok` when the publish was accepted (including duplicates); otherwise how it failed.
 async fn fire_scheduled_publish(
     state: &Arc<AppState>,
     pending: broker_schedule::ScheduledPublishRequest,
-) -> bool {
+) -> Result<(), broker_schedule::FireFailure> {
     let req = PublishRequest {
         routing_id: None,
         topic: pending.topic,
@@ -1365,11 +1420,17 @@ async fn fire_scheduled_publish(
                 if !resp.duplicate {
                     enqueue_dispatch_after_publish(state, &resp);
                 }
-                true
+                Ok(())
             }
             Err(e) => {
                 tracing::warn!(error = ?e, "scheduled cluster publish failed");
-                false
+                Err(match &e {
+                    ApiError::Broker(error) => {
+                        broker_schedule::FireFailure::from_broker_error(error)
+                    }
+                    // Forwarding and quorum errors are not specific enough to give up on.
+                    _ => broker_schedule::FireFailure::Transient,
+                })
             }
         }
     } else {
@@ -1388,7 +1449,7 @@ async fn fire_scheduled_publish(
                             offset,
                             "scheduled enqueue commit failed"
                         );
-                        return false;
+                        return Err(broker_schedule::FireFailure::Transient);
                     }
                 }
                 if !resp.duplicate {
@@ -1402,11 +1463,11 @@ async fn fire_scheduled_publish(
                         }
                     }
                 }
-                true
+                Ok(())
             }
             Err(e) => {
                 tracing::warn!(error = %e, "scheduled enqueue failed");
-                false
+                Err(broker_schedule::FireFailure::from_broker_error(&e))
             }
         }
     }
@@ -1712,7 +1773,8 @@ mod tests {
             .schedule(scheduled("no-such-queue"), 0)
             .unwrap();
 
-        fire_due_schedules(&state, state.schedule.pop_due(i64::MAX)).await;
+        let now = Utc::now().timestamp_millis();
+        fire_due_schedules(&state, state.schedule.pop_due(i64::MAX), now).await;
 
         assert_eq!(
             state
@@ -1725,7 +1787,8 @@ mod tests {
         let left = state.schedule.list();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, missing.id);
-        // The failed job is back on the heap, not stuck in flight.
+        // The failed job is back on the heap behind its backoff, not stuck in flight.
+        assert!(state.schedule.pop_due(now).is_empty());
         assert_eq!(state.schedule.pop_due(i64::MAX).len(), 1);
 
         drop(state);

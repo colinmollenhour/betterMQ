@@ -74,6 +74,7 @@ pub use metrics::{
 };
 pub use payload_repair::{repair_legacy_payloads, PayloadRepairReport};
 pub use retention::{compute_safe_watermark, run_retention_tick, spawn_retention_loop};
+pub use routes::ApiError;
 
 /// Reject new ingest while allowing already-admitted requests to drain.
 pub fn begin_shutdown() {

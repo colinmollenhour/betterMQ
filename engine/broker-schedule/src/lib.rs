@@ -2,11 +2,16 @@
 
 mod cron;
 mod persist;
+mod retry;
 
 use chrono::Utc;
 pub use cron::{normalize_cron, CronError, CronJob, CronRegistry, ScheduleKind};
 use parking_lot::Mutex;
 use persist::{load_json_with_recovery, persist_json_atomic, JsonLoadSource, MetadataLoadError};
+pub use retry::{
+    fire_backoff_ms, FireFailure, FireRetry, FIRE_RETRY_BASE_MS, FIRE_RETRY_MAX_MS,
+    PERMANENT_FAILURE_ATTEMPTS,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
@@ -116,11 +121,21 @@ struct HeapItem {
     deliver_at_ms: i64,
     id: Uuid,
     request: ScheduledPublishRequest,
+    /// In-memory retry gate after a failed fire; not persisted, so a restart
+    /// retries once immediately and then backs off again.
+    #[serde(skip)]
+    not_before_ms: i64,
+}
+
+impl HeapItem {
+    fn due_at_ms(&self) -> i64 {
+        self.deliver_at_ms.max(self.not_before_ms)
+    }
 }
 
 impl PartialEq for HeapItem {
     fn eq(&self, other: &Self) -> bool {
-        self.deliver_at_ms == other.deliver_at_ms && self.id == other.id
+        self.due_at_ms() == other.due_at_ms() && self.id == other.id
     }
 }
 
@@ -135,8 +150,8 @@ impl PartialOrd for HeapItem {
 impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> Ordering {
         other
-            .deliver_at_ms
-            .cmp(&self.deliver_at_ms)
+            .due_at_ms()
+            .cmp(&self.due_at_ms())
             .then_with(|| other.id.cmp(&self.id))
     }
 }
@@ -153,6 +168,8 @@ struct ScheduleState {
     heap: BinaryHeap<HeapItem>,
     in_flight: HashMap<Uuid, HeapItem>,
     listing: BTreeMap<(i64, Uuid), ScheduledSummary>,
+    /// Consecutive failed fires per job (in memory only).
+    attempts: HashMap<Uuid, u32>,
     sequence: u64,
     journal_ops: usize,
 }
@@ -280,6 +297,7 @@ impl ScheduleQueue {
                 heap,
                 in_flight: HashMap::new(),
                 listing,
+                attempts: HashMap::new(),
                 sequence,
                 journal_ops,
             })),
@@ -297,6 +315,7 @@ impl ScheduleQueue {
             deliver_at_ms,
             id,
             request: request.clone(),
+            not_before_ms: 0,
         };
         let mut state = self.state.lock();
         self.append_op(&mut state, JournalOp::Add { item: item.clone() })?;
@@ -362,6 +381,7 @@ impl ScheduleQueue {
             return Err(error);
         }
         state.listing.remove(&(removed.deliver_at_ms, removed.id));
+        state.attempts.remove(&id);
         state.journal_ops += 1;
         self.maybe_compact(&mut state);
         Ok(ScheduledPublish {
@@ -378,7 +398,7 @@ impl ScheduleQueue {
         let mut state = self.state.lock();
         let mut popped = Vec::new();
         while let Some(top) = state.heap.peek() {
-            if top.deliver_at_ms > now_ms {
+            if top.due_at_ms() > now_ms {
                 break;
             }
             let item = state.heap.pop().expect("peeked");
@@ -399,6 +419,7 @@ impl ScheduleQueue {
         if let Some(item) = state.in_flight.remove(&id) {
             state.listing.remove(&(item.deliver_at_ms, item.id));
         }
+        state.attempts.remove(&id);
         state.journal_ops += 1;
         self.maybe_compact(&mut state);
         Ok(())
@@ -415,35 +436,73 @@ impl ScheduleQueue {
             ids.iter().map(|id| JournalOp::Remove { id: *id }).collect(),
         )?;
         for id in ids {
-            state.in_flight.remove(id);
+            if let Some(item) = state.in_flight.remove(id) {
+                state.listing.remove(&(item.deliver_at_ms, item.id));
+            }
+            state.attempts.remove(id);
         }
         state.journal_ops += ids.len();
         self.maybe_compact(&mut state);
         Ok(())
     }
 
-    /// Put a failed fire back onto the heap. Its original durable Add remains
-    /// in the journal until a successful completion appends Remove.
-    pub fn requeue(&self, job: ScheduledPublish) -> Result<(), ScheduleError> {
+    /// Record a failed fire of a job returned by [`Self::pop_due`].
+    ///
+    /// On [`FireRetry::Retry`] the job goes back onto the heap but is not due
+    /// again until the backoff elapses; its durable Add stays in the journal.
+    /// On [`FireRetry::GiveUp`] (a permanent failure that kept failing) the
+    /// job is removed durably, like [`Self::complete`].
+    pub fn fail(
+        &self,
+        job: ScheduledPublish,
+        failure: FireFailure,
+        now_ms: i64,
+    ) -> Result<FireRetry, ScheduleError> {
         let mut state = self.state.lock();
-        if let Some(previous) = state.in_flight.remove(&job.id) {
-            state.listing.remove(&(previous.deliver_at_ms, previous.id));
+        let attempt = state
+            .attempts
+            .get(&job.id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let decision = retry::decide(attempt, failure, now_ms);
+        let retry_at_ms = match decision {
+            FireRetry::Retry { retry_at_ms, .. } => retry_at_ms,
+            FireRetry::GiveUp { .. } => {
+                match self.append_op(&mut state, JournalOp::Remove { id: job.id }) {
+                    Ok(()) => {
+                        state.in_flight.remove(&job.id);
+                        state.listing.remove(&(job.deliver_at_ms, job.id));
+                        state.attempts.remove(&job.id);
+                        state.journal_ops += 1;
+                        self.maybe_compact(&mut state);
+                        return Ok(decision);
+                    }
+                    Err(error) => {
+                        // Keep the job and retry later rather than losing track of it.
+                        Self::push_retry(&mut state, job, attempt, now_ms + FIRE_RETRY_MAX_MS);
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        Self::push_retry(&mut state, job, attempt, retry_at_ms);
+        Ok(decision)
+    }
+
+    fn push_retry(state: &mut ScheduleState, job: ScheduledPublish, attempt: u32, at_ms: i64) {
+        if state.in_flight.remove(&job.id).is_none() {
+            // Cancelled while the fire was in progress.
+            state.attempts.remove(&job.id);
+            return;
         }
-        state.listing.insert(
-            (job.deliver_at_ms, job.id),
-            ScheduledSummary {
-                id: job.id,
-                deliver_at_ms: job.deliver_at_ms,
-                topic: job.request.topic.clone(),
-                routing_key: job.request.routing_key.clone(),
-            },
-        );
+        state.attempts.insert(job.id, attempt);
         state.heap.push(HeapItem {
             deliver_at_ms: job.deliver_at_ms,
             id: job.id,
             request: job.request,
+            not_before_ms: at_ms,
         });
-        Ok(())
     }
 
     fn append_op(&self, state: &mut ScheduleState, op: JournalOp) -> Result<(), ScheduleError> {
@@ -574,7 +633,9 @@ mod schedule_tests {
         assert_eq!(queue.count(), 4);
         let mut due = queue.pop_due(i64::MAX);
         assert_eq!(queue.count(), 4, "in-flight jobs remain visible");
-        queue.requeue(due.pop().unwrap()).unwrap();
+        queue
+            .fail(due.pop().unwrap(), FireFailure::Transient, 0)
+            .unwrap();
         queue.complete(due.pop().unwrap().id).unwrap();
         assert_eq!(queue.count(), 3);
         drop(queue);
@@ -626,7 +687,7 @@ mod schedule_tests {
         let queue = ScheduleQueue::open(dir.path()).unwrap();
         assert_eq!(queue.list().len(), 1);
         let pending = queue.pop_due(i64::MAX).pop().unwrap();
-        queue.requeue(pending).unwrap();
+        queue.fail(pending, FireFailure::Transient, 0).unwrap();
         drop(queue);
 
         let queue = ScheduleQueue::open(dir.path()).unwrap();
@@ -665,6 +726,77 @@ mod schedule_tests {
         expected.sort();
         assert_eq!(left, expected);
         queue.complete_many(&[]).unwrap();
+    }
+
+    #[test]
+    fn failed_fire_backs_off_exponentially() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        let scheduled = queue.schedule(request(), 0).unwrap();
+        let now = scheduled.deliver_at_ms + 1;
+
+        let pending = queue.pop_due(now).pop().unwrap();
+        assert_eq!(
+            queue.fail(pending, FireFailure::Transient, now).unwrap(),
+            FireRetry::Retry {
+                attempt: 1,
+                retry_at_ms: now + FIRE_RETRY_BASE_MS
+            }
+        );
+        assert!(queue.pop_due(now + FIRE_RETRY_BASE_MS - 1).is_empty());
+        let listed = queue.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].deliver_at_ms, scheduled.deliver_at_ms);
+
+        let retry_at = now + FIRE_RETRY_BASE_MS;
+        let pending = queue.pop_due(retry_at).pop().unwrap();
+        assert_eq!(pending.deliver_at_ms, scheduled.deliver_at_ms);
+        assert_eq!(
+            queue
+                .fail(pending, FireFailure::Transient, retry_at)
+                .unwrap(),
+            FireRetry::Retry {
+                attempt: 2,
+                retry_at_ms: retry_at + 2 * FIRE_RETRY_BASE_MS
+            }
+        );
+
+        let pending = queue.pop_due(i64::MAX).pop().unwrap();
+        queue.complete(pending.id).unwrap();
+        assert!(queue.list().is_empty());
+    }
+
+    #[test]
+    fn permanent_failure_gives_up_and_removes_job_durably() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        queue.schedule(request(), 0).unwrap();
+        let mut outcome = None;
+        for _ in 0..PERMANENT_FAILURE_ATTEMPTS {
+            let pending = queue.pop_due(i64::MAX).pop().unwrap();
+            outcome = Some(queue.fail(pending, FireFailure::Permanent, 0).unwrap());
+        }
+        assert_eq!(
+            outcome,
+            Some(FireRetry::GiveUp {
+                attempt: PERMANENT_FAILURE_ATTEMPTS
+            })
+        );
+        assert!(queue.list().is_empty());
+        assert!(queue.pop_due(i64::MAX).is_empty());
+        drop(queue);
+        assert!(ScheduleQueue::open(dir.path()).unwrap().list().is_empty());
+    }
+
+    #[test]
+    fn failed_fire_of_cancelled_job_is_not_requeued() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        queue.schedule(request(), 0).unwrap();
+        let pending = queue.pop_due(i64::MAX).pop().unwrap();
+        queue.cancel(pending.id).unwrap();
+        queue.fail(pending, FireFailure::Transient, 0).unwrap();
+        assert!(queue.list().is_empty());
     }
 
     #[test]
