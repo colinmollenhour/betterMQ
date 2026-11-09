@@ -82,6 +82,41 @@ Sealed-segment archive is asynchronous and off the `202` path. Optional
 See [ARCHIVE.md](../engine/broker-storage/ARCHIVE.md). This is extra storage,
 not a substitute for the RF=3 WAL.
 
+Images include `bettermq-archive` (with S3 support) and `bettermq-wal-migrate`.
+GitHub releases also ship platform-specific ZIPs for each tool; download the
+same version as the broker and verify its ZIP against `checksums.txt` before
+extracting it into your private tools directory. The one-line broker installer
+does not install the recovery tools. No Rust compiler is needed for recovery.
+To run a tool in the image, override its broker entrypoint, for example:
+
+```bash
+docker run --rm --network none --entrypoint bettermq-wal-migrate \
+  -v /srv/offline-copy:/recovery \
+  "ghcr.io/colinmollenhour/bettermq:$BETTERMQ_VERSION" inspect /recovery/wal
+```
+
+Stop the broker before either restore or migration. Restore archives to a fresh
+directory, not a live or previously populated WAL. A missing, malformed or
+duplicate `--until-unix-ms` value is an error, never an unrestricted restore.
+PITR filters archive timestamps, not individual message timestamps.
+
+### Offline V1-to-V2 WAL migration
+
+1. Stop the broker and take a checksummed backup of **all** state. Work on a
+   copy; this tool migrates a WAL directory, not cluster identities, RocksDB
+   metadata, auth or object storage.
+2. Run `bettermq-wal-migrate inspect /srv/copy/v1-wal` and record its report.
+3. Run `bettermq-wal-migrate migrate /srv/copy/v1-wal /srv/copy/v2-wal SHARD_ID`,
+   replacing `SHARD_ID` with the actual numeric shard. Inspect the destination
+   and verify frame counts and offsets before any cutover.
+4. Before the V2 WAL takes writes, `bettermq-wal-migrate rollback /srv/copy/v2-wal`
+   quarantines the migrated destination; use the untouched V1 source to roll
+   back. The command refuses a changed source or V2
+   destination; once new writes occur, restore a consistent offline backup of
+   **all** stores instead. Never point an older broker at newer-format state.
+5. Validate the complete recovered data layout with `bettermq doctor` and an
+   isolated canary before resuming traffic. Do not rename WAL formats in place.
+
 ## Rolling migration
 
 1. Take and checksum an offline backup. Keep the old binary and data directory.

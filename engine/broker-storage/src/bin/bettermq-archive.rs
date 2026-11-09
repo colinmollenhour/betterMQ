@@ -18,20 +18,42 @@ fn print_report(report: ArchiveToolReport) {
     }
 }
 
-fn take_until(raw: Vec<String>) -> (Vec<String>, Option<u128>) {
+fn take_until(raw: Vec<String>) -> Result<(Vec<String>, Option<u128>), String> {
     let mut until = None;
     let mut positional = Vec::new();
     let mut iter = raw.into_iter();
     while let Some(arg) = iter.next() {
-        if arg == "--until-unix-ms" {
-            until = iter.next().and_then(|value| value.parse().ok());
+        let value = if arg == "--until-unix-ms" {
+            Some(iter.next().ok_or("--until-unix-ms requires a value")?)
         } else if let Some(value) = arg.strip_prefix("--until-unix-ms=") {
-            until = value.parse().ok();
+            Some(value.to_owned())
+        } else if arg.starts_with('-') {
+            return Err(format!("unknown option: {arg}"));
         } else {
             positional.push(arg);
+            None
+        };
+        if let Some(value) = value {
+            if until.is_some() {
+                return Err("--until-unix-ms may only be specified once".into());
+            }
+            until = Some(value.parse().map_err(|_| {
+                format!("invalid --until-unix-ms: {value:?}; expected Unix milliseconds")
+            })?);
         }
     }
-    (positional, until)
+    Ok((positional, until))
+}
+
+fn restore_args(raw: Vec<String>, min: usize) -> (Vec<String>, Option<u128>) {
+    let parsed = take_until(raw).unwrap_or_else(|error| {
+        eprintln!("error: {error}");
+        std::process::exit(2);
+    });
+    if !(min..=2).contains(&parsed.0.len()) {
+        usage();
+    }
+    parsed
 }
 
 fn main() {
@@ -43,7 +65,7 @@ fn main() {
         }
         Some("restore") => {
             let raw: Vec<String> = args.collect();
-            let (positional, until) = take_until(raw);
+            let (positional, until) = restore_args(raw, 2);
             let root = PathBuf::from(positional.first().cloned().unwrap_or_else(|| usage()));
             let destination = PathBuf::from(positional.get(1).cloned().unwrap_or_else(|| usage()));
             print_report(restore_local_archive_until(&root, &destination, until));
@@ -59,7 +81,7 @@ fn main() {
         #[cfg(feature = "s3")]
         Some("restore-s3") => {
             let raw: Vec<String> = args.collect();
-            let (positional, until) = take_until(raw);
+            let (positional, until) = restore_args(raw, 1);
             let destination = PathBuf::from(positional.first().cloned().unwrap_or_else(|| usage()));
             let prefix = positional
                 .get(1)
@@ -78,5 +100,30 @@ fn main() {
             );
         }
         _ => usage(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_pitr_never_becomes_unrestricted_restore() {
+        for args in [
+            vec!["--until-unix-ms"],
+            vec!["--until-unix-ms", "typo"],
+            vec!["--until-unix-ms="],
+            vec!["--until-unix-ms=-1"],
+            vec!["--until-unix-ms=340282366920938463463374607431768211456"],
+            vec!["--until-unix-ms=1", "--until-unix-ms=2"],
+            vec!["--unknown"],
+        ] {
+            assert!(take_until(args.into_iter().map(String::from).collect()).is_err());
+        }
+        let (paths, until) =
+            take_until(vec!["archive".into(), "--until-unix-ms=123".into()]).unwrap();
+        assert_eq!(paths, vec!["archive"]);
+        assert_eq!(until, Some(123));
+        assert_eq!(take_until(vec![]).unwrap().1, None);
     }
 }

@@ -5,7 +5,7 @@ fn usage() -> ! {
     eprintln!(
         "usage:\n  bettermq-wal-migrate inspect <wal-dir>\n  \
          bettermq-wal-migrate migrate <v1-dir> <v2-dir> <shard-id>\n  \
-         bettermq-wal-migrate rollback <v2-dir>"
+         bettermq-wal-migrate rollback <v2-dir>\n\nStop the broker and back up all stores first. Rollback requires unchanged source and destination; after V2 writes, restore a complete offline backup."
     );
     std::process::exit(2);
 }

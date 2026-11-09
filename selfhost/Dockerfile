@@ -10,7 +10,11 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY engine ./engine
 COPY tools ./tools
 ARG CARGO_BUILD_JOBS=2
-RUN cargo build --locked --release -p broker-server
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/app/target \
+    cargo build --locked --release -p broker-server -p broker-storage --features broker-storage/s3 --bins \
+    && mkdir -p /out \
+    && cp target/release/bettermq target/release/bettermq-archive target/release/bettermq-wal-migrate /out/
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
@@ -19,7 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && useradd --system --uid 1000 --gid bettermq --home-dir /data --no-create-home bettermq \
     && mkdir -p /data /cluster-shared/meta \
     && chown bettermq:bettermq /data /cluster-shared/meta
-COPY --from=builder /app/target/release/bettermq /usr/local/bin/bettermq
+COPY --from=builder /out/bettermq /usr/local/bin/bettermq
+COPY --from=builder /out/bettermq-archive /out/bettermq-wal-migrate /usr/local/bin/
 COPY engine/panel/dist /usr/share/bettermq/panel
 ENV BETTERMQ_PANEL_DIR=/usr/share/bettermq/panel
 EXPOSE 8080

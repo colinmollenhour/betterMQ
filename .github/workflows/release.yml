@@ -198,8 +198,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build broker-server
-        run: cargo build -p broker-server --release --target ${{ matrix.target }}
+      - name: Build broker and recovery tools
+        run: cargo build --locked -p broker-server -p broker-storage --features broker-storage/s3 --bins --release --target ${{ matrix.target }}
 
       - name: Stage binary
         shell: bash
@@ -210,11 +210,17 @@ jobs:
           else
             cp "target/${{ matrix.target }}/release/bettermq" "dist/${{ matrix.artifact }}"
           fi
+          artifact="${{ matrix.artifact }}"
+          ext=""
+          [[ "${{ matrix.os }}" != windows-latest ]] || ext=.exe
+          for tool in archive wal-migrate; do
+            cp "target/${{ matrix.target }}/release/bettermq-${tool}${ext}" "dist/${artifact/bettermq-/bettermq-${tool}-}"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          path: dist/*
 
   docker:
     needs: [bump, verify]
