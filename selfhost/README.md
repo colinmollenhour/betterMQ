@@ -122,6 +122,10 @@ then the saved file, then defaults. `BETTERMQ_STORAGE`, `S3_*`, webhook timeout
 variables and `BETTERMQ_DEFAULT_MAX_RETRIES` override file values. Invalid values
 or incomplete Slate credentials fail startup rather than selecting local storage.
 
+Config saves use private (Unix `0600`) temporary files and atomic replacement,
+with file and directory sync. Newly created config directories are private
+(`0700`); existing directories retain their permissions.
+
 ```bash
 bettermq serve
 bettermq serve -p 9000

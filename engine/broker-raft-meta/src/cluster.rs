@@ -999,7 +999,7 @@ impl ClusterRuntime {
         let state = ClusterStateFile::default();
         write_state_file(&path, &state)?;
         let cfg_path = data_dir.as_ref().join("cluster-config.json");
-        fs::write(cfg_path, serde_json::to_vec_pretty(config)?)?;
+        broker_proto::write_secret_atomic(&cfg_path, &serde_json::to_vec_pretty(config)?)?;
         Ok(())
     }
 

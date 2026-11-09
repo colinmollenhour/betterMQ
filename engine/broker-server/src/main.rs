@@ -436,7 +436,7 @@ fn cluster_init(args: ClusterInitArgs) -> anyhow::Result<()> {
     };
     ClusterRuntime::init_cluster_file(&args.data_dir, &config)?;
     let cfg_path = args.data_dir.join("cluster-config.json");
-    std::fs::write(cfg_path, serde_json::to_vec_pretty(&config)?)?;
+    broker_proto::write_secret_atomic(&cfg_path, &serde_json::to_vec_pretty(&config)?)?;
     info!(node_id = %node_id, peers = args.peers.len(), "cluster initialized");
     Ok(())
 }
@@ -470,7 +470,7 @@ async fn cluster_join(args: ClusterJoinArgs) -> anyhow::Result<()> {
         hash_version: remote.hash_version.max(broker_config::HASH_VERSION),
     };
     let cfg_path = args.data_dir.join("cluster-config.json");
-    std::fs::write(cfg_path, serde_json::to_vec_pretty(&config)?)?;
+    broker_proto::write_secret_atomic(&cfg_path, &serde_json::to_vec_pretty(&config)?)?;
     ClusterRuntime::init_cluster_file(&args.data_dir, &config)?;
     info!(node_id = %node_id, "joined cluster");
     Ok(())

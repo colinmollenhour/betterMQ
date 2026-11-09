@@ -79,7 +79,7 @@ pub fn ensure_cluster_config(cfg: &BetterMqConfig, data_dir: &Path) -> Result<bo
     if write {
         ClusterRuntime::init_cluster_file(data_dir, &desired)
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
-        std::fs::write(cfg_path, serde_json::to_vec_pretty(&desired)?)?;
+        broker_proto::write_secret_atomic(&cfg_path, &serde_json::to_vec_pretty(&desired)?)?;
     }
 
     Ok(true)

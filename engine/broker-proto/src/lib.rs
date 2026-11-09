@@ -1,6 +1,8 @@
 //! Wire format and shared domain types for BetterMQ.
 
+mod atomic_file;
 pub mod codec;
+pub use atomic_file::write_secret_atomic;
 pub mod epoch;
 pub mod paths;
 pub mod record;
