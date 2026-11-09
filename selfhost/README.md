@@ -463,6 +463,10 @@ S3/R2 credentials for Slate and archive are **not** `BETTERMQ_*`: `S3_ENDPOINT` 
 Operational runbooks: [backup/restore and migration](BACKUP.md) and
 [production launch/soak gates](PRODUCTION.md). Compose health checks use the
 deep `/readyz` endpoint; `/healthz` is liveness only.
+Readiness returns 503 during drain, archive saturation, critical memory pressure,
+controller lease loss, or local shard recovery. Its JSON reason fields identify
+which serving gate is closed. Gateways probe authenticated `/internal/v1/readyz`
+on their broker seeds, so an invalid cluster credential also fails readiness.
 
 ---
 

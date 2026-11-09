@@ -700,13 +700,19 @@ async fn admin_metrics(
 
 async fn admin_readyz(
     State(state): State<AdminState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<AdminErrorBody>)> {
     if let Some(local) = &state.local {
-        return Ok(Json(to_json(ops::ready_snapshot(local))));
+        let body = ops::ready_snapshot(local);
+        let status = if body.ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        return Ok((status, Json(to_json(body))));
     }
     proxy_controller(&state, reqwest::Method::GET, "readyz", None)
         .await
-        .map(Json)
+        .map(|body| (StatusCode::OK, Json(body)))
 }
 
 async fn audit_log(

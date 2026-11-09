@@ -122,14 +122,17 @@ impl GatewayOnlyState {
 
     async fn healthy_brokers(&self) -> usize {
         let probes = self.seeds.iter().map(|seed| {
-            let url = format!("{}/healthz", seed.trim_end_matches('/'));
+            // Probe serving readiness using the same listener and credentials as forwarding.
+            let url = format!("{}/internal/v1/readyz", seed.trim_end_matches('/'));
             async move {
-                gateway_http_client()
-                    .get(url)
-                    .timeout(Duration::from_secs(2))
-                    .send()
-                    .await
-                    .is_ok_and(|response| response.status().is_success())
+                crate::cluster_auth::apply_cluster_secret(
+                    gateway_http_client()
+                        .get(url)
+                        .timeout(Duration::from_secs(2)),
+                )
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
             }
         });
         futures_util::future::join_all(probes)
@@ -601,13 +604,15 @@ pub struct GatewayOnlyStatus {
     configured_brokers: usize,
     shard_count: u32,
     layout_version: u32,
+    draining: bool,
 }
 
 pub async fn gateway_only_ready(
     State(state): State<Arc<GatewayOnlyState>>,
 ) -> (StatusCode, Json<GatewayOnlyStatus>) {
     let healthy = state.healthy_brokers().await;
-    let ready = state.auth_configured() && healthy > 0;
+    let draining = crate::admission::is_shutting_down();
+    let ready = state.auth_configured() && healthy > 0 && !draining;
     (
         if ready {
             StatusCode::OK
@@ -621,6 +626,7 @@ pub async fn gateway_only_ready(
             configured_brokers: state.seeds.len(),
             shard_count: state.shard_count,
             layout_version: state.layout_version,
+            draining,
         }),
     )
 }
@@ -631,11 +637,12 @@ pub async fn gateway_only_status(
     let healthy = state.healthy_brokers().await;
     Json(GatewayOnlyStatus {
         mode: "gateway-only",
-        ready: state.auth_configured() && healthy > 0,
+        ready: state.auth_configured() && healthy > 0 && !crate::admission::is_shutting_down(),
         healthy_brokers: healthy,
         configured_brokers: state.seeds.len(),
         shard_count: state.shard_count,
         layout_version: state.layout_version,
+        draining: crate::admission::is_shutting_down(),
     })
 }
 

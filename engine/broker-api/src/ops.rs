@@ -13,6 +13,11 @@ pub struct ReadyResponse {
     pub ready: bool,
     pub cluster_healthy: bool,
     pub auth_configured: bool,
+    pub draining: bool,
+    pub archive_blocked: bool,
+    pub memory_critical: bool,
+    pub controller_ready: bool,
+    pub local_shards_ready: bool,
     pub metadata_ready: bool,
     /// False while any local partition log is quarantined or fenced.
     pub storage_healthy: bool,
@@ -151,13 +156,39 @@ pub fn ready_snapshot(state: &AppState) -> ReadyResponse {
     let storage_faults = shard_storage_faults(broker_storage::storage_faults());
     let storage_healthy = storage_faults.is_empty();
     let metadata_ready = state.broker.metadata_ready();
+    let draining = crate::admission::is_shutting_down();
+    let archive_blocked = broker_storage::archive_admission_blocked();
+    let memory_critical = state.dispatch.memory_guard().is_critical();
+    let controller_ready = state
+        .cluster
+        .as_ref()
+        .is_none_or(|c| c.runtime.has_controller_lease());
+    let local_shards_ready = state.cluster.as_ref().is_none_or(|c| {
+        (0..state.broker.config().partitions).all(|shard| {
+            c.runtime.elect_leader_for_shard(shard) != Some(c.runtime.config().node_id)
+                || c.runtime.shard_ready(shard)
+        })
+    });
     ReadyResponse {
-        ready: auth_configured && cluster_healthy && storage_healthy && metadata_ready,
+        ready: auth_configured
+            && cluster_healthy
+            && storage_healthy
+            && metadata_ready
+            && !draining
+            && !archive_blocked
+            && !memory_critical
+            && controller_ready
+            && local_shards_ready,
         cluster_healthy,
         auth_configured,
         storage_healthy,
         storage_faults,
         metadata_ready,
+        draining,
+        archive_blocked,
+        memory_critical,
+        controller_ready,
+        local_shards_ready,
     }
 }
 

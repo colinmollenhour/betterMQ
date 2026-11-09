@@ -1143,6 +1143,21 @@
           },
           "auth_configured": {
             "type": "boolean"
+          },
+          "draining": {
+            "type": "boolean"
+          },
+          "archive_blocked": {
+            "type": "boolean"
+          },
+          "memory_critical": {
+            "type": "boolean"
+          },
+          "controller_ready": {
+            "type": "boolean"
+          },
+          "local_shards_ready": {
+            "type": "boolean"
           }
         }
       },

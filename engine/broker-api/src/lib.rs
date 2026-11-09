@@ -250,6 +250,7 @@ fn internal_cluster_routes() -> Router<Arc<AppState>> {
 
 fn internal_cluster_route_table() -> Router<Arc<AppState>> {
     Router::new()
+        .route("/internal/v1/readyz", axum::routing::get(ops::readyz))
         .route(
             "/internal/v1/lease/claim",
             axum::routing::post(lease::lease_claim),
@@ -575,6 +576,61 @@ mod tests {
         let _ = infra::infra_update_storage(axum::extract::State(state), axum::Json(body))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_checks_local_shard_fences_and_internal_credentials() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BETTERMQ_CLUSTER_SECRET", "readiness-test");
+        let dir = tempdir().unwrap();
+        let store = broker_local_auth::LocalAuthStore::open(dir.path()).unwrap();
+        store.setup("password1234").unwrap();
+        let mut state = test_state(&dir);
+        state.local_auth = Some(Arc::new(store));
+        let node_id = uuid::Uuid::new_v4();
+        let runtime =
+            broker_raft_meta::ClusterRuntime::from_config_only(broker_raft_meta::ClusterConfig {
+                cluster_id: uuid::Uuid::new_v4(),
+                node_id,
+                nodes: vec![broker_raft_meta::NodeConfig {
+                    id: node_id,
+                    addr: "http://localhost:1".into(),
+                    internal_url: None,
+                }],
+                generation: 1,
+                hash_version: 1,
+            });
+        runtime.record_self_alive(chrono::Utc::now().timestamp_millis());
+        state.cluster = Some(Cluster::new(runtime.clone()));
+        assert!(ops::ready_snapshot(&state).ready);
+        runtime.set_shard_ready(0, false);
+        let body = ops::ready_snapshot(&state);
+        assert!(!body.ready);
+        assert!(!body.local_shards_ready);
+        let app = internal_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/v1/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/v1/readyz")
+                    .header("x-bettermq-cluster-secret", "readiness-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
     }
 
     #[tokio::test]
