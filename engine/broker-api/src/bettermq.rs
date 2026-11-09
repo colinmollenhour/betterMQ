@@ -538,8 +538,10 @@ async fn publish_to_group(
         .transpose()
         .map_err(|error| fanout_store_error(crate::fanout::FanoutStoreError::Serde(error)))?;
     let mut expansion_permit = None;
-    let command = if let Some(existing) =
-        replicated_existing.or(fanout_store.get(fanout_id).map_err(fanout_store_error)?)
+    let command = if let Some(existing) = replicated_existing.or(fanout_store
+        .get_async(fanout_id)
+        .await
+        .map_err(fanout_store_error)?)
     {
         if existing.group_id != group_id
             || (!existing.tenant_id.is_empty() && existing.tenant_id != fanout_tenant)
@@ -706,7 +708,7 @@ async fn publish_to_group(
                     .unwrap_or(0)
                     .saturating_add(1);
                 let updated = fanout_store
-                    .record_result(
+                    .record_result_async(
                         fanout_id,
                         member_id,
                         crate::fanout::FanoutMemberOutcome {
@@ -717,6 +719,7 @@ async fn publish_to_group(
                             terminal: false,
                         },
                     )
+                    .await
                     .map_err(fanout_store_error)?;
                 crate::fanout::update_authoritative(&state, &fanout_store, updated)
                     .await
@@ -732,7 +735,7 @@ async fn publish_to_group(
                     .unwrap_or(0)
                     .saturating_add(1);
                 let updated = fanout_store
-                    .record_result(
+                    .record_result_async(
                         fanout_id,
                         member_id,
                         crate::fanout::FanoutMemberOutcome {
@@ -748,6 +751,7 @@ async fn publish_to_group(
                             terminal: attempts >= fanout_max_attempts(),
                         },
                     )
+                    .await
                     .map_err(fanout_store_error)?;
                 crate::fanout::update_authoritative(&state, &fanout_store, updated)
                     .await
@@ -896,7 +900,7 @@ pub(crate) fn spawn_fanout_replay(state: Arc<AppState>) {
             if crate::admission::is_shutting_down() {
                 break;
             }
-            let pending = match crate::fanout::pending_authoritative(&state, &store, 32) {
+            let pending = match crate::fanout::pending_authoritative(&state, &store, 32).await {
                 Ok(pending) => pending,
                 Err(error) => {
                     tracing::warn!(%error, "fanout replay scan failed");
@@ -983,7 +987,8 @@ async fn replay_fanout_command(
                 },
             };
         let updated = store
-            .record_result(command.id, member.member_id, outcome)
+            .record_result_async(command.id, member.member_id, outcome)
+            .await
             .map_err(fanout_store_error)?;
         crate::fanout::update_authoritative(state, store, updated)
             .await
@@ -1143,6 +1148,7 @@ mod fanout_tests {
         };
         store.accept(command.clone()).unwrap();
         // Reopen the legacy shape (without shared_payload) before replay.
+        store.evict_cached_state();
         let store = crate::fanout::FanoutStore::open(dir.path()).unwrap();
         let command = store.get(command.id).unwrap().unwrap();
         replay_fanout_command(&state, &store, command.clone())
