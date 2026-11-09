@@ -465,6 +465,31 @@ fn append_dispatch_metrics(
             out.push_str(&format!(concat!($name, " {}\n"), $value));
         };
     }
+    out.push_str("# HELP bettermq_dispatch_delivery_outcomes_total Webhook attempts by bounded outcome class\n# TYPE bettermq_dispatch_delivery_outcomes_total counter\n");
+    for (class, count) in broker_dispatch::DELIVERY_OUTCOME_CLASSES
+        .iter()
+        .zip(snapshot.delivery.outcomes)
+    {
+        out.push_str(&format!(
+            "bettermq_dispatch_delivery_outcomes_total{{outcome=\"{class}\"}} {count}\n"
+        ));
+    }
+    out.push_str("# HELP bettermq_dispatch_webhook_duration_seconds Webhook time to response headers or failure\n# TYPE bettermq_dispatch_webhook_duration_seconds histogram\n");
+    append_histogram(
+        out,
+        "bettermq_dispatch_webhook_duration_seconds",
+        "",
+        &broker_dispatch::WEBHOOK_DURATION_BUCKETS,
+        &snapshot.delivery.duration_buckets,
+        snapshot.delivery.outcomes.iter().sum(),
+        snapshot.delivery.duration_sum_us as f64 / 1_000_000.0,
+    );
+    metric!(
+        "Flow deliveries returning an error",
+        "counter",
+        "bettermq_dispatch_flow_errors_total",
+        snapshot.delivery.flow_errors
+    );
     metric!(
         "Committed ranges announced to dispatch",
         "counter",
@@ -663,6 +688,7 @@ fn append_dispatch_metrics(
     out.push_str("# TYPE bettermq_dispatch_completion_gap_records gauge\n");
     out.push_str("# HELP bettermq_dispatch_tracked_cursor_lanes Internally tracked cursor lanes\n");
     out.push_str("# TYPE bettermq_dispatch_tracked_cursor_lanes gauge\n");
+    out.push_str("# HELP bettermq_dispatch_oldest_pending_age_seconds Age of the oldest tracked pending delivery in a shard\n# TYPE bettermq_dispatch_oldest_pending_age_seconds gauge\n");
     for shard in &snapshot.shards {
         let label = format!("shard=\"{}\"", shard.shard);
         out.push_str(&format!(
@@ -689,6 +715,10 @@ fn append_dispatch_metrics(
             "bettermq_dispatch_tracked_cursor_lanes{{{label}}} {}\n",
             shard.tracked_cursor_lanes
         ));
+        out.push_str(&format!(
+            "bettermq_dispatch_oldest_pending_age_seconds{{{label}}} {}\n",
+            shard.oldest_pending_age_ms as f64 / 1000.0
+        ));
     }
     metric!(
         "Cursor lanes omitted after the bounded telemetry cap",
@@ -708,13 +738,20 @@ fn append_histogram<const N: usize>(
     sum: f64,
 ) {
     let mut cumulative = 0u64;
+    let bucket_labels = if labels.is_empty() {
+        String::new()
+    } else {
+        format!("{labels},")
+    };
     for (boundary, bucket) in boundaries.iter().zip(buckets) {
         cumulative = cumulative.saturating_add(*bucket);
         out.push_str(&format!(
-            "{name}_bucket{{{labels},le=\"{boundary}\"}} {cumulative}\n"
+            "{name}_bucket{{{bucket_labels}le=\"{boundary}\"}} {cumulative}\n"
         ));
     }
-    out.push_str(&format!("{name}_bucket{{{labels},le=\"+Inf\"}} {count}\n"));
+    out.push_str(&format!(
+        "{name}_bucket{{{bucket_labels}le=\"+Inf\"}} {count}\n"
+    ));
     out.push_str(&format!("{name}_sum{{{labels}}} {sum}\n"));
     out.push_str(&format!("{name}_count{{{labels}}} {count}\n"));
 }
@@ -802,6 +839,12 @@ mod tests {
                 admission_blocked: false,
             },
             dispatch: broker_dispatch::DispatchTelemetrySnapshot {
+                delivery: broker_dispatch::DeliveryTelemetrySnapshot {
+                    outcomes: [2, 0, 1, 3, 1, 0, 0],
+                    duration_buckets: [0; 16],
+                    duration_sum_us: 123_000,
+                    flow_errors: 1,
+                },
                 committed_ready_ranges: 4,
                 committed_ready_records: 16,
                 queue_depth: 3,
@@ -831,6 +874,7 @@ mod tests {
                     cursor_max_offset: 50,
                     completion_gap_records: 4,
                     tracked_cursor_lanes: 2,
+                    oldest_pending_age_ms: 10_000,
                 }],
                 dropped_cursor_lanes: 0,
                 host_pressure: broker_dispatch::HostPressureSnapshot {
@@ -850,6 +894,10 @@ mod tests {
             },
         };
         let output = prometheus_text_with_native(&native);
+        assert!(output.contains("bettermq_dispatch_delivery_outcomes_total{outcome=\"5xx\"} 3"));
+        assert!(output.contains("bettermq_dispatch_webhook_duration_seconds_bucket{le=\"+Inf\"} 7"));
+        assert!(output.contains("bettermq_dispatch_oldest_pending_age_seconds{shard=\"7\"} 10"));
+        assert!(!output.contains("{,le="));
         assert!(output.contains("bettermq_wal_epoch_total{shard=\"7\"} 3"));
         assert!(output.contains("bettermq_wal_records_per_fsync{shard=\"7\"} 6"));
         assert!(output

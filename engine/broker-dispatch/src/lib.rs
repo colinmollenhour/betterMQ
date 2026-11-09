@@ -29,7 +29,8 @@ pub use memory_guard::{
     sample_process_resources, MemoryGuard, MemoryGuardConfig, ProcessResourceStats,
 };
 pub use telemetry::{
-    DispatchShardTelemetrySnapshot, DispatchTelemetrySnapshot, HostPressureSnapshot,
-    TenantFairnessSnapshot, MAX_DISPATCH_CURSOR_LANES, MAX_DISPATCH_TELEMETRY_SHARDS,
+    DeliveryTelemetrySnapshot, DispatchShardTelemetrySnapshot, DispatchTelemetrySnapshot,
+    HostPressureSnapshot, TenantFairnessSnapshot, DELIVERY_OUTCOME_CLASSES,
+    MAX_DISPATCH_CURSOR_LANES, MAX_DISPATCH_TELEMETRY_SHARDS, WEBHOOK_DURATION_BUCKETS,
 };
 pub use worker::{DeliveryJob, DeliveryPriority, DispatchConfig, DispatchEngine, DispatchError};

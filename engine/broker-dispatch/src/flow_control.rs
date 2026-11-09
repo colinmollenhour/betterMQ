@@ -634,12 +634,15 @@ fn spawn_lane_drainer(
                     ordered.work.msg.partition,
                     ordered.work.msg.offset,
                 );
-                ordered
+                if ordered
                     .work
                     .engine
                     .deliver_message(&ordered.work.msg)
                     .await
-                    .ok();
+                    .is_err()
+                {
+                    ordered.work.engine.record_flow_error();
+                }
                 lane2.members.lock().await.remove(&member);
                 lane2.active.fetch_sub(1, AtomicOrdering::Relaxed);
                 global_active2.fetch_sub(1, AtomicOrdering::Relaxed);

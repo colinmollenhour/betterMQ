@@ -432,6 +432,7 @@ impl DispatchEngine {
             .filter(|transition| transition.phase == DlqPhase::DlqCommitted)
             .count() as u64;
         crate::telemetry::DispatchTelemetrySnapshot {
+            delivery: counters.delivery,
             committed_ready_ranges: counters.committed_ready_ranges,
             committed_ready_records: counters.committed_ready_records,
             queue_depth: counters.queue_depth,
@@ -648,6 +649,8 @@ impl DispatchEngine {
             .unwrap_or(0);
         self.telemetry
             .record_pending(msg.partition, &lane, cursor, hwm);
+        self.telemetry
+            .record_pending_age(msg.partition, &lane, msg.offset, msg.published_at_ms);
     }
 }
 
@@ -1131,6 +1134,7 @@ impl DispatchEngine {
         {
             let long = delivery_msg.payload.len() >= self.config.long_payload_threshold_bytes;
             if let Err(error) = crate::egress::validate_destination_url(url) {
+                self.telemetry.record_http_outcome(5, Duration::ZERO);
                 self.finalize_dead_letter(
                     msg,
                     format!("destination blocked by egress policy: {error}"),
@@ -1144,6 +1148,7 @@ impl DispatchEngine {
                 &self.client
             };
             let response = apply_to_reqwest(http, url, outbound.clone()).send().await;
+            self.record_http_result(&response, started.elapsed());
             let mut requested_retry_after_ms = None;
 
             match response {
@@ -1337,6 +1342,16 @@ impl DispatchEngine {
         }
         self.telemetry
             .record_completion(partition, cursor_key, cursor, next, hwm, newly_completed);
+        let next_head = if next < hwm {
+            self.broker
+                .read_message(topic, partition, next)
+                .ok()
+                .map(|msg| (msg.offset, msg.published_at_ms))
+        } else {
+            None
+        };
+        self.telemetry
+            .advance_pending_head(partition, cursor_key, next, next_head);
         Ok(())
     }
 
@@ -1485,14 +1500,18 @@ impl DispatchEngine {
             }
             self.telemetry.record_retry_due();
         }
-        crate::egress::validate_destination_url(url)
-            .map_err(|error| DispatchError::Egress(error.to_string()))?;
+        crate::egress::validate_destination_url(url).map_err(|error| {
+            self.telemetry.record_http_outcome(5, Duration::ZERO);
+            DispatchError::Egress(error.to_string())
+        })?;
         let http = if long {
             &self.long_client
         } else {
             &self.client
         };
+        let started = Instant::now();
         let response = apply_to_reqwest(http, url, outbound).send().await;
+        self.record_http_result(&response, started.elapsed());
         let retry_after_ms;
         let failure = match response {
             Ok(response) if response.status().is_success() => {
@@ -1564,6 +1583,29 @@ impl DispatchEngine {
             retry_after_ms: wait_ms,
             reason: failure,
         })
+    }
+
+    fn record_http_result(
+        &self,
+        response: &Result<reqwest::Response, reqwest::Error>,
+        elapsed: Duration,
+    ) {
+        let class = match response {
+            Ok(response) => match response.status().as_u16() / 100 {
+                2 => 0,
+                3 => 1,
+                4 => 2,
+                5 => 3,
+                _ => 6,
+            },
+            Err(error) if crate::egress::is_policy_failure(error) => 5,
+            Err(_) => 4,
+        };
+        self.telemetry.record_http_outcome(class, elapsed);
+    }
+
+    pub(crate) fn record_flow_error(&self) {
+        self.telemetry.record_flow_error();
     }
 
     /// Move a leased offset to the DLQ and advance the gap-aware cursor.
@@ -1698,6 +1740,7 @@ mod tests {
         ));
         assert_eq!(engine.retry_state.get(&key).unwrap().attempts, 1);
         engine.shutdown_background().await;
+        assert_eq!(engine.telemetry_snapshot().delivery.outcomes[4], 2);
     }
 
     #[tokio::test]

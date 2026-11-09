@@ -267,6 +267,8 @@ With shared metadata, host-breaker snapshots merge per-host revisions under the 
 
 Panel destination block/unblock controls acknowledge only the serving node (`scope: serving_process`, `applied_nodes` in the API response). They do not confirm application to peers or fleet workers. Shared-metadata nodes may observe changes asynchronously; Slate/fleet deployments without a shared metadata directory have process-local controls. Stopping all fleet delivery requires deployment-level controls, not this panel action.
 
+Dispatch metrics include `bettermq_dispatch_delivery_outcomes_total` (bounded HTTP class, transport error, or policy block), `bettermq_dispatch_webhook_duration_seconds` (attempt to response headers/failure), `bettermq_dispatch_flow_errors_total`, and per-shard `bettermq_dispatch_oldest_pending_age_seconds`. Pending age grows while delivery is stalled and is reconstructed from durable pending work on backfill/startup. It covers the bounded tracked cursor lanes; monitor `bettermq_dispatch_dropped_cursor_lanes_total` for coverage loss. No destination URLs or routing keys are metric labels.
+
 #### DLQ and group fan-out
 
 Fan-out vars are **group bookkeeping**, not DLQ TTL.

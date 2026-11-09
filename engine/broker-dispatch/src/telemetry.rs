@@ -6,6 +6,19 @@ use std::sync::Mutex;
 
 pub const MAX_DISPATCH_TELEMETRY_SHARDS: usize = 4096;
 pub const MAX_DISPATCH_CURSOR_LANES: usize = 4096;
+pub const DELIVERY_OUTCOME_CLASSES: [&str; 7] = [
+    "2xx",
+    "3xx",
+    "4xx",
+    "5xx",
+    "transport_error",
+    "policy_block",
+    "other",
+];
+pub const WEBHOOK_DURATION_BUCKETS: [f64; 16] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 120.0, 900.0, 3600.0,
+    43200.0,
+];
 
 #[derive(Default)]
 struct ShardCounters {
@@ -33,6 +46,11 @@ pub(crate) struct DispatchTelemetry {
     shards: Box<[ShardCounters]>,
     cursor_lanes: Mutex<BTreeMap<(u32, String), (u64, u64)>>,
     dropped_cursor_lanes: AtomicU64,
+    delivery_outcomes: [AtomicU64; 7],
+    webhook_buckets: [AtomicU64; 16],
+    webhook_duration_sum_us: AtomicU64,
+    flow_errors: AtomicU64,
+    pending_heads: Mutex<BTreeMap<(u32, String), (u64, i64)>>,
 }
 
 impl DispatchTelemetry {
@@ -50,6 +68,89 @@ impl DispatchTelemetry {
         self.committed_ready_ranges.fetch_add(1, Ordering::Relaxed);
         self.committed_ready_records
             .fetch_add(records, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_http_outcome(&self, outcome: usize, elapsed: std::time::Duration) {
+        self.delivery_outcomes[outcome].fetch_add(1, Ordering::Relaxed);
+        self.webhook_duration_sum_us.fetch_add(
+            elapsed.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        if let Some(bucket) = WEBHOOK_DURATION_BUCKETS
+            .iter()
+            .position(|limit| elapsed.as_secs_f64() <= *limit)
+        {
+            self.webhook_buckets[bucket].fetch_add(1, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn record_flow_error(&self) {
+        self.flow_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_pending_age(
+        &self,
+        shard: u32,
+        lane: &str,
+        offset: u64,
+        published_at_ms: i64,
+    ) {
+        let lanes = self
+            .cursor_lanes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lanes
+            .get(&(shard, lane.to_owned()))
+            .is_none_or(|(cursor, _)| offset < *cursor)
+        {
+            return;
+        }
+        let mut heads = self
+            .pending_heads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (shard, lane.to_owned());
+        if let Some(head) = heads.get_mut(&key) {
+            if offset < head.0 {
+                *head = (offset, published_at_ms);
+            }
+        } else if heads.len() < MAX_DISPATCH_CURSOR_LANES && (shard as usize) < self.shards.len() {
+            heads.insert(key, (offset, published_at_ms));
+        }
+    }
+
+    pub(crate) fn advance_pending_head(
+        &self,
+        shard: u32,
+        lane: &str,
+        cursor: u64,
+        next: Option<(u64, i64)>,
+    ) {
+        let lanes = self
+            .cursor_lanes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cursor = lanes
+            .get(&(shard, lane.to_owned()))
+            .map_or(cursor, |(current, _)| cursor.max(*current));
+        let next = next.filter(|head| head.0 >= cursor);
+        let mut heads = self
+            .pending_heads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (shard, lane.to_owned());
+        if heads.get(&key).is_some_and(|head| head.0 < cursor) {
+            heads.remove(&key);
+        }
+        if let Some(next) = next {
+            if let Some(head) = heads.get_mut(&key) {
+                if next.0 < head.0 {
+                    *head = next;
+                }
+            } else if heads.len() < MAX_DISPATCH_CURSOR_LANES {
+                heads.insert(key, next);
+            }
+        }
     }
 
     pub(crate) fn record_queue_enqueue(&self) {
@@ -172,7 +273,31 @@ impl DispatchTelemetry {
                 aggregate.entry(shard as u32).or_insert((0, 0, 0, 0));
             }
         }
+        let now = chrono::Utc::now().timestamp_millis();
+        let heads = self
+            .pending_heads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut oldest_ages = BTreeMap::<u32, u64>::new();
+        for ((shard, _), (_, published)) in heads.iter() {
+            let age = now.saturating_sub(*published).max(0) as u64;
+            let oldest = oldest_ages.entry(*shard).or_default();
+            *oldest = (*oldest).max(age);
+        }
+        // Snapshot finite buckets before outcome/count totals. Acquiring each
+        // bucket publishes its preceding outcome increment, so +Inf/count can
+        // never lag behind an observed finite bucket during concurrent updates.
+        let duration_buckets =
+            std::array::from_fn(|index| self.webhook_buckets[index].load(Ordering::Acquire));
+        let outcomes =
+            std::array::from_fn(|index| self.delivery_outcomes[index].load(Ordering::Relaxed));
         DispatchCounterSnapshot {
+            delivery: DeliveryTelemetrySnapshot {
+                outcomes,
+                duration_buckets,
+                duration_sum_us: self.webhook_duration_sum_us.load(Ordering::Relaxed),
+                flow_errors: self.flow_errors.load(Ordering::Relaxed),
+            },
             committed_ready_ranges: self.committed_ready_ranges.load(Ordering::Relaxed),
             committed_ready_records: self.committed_ready_records.load(Ordering::Relaxed),
             queue_depth: self.queue_depth.load(Ordering::Relaxed),
@@ -203,6 +328,7 @@ impl DispatchTelemetry {
                             cursor_max_offset: cursor_max,
                             completion_gap_records: gap_records,
                             tracked_cursor_lanes: tracked_lanes,
+                            oldest_pending_age_ms: oldest_ages.get(&shard).copied().unwrap_or(0),
                         }
                     },
                 )
@@ -213,6 +339,7 @@ impl DispatchTelemetry {
 }
 
 pub(crate) struct DispatchCounterSnapshot {
+    pub delivery: DeliveryTelemetrySnapshot,
     pub committed_ready_ranges: u64,
     pub committed_ready_records: u64,
     pub queue_depth: u64,
@@ -241,6 +368,15 @@ pub struct DispatchShardTelemetrySnapshot {
     pub cursor_max_offset: u64,
     pub completion_gap_records: u64,
     pub tracked_cursor_lanes: u64,
+    pub oldest_pending_age_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeliveryTelemetrySnapshot {
+    pub outcomes: [u64; 7],
+    pub duration_buckets: [u64; 16],
+    pub duration_sum_us: u64,
+    pub flow_errors: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +399,7 @@ pub struct TenantFairnessSnapshot {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DispatchTelemetrySnapshot {
+    pub delivery: DeliveryTelemetrySnapshot,
     pub committed_ready_ranges: u64,
     pub committed_ready_records: u64,
     pub queue_depth: u64,
@@ -292,6 +429,31 @@ pub struct DispatchTelemetrySnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outcomes_histograms_and_stalled_pending_age_are_observable() {
+        let telemetry = DispatchTelemetry::new();
+        telemetry.record_http_outcome(0, std::time::Duration::from_millis(2));
+        telemetry.record_http_outcome(3, std::time::Duration::from_secs(2));
+        telemetry.record_http_outcome(4, std::time::Duration::from_secs(50_000));
+        telemetry.record_flow_error();
+        telemetry.record_pending(0, "lane", 0, 2);
+        telemetry.record_pending_age(0, "lane", 0, chrono::Utc::now().timestamp_millis() - 1_000);
+        let first = telemetry.snapshot();
+        assert_eq!(first.delivery.outcomes, [1, 0, 0, 1, 1, 0, 0]);
+        assert_eq!(first.delivery.duration_buckets.iter().sum::<u64>(), 2);
+        assert_eq!(first.delivery.flow_errors, 1);
+        assert!(first.shards[0].oldest_pending_age_ms >= 1_000);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(
+            telemetry.snapshot().shards[0].oldest_pending_age_ms
+                > first.shards[0].oldest_pending_age_ms
+        );
+        telemetry.record_completion(0, "lane", 0, 2, 2, true);
+        telemetry.advance_pending_head(0, "lane", 2, None);
+        telemetry.record_pending_age(0, "lane", 0, 0);
+        assert_eq!(telemetry.snapshot().shards[0].oldest_pending_age_ms, 0);
+    }
 
     #[test]
     fn counters_and_cursor_gaps_are_aggregated_without_lane_labels() {
