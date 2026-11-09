@@ -23,7 +23,8 @@ x-broker: &broker
     S3_REGION: us-east-1
     BETTERMQ_METRICS_TOKEN: ${BETTERMQ_METRICS_TOKEN:?set BETTERMQ_METRICS_TOKEN}
   depends_on:
-    - minio
+    minio-init:
+      condition: service_completed_successfully
   restart: unless-stopped
   stop_grace_period: ${BETTERMQ_STOP_GRACE_PERIOD:-120s}
   healthcheck:
@@ -40,9 +41,9 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+    expose:
+      - "9000"
+      - "9001"
     volumes:
       - minio-data:/data
 
@@ -53,14 +54,18 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
-    entrypoint: >
-      /bin/sh -c "
-      sleep 3;
-      mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\";
-      mc mb -p local/bettermq || true;
-      mc mb -p local/bettermq-payloads || true;
-      exit 0;
-      "
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        attempts=0
+        until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" && mc ready local; do
+          attempts=$$((attempts + 1))
+          [ "$$attempts" -lt 60 ] || { echo 'MinIO initialization timed out' >&2; exit 1; }
+          sleep 1
+        done
+        mc mb --ignore-existing local/bettermq
+        mc mb --ignore-existing local/bettermq-payloads
 
   broker1:
     <<: *broker
