@@ -283,6 +283,14 @@ impl PartitionLog {
             .collect();
         segment_files.sort();
 
+        // A crash between the roll rename and the meta checkpoint, a failed
+        // checkpoint, or a reset meta.json leaves a stale counter. Never hand
+        // out a roll number that already names a sealed segment on disk.
+        if let Some(highest) = segment_files.iter().filter_map(|p| segment_index(p)).max() {
+            self.meta.segment_roll_count =
+                self.meta.segment_roll_count.max(highest.saturating_add(1));
+        }
+
         for path in &segment_files {
             let first = next;
             next = self.scan_file(path, next, false)?;
@@ -801,11 +809,12 @@ impl PartitionLog {
         }
 
         let roll = self.meta.segment_roll_count;
-        let seg_path = self
-            .dir
-            .join(SEGMENTS_DIR)
-            .join(format!("segment-{roll:06}.log"));
+        let seg_path = self.dir.join(SEGMENTS_DIR).join(segment_file_name(roll));
         let wal_path = self.dir.join(WAL_FILE);
+        if std::fs::symlink_metadata(&seg_path).is_ok() {
+            // Checked before the WAL handle is swapped so the log stays usable.
+            return Err(segment_exists_error(&seg_path).into());
+        }
 
         if self.config.fsync != FsyncMode::Os {
             let started = Instant::now();
@@ -830,7 +839,13 @@ impl PartitionLog {
                 .open(&placeholder)?,
         );
 
-        std::fs::rename(&wal_path, &seg_path)?;
+        if let Err(error) = rename_no_replace(&wal_path, &seg_path) {
+            // active.wal is still in place: reattach to it so later appends do
+            // not land in the placeholder.
+            self.wal = OpenOptions::new().append(true).read(true).open(&wal_path)?;
+            let _ = std::fs::remove_file(&placeholder);
+            return Err(error.into());
+        }
         if let Ok(mut cache) = self.reader_cache.lock() {
             cache.remove(&wal_path);
             cache.remove(&seg_path);
@@ -846,31 +861,52 @@ impl PartitionLog {
         }
         let _ = std::fs::remove_file(&placeholder);
 
-        self.meta.segment_roll_count += 1;
-        self.meta
-            .save_with(&self.dir, self.config.fsync != FsyncMode::Os)?;
+        // The segment is sealed on disk from here on. Bring the in-memory
+        // state in line before anything else can fail, so an error below
+        // never leaves the index pointing at the renamed active.wal or the
+        // write handle on the deleted placeholder.
+        self.meta.segment_roll_count = roll + 1;
         self.dirty = false;
         self.last_flush = Instant::now();
         self.committed_hwm = self.meta.next_offset;
-
-        if self.meta.next_offset > self.active_base_offset {
-            self.sealed_indexes.push(self.build_sparse_index(
-                &seg_path,
-                self.active_base_offset,
-                self.meta.next_offset,
-            )?);
-        }
-        self.index.retain(|_, pos| pos.path != wal_path);
+        let sparse = if self.meta.next_offset > self.active_base_offset {
+            Some(self.build_sparse_index(&seg_path, self.active_base_offset, self.meta.next_offset))
+        } else {
+            None
+        };
+        let sparse_error = match sparse {
+            Some(Ok(segment)) => {
+                self.sealed_indexes.push(segment);
+                self.index.retain(|_, pos| pos.path != wal_path);
+                None
+            }
+            Some(Err(error)) => {
+                // Keep the exact positions; the bytes moved with the rename.
+                for pos in self.index.values_mut() {
+                    if pos.path == wal_path {
+                        pos.path = seg_path.clone();
+                    }
+                }
+                Some(error)
+            }
+            None => None,
+        };
         self.active_base_offset = self.meta.next_offset;
-
+        self.wal_size = 0;
         self.wal = OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
             .open(&wal_path)?;
-        self.wal_size = 0;
         crate::archive::enqueue_sealed_segment(&seg_path);
-        Ok(())
+        // meta.json is a checkpoint: open reconciles the roll counter with
+        // the segment files, so a failed save here cannot cause an overwrite.
+        self.meta
+            .save_with(&self.dir, self.config.fsync != FsyncMode::Os)?;
+        match sparse_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub fn read_range(
@@ -1177,6 +1213,70 @@ fn truncate_file(path: &Path, len: u64) -> io::Result<()> {
     Ok(())
 }
 
+fn segment_file_name(roll: u64) -> String {
+    format!("segment-{roll:06}.log")
+}
+
+/// Roll number of a canonical sealed segment name (`segment-NNNNNN.log`).
+fn segment_index(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let digits = name.strip_prefix("segment-")?.strip_suffix(".log")?;
+    if digits.len() < 6 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn segment_exists_error(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "refusing to roll onto existing sealed segment {}",
+            path.display()
+        ),
+    )
+}
+
+/// Rename that fails with `AlreadyExists` instead of replacing `to`.
+///
+/// Uses `renameat2(RENAME_NOREPLACE)` on Linux. Filesystems without it fall
+/// back to an existence check, which is race-free here because only the
+/// owning shard actor writes this directory.
+fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        const RENAME_NOREPLACE: libc::c_uint = 1;
+        let from_c = CString::new(from.as_os_str().as_bytes())?;
+        let to_c = CString::new(to.as_os_str().as_bytes())?;
+        // SAFETY: both paths are valid NUL-terminated strings that outlive the call.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from_c.as_ptr(),
+                libc::AT_FDCWD,
+                to_c.as_ptr(),
+                RENAME_NOREPLACE,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EEXIST) => return Err(segment_exists_error(to)),
+            Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP) => {}
+            _ => return Err(error),
+        }
+    }
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err(segment_exists_error(to));
+    }
+    std::fs::rename(from, to)
+}
+
 fn stored_message(
     header: LogRecord,
     payload: Vec<u8>,
@@ -1317,6 +1417,156 @@ mod tests {
         let log = PartitionLog::open(dir.path(), cfg).unwrap();
         let msgs = log.read_range(0, 0, 50).unwrap();
         assert_eq!(msgs.len(), 20);
+    }
+
+    fn small_segment_cfg() -> PartitionLogConfig {
+        PartitionLogConfig {
+            segment_max_bytes: 256,
+            fsync: FsyncMode::Always,
+            group_interval: Duration::from_millis(10),
+        }
+    }
+
+    fn segment_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.join(SEGMENTS_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn append_until_roll(log: &mut PartitionLog, payload: u8) -> u64 {
+        let rolls = log.meta.segment_roll_count;
+        let mut appended = 0;
+        while log.meta.segment_roll_count == rolls {
+            log.append(0, sample_record("t"), vec![payload; 32])
+                .unwrap();
+            appended += 1;
+        }
+        appended
+    }
+
+    fn assert_payloads(log: &PartitionLog, expected: &[u8]) {
+        let msgs = log.read_range(0, 0, 1000).unwrap();
+        let got: Vec<u8> = msgs.iter().map(|m| m.payload[0]).collect();
+        assert_eq!(got, expected);
+        for (index, msg) in msgs.iter().enumerate() {
+            assert_eq!(msg.offset, index as u64);
+        }
+    }
+
+    fn reopen_after_stale_roll_counter_keeps_sealed_segments(format: u16, tamper: impl Fn(&Path)) {
+        let dir = tempdir().unwrap();
+        let mut expected = Vec::new();
+        {
+            let mut log =
+                PartitionLog::open_for_shard(dir.path(), small_segment_cfg(), 0, format).unwrap();
+            let first = append_until_roll(&mut log, 1);
+            expected.extend(std::iter::repeat_n(1u8, first as usize));
+        }
+        assert_eq!(segment_names(dir.path()), vec!["segment-000000.log"]);
+        tamper(dir.path());
+
+        {
+            let mut log =
+                PartitionLog::open_for_shard(dir.path(), small_segment_cfg(), 0, format).unwrap();
+            assert_eq!(log.meta.segment_roll_count, 1);
+            let second = append_until_roll(&mut log, 2);
+            expected.extend(std::iter::repeat_n(2u8, second as usize));
+            assert_payloads(&log, &expected);
+        }
+        assert_eq!(
+            segment_names(dir.path()),
+            vec!["segment-000000.log", "segment-000001.log"]
+        );
+        let log = PartitionLog::open_for_shard(dir.path(), small_segment_cfg(), 0, format).unwrap();
+        assert_payloads(&log, &expected);
+    }
+
+    fn rewind_roll_counter(dir: &Path) {
+        // Crash after the rename but before the incremented counter was saved.
+        let mut meta = LogMeta::load(dir).unwrap();
+        meta.segment_roll_count -= 1;
+        meta.save(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_roll_counter_after_crash_does_not_overwrite_segment() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            reopen_after_stale_roll_counter_keeps_sealed_segments(format, rewind_roll_counter);
+        }
+    }
+
+    #[test]
+    fn missing_meta_does_not_overwrite_segment() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            reopen_after_stale_roll_counter_keeps_sealed_segments(format, |dir| {
+                std::fs::remove_file(LogMeta::path(dir)).unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn roll_refuses_to_replace_existing_segment_and_log_stays_usable() {
+        let dir = tempdir().unwrap();
+        let mut log = PartitionLog::open(dir.path(), small_segment_cfg()).unwrap();
+        let foreign = dir.path().join(SEGMENTS_DIR).join("segment-000000.log");
+        std::fs::write(&foreign, b"not ours").unwrap();
+
+        let mut appended = 0u8;
+        let err = loop {
+            match log.append(0, sample_record("t"), vec![appended; 32]) {
+                Ok(_) => appended += 1,
+                Err(err) => break err,
+            }
+        };
+        assert!(
+            matches!(&err, LogError::Io(e) if e.kind() == io::ErrorKind::AlreadyExists),
+            "unexpected error {err}"
+        );
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"not ours");
+        assert!(dir.path().join(WAL_FILE).exists());
+        // The record that triggered the roll is in active.wal and later
+        // appends still land there, not in a placeholder.
+        let more = log.append(0, sample_record("t"), vec![0xee; 32]);
+        assert!(more.is_err(), "roll is retried and refused again");
+        let msgs = log.read_range(0, 0, 1000).unwrap();
+        assert_eq!(msgs.len(), appended as usize + 2);
+        assert_eq!(msgs.last().unwrap().payload, vec![0xee; 32]);
+    }
+
+    #[test]
+    fn rename_no_replace_keeps_existing_target() {
+        let dir = tempdir().unwrap();
+        let from = dir.path().join("from");
+        let to = dir.path().join("to");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+        let err = rename_no_replace(&from, &to).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&to).unwrap(), b"old");
+        assert_eq!(std::fs::read(&from).unwrap(), b"new");
+        std::fs::remove_file(&to).unwrap();
+        rename_no_replace(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        assert!(!from.exists());
+    }
+
+    #[test]
+    fn segment_index_accepts_only_canonical_names() {
+        assert_eq!(segment_index(Path::new("segment-000007.log")), Some(7));
+        assert_eq!(
+            segment_index(Path::new("segment-1234567.log")),
+            Some(1_234_567)
+        );
+        assert_eq!(
+            segment_index(Path::new("segment-000007.log.archive.pending")),
+            None
+        );
+        assert_eq!(segment_index(Path::new("segment-000007.corrupt.1")), None);
+        assert_eq!(segment_index(Path::new("segment-7.log")), None);
+        assert_eq!(segment_index(Path::new("segment-00000x.log")), None);
     }
 
     #[test]

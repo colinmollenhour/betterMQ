@@ -665,6 +665,7 @@ dependencies = [
  "fs2",
  "futures",
  "hex",
+ "libc",
  "object_store",
  "rocksdb",
  "serde",
