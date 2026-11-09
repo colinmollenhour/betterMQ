@@ -51,6 +51,9 @@ broker before sending traffic. Fleet workers retry while brokers are unready.
 Free self-hosted BetterMQ. **No config files required** — install the CLI or run Docker, then use the panel.
 
 Shared engine code lives in [`../engine/`](../engine/). This folder is the self-host product (Docker + docs only).
+Standalone panel Compose stores `cell-registry.json` in its `panel-data` named
+volume at `/data`. Container recreation and image upgrades retain the registry;
+`docker compose down --volumes` deletes it. Include this volume in backups.
 For node loss, replacement, seed loss, drain/rebalance and controller changes,
 use the [HA operations runbook](OPERATIONS.md).
 For any internet-facing or multi-host deployment, follow the

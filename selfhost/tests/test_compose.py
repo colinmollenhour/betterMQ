@@ -20,6 +20,12 @@ def config(name):
 
 
 class ComposeTests(unittest.TestCase):
+    def test_panel_registry_uses_named_persistent_volume(self):
+        panel = config("docker-compose.panel.yml")["services"]["panel"]
+        self.assertEqual(panel["environment"]["BETTERMQ_PANEL_DATA_DIR"], "/data")
+        self.assertTrue(any(v["type"] == "volume" and v["target"] == "/data"
+                            for v in panel["volumes"]))
+
     def test_version_selection_is_required(self):
         env = dict(ENV)
         env.pop("BETTERMQ_VERSION")

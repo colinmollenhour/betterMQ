@@ -16,7 +16,10 @@ services:
     environment:
       BETTERMQ_CLUSTER_SECRET: ${BETTERMQ_CLUSTER_SECRET:-}
       BETTERMQ_PANEL_MODE: standalone
+      BETTERMQ_PANEL_DATA_DIR: /data
       BETTERMQ_CELL_LABEL: global
+    volumes:
+      - panel-data:/data
     command:
       [
         "panel",
@@ -27,3 +30,6 @@ services:
       ]
     restart: unless-stopped
     stop_grace_period: ${BETTERMQ_STOP_GRACE_PERIOD:-120s}
+
+volumes:
+  panel-data:
