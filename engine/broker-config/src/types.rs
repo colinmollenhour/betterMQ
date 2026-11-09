@@ -261,7 +261,7 @@ impl BetterMqConfig {
     }
 }
 
-fn validate_s3(s3: &S3Config) -> Result<(), ConfigError> {
+pub(crate) fn validate_s3(s3: &S3Config) -> Result<(), ConfigError> {
     if s3.endpoint.trim().is_empty() {
         return Err(ConfigError::Invalid(
             "storage.s3.endpoint is required".into(),

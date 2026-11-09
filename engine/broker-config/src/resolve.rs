@@ -120,9 +120,18 @@ pub fn resolve_serve(
     file_cfg: Option<&BetterMqConfig>,
     overrides: &ServeOverrides,
 ) -> Result<ResolvedServeSettings, ConfigError> {
-    let base = file_cfg
+    resolve_serve_with_env(file_cfg, overrides, |key| std::env::var(key).ok())
+}
+
+fn resolve_serve_with_env(
+    file_cfg: Option<&BetterMqConfig>,
+    overrides: &ServeOverrides,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<ResolvedServeSettings, ConfigError> {
+    let mut base = file_cfg
         .cloned()
         .unwrap_or_else(BetterMqConfig::template_single_local);
+    apply_runtime_env(&mut base, &env)?;
 
     let listen = overrides
         .listen
@@ -252,6 +261,76 @@ pub fn resolve_serve(
     })
 }
 
+// Dispatch consumes typed values; storage crates still consume normalized S3 env.
+fn apply_runtime_env(
+    cfg: &mut BetterMqConfig,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<(), ConfigError> {
+    if let Some(mode) = env("BETTERMQ_STORAGE") {
+        cfg.storage = match mode.as_str() {
+            "local" | "rocksdb" | "wal" => StorageConfig::Local,
+            "slate" => match &cfg.storage {
+                StorageConfig::Slate { .. } => cfg.storage.clone(),
+                StorageConfig::Local => StorageConfig::Slate {
+                    s3: S3Config {
+                        endpoint: String::new(),
+                        bucket: String::new(),
+                        payload_bucket: None,
+                        access_key: String::new(),
+                        secret_key: String::new(),
+                        region: "auto".into(),
+                    },
+                },
+            },
+            _ => {
+                return Err(ConfigError::Invalid(format!(
+                    "invalid BETTERMQ_STORAGE '{mode}'"
+                )))
+            }
+        };
+    }
+    if let StorageConfig::Slate { s3 } = &mut cfg.storage {
+        for (key, field) in [
+            ("S3_ENDPOINT", &mut s3.endpoint),
+            ("S3_BUCKET", &mut s3.bucket),
+            ("S3_ACCESS_KEY", &mut s3.access_key),
+            ("S3_SECRET_KEY", &mut s3.secret_key),
+            ("S3_REGION", &mut s3.region),
+        ] {
+            if let Some(value) = env(key) {
+                *field = value;
+            }
+        }
+        if let Some(value) = env("S3_PAYLOAD_BUCKET") {
+            s3.payload_bucket = Some(value);
+        }
+        crate::types::validate_s3(s3)?;
+    }
+    for (key, field) in [
+        (
+            "BETTERMQ_HTTP_TIMEOUT_SECS",
+            &mut cfg.dispatch.http_timeout_secs,
+        ),
+        (
+            "BETTERMQ_LONG_HTTP_TIMEOUT_SECS",
+            &mut cfg.dispatch.long_http_timeout_secs,
+        ),
+    ] {
+        if let Some(value) = env(key) {
+            *field =
+                value.parse().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    ConfigError::Invalid(format!("{key} must be a positive integer"))
+                })?;
+        }
+    }
+    if let Some(value) = env("BETTERMQ_DEFAULT_MAX_RETRIES") {
+        cfg.dispatch.retry.max_retries = value.parse().map_err(|_| {
+            ConfigError::Invalid("BETTERMQ_DEFAULT_MAX_RETRIES must be an unsigned integer".into())
+        })?;
+    }
+    Ok(())
+}
+
 pub fn resolve_from_path(
     path: &Path,
     overrides: &ServeOverrides,
@@ -314,5 +393,49 @@ mod tests {
         .unwrap();
         assert_eq!(settings.replication.factor, 3);
         assert_eq!(settings.replication.min_isr, 2);
+    }
+
+    #[test]
+    fn storage_and_dispatch_env_override_file_and_defaults() {
+        let env = |key: &str| {
+            match key {
+                "BETTERMQ_STORAGE" => Some("slate"),
+                "S3_ENDPOINT" => Some("http://object-store:9000"),
+                "S3_BUCKET" => Some("messages"),
+                "S3_PAYLOAD_BUCKET" => Some("payloads"),
+                "S3_ACCESS_KEY" => Some("access"),
+                "S3_SECRET_KEY" => Some("secret"),
+                "BETTERMQ_HTTP_TIMEOUT_SECS" => Some("5"),
+                "BETTERMQ_LONG_HTTP_TIMEOUT_SECS" => Some("60"),
+                "BETTERMQ_DEFAULT_MAX_RETRIES" => Some("10"),
+                _ => None,
+            }
+            .map(str::to_owned)
+        };
+        for cfg in [None, Some(BetterMqConfig::template_single_local())] {
+            let resolved =
+                resolve_serve_with_env(cfg.as_ref(), &ServeOverrides::default(), env).unwrap();
+            assert_eq!(resolved.storage, StorageMode::Slate);
+            assert_eq!(resolved.s3.unwrap().bucket, "messages");
+            assert_eq!(resolved.dispatch_http_timeout_secs, 5);
+            assert_eq!(resolved.dispatch_long_http_timeout_secs, 60);
+            assert_eq!(resolved.dispatch_retry.max_retries, 10);
+        }
+    }
+
+    #[test]
+    fn invalid_runtime_env_fails_instead_of_silently_defaulting() {
+        for (key, value) in [
+            ("BETTERMQ_STORAGE", "typo"),
+            ("BETTERMQ_STORAGE", "slate"),
+            ("BETTERMQ_HTTP_TIMEOUT_SECS", "0"),
+            ("BETTERMQ_DEFAULT_MAX_RETRIES", "no"),
+        ] {
+            assert!(
+                resolve_serve_with_env(None, &ServeOverrides::default(), |k| (k == key)
+                    .then(|| value.into()))
+                .is_err()
+            );
+        }
     }
 }

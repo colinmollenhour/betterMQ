@@ -117,6 +117,11 @@ is also set. An explicit `--admin-listen` takes precedence over the panel alias.
 
 Examples:
 
+Configuration precedence is CLI flags, then supported environment variables,
+then the saved file, then defaults. `BETTERMQ_STORAGE`, `S3_*`, webhook timeout
+variables and `BETTERMQ_DEFAULT_MAX_RETRIES` override file values. Invalid values
+or incomplete Slate credentials fail startup rather than selecting local storage.
+
 ```bash
 bettermq serve
 bettermq serve -p 9000
@@ -218,8 +223,8 @@ The public repo reads **92** `BETTERMQ_*` names used by self-host. **16** are CL
 | `BETTERMQ_DISPATCH_QUEUE_CAP` | Dispatch work-queue capacity (default `4096`) |
 | `BETTERMQ_DISPATCH_GLOBAL_MAX` | Optional global in-flight delivery cap |
 | `BETTERMQ_DEFAULT_MAX_RETRIES` | Default webhook retries (default `3`) |
-| `BETTERMQ_HTTP_TIMEOUT_SECS` | Webhook HTTP timeout (default `30`; also set from config) |
-| `BETTERMQ_LONG_HTTP_TIMEOUT_SECS` | Long-payload webhook timeout (default `7200`; also set from config) |
+| `BETTERMQ_HTTP_TIMEOUT_SECS` | Webhook HTTP timeout (default `300`; overrides config) |
+| `BETTERMQ_LONG_HTTP_TIMEOUT_SECS` | Long-payload webhook timeout (default `7200`; overrides config) |
 | `BETTERMQ_FLOW_WAITLIST_CAP` | Per-lane flow waitlist (default `8192`) |
 | `BETTERMQ_MEMORY_LIMIT_MB` | Pause dispatch fetches above this RSS (optional) |
 | `BETTERMQ_FAIRNESS_TENANT_SOFT_LIMIT` | Tenant fairness tracking soft cap (default `1024`) |
