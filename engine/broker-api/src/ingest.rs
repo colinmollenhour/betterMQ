@@ -77,7 +77,7 @@ mod tests {
             delay_ms: delay,
             priority: None,
             flow_id: None,
-            url: Some("http://127.0.0.1:9/h".into()),
+            url: Some("https://example.com/hook".into()),
             secret: Some("s".into()),
             destination: None,
             flow: None,
@@ -93,7 +93,6 @@ mod tests {
 
     #[test]
     fn batch_preserves_delay_ms() {
-        std::env::set_var("BETTERMQ_ALLOW_PRIVATE_DESTINATIONS", "1");
         let batch = IngestBatch::from_requests(vec![sample(Some(1500)), sample(None)]).unwrap();
         assert_eq!(batch.records[0].req.delay_ms, Some(1500));
         assert_eq!(batch.records[1].req.delay_ms, None);
