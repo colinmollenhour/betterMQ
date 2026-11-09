@@ -301,7 +301,7 @@ Standalone management gateway (no broker storage). Same `--config` / `--listen` 
 | Flag | Env | Meaning |
 |------|-----|---------|
 | `--controller <URL>` | `BETTERMQ_CONTROLLER` | Broker/controller base URL this panel talks to |
-| `--panel-data-dir <DIR>` | `BETTERMQ_PANEL_DATA_DIR` | Panel-only data directory |
+| `--data-dir <DIR>` | `BETTERMQ_PANEL_DATA_DIR` | Panel-only data directory (`bettermq panel`) |
 
 ### Related environment variables
 
@@ -433,7 +433,7 @@ S3/R2 credentials for Slate and archive are **not** `BETTERMQ_*`: `S3_ENDPOINT` 
 | Env | Used for |
 |-----|----------|
 | `BETTERMQ_PANEL_DIR` | Serve panel assets from a directory instead of embedded (`engine/panel/dist` after `npm run build`) |
-| `BETTERMQ_PANEL_MODE` | `embedded` (default) or `standalone` (set automatically by `bettermq panel`) |
+| `BETTERMQ_PANEL_MODE` | Runtime mode: `embedded`, `separate`, `disabled`, or `standalone` (set automatically from resolved settings; `bettermq panel` selects standalone) |
 | `BETTERMQ_ADMIN_API_BASE` | Admin API prefix injected into the panel (default `/admin/v1`) |
 | `BETTERMQ_PANEL_FLAGS` | Comma-separated feature flags injected into the panel |
 

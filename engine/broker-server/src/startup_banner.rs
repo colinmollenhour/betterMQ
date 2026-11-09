@@ -1,6 +1,6 @@
 //! Colored startup banner for interactive terminals (brand wordmark + URLs, then logs below).
 
-use broker_config::ResolvedServeSettings;
+use broker_config::{Component, PanelMode, ResolvedServeSettings};
 use broker_storage::StorageMode;
 use std::io::{IsTerminal, Write};
 
@@ -14,9 +14,11 @@ pub fn print(settings: &ResolvedServeSettings, storage: StorageMode) {
         return;
     }
 
-    let base = public_base_url(&settings.listen.to_string());
-    let panel = format!("{base}/panel/");
-    let docs = format!("{base}/docs");
+    let (base, panel, docs) = endpoint_urls(
+        &settings.listeners.public.to_string(),
+        &settings.listeners.admin.to_string(),
+        settings.panel_mode != PanelMode::Disabled && settings.has(Component::Panel),
+    );
     let data = settings.data_dir.display().to_string();
     let storage_label = format!("{storage:?}");
     let cluster = if settings.cluster_enabled {
@@ -34,7 +36,9 @@ pub fn print(settings: &ResolvedServeSettings, storage: StorageMode) {
     let _ = writeln!(out, "  {BRAND}●{RESET} {BOLD}RUNNING{RESET}");
     let _ = writeln!(out);
     let _ = writeln!(out, "  {DIM}API{RESET}      {base}");
-    let _ = writeln!(out, "  {DIM}Panel{RESET}    {panel}");
+    if let Some(panel) = panel {
+        let _ = writeln!(out, "  {DIM}Panel{RESET}    {panel}");
+    }
     let _ = writeln!(out, "  {DIM}Docs{RESET}     {docs}");
     let _ = writeln!(out, "  {DIM}Data{RESET}     {data}");
     let _ = writeln!(
@@ -50,6 +54,17 @@ fn print_logo(out: &mut impl Write) {
     let _ = writeln!(out, "  {BOLD}{BRAND}            betterMQ{RESET}");
 }
 
+fn endpoint_urls(
+    public: &str,
+    admin: &str,
+    include_panel: bool,
+) -> (String, Option<String>, String) {
+    let base = public_base_url(public);
+    let management = public_base_url(admin);
+    let panel = include_panel.then(|| format!("{management}/panel/"));
+    (base, panel, format!("{management}/docs"))
+}
+
 fn public_base_url(listen: &str) -> String {
     let (host, port) = match listen.rsplit_once(':') {
         Some((h, p)) => (h.trim_matches(['[', ']']), p),
@@ -60,7 +75,11 @@ fn public_base_url(listen: &str) -> String {
         h if h.starts_with("::ffff:") => &h[7..],
         h => h,
     };
-    format!("http://{host}:{port}")
+    if host.contains(':') {
+        format!("http://[{host}]:{port}")
+    } else {
+        format!("http://{host}:{port}")
+    }
 }
 
 #[cfg(test)]
@@ -71,5 +90,26 @@ mod tests {
     fn maps_wildcard_bind_to_localhost() {
         assert_eq!(public_base_url("0.0.0.0:8080"), "http://127.0.0.1:8080");
         assert_eq!(public_base_url("127.0.0.1:9090"), "http://127.0.0.1:9090");
+        assert_eq!(
+            public_base_url("[2001:db8::1]:9090"),
+            "http://[2001:db8::1]:9090"
+        );
+    }
+
+    #[test]
+    fn banner_hides_disabled_panel_and_uses_management_listener() {
+        let (api, panel, docs) = endpoint_urls("0.0.0.0:8080", "127.0.0.1:9090", true);
+        assert_eq!(api, "http://127.0.0.1:8080");
+        assert_eq!(panel.as_deref(), Some("http://127.0.0.1:9090/panel/"));
+        assert_eq!(docs, "http://127.0.0.1:9090/docs");
+        assert!(endpoint_urls("0.0.0.0:8080", "127.0.0.1:9090", false)
+            .1
+            .is_none());
+        assert_eq!(
+            endpoint_urls("0.0.0.0:8080", "0.0.0.0:8080", true)
+                .1
+                .as_deref(),
+            Some("http://127.0.0.1:8080/panel/")
+        );
     }
 }
