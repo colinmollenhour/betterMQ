@@ -1007,6 +1007,328 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    async fn admin_call(
+        app: Router,
+        method: &str,
+        uri: &str,
+        bearer: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> StatusCode {
+        let mut req = Request::builder().method(method).uri(uri);
+        if let Some(token) = bearer {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let req = match body {
+            Some(body) => req
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    fn embedded_admin(dir: &tempfile::TempDir, configure: bool) -> (AdminState, Option<String>) {
+        let store = broker_local_auth::LocalAuthStore::open(dir.path()).unwrap();
+        let token = configure.then(|| store.setup("password1234").unwrap());
+        let mut state = test_state(dir);
+        state.local_auth = Some(Arc::new(store));
+        let mut admin = AdminState::local(Arc::new(state));
+        admin.cluster_secret = None;
+        (admin, token)
+    }
+
+    #[tokio::test]
+    async fn embedded_admin_is_401_before_local_auth_setup() {
+        let dir = tempdir().unwrap();
+        let (admin, _) = embedded_admin(&dir, false);
+        let app = admin_router(admin);
+        for (method, uri, body) in [
+            ("GET", "/admin/v1/cells", None),
+            ("GET", "/admin/v1/cluster", None),
+            (
+                "POST",
+                "/admin/v1/cells",
+                Some(serde_json::json!({
+                    "id": "x", "region": "x", "controllerUrl": "http://attacker.example"
+                })),
+            ),
+            (
+                "POST",
+                "/admin/v1/gc/0",
+                Some(serde_json::json!({ "watermark": 1_000_000 })),
+            ),
+        ] {
+            assert_eq!(
+                admin_call(app.clone(), method, uri, None, body).await,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must fail closed before setup"
+            );
+        }
+        assert_eq!(
+            admin_call(app, "GET", "/admin/v1/health", None, None).await,
+            StatusCode::OK,
+            "health stays public"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_admin_requires_local_token_or_cluster_secret() {
+        let dir = tempdir().unwrap();
+        let (mut admin, token) = embedded_admin(&dir, true);
+        let token = token.unwrap();
+        admin.cluster_secret = Some("cluster-secret".into());
+        let app = admin_router(admin);
+        assert_eq!(
+            admin_call(app.clone(), "GET", "/admin/v1/cells", None, None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            admin_call(
+                app.clone(),
+                "GET",
+                "/admin/v1/cells",
+                Some("sk_local_wrong"),
+                None
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            admin_call(app.clone(), "GET", "/admin/v1/cells", Some(&token), None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            admin_call(app, "GET", "/admin/v1/cells", Some("cluster-secret"), None).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_admin_without_local_store_is_401() {
+        let dir = tempdir().unwrap();
+        let mut admin = AdminState::local(Arc::new(test_state(&dir)));
+        admin.cluster_secret = None;
+        let app = admin_router(admin);
+        assert_eq!(
+            admin_call(app, "GET", "/admin/v1/cells", Some("anything"), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_admin_fails_closed_without_cluster_secret() {
+        let mut admin = AdminState::remote("http://127.0.0.1:9".into(), CellRegistry::default());
+        admin.cluster_secret = None;
+        let app = admin_router(admin);
+        assert_eq!(
+            admin_call(app.clone(), "GET", "/admin/v1/cells", None, None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            admin_call(
+                app,
+                "POST",
+                "/admin/v1/cells",
+                None,
+                Some(serde_json::json!({
+                    "id": "x", "region": "x", "controllerUrl": "http://attacker.example"
+                })),
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_admin_accepts_only_the_cluster_secret() {
+        let mut admin = AdminState::remote("http://127.0.0.1:9".into(), CellRegistry::default());
+        admin.cluster_secret = Some("cluster-secret".into());
+        let app = admin_router(admin);
+        assert_eq!(
+            admin_call(app.clone(), "GET", "/admin/v1/cells", Some("nope"), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            admin_call(
+                app.clone(),
+                "GET",
+                "/admin/v1/cells",
+                Some("cluster-secret"),
+                None
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            admin_call(
+                app,
+                "POST",
+                "/admin/v1/cells",
+                Some("cluster-secret"),
+                Some(serde_json::json!({
+                    "id": "x", "region": "x", "controllerUrl": "http://169.254.169.254/latest?x="
+                })),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "link-local controller URLs are rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn federated_query_uses_only_the_cell_credential() {
+        use axum::routing::get;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let record = seen.clone();
+        let probe = Router::new().route(
+            "/admin/v1/nodes",
+            get(move |headers: axum::http::HeaderMap| {
+                let record = record.clone();
+                async move {
+                    record.lock().unwrap().push(
+                        headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    Json(serde_json::json!({ "nodes": [] }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, probe).await.unwrap() });
+
+        let mut registry = CellRegistry::default();
+        for (id, admin_token) in [("with-token", Some("sk_local_cell")), ("no-token", None)] {
+            registry.cells.push(CellRecord {
+                id: id.into(),
+                region: "r".into(),
+                controller_url: format!("http://{addr}"),
+                label: None,
+                admin_token: admin_token.map(str::to_string),
+            });
+        }
+        let mut admin = AdminState::remote("http://127.0.0.1:9".into(), registry);
+        admin.cluster_secret = Some("cluster-secret".into());
+        let response = admin_router(admin)
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/v1/cells/query/nodes")
+                    .header("authorization", "Bearer cluster-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ok"][0]["cell"], "with-token");
+        assert_eq!(body["failed"][0]["cell"], "no-token");
+        assert_eq!(body["failed"][0]["error"], "cell credential not configured");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[Some("Bearer sk_local_cell".to_string())],
+            "only the cell's own token is sent; never the caller's bearer"
+        );
+    }
+
+    async fn admin_json(
+        app: Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", "Bearer cluster-secret")
+            .header("content-type", "application/json");
+        let req = req
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn cell_admin_token_is_required_kept_and_redacted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cell-registry.json");
+        let mut admin = AdminState::remote_with_path(
+            "http://127.0.0.1:9".into(),
+            CellRegistry::default(),
+            Some(path.clone()),
+        );
+        admin.cluster_secret = Some("cluster-secret".into());
+        let app = admin_router(admin);
+        let cell = |token: Option<&str>| {
+            let mut body = serde_json::json!({
+                "id": "eu", "region": "eu", "controllerUrl": "http://10.0.0.9:8080"
+            });
+            if let Some(token) = token {
+                body["adminToken"] = token.into();
+            }
+            body
+        };
+        let (status, _) =
+            admin_json(app.clone(), "POST", "/admin/v1/cells", Some(cell(None))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "new cell needs a token");
+        let (status, _) = admin_json(
+            app.clone(),
+            "POST",
+            "/admin/v1/cells",
+            Some(cell(Some("not-a-local-token"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = admin_json(
+            app.clone(),
+            "POST",
+            "/admin/v1/cells",
+            Some(cell(Some("sk_local_eu"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["cells"][0]["adminTokenConfigured"], true);
+        assert!(!body.to_string().contains("sk_local_eu"));
+        let (status, body) = admin_json(
+            app.clone(),
+            "POST",
+            "/admin/v1/cells",
+            Some(cell(Some(" "))),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "blank token on update keeps the saved one"
+        );
+        assert_eq!(body["cells"][0]["adminTokenConfigured"], true);
+        let (_, listed) = admin_json(app, "GET", "/admin/v1/cells", None).await;
+        assert_eq!(listed["cells"][0]["adminTokenConfigured"], true);
+        assert!(!listed.to_string().contains("sk_local_eu"));
+        let on_disk = CellRegistry::load(&path);
+        assert_eq!(on_disk.cells[0].admin_token.as_deref(), Some("sk_local_eu"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
     #[tokio::test]
     async fn publish_with_flow_and_no_flow_id_does_not_panic() {
         let dir = tempdir().unwrap();

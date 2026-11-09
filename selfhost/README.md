@@ -324,7 +324,7 @@ The public repo reads **92** `BETTERMQ_*` names used by self-host. **16** are CL
 
 | Env | Used for |
 |-----|----------|
-| `BETTERMQ_CLUSTER_SECRET` | Internal `/internal/v1/*` (replication, lease, catalog) |
+| `BETTERMQ_CLUSTER_SECRET` | Internal `/internal/v1/*` (replication, lease, catalog). Also an admin credential for `/admin/v1`, and the **only** one on a standalone `bettermq panel` (required there) |
 | `BETTERMQ_SHARED_META_DIR` | Local-WAL HA only: one shared filesystem for leases, cursors, catalogs, host breaker. Each node still has its own `--data-dir`. Skip this when nodes have no shared disk — use Slate + S3 instead |
 | `BETTERMQ_BROKER_URLS` | Fleet/gateway: comma-separated broker base URLs |
 | `BETTERMQ_FLEET_CONCURRENCY` | Fleet in-flight jobs (default `1`) |
@@ -567,7 +567,9 @@ Prefer compose profiles above, or run **one broker per server**. Two `all` nodes
 
 `docker-compose.ha.yml` maps broker1→8081, broker2→8082, broker3→8083. Use the URL this panel process can call (compose DNS if the panel is in the compose network; `127.0.0.1` plus the published port if the panel is on the host).
 
-Standalone panel: `docker compose -f docker-compose.panel.yml up -d` then register each cell’s admin URL.
+Standalone panel: `BETTERMQ_CLUSTER_SECRET=… docker compose -f docker-compose.panel.yml up -d` then register each cell’s admin URL. The panel publishes on `127.0.0.1:8090` and authenticates admins with the cluster secret.
+
+`/admin/v1` fails closed. Every route except `/admin/v1/health` needs `Authorization: Bearer <token>`: the local `sk_local_…` API token (embedded panel) or `BETTERMQ_CLUSTER_SECRET`. Before a panel password is set, admin calls return `401` (`auth_not_configured`); a standalone panel without a cluster secret rejects every admin call. Registering a remote cell (`POST /admin/v1/cells`) requires `adminToken`, that cell's own `sk_local_…` token; leave it blank on update to keep the saved one. Federated cell queries authenticate to each cell with only that token (never the caller's bearer or the cluster secret); a cell without one is reported as `cell credential not configured`. Responses show `adminTokenConfigured` instead of the token, and `cell-registry.json` is written with mode `0600`.
 
 Local WAL HA still requires `BETTERMQ_SHARED_META_DIR` (shared volume/NFS). Separate servers without shared FS → Slate + S3.
 

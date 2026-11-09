@@ -102,7 +102,8 @@ async fn embedded_panel_persists_local_cell_and_federates_local_kinds() {
             "id": "eu-west",
             "region": "eu-west",
             "controllerUrl": "http://10.0.0.9:8090",
-            "label": "EU"
+            "label": "EU",
+            "adminToken": "sk_local_eu"
         }))
         .send()
         .await
@@ -110,6 +111,19 @@ async fn embedded_panel_persists_local_cell_and_federates_local_kinds() {
     assert!(upsert.status().is_success(), "{}", upsert.status());
     let on_disk = std::fs::read_to_string(data.path().join("cell-registry.json")).unwrap();
     assert!(on_disk.contains("eu-west"));
+    let listed = client
+        .get(format!("{base}/admin/v1/cells"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(listed.contains("\"adminTokenConfigured\":true"), "{listed}");
+    assert!(
+        !listed.contains("sk_local_eu"),
+        "cell token must be redacted"
+    );
 
     let cors = client
         .request(reqwest::Method::OPTIONS, format!("{base}/admin/v1/health"))

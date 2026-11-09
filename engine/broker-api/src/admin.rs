@@ -4,9 +4,10 @@ use crate::auth;
 use crate::ops::{self, MetricsResponse, ReadyResponse};
 use crate::AppState;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    middleware::Next,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -52,7 +53,7 @@ impl AdminState {
             local: Some(state),
             remote_controller: None,
             cell_registry: Arc::new(parking_lot::RwLock::new(registry)),
-            cluster_secret: std::env::var("BETTERMQ_CLUSTER_SECRET").ok(),
+            cluster_secret: crate::cluster_auth::cluster_secret(),
             registry_path,
         }
     }
@@ -81,7 +82,7 @@ impl AdminState {
             local: None,
             remote_controller: Some(controller),
             cell_registry: Arc::new(parking_lot::RwLock::new(registry)),
-            cluster_secret: std::env::var("BETTERMQ_CLUSTER_SECRET").ok(),
+            cluster_secret: crate::cluster_auth::cluster_secret(),
             registry_path,
         }
     }
@@ -111,6 +112,47 @@ pub struct CellRecord {
     pub controller_url: String,
     #[serde(default)]
     pub label: Option<String>,
+    /// The cell's own `sk_local_` admin token, used for federated admin calls
+    /// to `controller_url`. Persisted (secret file mode), never returned by the API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_token: Option<String>,
+}
+
+/// API view of a [`CellRecord`]: the admin token is replaced by a flag.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CellView {
+    pub id: String,
+    pub region: String,
+    pub controller_url: String,
+    pub label: Option<String>,
+    pub admin_token_configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CellRegistryView {
+    pub cells: Vec<CellView>,
+    pub members: Vec<CellMember>,
+}
+
+impl From<&CellRegistry> for CellRegistryView {
+    fn from(registry: &CellRegistry) -> Self {
+        Self {
+            cells: registry
+                .cells
+                .iter()
+                .map(|c| CellView {
+                    id: c.id.clone(),
+                    region: c.region.clone(),
+                    controller_url: c.controller_url.clone(),
+                    label: c.label.clone(),
+                    admin_token_configured: c.admin_token.is_some(),
+                })
+                .collect(),
+            members: registry.members.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -135,7 +177,10 @@ impl CellRegistry {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)
+        std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
+        // Holds per-cell admin tokens.
+        broker_storage::set_secret_file_mode(path);
+        Ok(())
     }
 
     pub fn upsert_member(&mut self, member: CellMember) {
@@ -170,6 +215,7 @@ fn ensure_local_cell(registry: &mut CellRegistry, local: &AppState, controller_u
         region: std::env::var("BETTERMQ_CELL_REGION").unwrap_or_else(|_| "local".into()),
         controller_url: controller_url.trim_end_matches('/').to_string(),
         label: Some(std::env::var("BETTERMQ_CELL_LABEL").unwrap_or_else(|_| "local".into())),
+        admin_token: None,
     });
 }
 
@@ -222,8 +268,9 @@ pub struct AuditQuery {
 }
 
 pub fn router(state: AdminState) -> Router {
-    Router::new()
-        .route("/admin/v1/health", get(admin_health))
+    // Every route except health sits behind `admin_auth`, so a new route cannot
+    // forget the check.
+    let protected = Router::new()
         .route("/admin/v1/cluster", get(cluster_overview))
         .route("/admin/v1/nodes", get(list_nodes))
         .route("/admin/v1/shards", get(list_shards))
@@ -241,42 +288,62 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/v1/nodes/drain", post(drain_node))
         .route("/admin/v1/controller/voters", post(controller_voter))
         .route("/admin/v1/gc/{shard}", post(advance_gc))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admin_auth,
+        ));
+    Router::new()
+        .route("/admin/v1/health", get(admin_health))
+        .merge(protected)
         .with_state(state)
 }
 
-async fn require_admin(
+async fn admin_auth(
+    State(state): State<AdminState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<AdminErrorBody>)> {
+    require_admin(req.headers(), &state)?;
+    Ok(next.run(req).await)
+}
+
+/// Fail closed: a caller is an admin only when it presents a credential that
+/// was affirmatively configured. Embedded nodes accept the local API token;
+/// every mode accepts the cluster secret (it already controls `/internal/v1`).
+/// An unconfigured node or a standalone panel without a secret rejects
+/// everyone; only `/v1/local-auth/setup` is reachable before setup.
+fn require_admin(
     headers: &HeaderMap,
     state: &AdminState,
 ) -> Result<(), (StatusCode, Json<AdminErrorBody>)> {
-    if let Some(local) = &state.local {
-        if auth::insecure_no_auth() {
-            return Ok(());
-        }
-        if local.uses_cloud_auth() {
-            return Ok(());
-        }
-        if let Some(store) = &local.local_auth {
-            if !store.is_configured() {
-                return Ok(());
-            }
-            let token = bearer(headers);
-            if token.is_some_and(|t| store.authorize_admin(t)) {
-                return Ok(());
-            }
-            return Err(deny("admin authentication required", "unauthorized"));
-        }
-        return Ok(());
-    }
     if auth::insecure_no_auth() {
         return Ok(());
     }
-    let expected = state.cluster_secret.as_deref().unwrap_or("");
-    if expected.is_empty() {
-        return Ok(());
+    let token = bearer(headers);
+    if let (Some(token), Some(secret)) = (token, state.cluster_secret.as_deref()) {
+        if subtle_eq(token, secret) {
+            return Ok(());
+        }
     }
-    let token = bearer(headers).unwrap_or("");
-    if subtle_eq(token, expected) {
-        return Ok(());
+    if let Some(local) = &state.local {
+        if let Some(store) = &local.local_auth {
+            if !store.is_configured() {
+                return Err(deny(
+                    "local auth not configured — set a panel password at /panel/ first",
+                    "auth_not_configured",
+                ));
+            }
+            if token.is_some_and(|t| store.authorize_admin(t)) {
+                return Ok(());
+            }
+        }
+        return Err(deny("admin authentication required", "unauthorized"));
+    }
+    if state.cluster_secret.is_none() {
+        return Err(deny(
+            "standalone panel requires BETTERMQ_CLUSTER_SECRET",
+            "auth_not_configured",
+        ));
     }
     Err(deny("admin authentication required", "unauthorized"))
 }
@@ -314,9 +381,7 @@ async fn admin_health(State(state): State<AdminState>) -> impl IntoResponse {
 
 async fn cluster_overview(
     State(state): State<AdminState>,
-    headers: HeaderMap,
 ) -> Result<Json<ClusterOverview>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     if let Some(local) = &state.local {
         let ready = ops::ready_snapshot(local);
         let (node_count, catalog_epoch, rf, min_isr) = match &local.cluster {
@@ -365,9 +430,7 @@ async fn cluster_overview(
 
 async fn list_nodes(
     State(state): State<AdminState>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     if let Some(local) = &state.local {
         return Ok(Json(nodes_from_local(local)));
     }
@@ -376,9 +439,7 @@ async fn list_nodes(
 
 async fn list_shards(
     State(state): State<AdminState>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     if let Some(local) = &state.local {
         return Ok(Json(shards_from_local(local)));
     }
@@ -387,9 +448,7 @@ async fn list_shards(
 
 async fn catalog_snapshot(
     State(state): State<AdminState>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     if let Some(local) = &state.local {
         if let Some(cluster) = &local.cluster {
             if let Some(controller) = cluster.runtime.controller() {
@@ -416,9 +475,7 @@ async fn catalog_snapshot(
 
 async fn admin_metrics(
     State(state): State<AdminState>,
-    headers: HeaderMap,
 ) -> Result<Json<MetricsResponse>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     if let Some(local) = &state.local {
         return Ok(Json(ops::metrics_snapshot(local)));
     }
@@ -440,9 +497,7 @@ async fn admin_metrics(
 
 async fn admin_readyz(
     State(state): State<AdminState>,
-    headers: HeaderMap,
 ) -> Result<Json<ReadyResponse>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     if let Some(local) = &state.local {
         return Ok(Json(ops::ready_snapshot(local)));
     }
@@ -454,20 +509,15 @@ async fn admin_readyz(
 }
 
 async fn audit_log(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
     Query(_q): Query<AuditQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     Ok(Json(serde_json::json!({ "events": [] })))
 }
 
 async fn list_cells(
     State(state): State<AdminState>,
-    headers: HeaderMap,
-) -> Result<Json<CellRegistry>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
-    Ok(Json(state.cell_registry.read().clone()))
+) -> Result<Json<CellRegistryView>, (StatusCode, Json<AdminErrorBody>)> {
+    Ok(Json(CellRegistryView::from(&*state.cell_registry.read())))
 }
 
 #[derive(Debug, Deserialize)]
@@ -477,37 +527,96 @@ struct UpsertCell {
     region: String,
     controller_url: String,
     label: Option<String>,
+    /// Omitted or blank on update keeps the saved token.
+    #[serde(default)]
+    admin_token: Option<String>,
+}
+
+const LOCAL_TOKEN_PREFIX: &str = "sk_local_";
+
+/// Cells served from this process's own state (no credential needed).
+fn is_local_cell(state: &AdminState, id: &str) -> bool {
+    state.local.as_ref().is_some_and(|local| {
+        id == "local"
+            || local
+                .cluster
+                .as_ref()
+                .is_some_and(|c| c.runtime.config().cluster_id.to_string() == id)
+    })
+}
+
+fn bad_cell(error: &str) -> (StatusCode, Json<AdminErrorBody>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(AdminErrorBody {
+            error: error.into(),
+            code: "bad_cell",
+        }),
+    )
 }
 
 async fn upsert_cell(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<UpsertCell>,
-) -> Result<Json<CellRegistry>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
+) -> Result<Json<CellRegistryView>, (StatusCode, Json<AdminErrorBody>)> {
+    let id = body.id.trim().to_string();
+    let region = body.region.trim().to_string();
+    if id.is_empty() || region.is_empty() {
+        return Err(bad_cell("cell id and region are required"));
+    }
+    let admin_token = body
+        .admin_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    if admin_token
+        .as_deref()
+        .is_some_and(|t| !t.starts_with(LOCAL_TOKEN_PREFIX) || t.len() > 256)
+    {
+        return Err(bad_cell(
+            "adminToken must be the cell's sk_local_… API token",
+        ));
+    }
+    let controller_url = validate_attach_url(&body.controller_url).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(AdminErrorBody {
+                error,
+                code: "bad_url",
+            }),
+        )
+    })?;
     let mut registry = state.cell_registry.write();
-    if let Some(existing) = registry.cells.iter_mut().find(|c| c.id == body.id) {
-        existing.region = body.region;
-        existing.controller_url = body.controller_url;
+    if let Some(existing) = registry.cells.iter_mut().find(|c| c.id == id) {
+        existing.region = region;
+        existing.controller_url = controller_url;
         existing.label = body.label;
+        if admin_token.is_some() {
+            existing.admin_token = admin_token;
+        }
     } else {
+        if admin_token.is_none() && !is_local_cell(&state, &id) {
+            return Err(bad_cell(
+                "adminToken (the cell's sk_local_… API token) is required to register a cell",
+            ));
+        }
         registry.cells.push(CellRecord {
-            id: body.id,
-            region: body.region,
-            controller_url: body.controller_url,
+            id,
+            region,
+            controller_url,
             label: body.label,
+            admin_token,
         });
     }
     state.persist_registry(&registry);
-    Ok(Json(registry.clone()))
+    Ok(Json(CellRegistryView::from(&*registry)))
 }
 
 async fn federated_query(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Path(kind): Path<String>,
 ) -> Result<Json<PartialResult<serde_json::Value>>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     let cells = state.cell_registry.read().cells.clone();
     if cells.is_empty() {
         if let Some(local) = &state.local {
@@ -520,30 +629,42 @@ async fn federated_query(
             }));
         }
     }
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|err| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(AdminErrorBody {
+                    error: err.to_string(),
+                    code: "client",
+                }),
+            )
+        })?;
     let mut ok = Vec::new();
     let mut failed = Vec::new();
-    let auth_token = bearer(&headers).map(str::to_string).or_else(|| {
-        state
-            .cluster_secret
-            .clone()
-            .filter(|secret| !secret.is_empty())
-    });
     for cell in cells {
-        if let Some(local) = &state.local {
-            if cell.id == "local"
-                || local
-                    .cluster
-                    .as_ref()
-                    .is_some_and(|c| c.runtime.config().cluster_id.to_string() == cell.id)
-            {
-                ok.push(CellOk {
-                    cell: cell.id,
-                    data: local_kind_data(local, &kind),
-                });
-                continue;
-            }
+        if let Some(local) = state
+            .local
+            .as_ref()
+            .filter(|_| is_local_cell(&state, &cell.id))
+        {
+            ok.push(CellOk {
+                cell: cell.id,
+                data: local_kind_data(local, &kind),
+            });
+            continue;
         }
+        // Registry URLs are operator-supplied, not proven peers: authenticate with
+        // the cell's own credential only, never the caller's bearer or the
+        // cluster secret.
+        let Some(token) = cell.admin_token.clone() else {
+            failed.push(CellFailure {
+                cell: cell.id,
+                error: "cell credential not configured".into(),
+            });
+            continue;
+        };
         let url = format!(
             "{}/admin/v1/{}",
             cell.controller_url.trim_end_matches('/'),
@@ -554,11 +675,7 @@ async fn federated_query(
                 _ => "cluster",
             }
         );
-        let mut req = client.get(url);
-        if let Some(token) = auth_token.as_deref() {
-            req = req.bearer_auth(token);
-        }
-        match req.send().await {
+        match client.get(url).bearer_auth(token).send().await {
             Ok(resp) if resp.status().is_success() => match resp.json().await {
                 Ok(data) => ok.push(CellOk {
                     cell: cell.id,
@@ -701,10 +818,8 @@ struct RebalanceRequest {
 
 async fn start_rebalance(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<RebalanceRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     if let Some(local) = &state.local {
         if let Some(cluster) = &local.cluster {
             if let Some(controller) = cluster.runtime.controller() {
@@ -750,11 +865,9 @@ struct GcRequest {
 
 async fn advance_gc(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Path(shard): Path<u32>,
     Json(body): Json<GcRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     if let Some(local) = &state.local {
         if let Some(cluster) = &local.cluster {
             if let Some(controller) = cluster.runtime.controller() {
@@ -800,10 +913,8 @@ struct DrainNodeRequest {
 
 async fn drain_node(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<DrainNodeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     let Some(local) = &state.local else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -857,10 +968,8 @@ struct ControllerVoterRequest {
 
 async fn controller_voter(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<ControllerVoterRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     let Some(local) = &state.local else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -936,17 +1045,25 @@ pub fn validate_attach_url(raw: &str) -> Result<String, String> {
         return Err("url must not contain credentials".into());
     }
     if let Some(host) = parsed.host_str() {
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            match ip {
-                std::net::IpAddr::V4(v4) if v4.is_unspecified() || v4.is_link_local() => {
-                    return Err("url host is not allowed".into());
+        let lower = host.to_ascii_lowercase();
+        if lower == "metadata"
+            || lower == "metadata.google.internal"
+            || lower.ends_with(".metadata.google.internal")
+        {
+            return Err("url host is not allowed".into());
+        }
+        if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+            let blocked_v4 = |v4: std::net::Ipv4Addr| v4.is_unspecified() || v4.is_link_local();
+            let blocked = match ip {
+                std::net::IpAddr::V4(v4) => blocked_v4(v4),
+                std::net::IpAddr::V6(v6) => {
+                    v6.is_unspecified()
+                        || (v6.segments()[0] & 0xffc0) == 0xfe80
+                        || v6.to_ipv4_mapped().is_some_and(blocked_v4)
                 }
-                std::net::IpAddr::V6(v6)
-                    if v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80 =>
-                {
-                    return Err("url host is not allowed".into());
-                }
-                _ => {}
+            };
+            if blocked {
+                return Err("url host is not allowed".into());
             }
         }
     } else {
@@ -957,10 +1074,8 @@ pub fn validate_attach_url(raw: &str) -> Result<String, String> {
 
 async fn list_cell_members(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     let registry = state.cell_registry.read().clone();
     let members: Vec<_> = registry
         .members
@@ -1010,11 +1125,8 @@ struct ExpandRfRequest {
 }
 
 async fn probe_node(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<ProbeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     let reach = validate_attach_url(&body.reach_url).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
@@ -1112,10 +1224,8 @@ async fn probe_reach(reach: &str) -> serde_json::Value {
 
 async fn attach_node(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<AttachRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     let profile = body.profile.trim().to_ascii_lowercase();
     if !is_known_profile(&profile) {
         return Err((
@@ -1338,10 +1448,8 @@ async fn attach_node(
 
 async fn expand_rf(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<ExpandRfRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     let Some(local) = &state.local else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1502,6 +1610,7 @@ mod tests {
             region: "us-east".into(),
             controller_url: "http://broker1:8080".into(),
             label: Some("prod".into()),
+            admin_token: Some("sk_local_prod".into()),
         });
         registry.upsert_member(CellMember {
             profile: "dispatch".into(),
@@ -1514,6 +1623,10 @@ mod tests {
         let loaded = CellRegistry::load(&path);
         assert_eq!(loaded.cells.len(), 1);
         assert_eq!(loaded.cells[0].id, "us-east");
+        assert_eq!(
+            loaded.cells[0].admin_token.as_deref(),
+            Some("sk_local_prod")
+        );
         assert_eq!(loaded.members.len(), 1);
         assert_eq!(loaded.members[0].profile, "dispatch");
     }
@@ -1524,6 +1637,9 @@ mod tests {
         assert!(validate_attach_url("http://broker2:8080").is_ok());
         assert!(validate_attach_url("http://10.0.0.5:8090").is_ok());
         assert!(validate_attach_url("http://169.254.169.254/").is_err());
+        assert!(validate_attach_url("http://[::ffff:169.254.169.254]/").is_err());
+        assert!(validate_attach_url("http://[fe80::1]:8080").is_err());
+        assert!(validate_attach_url("http://metadata.google.internal/").is_err());
         assert!(validate_attach_url("http://user:pass@broker2:8080").is_err());
         assert!(validate_attach_url("ftp://broker2:8080").is_err());
     }
