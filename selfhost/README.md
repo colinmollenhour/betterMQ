@@ -586,7 +586,7 @@ If you prefer to compile yourself (or no prebuilt binary exists for your platfor
 
 ```bash
 git clone https://github.com/colinmollenhour/betterMQ.git
-cd BetterMQ
+cd betterMQ
 cargo build --release -p broker-server
 ./target/release/bettermq serve
 ```
