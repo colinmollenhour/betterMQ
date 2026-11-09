@@ -283,23 +283,34 @@ impl SlatePartitionLog {
         offset: u64,
         max_messages: usize,
     ) -> Result<Vec<StoredMessage>, LogError> {
-        let mut out = Vec::new();
-        for i in 0..max_messages {
-            let off = offset + i as u64;
-            if off >= self.next_offset {
-                break;
-            }
-            let db = Arc::clone(&self.db);
-            let key = frame_key(off);
-            let frame = block_on_slate(async move { db.get(&key).await.map_err(slate_err) })?
-                .ok_or(LogError::OffsetNotFound(off))?;
-            let (header, payload) = {
-                let mut cursor = std::io::Cursor::new(frame.as_ref());
-                decode_frame(&mut cursor)?
-            };
-            out.push(stored_from_header(header, partition, off, payload));
+        if max_messages == 0 || offset >= self.next_offset {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        let db = Arc::clone(&self.db);
+        let end = self.next_offset;
+        block_on_slate(async move {
+            let mut out = Vec::with_capacity(max_messages.min(256));
+            // Range iteration skips deleted frames and counts live messages,
+            // just like the local WAL, without probing every purged offset.
+            let mut frames = db
+                .scan(frame_key(offset)..frame_key(end))
+                .await
+                .map_err(slate_err)?;
+            while out.len() < max_messages {
+                let Some(frame) = frames.next().await.map_err(slate_err)? else {
+                    break;
+                };
+                let off = std::str::from_utf8(&frame.key)
+                    .ok()
+                    .and_then(|key| key.strip_prefix("fr/"))
+                    .and_then(|key| key.parse::<u64>().ok())
+                    .ok_or_else(|| LogError::Slate("invalid frame offset key".into()))?;
+                let mut cursor = std::io::Cursor::new(frame.value.as_ref());
+                let (header, payload) = decode_frame(&mut cursor)?;
+                out.push(stored_from_header(header, partition, off, payload));
+            }
+            Ok(out)
+        })
     }
 
     pub fn high_watermark(&self) -> u64 {
@@ -390,6 +401,65 @@ fn slate_err(e: slatedb::Error) -> LogError {
 #[cfg(all(test, feature = "slate"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_and_slate_reads_skip_purges_after_reopen() {
+        for slate in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+            let open = || {
+                if slate {
+                    crate::PartitionBackend::open_slate(
+                        "purge-parity".into(),
+                        dir.path(),
+                        store.clone(),
+                        0,
+                        PartitionLogConfig::default(),
+                    )
+                    .unwrap()
+                } else {
+                    crate::PartitionBackend::open_local(dir.path(), PartitionLogConfig::default())
+                        .unwrap()
+                }
+            };
+            let close = |backend: crate::PartitionBackend| {
+                if let crate::PartitionBackend::Slate(log) = backend {
+                    block_on_slate(async move { log.db.close().await }).unwrap();
+                }
+            };
+            let mut backend = open();
+            for n in 0..4u8 {
+                let header: LogRecord = serde_json::from_value(serde_json::json!({
+                    "id": uuid::Uuid::new_v4(), "tenant_id": "tenant", "topic": "dlq",
+                    "routing_key": "", "idempotency_key": null, "published_at_ms": 0
+                }))
+                .unwrap();
+                backend.append(0, header, vec![n]).unwrap();
+            }
+            assert!(backend.purge_offset(0).unwrap());
+            assert!(backend.purge_offset(2).unwrap());
+            backend.sync().unwrap();
+            close(backend);
+            let mut backend = open();
+            assert_eq!(backend.high_watermark(), 4);
+            let messages = backend.read_range(0, 0, 2).unwrap();
+            assert_eq!(
+                messages.iter().map(|m| m.offset).collect::<Vec<_>>(),
+                vec![1, 3]
+            );
+            assert_eq!(backend.read_range(0, 2, 1).unwrap()[0].payload, vec![3]);
+            assert!(backend.read_range(0, 0, 0).unwrap().is_empty());
+            assert!(backend.read_range(0, u64::MAX, 10).unwrap().is_empty());
+            assert!(backend.purge_offset(1).unwrap());
+            assert!(backend.purge_offset(3).unwrap());
+            assert!(backend.read_range(0, 0, 10).unwrap().is_empty());
+            close(backend);
+            let backend = open();
+            assert_eq!(backend.high_watermark(), 4);
+            assert!(backend.read_range(0, 0, 10).unwrap().is_empty());
+            close(backend);
+        }
+    }
 
     #[test]
     fn recovery_uses_atomic_offset_independent_of_history_size() {
