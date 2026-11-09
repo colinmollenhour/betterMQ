@@ -93,6 +93,20 @@ impl CronJob {
             }
         }
     }
+
+    /// Publish idempotency key for one firing of this job, as returned by
+    /// [`CronRegistry::pop_due`].
+    ///
+    /// Dedup entries never expire, so the key must differ per firing. A
+    /// user-supplied `idempotency_key` is kept only as a suffix: reusing it
+    /// verbatim would turn every firing after the first into a duplicate.
+    pub fn fire_idempotency_key(&self) -> String {
+        let fire_ts = self.last_run_at_ms.unwrap_or(self.next_run_at_ms);
+        match self.request.idempotency_key.as_deref() {
+            Some(user_key) => format!("cron:{}:{}:{}", self.id, fire_ts, user_key),
+            None => format!("cron:{}:{}", self.id, fire_ts),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -731,6 +745,45 @@ mod tests {
         assert_eq!(due.len(), 1);
         let updated = reg.get(job.id).unwrap();
         assert_eq!(updated.next_run_at_ms, now + 20_000);
+    }
+
+    #[test]
+    fn fire_idempotency_key_differs_per_firing_even_with_user_key() {
+        let dir = temp_dir().join(format!("bettermq-cron-key-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        let mut request = sample_request();
+        request.idempotency_key = Some("user-key".into());
+        let job = reg
+            .create_with_kind(ScheduleKind::Interval { every_seconds: 10 }, request)
+            .unwrap();
+
+        let first = reg.pop_due(job.created_at_ms + 10_000).pop().unwrap();
+        reg.commit_fire(first.id).unwrap();
+        let second = reg.pop_due(job.created_at_ms + 20_000).pop().unwrap();
+
+        let first_key = first.fire_idempotency_key();
+        let second_key = second.fire_idempotency_key();
+        assert_ne!(first_key, second_key);
+        assert!(first_key.starts_with(&format!("cron:{}:", job.id)));
+        assert!(first_key.ends_with(":user-key"));
+        assert!(second_key.ends_with(":user-key"));
+
+        let plain = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        let fired = reg
+            .pop_due(plain.created_at_ms + 10_000)
+            .into_iter()
+            .find(|due| due.id == plain.id)
+            .unwrap();
+        assert_eq!(
+            fired.fire_idempotency_key(),
+            format!("cron:{}:{}", plain.id, plain.created_at_ms + 10_000)
+        );
     }
 
     #[test]

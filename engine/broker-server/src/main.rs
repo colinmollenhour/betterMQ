@@ -1252,14 +1252,8 @@ fn spawn_schedule_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
             for job in state.crons.pop_due(now) {
                 tracing::info!(cron_id = %job.id, queue = %job.request.topic, "cron tick");
                 let mut req = job.request.clone();
-                // Idempotent publish key absorbs brief dual-hold / retry.
-                if req.idempotency_key.is_none() {
-                    req.idempotency_key = Some(format!(
-                        "cron:{}:{}",
-                        job.id,
-                        job.last_run_at_ms.unwrap_or(now)
-                    ));
-                }
+                // Per-firing key: a user key alone would dedupe every later tick.
+                req.idempotency_key = Some(job.fire_idempotency_key());
                 let ok = fire_scheduled_publish(&state, req).await;
                 if ok {
                     if let Err(e) = state.crons.commit_fire(job.id) {
