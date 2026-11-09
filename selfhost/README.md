@@ -53,6 +53,9 @@ Free self-hosted BetterMQ. **No config files required** — install the CLI or r
 Shared engine code lives in [`../engine/`](../engine/). This folder is the self-host product (Docker + docs only).
 For node loss, replacement, seed loss, drain/rebalance and controller changes,
 use the [HA operations runbook](OPERATIONS.md).
+For any internet-facing or multi-host deployment, follow the
+[TLS and encrypted peer transport guide](SECURITY.md). The binary itself does
+not provide TLS; HTTP peer examples assume an isolated local Docker network.
 
 ### Panel build contract
 
