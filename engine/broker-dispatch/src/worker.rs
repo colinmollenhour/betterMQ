@@ -161,6 +161,8 @@ pub enum DispatchError {
     RetryExhausted(String),
     #[error("delivery retry deferred for {retry_after_ms} ms: {reason}")]
     RetryDeferred { retry_after_ms: u64, reason: String },
+    #[error("message body is stored externally and was not loaded")]
+    PayloadUnresolved,
     #[error("{0}")]
     Failed(String),
 }
@@ -1592,6 +1594,11 @@ impl DispatchEngine {
         self.memory_guard.wait_below_limit().await;
         if msg.offset >= committed_hwm {
             return Err(DispatchError::Uncommitted);
+        }
+        // Blob-backed bodies arrive from the claim with an empty inline payload;
+        // the caller must load them first or the destination gets an empty body.
+        if msg.payload_ref_json.is_some() && msg.payload.is_empty() {
+            return Err(DispatchError::PayloadUnresolved);
         }
         let url = msg
             .destination_url

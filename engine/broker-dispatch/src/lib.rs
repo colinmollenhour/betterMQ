@@ -2,6 +2,7 @@
 
 mod egress;
 mod fairness;
+mod fleet;
 mod flow_control;
 mod hmac_sig;
 mod host_blocker;
@@ -17,6 +18,7 @@ pub use egress::{
     pin_destination_addr, validate_destination_url, validate_destination_url_resolved, EgressError,
 };
 pub use fairness::TenantFairQueue;
+pub use fleet::deliver_claimed_job;
 
 pub use flow_control::{FlowControlInfo, FlowController, FlowKey, GlobalParallelismInfo};
 pub use host_blocker::{HostBlocker, HostBlockerConfig};

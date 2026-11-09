@@ -241,6 +241,26 @@ fn cursor_key_for(msg: &StoredMessage) -> String {
     broker_partition::flow_lane_owner(msg).to_string()
 }
 
+/// Body bytes one claim carries; further jobs wait for the next claim (a
+/// claim always carries at least one job).
+const CLAIM_PAYLOAD_BUDGET: usize = 32 * 1024 * 1024;
+
+/// Load a blob-backed body into `msg` and verify it against its reference.
+fn resolve_payload(broker: &Broker, msg: &mut StoredMessage) -> Result<(), String> {
+    let Some(reference) = msg.payload_ref_json.as_deref() else {
+        return Ok(());
+    };
+    if !msg.payload.is_empty() {
+        return Ok(());
+    }
+    let reference: broker_payload::PayloadRef =
+        serde_json::from_str(reference).map_err(|e| format!("invalid payload reference: {e}"))?;
+    broker
+        .hydrate_message_payload(msg)
+        .map_err(|e| e.to_string())?;
+    verify_payload(&reference, &msg.payload)
+}
+
 /// Shared claim selection used by HTTP lease API and in-process dispatch.
 #[allow(clippy::too_many_arguments)]
 pub fn claim_from_broker(
@@ -258,6 +278,7 @@ pub fn claim_from_broker(
     let ttl = lease_ttl_ms.max(5_000);
     let now = Utc::now().timestamp_millis();
     let mut jobs = Vec::new();
+    let mut claimed_bytes = 0usize;
 
     let mut topics: HashSet<String> = HashSet::new();
     topics.insert(DIRECT_TOPIC.to_string());
@@ -329,6 +350,30 @@ pub fn claim_from_broker(
                     {
                         continue;
                     }
+                    if leases.is_offset_leased(&topic, partition, msg.offset) {
+                        continue;
+                    }
+                    // Blob-backed bodies are loaded and verified here, so a claim
+                    // is always deliverable as-is; an unreadable blob is never
+                    // leased (the message stays pending: no empty body, no DLQ).
+                    let mut msg = msg;
+                    if let Err(error) = resolve_payload(broker, &mut msg) {
+                        tracing::warn!(
+                            %error,
+                            %topic,
+                            partition,
+                            offset = msg.offset,
+                            message_id = %msg.id,
+                            "lease claim withheld: payload blob could not be loaded"
+                        );
+                        continue;
+                    }
+                    if !jobs.is_empty()
+                        && claimed_bytes.saturating_add(msg.payload.len()) > CLAIM_PAYLOAD_BUDGET
+                    {
+                        break 'outer;
+                    }
+                    let payload_len = msg.payload.len();
                     let lease_id = Uuid::new_v4();
                     let claimed = ClaimedJob {
                         lease_id,
@@ -345,6 +390,7 @@ pub fn claim_from_broker(
                     if !leases.try_insert(holder.to_string(), claimed.clone()) {
                         continue;
                     }
+                    claimed_bytes = claimed_bytes.saturating_add(payload_len);
                     jobs.push(claimed);
                 }
                 if !advanced || batch_len < PAGE {
@@ -378,6 +424,10 @@ impl LeaseClient {
         }
         let holder = std::env::var("BETTERMQ_FLEET_HOLDER")
             .unwrap_or_else(|_| format!("fleet-{}", Uuid::new_v4()));
+        Some(Self::new(broker_urls, holder))
+    }
+
+    pub fn new(broker_urls: Vec<String>, holder: String) -> Self {
         let timeout_secs = long_wait_tier_secs()
             .or_else(|| {
                 std::env::var("BETTERMQ_LONG_HTTP_TIMEOUT_SECS")
@@ -385,7 +435,7 @@ impl LeaseClient {
                     .and_then(|s| s.parse().ok())
             })
             .unwrap_or(30);
-        Some(Self {
+        Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(timeout_secs.max(30)))
                 .redirect(reqwest::redirect::Policy::none())
@@ -393,7 +443,7 @@ impl LeaseClient {
                 .expect("lease client"),
             broker_urls,
             holder,
-        })
+        }
     }
 
     pub fn holder(&self) -> &str {
@@ -513,6 +563,24 @@ impl LeaseClient {
         }
         Ok(())
     }
+}
+
+fn verify_payload(reference: &broker_payload::PayloadRef, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() as u64 != reference.size {
+        return Err(format!(
+            "payload size mismatch: got {} bytes, expected {}",
+            bytes.len(),
+            reference.size
+        ));
+    }
+    if let Some(expected) = reference.sha256.as_deref() {
+        use sha2::Digest;
+        let actual = hex::encode(sha2::Sha256::digest(bytes));
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err("payload checksum mismatch".into());
+        }
+    }
+    Ok(())
 }
 
 /// Fleet concurrency (jobs in flight per fleet process).

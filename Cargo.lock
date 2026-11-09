@@ -465,6 +465,7 @@ name = "broker-dispatch"
 version = "0.6.2"
 dependencies = [
  "broker-partition",
+ "broker-payload",
  "broker-proto",
  "broker-storage",
  "bytes",

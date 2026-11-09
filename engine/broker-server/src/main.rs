@@ -1634,61 +1634,7 @@ fn spawn_fleet_workers(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<(
                     }
                 };
                 for job in claimed.jobs {
-                    let Some(msg) = job.message.clone() else {
-                        let _ = client
-                            .fail(&broker, &job, "missing message envelope", true, 0)
-                            .await;
-                        continue;
-                    };
-                    let hb = client.clone();
-                    let broker_hb = broker.clone();
-                    let lease_id = job.lease_id;
-                    let heartbeat = tokio::spawn(async move {
-                        let mut tick = tokio::time::interval(Duration::from_secs(10));
-                        loop {
-                            tick.tick().await;
-                            if hb.heartbeat(&broker_hb, lease_id).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-                    match dispatch.push_http_only(&msg, job.committed_hwm).await {
-                        Ok(()) => {
-                            heartbeat.abort();
-                            if let Err(e) = client.complete(&broker, &job).await {
-                                tracing::warn!(error = %e, "fleet complete failed");
-                            }
-                        }
-                        Err(e) => {
-                            heartbeat.abort();
-                            let dead = matches!(
-                                &e,
-                                broker_dispatch::DispatchError::NoDestination
-                                    | broker_dispatch::DispatchError::Egress(_)
-                                    | broker_dispatch::DispatchError::NonRetryable(_)
-                                    | broker_dispatch::DispatchError::RetryExhausted(_)
-                            );
-                            let retry_after_ms =
-                                if let broker_dispatch::DispatchError::RetryDeferred {
-                                    retry_after_ms,
-                                    ..
-                                } = &e
-                                {
-                                    *retry_after_ms
-                                } else if matches!(&e, broker_dispatch::DispatchError::HostBlocked)
-                                {
-                                    30_000
-                                } else if matches!(&e, broker_dispatch::DispatchError::Uncommitted)
-                                {
-                                    250
-                                } else {
-                                    1_000
-                                };
-                            let _ = client
-                                .fail(&broker, &job, &e.to_string(), dead, retry_after_ms)
-                                .await;
-                        }
-                    }
+                    broker_dispatch::deliver_claimed_job(&dispatch, &client, &broker, job).await;
                 }
             });
         }
