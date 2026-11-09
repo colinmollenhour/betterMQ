@@ -1,6 +1,6 @@
 import { reactive } from "vue";
 import { isExternalAuth, isStandalone } from "@/lib/config";
-import { adminUrl, apiGet, apiPost, isAuthRejection, onAuthRejected, publicUrl, setBrokerAccessGuard } from "@/lib/api";
+import { ApiError, adminUrl, apiGet, apiPost, isAuthRejection, onAuthRejected, publicUrl, setBrokerAccessGuard } from "@/lib/api";
 import { isLocalCell } from "@/lib/targets";
 import { refreshFlows, refreshGroups, refreshQueues } from "@/lib/catalog";
 import {
@@ -69,6 +69,8 @@ export const session = reactive({
   auth: null as AuthConfig | null,
   health: "…",
   healthOk: false,
+  ready: null as boolean | null,
+  readyAt: 0,
   clusterLabel: "—",
   cluster: null as ClusterStatus | null,
   cells: [] as CellRecord[],
@@ -229,11 +231,11 @@ export function startApp() {
     void refreshGroups().catch(() => {});
     void refreshFlows().catch(() => {});
   }
-  void pollHealth();
+  void pollHealth().catch(() => {});
   void pollCluster().catch(() => {});
   if (healthTimer) clearInterval(healthTimer);
   if (clusterTimer) clearInterval(clusterTimer);
-  healthTimer = setInterval(() => void pollHealth(), 15000);
+  healthTimer = setInterval(() => void pollHealth().catch(() => {}), 15000);
   clusterTimer = setInterval(() => void pollCluster().catch(() => {}), 5000);
 }
 
@@ -253,8 +255,9 @@ export async function refreshCells() {
 }
 
 export async function pollHealth() {
-  try {
-    const r = await fetch(publicUrl("/healthz"));
+  const live = (async () => {
+    try {
+    const r = await fetch(publicUrl("/healthz"), { signal: AbortSignal.timeout(5000) });
     session.healthOk = r.ok;
     const j = (await r.json().catch(() => ({}))) as { status?: string; version?: string };
     session.health = j.version || (r.ok ? "ok" : "down");
@@ -262,6 +265,24 @@ export async function pollHealth() {
     session.healthOk = false;
     session.health = "down";
   }
+  })();
+  const readiness = (async () => {
+    try {
+      const result = await apiGet<{ ready?: boolean }>(isStandalone() ? adminUrl("/readyz") : publicUrl("/readyz"), { signal: AbortSignal.timeout(5000) });
+      session.ready = typeof result.ready === "boolean" ? result.ready : null;
+      session.readyAt = Date.now();
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 503 && error.body && typeof error.body === "object" && "ready" in error.body && error.body.ready === false) {
+        session.ready = false;
+        session.readyAt = Date.now();
+        return;
+      }
+      session.ready = null;
+      session.readyAt = 0;
+      throw error;
+    }
+  })();
+  await Promise.all([live, readiness]);
 }
 
 export async function pollCluster() {

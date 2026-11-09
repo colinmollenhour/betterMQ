@@ -79,8 +79,8 @@ async function request<T>(url: string, init: RequestInit = {}): Promise<T> {
   return body as T;
 }
 
-export function apiGet<T>(url: string): Promise<T> {
-  return request<T>(url);
+export function apiGet<T>(url: string, init?: RequestInit): Promise<T> {
+  return request<T>(url, init);
 }
 
 export function apiPost<T>(url: string, data?: unknown): Promise<T> {

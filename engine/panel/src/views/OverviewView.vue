@@ -9,12 +9,15 @@ import SecretInput from "@/components/form/SecretInput.vue";
 import { prepareDestination } from "@/lib/destination";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useActionStatus } from "@/composables/useActionStatus";
+import { useReadiness } from "@/composables/useReadiness";
+import { memberHealthLabel } from "@/lib/health";
 import { apiPost, publicUrl } from "@/lib/api";
 import { catalog, refreshFlows, refreshGroups, refreshQueues } from "@/lib/catalog";
 import { mergeOutbound, parseBody } from "@/lib/payload";
 import { pollCluster, pollHealth, session } from "@/lib/session";
 
 const publishStatus = useActionStatus();
+const readiness = useReadiness();
 
 const kpis = reactive({
   queues: "—",
@@ -93,7 +96,7 @@ const groupCount = computed(() => catalog.loaded.groups && !catalog.errors.group
       <Card size="sm">
         <CardHeader class="pb-1">
           <CardDescription>Status</CardDescription>
-          <CardTitle class="font-mono text-lg">{{ session.health }}</CardTitle>
+          <CardTitle class="font-mono text-lg">{{ readiness }}</CardTitle>
         </CardHeader>
       </Card>
       <Card size="sm">
@@ -139,7 +142,7 @@ const groupCount = computed(() => catalog.loaded.groups && !catalog.errors.group
           <TableBody>
             <TableRow v-for="n in clusterNodes()" :key="n.id || n.addr">
               <TableCell class="font-mono text-xs">{{ n.name || n.addr }}</TableCell>
-              <TableCell>{{ n.healthy === false ? "down" : "ok" }}</TableCell>
+              <TableCell>{{ memberHealthLabel(n.healthy) }}</TableCell>
               <TableCell class="font-mono text-xs">{{ (n.led_shards || []).join(", ") || "—" }}</TableCell>
             </TableRow>
           </TableBody>

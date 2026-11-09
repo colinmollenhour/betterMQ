@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
+import { useTimestamp } from "@vueuse/core";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -39,6 +40,7 @@ import { useActionStatus } from "@/composables/useActionStatus";
 import { errText } from "@/lib/payload";
 import { canRemoveNode } from "@/lib/targets";
 import { isStandalone } from "@/lib/config";
+import { memberHealthLabel, readinessLabel } from "@/lib/health";
 import { cellCredentialError } from "@/lib/cellCredentials";
 import { localBrokerSelected, refreshCells, selectedCell, session, type CellMember, type CellRecord } from "@/lib/session";
 
@@ -49,7 +51,7 @@ type NodeRow = {
   name: string;
   role: string;
   addr: string;
-  healthy: boolean;
+  healthy?: boolean;
   self: boolean;
   cellId: string;
   cellLabel: string;
@@ -72,6 +74,8 @@ const selectedNodeKey = ref("");
 const nodesByCell = reactive<Record<string, AdminNode[]>>({});
 const shardsByCell = reactive<Record<string, AdminShard[]>>({});
 const clusterByCell = reactive<Record<string, AdminCluster>>({});
+const federationObservedAt = ref(0);
+const now = useTimestamp({ interval: 1000 });
 const restartMsg = ref("");
 const rfMsg = ref("");
 const infraStatus = ref<Record<string, unknown> | null>(null);
@@ -173,7 +177,7 @@ const nodeRows = computed<NodeRow[]>(() => {
         name: n.name || shortId(n.id) || n.addr || "broker",
         role: "broker",
         addr: n.addr || "",
-        healthy: n.alive ?? n.healthy ?? true,
+        healthy: now.value - federationObservedAt.value > 30000 ? undefined : n.alive ?? n.healthy,
         self: Boolean(n.self ?? n.is_self),
         cellId: cell.id,
         cellLabel: cell.label || cell.id,
@@ -188,7 +192,7 @@ const nodeRows = computed<NodeRow[]>(() => {
         name: m.name || m.profile,
         role: m.profile,
         addr: m.reachUrl,
-        healthy: true,
+        healthy: undefined,
         self: false,
         cellId: cell.id,
         cellLabel: cell.label || cell.id,
@@ -244,6 +248,7 @@ async function loadFed() {
     for (const row of shards.ok || []) shardsByCell[row.cell] = row.data.shards || [];
     for (const key of Object.keys(clusterByCell)) delete clusterByCell[key];
     for (const row of cluster.ok || []) clusterByCell[row.cell] = row.data;
+    federationObservedAt.value = Date.now();
     const failed = [...(nodes.failed || []), ...(shards.failed || []), ...(cluster.failed || [])];
     if (failed.length) fedStatus.fail(`Federated query failed: ${[...new Set(failed.map((failure) => `${failure.cell} — ${failure.error}`))].join("; ")}`);
     const cell = selectedCell();
@@ -515,9 +520,12 @@ function openAddNode() {
 
 <template>
   <div class="space-y-4">
-    <div>
-      <h1 class="text-lg font-semibold tracking-tight">Infrastructure</h1>
-      <p class="text-sm text-muted-foreground">Cells, brokers, storage, and replication</p>
+    <div class="flex items-center justify-between gap-2">
+      <div>
+        <h1 class="text-lg font-semibold tracking-tight">Infrastructure</h1>
+        <p class="text-sm text-muted-foreground">Cells, brokers, storage, and replication</p>
+      </div>
+      <Button size="sm" variant="outline" @click="load">Refresh infrastructure</Button>
     </div>
 
     <Alert v-if="restartMsg">
@@ -608,8 +616,8 @@ function openAddNode() {
                     </TableCell>
                     <TableCell class="capitalize">{{ row.role }}</TableCell>
                     <TableCell>
-                      <Badge :variant="row.healthy ? 'outline' : 'destructive'">
-                        {{ row.healthy ? "Healthy" : "Down" }}
+                      <Badge :variant="row.healthy === false ? 'destructive' : 'outline'">
+                        {{ memberHealthLabel(row.healthy) }}
                       </Badge>
                     </TableCell>
                     <TableCell class="max-w-[16rem] truncate font-mono text-xs">{{ row.addr || "—" }}</TableCell>
@@ -660,8 +668,8 @@ function openAddNode() {
                       <TableCell class="capitalize">{{ row.role }}</TableCell>
                       <TableCell>{{ row.cellLabel }}</TableCell>
                       <TableCell>
-                        <Badge :variant="row.healthy ? 'outline' : 'destructive'">
-                          {{ row.healthy ? "Healthy" : "Down" }}
+                        <Badge :variant="row.healthy === false ? 'destructive' : 'outline'">
+                          {{ memberHealthLabel(row.healthy) }}
                         </Badge>
                       </TableCell>
                     </TableRow>
@@ -682,7 +690,7 @@ function openAddNode() {
                   </div>
                   <div>
                     <p class="text-xs text-muted-foreground">Health</p>
-                    <p>{{ selectedRow.healthy ? "Healthy" : "Down" }}</p>
+                    <p>{{ memberHealthLabel(selectedRow.healthy) }}</p>
                   </div>
                   <div v-if="selectedRow.broker?.id">
                     <p class="text-xs text-muted-foreground">Node ID</p>
@@ -768,6 +776,7 @@ function openAddNode() {
                 Status: {{ session.clusterLabel }}
                 <span v-if="currentCluster">
                   · {{ currentCluster.nodeCount || 0 }} nodes · RF {{ currentCluster.replicationFactor || "—" }}
+                  · {{ readinessLabel(currentCluster.ready ?? null, federationObservedAt, now) }}
                 </span>
               </p>
               <div v-if="localBrokerSelected()" class="flex flex-wrap items-center gap-2">

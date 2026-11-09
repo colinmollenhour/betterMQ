@@ -85,3 +85,14 @@ it("centrally rejects revoked credentials during an active session and stops pol
   expect(session.token).toBe("");
   expect(vi.getTimerCount()).toBe(0);
 });
+
+it("reports lost quorum as not ready even when liveness succeeds", async () => {
+  window.__BETTERMQ_PANEL_MODE__ = "embedded";
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => String(url).endsWith("/healthz")
+    ? new Response(JSON.stringify({ status: "ok", version: "1.2.3" }))
+    : new Response(JSON.stringify({ ready: false, cluster_healthy: false }), { status: 503 })));
+  const { pollHealth, session } = await import("./session");
+  await pollHealth();
+  expect(session.healthOk).toBe(true);
+  expect(session.ready).toBe(false);
+});
