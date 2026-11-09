@@ -240,21 +240,22 @@ impl FlowController {
     }
 
     pub async fn get(&self, endpoint_id: Uuid, flow_key: &str) -> Option<FlowControlInfo> {
-        let lanes = self.lanes.lock().await;
-        let lane = lanes.get(&FlowKey {
-            endpoint_id,
-            flow_key: flow_key.to_string(),
-        })?;
-        Some(self.info_from_lane(lane).await)
+        let lane = self.lane_ref(endpoint_id, flow_key).await?;
+        Some(self.info_from_lane(&lane).await)
     }
 
     pub async fn list_keys(&self, endpoint_id: Uuid) -> Vec<FlowControlInfo> {
-        let lanes = self.lanes.lock().await;
+        let lanes: Vec<_> = self
+            .lanes
+            .lock()
+            .await
+            .iter()
+            .filter(|(key, _)| key.endpoint_id == endpoint_id)
+            .map(|(_, lane)| lane.clone())
+            .collect();
         let mut out = Vec::new();
-        for (key, lane) in lanes.iter() {
-            if key.endpoint_id == endpoint_id {
-                out.push(self.info_from_lane(lane).await);
-            }
+        for lane in lanes {
+            out.push(self.info_from_lane(&lane).await);
         }
         out
     }
@@ -267,9 +268,9 @@ impl FlowController {
     }
 
     pub async fn pending_count(&self) -> usize {
-        let lanes = self.lanes.lock().await;
+        let lanes: Vec<_> = self.lanes.lock().await.values().cloned().collect();
         let mut pending = 0usize;
-        for lane in lanes.values() {
+        for lane in lanes {
             pending = pending
                 .saturating_add(lane.waitlist.lock().await.len())
                 .saturating_add(lane.active.load(AtomicOrdering::Acquire) as usize);
@@ -326,6 +327,7 @@ impl FlowController {
             if period_secs.is_some() {
                 pin.period_secs = period_secs;
             }
+            drop(pin);
             self.apply_pins(&lane).await;
             lane.notify.notify_one();
             return true;
@@ -365,9 +367,10 @@ impl FlowController {
     }
 
     async fn info_from_lane(&self, lane: &FlowLane) -> FlowControlInfo {
+        // Same lock order as apply_pins: pinned -> limits -> rate.
+        let pin = lane.pinned.lock().await;
         let lim = lane.limits.lock().await;
         let rate = lane.rate.lock().await;
-        let pin = lane.pinned.lock().await;
         FlowControlInfo {
             flow_key: lim.key.clone(),
             endpoint_id: Uuid::nil(), // filled by caller if needed
@@ -396,7 +399,8 @@ impl FlowController {
 
     async fn get_or_create_lane(&self, key: FlowKey, limits: ResolvedFlow) -> Arc<FlowLane> {
         let mut map = self.lanes.lock().await;
-        if let Some(existing) = map.get(&key) {
+        if let Some(existing) = map.get(&key).cloned() {
+            drop(map);
             // Update limits in place — never replace the lane (that orphans the waitlist
             // and leaks a drainer task parked on the old Notify).
             {
@@ -411,7 +415,8 @@ impl FlowController {
                 rate.period_secs = limits.period_secs.max(1);
             }
             existing.notify.notify_one();
-            return existing.clone();
+            self.apply_pins(&existing).await;
+            return existing;
         }
         let lane = Arc::new(FlowLane {
             limits: Mutex::new(limits.clone()),
@@ -539,4 +544,90 @@ fn spawn_lane_drainer(
         }
     });
     drainers.lock().push(handle);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory_guard::MemoryGuardConfig;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn operator_controls_do_not_deadlock() {
+        let controller = FlowController::new(
+            None,
+            Arc::new(MemoryGuard::new(MemoryGuardConfig::default())),
+        );
+        let owner = Uuid::new_v4();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            controller
+                .ensure_lane(
+                    owner,
+                    "key",
+                    ResolvedFlow {
+                        key: "key".into(),
+                        parallelism: 1,
+                        rate: 0,
+                        period_secs: 1,
+                    },
+                )
+                .await;
+            assert!(
+                controller
+                    .pin(owner, "key", Some(2), Some(3), Some(4))
+                    .await
+            );
+            let info = controller.get(owner, "key").await.unwrap();
+            assert_eq!(info.parallelism_max, 2);
+            assert_eq!(info.rate_max, 3);
+            assert_eq!(controller.list_keys(owner).await.len(), 1);
+            assert!(controller.unpin(owner, "key", true, true).await);
+            assert!(
+                !controller
+                    .get(owner, "key")
+                    .await
+                    .unwrap()
+                    .pinned_parallelism
+            );
+            assert!(controller.pause(owner, "key").await);
+            assert!(controller.resume(owner, "key").await);
+        })
+        .await
+        .expect("operator controls must finish");
+        for task in controller.take_drainer_tasks() {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn inspection_does_not_hold_global_map_while_waiting_on_lane() {
+        let controller = FlowController::new(
+            None,
+            Arc::new(MemoryGuard::new(MemoryGuardConfig::default())),
+        );
+        let owner = Uuid::new_v4();
+        let limits = ResolvedFlow {
+            key: "a".into(),
+            parallelism: 1,
+            rate: 0,
+            period_secs: 1,
+        };
+        controller.ensure_lane(owner, "a", limits.clone()).await;
+        let lane = controller.lane_ref(owner, "a").await.unwrap();
+        let guard = lane.pinned.lock().await;
+        let other = controller.clone();
+        let inspection = tokio::spawn(async move { other.get(owner, "a").await });
+        tokio::task::yield_now().await;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            controller.ensure_lane(owner, "b", limits),
+        )
+        .await
+        .expect("unrelated lanes must remain available");
+        drop(guard);
+        inspection.await.unwrap();
+        for task in controller.take_drainer_tasks() {
+            task.abort();
+        }
+    }
 }
