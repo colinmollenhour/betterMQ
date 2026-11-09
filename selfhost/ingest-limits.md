@@ -20,3 +20,8 @@ releases the reservation. Bodies exceeding their reserved size return 413.
 The existing `BETTERMQ_INGEST_MAX_IN_FLIGHT`, `BETTERMQ_INGEST_MAX_QUEUED_BYTES`,
 `BETTERMQ_INGEST_MAX_TENANT_RECORDS` and `BETTERMQ_INGEST_MAX_TENANT_BYTES` settings
 bound concurrent uploads as well as canonical ingestion.
+
+Single-message failures increment `bettermq_ingest_rejected_total` exactly once
+at the canonical single-record boundary, including validation, admission and
+replication errors. `bettermq_ingest_single_rejected_total{reason="..."}` provides
+a bounded reason breakdown without request identifiers or free-form messages.

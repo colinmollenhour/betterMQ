@@ -22,10 +22,10 @@ pub(crate) async fn publish(
     if state.uses_cloud_auth() {
         if let Some(plan) = plan.as_ref().map(|e| &e.0) {
             if req.payload.len() as u64 > plan.max_message_bytes {
-                return Err(ApiError::BadRequest(format!(
+                return crate::metrics::record_single_outcome(Err(ApiError::BadRequest(format!(
                     "message exceeds plan limit of {} bytes",
                     plan.max_message_bytes
-                )));
+                ))));
             }
         }
     }

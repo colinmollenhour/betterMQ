@@ -6,6 +6,18 @@ use std::time::Duration;
 static ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static DUPLICATE: AtomicU64 = AtomicU64::new(0);
 static REJECTED: AtomicU64 = AtomicU64::new(0);
+const REJECTION_REASONS: [&str; 9] = [
+    "invalid_request",
+    "unauthorized",
+    "not_found",
+    "conflict",
+    "unavailable",
+    "replication_failed",
+    "saturated",
+    "tenant_saturated",
+    "broker_error",
+];
+static REJECTIONS_BY_REASON: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 static ACK_COUNT: AtomicU64 = AtomicU64::new(0);
 static ACK_SUM_US: AtomicU64 = AtomicU64::new(0);
 /// Non-cumulative bucket storage for 1, 2, 5, 10, 20, 50, 100, 250, 500, 1000 ms.
@@ -37,6 +49,28 @@ pub fn record_duplicate() {
 
 pub fn record_rejected() {
     REJECTED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_single_outcome<T>(
+    result: Result<T, crate::routes::ApiError>,
+) -> Result<T, crate::routes::ApiError> {
+    if let Err(error) = &result {
+        use crate::routes::ApiError;
+        let index = match error {
+            ApiError::BadRequest(_) => 0,
+            ApiError::Unauthorized(_) => 1,
+            ApiError::NotFound(_) => 2,
+            ApiError::Conflict(_) => 3,
+            ApiError::Unavailable(_) => 4,
+            ApiError::ReplicationFailed(_) => 5,
+            ApiError::Overloaded { .. } => 6,
+            ApiError::TooManyRequests { .. } => 7,
+            ApiError::Broker(_) => 8,
+        };
+        record_rejected();
+        REJECTIONS_BY_REASON[index].fetch_add(1, Ordering::Relaxed);
+    }
+    result
 }
 
 pub fn record_ack_latency(d: Duration) {
@@ -99,6 +133,13 @@ pub fn prometheus_text() -> String {
         snapshot.rejected
     ));
     out.push_str("# HELP bettermq_ingest_stage_records_total Records observed at ingest stages\n");
+    out.push_str("# HELP bettermq_ingest_single_rejected_total Single-record rejections by bounded reason\n# TYPE bettermq_ingest_single_rejected_total counter\n");
+    for (reason, count) in REJECTION_REASONS.iter().zip(&REJECTIONS_BY_REASON) {
+        out.push_str(&format!(
+            "bettermq_ingest_single_rejected_total{{reason=\"{reason}\"}} {}\n",
+            count.load(Ordering::Relaxed)
+        ));
+    }
     out.push_str("# TYPE bettermq_ingest_stage_records_total counter\n");
     out.push_str(&format!(
         "bettermq_ingest_stage_records_total{{stage=\"accepted\"}} {}\n",
@@ -770,6 +811,30 @@ fn append_histogram<const N: usize>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn single_failure_accounting_covers_admission_and_replication() {
+        use super::*;
+        use crate::routes::ApiError;
+        for (index, error) in [
+            (
+                6,
+                ApiError::Overloaded {
+                    retry_after_ms: 1000,
+                    message: "busy".into(),
+                },
+            ),
+            (5, ApiError::ReplicationFailed("quorum".into())),
+        ] {
+            let before = REJECTIONS_BY_REASON[index].load(Ordering::Relaxed);
+            let total = snapshot().rejected;
+            assert!(record_single_outcome::<()>(Err(error)).is_err());
+            assert!(REJECTIONS_BY_REASON[index].load(Ordering::Relaxed) > before);
+            assert!(snapshot().rejected > total);
+        }
+        let before = REJECTIONS_BY_REASON[5].load(Ordering::Relaxed);
+        assert!(record_single_outcome(Ok::<_, ApiError>(())).is_ok());
+        assert_eq!(REJECTIONS_BY_REASON[5].load(Ordering::Relaxed), before);
+    }
     use super::*;
 
     #[test]

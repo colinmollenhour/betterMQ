@@ -227,8 +227,12 @@ pub async fn submit_one(
     req: PublishRequest,
     meter: Option<crate::metering::IngestMeter>,
 ) -> Result<PublishResponse, ApiError> {
-    validate_publish_destinations_pub(&req)?;
-    ingest_one_validated(state, req, meter).await
+    let result = async {
+        validate_publish_destinations_pub(&req)?;
+        ingest_one_validated(state, req, meter).await
+    }
+    .await;
+    crate::metrics::record_single_outcome(result)
 }
 
 #[derive(Debug)]
