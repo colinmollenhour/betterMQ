@@ -490,6 +490,20 @@ fn fanout_max_attempts() -> u32 {
         .max(1)
 }
 
+fn fanout_expanded_bytes(members: usize, request_bytes: usize) -> Result<usize, ApiError> {
+    // Bound metadata, journal serialization, and transient request copies too.
+    let bytes = request_bytes
+        .checked_add(4096)
+        .and_then(|bytes| bytes.checked_mul(members))
+        .and_then(|bytes| bytes.checked_mul(4));
+    if members > 1000 || bytes.is_none_or(|bytes| bytes > 64 * 1024 * 1024) {
+        return Err(ApiError::BadRequest(
+            "fan-out exceeds 1000 members or 64 MiB expanded memory budget".into(),
+        ));
+    }
+    Ok(bytes.expect("checked above"))
+}
+
 async fn publish_to_group(
     state: Arc<AppState>,
     ingest: Option<axum::extract::Extension<crate::metering::IngestAuth>>,
@@ -497,7 +511,7 @@ async fn publish_to_group(
         axum::extract::Extension<broker_control_plane::PlanLimits>,
     >,
     group_id: Uuid,
-    base: PublishRequest,
+    mut base: PublishRequest,
 ) -> Result<(StatusCode, Json<EnqueueResponse>), ApiError> {
     #[cfg(feature = "cloud")]
     let fanout_tenant = ingest
@@ -523,6 +537,7 @@ async fn publish_to_group(
         .map(|entry| serde_json::from_str(&entry.payload_json))
         .transpose()
         .map_err(|error| fanout_store_error(crate::fanout::FanoutStoreError::Serde(error)))?;
+    let mut expansion_permit = None;
     let command = if let Some(existing) =
         replicated_existing.or(fanout_store.get(fanout_id).map_err(fanout_store_error)?)
     {
@@ -566,6 +581,17 @@ async fn publish_to_group(
             }
         }
 
+        // Reserve before materializing requests or serializing the outbox.
+        let request_bytes = serde_json::to_vec(&base)
+            .map_err(|error| fanout_store_error(crate::fanout::FanoutStoreError::Serde(error)))?
+            .len();
+        let expanded_bytes = fanout_expanded_bytes(members.len(), request_bytes)?;
+        expansion_permit = Some(crate::admission::check_admission(
+            &state,
+            ingest.as_ref().map(|auth| auth.0.tenant_id),
+            expanded_bytes,
+        )?);
+        let shared_payload = Arc::new(std::mem::take(&mut base.payload));
         let members = members
             .into_iter()
             .map(|member| {
@@ -579,8 +605,11 @@ async fn publish_to_group(
                 crate::fanout::FanoutMemberCommand { member_id, request }
             })
             .collect();
-        let acceptance_bytes = serde_json::to_vec(&(fanout_tenant.as_str(), group_id, &members))
-            .map_err(|error| fanout_store_error(crate::fanout::FanoutStoreError::Serde(error)))?;
+        let acceptance_bytes =
+            serde_json::to_vec(&(fanout_tenant.as_str(), group_id, &shared_payload, &members))
+                .map_err(|error| {
+                    fanout_store_error(crate::fanout::FanoutStoreError::Serde(error))
+                })?;
         let acceptance_hash = Uuid::new_v5(&Uuid::NAMESPACE_OID, &acceptance_bytes).to_string();
         let now_ms = chrono::Utc::now().timestamp_millis();
         crate::fanout::FanoutCommand {
@@ -590,6 +619,7 @@ async fn publish_to_group(
             group_id,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
+            shared_payload: Some(shared_payload),
             members,
             outcomes: std::collections::HashMap::new(),
             completed: false,
@@ -607,10 +637,11 @@ async fn publish_to_group(
         .and_then(|command| crate::fanout::try_begin_execution(command.id));
     let can_execute = execution_guard.is_some();
     let command = claimed.unwrap_or(command);
+    drop(expansion_permit);
 
     let mut deliveries = Vec::new();
-    let mut joins = tokio::task::JoinSet::new();
-    for member in command.members.clone() {
+    let mut attempts = Vec::new();
+    for member in &command.members {
         let member_id = member.member_id;
         if let Some(outcome) = command.outcomes.get(&member_id) {
             if let Some(response) = &outcome.response {
@@ -646,11 +677,12 @@ async fn publish_to_group(
             });
             continue;
         }
-        let member_req = command.request_for_attempt(&member);
+        let command = &command;
         let state = state.clone();
         #[cfg(feature = "cloud")]
         let plan = plan.clone();
-        joins.spawn(async move {
+        attempts.push(async move {
+            let member_req = command.request_for_attempt(member);
             #[cfg(feature = "cloud")]
             let result = publish(State(state), ingest, plan, Json(member_req))
                 .await
@@ -662,9 +694,9 @@ async fn publish_to_group(
             (member_id, result)
         });
     }
-    while let Some(joined) = joins.join_next().await {
-        let (member_id, result) =
-            joined.map_err(|e| ApiError::BadRequest(format!("fanout join: {e}")))?;
+    use futures_util::StreamExt;
+    let mut attempts = futures_util::stream::iter(attempts).buffer_unordered(8);
+    while let Some((member_id, result)) = attempts.next().await {
         match result {
             Ok(inner) => {
                 let attempts = command
@@ -909,7 +941,7 @@ async fn replay_fanout_command(
     command: crate::fanout::FanoutCommand,
 ) -> Result<(), ApiError> {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    for member in command.members.clone() {
+    for member in &command.members {
         let existing = command.outcomes.get(&member.member_id);
         if existing.is_some_and(|outcome| outcome.response.is_some()) {
             continue;
@@ -927,33 +959,29 @@ async fn replay_fanout_command(
             .map(|outcome| outcome.attempts)
             .unwrap_or(0)
             .saturating_add(1);
-        let outcome = match crate::ingest::submit_one(
-            state,
-            command.request_for_attempt(&member),
-            None,
-        )
-        .await
-        {
-            Ok(response) => {
-                crate::cluster::enqueue_dispatch_after_publish(state, &response);
-                crate::fanout::FanoutMemberOutcome {
-                    response: Some(response),
-                    error: None,
-                    attempts,
-                    next_attempt_at_ms: None,
-                    terminal: false,
+        let outcome =
+            match crate::ingest::submit_one(state, command.request_for_attempt(member), None).await
+            {
+                Ok(response) => {
+                    crate::cluster::enqueue_dispatch_after_publish(state, &response);
+                    crate::fanout::FanoutMemberOutcome {
+                        response: Some(response),
+                        error: None,
+                        attempts,
+                        next_attempt_at_ms: None,
+                        terminal: false,
+                    }
                 }
-            }
-            Err(error) => crate::fanout::FanoutMemberOutcome {
-                response: None,
-                error: Some(format!("{error:?}")),
-                attempts,
-                next_attempt_at_ms: Some(now_ms.saturating_add(
-                    1_000i64.saturating_mul(1i64 << attempts.saturating_sub(1).min(6)),
-                )),
-                terminal: attempts >= fanout_max_attempts(),
-            },
-        };
+                Err(error) => crate::fanout::FanoutMemberOutcome {
+                    response: None,
+                    error: Some(format!("{error:?}")),
+                    attempts,
+                    next_attempt_at_ms: Some(now_ms.saturating_add(
+                        1_000i64.saturating_mul(1i64 << attempts.saturating_sub(1).min(6)),
+                    )),
+                    terminal: attempts >= fanout_max_attempts(),
+                },
+            };
         let updated = store
             .record_result(command.id, member.member_id, outcome)
             .map_err(fanout_store_error)?;
@@ -976,6 +1004,14 @@ mod fanout_tests {
     use broker_dispatch::{DispatchConfig, DispatchEngine, LeaseTable};
     use broker_partition::{Broker, BrokerConfig};
     use broker_schedule::{CronRegistry, ScheduleQueue};
+
+    #[test]
+    fn expansion_is_bounded_before_request_materialization() {
+        assert!(fanout_expanded_bytes(100, 4 * 1024 * 1024).is_err());
+        assert!(fanout_expanded_bytes(1001, 0).is_err());
+        assert!(fanout_expanded_bytes(2, usize::MAX).is_err());
+        assert!(fanout_expanded_bytes(2, 100).is_ok());
+    }
 
     #[tokio::test]
     async fn group_publish_returns_explicit_partial_member_results() {
@@ -1063,6 +1099,19 @@ mod fanout_tests {
 
         // Simulate recovery after durable acceptance but before member scheduling.
         let store = crate::fanout::FanoutStore::open(dir.path()).unwrap();
+        let stored = store.get(response.fanout_id.unwrap()).unwrap().unwrap();
+        assert_eq!(stored.shared_payload.as_ref().unwrap().as_str(), "body");
+        assert!(stored
+            .members
+            .iter()
+            .all(|member| member.request.payload.is_empty()));
+        let encoded = serde_json::to_value(&stored).unwrap();
+        // Metadata-only requests also make old binaries fail closed instead of
+        // ignoring shared_payload and silently replaying empty message bodies.
+        assert!(encoded["members"][0]["request"].get("payload").is_none());
+        let old_reader =
+            serde_json::from_value::<PublishRequest>(encoded["members"][0]["request"].clone());
+        assert!(old_reader.is_err());
         let member = state
             .broker
             .active_group_members(group.id)
@@ -1083,6 +1132,7 @@ mod fanout_tests {
             group_id: group.id,
             created_at_ms: accepted_at,
             updated_at_ms: accepted_at,
+            shared_payload: None,
             members: vec![crate::fanout::FanoutMemberCommand {
                 member_id: member.id,
                 request,
@@ -1092,6 +1142,9 @@ mod fanout_tests {
             completed_at_ms: None,
         };
         store.accept(command.clone()).unwrap();
+        // Reopen the legacy shape (without shared_payload) before replay.
+        let store = crate::fanout::FanoutStore::open(dir.path()).unwrap();
+        let command = store.get(command.id).unwrap().unwrap();
         replay_fanout_command(&state, &store, command.clone())
             .await
             .unwrap();

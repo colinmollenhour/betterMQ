@@ -33,7 +33,37 @@ pub enum FanoutStoreError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FanoutMemberCommand {
     pub member_id: Uuid,
+    #[serde(with = "member_request")]
     pub request: PublishRequest,
+}
+
+mod member_request {
+    use super::PublishRequest;
+    use serde::{Deserialize, Serialize};
+
+    pub fn serialize<S: serde::Serializer>(
+        request: &PublishRequest,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut value = serde_json::to_value(request).map_err(serde::ser::Error::custom)?;
+        if request.payload.is_empty() {
+            value
+                .as_object_mut()
+                .expect("request object")
+                .remove("payload");
+        }
+        value.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<PublishRequest, D::Error> {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(object) = value.as_object_mut() {
+            object.entry("payload").or_insert_with(|| "".into());
+        }
+        serde_json::from_value(value).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +90,9 @@ pub struct FanoutCommand {
     pub created_at_ms: i64,
     #[serde(default)]
     pub updated_at_ms: i64,
+    /// New commands keep one body; absent on legacy per-member commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_payload: Option<std::sync::Arc<String>>,
     pub members: Vec<FanoutMemberCommand>,
     #[serde(default)]
     pub outcomes: HashMap<Uuid, FanoutMemberOutcome>,
@@ -73,6 +106,9 @@ impl FanoutCommand {
     /// The accepted timestamp and original delay form a durable absolute deadline.
     pub(crate) fn request_for_attempt(&self, member: &FanoutMemberCommand) -> PublishRequest {
         let mut request = member.request.clone();
+        if let Some(payload) = &self.shared_payload {
+            request.payload = payload.as_ref().clone();
+        }
         request.delay_ms = request.delay_ms.map(|delay| {
             let deadline = self
                 .created_at_ms
@@ -658,6 +694,7 @@ mod tests {
             group_id: Uuid::new_v4(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            shared_payload: None,
             members: vec![FanoutMemberCommand {
                 member_id,
                 request: request(),
@@ -748,6 +785,7 @@ mod tests {
             group_id: Uuid::new_v4(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            shared_payload: None,
             members: vec![FanoutMemberCommand {
                 member_id,
                 request: request(),

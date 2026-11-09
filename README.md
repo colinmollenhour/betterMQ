@@ -34,6 +34,11 @@ Windows: `powershell -ExecutionPolicy Bypass -c "irm https://raw.githubuserconte
 
 Delivery is **at-least-once**. Handlers should be idempotent.
 
+Group publishes admit at most 1,000 members and a conservative 64 MiB expanded
+memory budget (four times serialized request bytes plus 4 KiB per member).
+The outbox stores the body once, executes at most eight member attempts at a time,
+and preserves the original delivery deadline across retries and restarts.
+
 ---
 
 ## Quick start
