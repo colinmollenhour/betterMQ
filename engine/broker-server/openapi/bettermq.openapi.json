@@ -4439,7 +4439,8 @@
           "Infra"
         ],
         "operationId": "infraUpdateStorage",
-        "summary": "Update storage mode (local / slate)",
+        "summary": "Update same-location storage credentials",
+        "description": "Live backend or location changes (endpoint, WAL/payload bucket, region) are refused. Stop ingestion and use a verified offline migration or a new deployment; this API never migrates messages. Credential changes on the same store require restart.",
         "requestBody": {
           "required": true,
           "content": {
@@ -4460,6 +4461,9 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Storage backend or location change requires an offline migration or new deployment"
           }
         }
       }

@@ -120,11 +120,6 @@ const profileOptions = [
   { value: "panel", label: "panel" },
 ];
 
-const storageOptions = [
-  { value: "local", label: "Local disk (WAL + RocksDB)" },
-  { value: "slate", label: "SlateDB (S3 / MinIO / R2)" },
-];
-
 const fedStatus = useActionStatus();
 const clusterStatus = useActionStatus();
 const cellStatus = useActionStatus();
@@ -816,19 +811,27 @@ function openAddNode() {
           <Card>
             <CardHeader>
               <CardTitle>Storage</CardTitle>
-              <CardDescription>WAL backend for this broker</CardDescription>
+              <CardDescription>Storage location is read-only while the broker is running. Only credentials can be updated here.</CardDescription>
             </CardHeader>
             <CardContent class="grid gap-3">
-              <Field label="Mode"><AppSelect v-model="storage.mode" :options="storageOptions" /></Field>
+              <Alert>
+                <AlertTitle>No live backend or location changes</AlertTitle>
+                <AlertDescription>
+                  Switching stores strands pending, retrying and dead-letter messages; this panel does not migrate data.
+                  Stop ingestion and use a verified offline migration, or start a new deployment.
+                  In a cluster, coordinate migration across every replica before restarting.
+                </AlertDescription>
+              </Alert>
+              <Field label="Mode"><Input :model-value="storage.mode" readonly /></Field>
               <template v-if="storage.mode === 'slate'">
-                <Field label="Endpoint"><Input v-model="storage.endpoint" class="font-mono text-xs" /></Field>
-                <Field label="Bucket"><Input v-model="storage.bucket" class="font-mono" /></Field>
-                <Field label="Payload bucket"><Input v-model="storage.payloadBucket" class="font-mono" /></Field>
+                <Field label="Endpoint"><Input :model-value="storage.endpoint" readonly class="font-mono text-xs" /></Field>
+                <Field label="Bucket"><Input :model-value="storage.bucket" readonly class="font-mono" /></Field>
+                <Field label="Payload bucket"><Input :model-value="storage.payloadBucket" readonly class="font-mono" /></Field>
                 <Field label="Access key"><Input v-model="storage.accessKey" class="font-mono" /></Field>
                 <Field label="Secret key">
                   <Input v-model="storage.secretKey" type="password" :placeholder="hasSavedS3Secret ? 'leave blank to keep' : 'required for first-time setup'" />
                 </Field>
-                <Field label="Region"><Input v-model="storage.region" class="font-mono" /></Field>
+                <Field label="Region"><Input :model-value="storage.region" readonly class="font-mono" /></Field>
               </template>
               <p v-if="storage.test" class="text-xs text-muted-foreground">{{ storage.test }}</p>
             </CardContent>

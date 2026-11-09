@@ -185,6 +185,20 @@ Panel destination forms start empty and require an explicit HTTP(S) destination.
 If the secret is blank, submission generates a unique cryptographically random
 secret; use **Reveal** to copy it to your receiver before enabling HMAC signing.
 
+The live `/v1/infra/storage` API returns **409** for every backend or storage
+location change (endpoint, WAL bucket, payload bucket or region), even when the
+store currently appears empty. Checking emptiness cannot prevent new writes
+before restart. The panel makes these fields read-only; same-location credential
+updates remain supported and require a restart to take effect.
+
+There is no automatic storage migration or force override. To change stores,
+stop producers and ingestion, preserve the original data and configuration, and
+use a verified offline migration with validation of pending, retrying and DLQ
+records before resuming traffic. Alternatively, create a new deployment and keep
+the original available until its accepted work is delivered or recovered. For a
+cluster, coordinate the procedure across all replicas; do not switch nodes one
+at a time. Simply changing configuration does not move messages.
+
 ### `bettermq config`
 
 ```bash

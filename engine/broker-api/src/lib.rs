@@ -519,6 +519,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_storage_switch_is_rejected_without_changing_config() {
+        let dir = tempdir().unwrap();
+        let cfg = broker_config::BetterMqConfig::template_single_local();
+        broker_config::save_managed_config(dir.path(), &cfg).unwrap();
+        let before = std::fs::read(broker_config::managed_config_path(dir.path())).unwrap();
+        let body = serde_json::from_value(serde_json::json!({
+            "mode": "slate", "s3": { "endpoint": "https://s3.example.com", "bucket": "wal", "payloadBucket": "payload", "accessKey": "access", "secretKey": "secret", "region": "auto" }
+        })).unwrap();
+        let state = Arc::new(test_state(&dir));
+        let error =
+            infra::infra_update_storage(axum::extract::State(state.clone()), axum::Json(body))
+                .await
+                .unwrap_err();
+        assert!(matches!(error, routes::ApiError::Conflict(_)));
+        assert_eq!(
+            before,
+            std::fs::read(broker_config::managed_config_path(dir.path())).unwrap()
+        );
+        let body = serde_json::from_value(serde_json::json!({ "mode": "local" })).unwrap();
+        let _ = infra::infra_update_storage(axum::extract::State(state), axum::Json(body))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn healthz_returns_ok() {
         let dir = tempdir().unwrap();
         let app = router(test_state(&dir));

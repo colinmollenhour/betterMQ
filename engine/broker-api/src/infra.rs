@@ -223,6 +223,29 @@ fn pending_storage_label(cfg: &BetterMqConfig, active: StorageMode) -> Option<&'
     }
 }
 
+// An emptiness check is insufficient: new writes may arrive before restart.
+// A live API must never point the next process at a different message store.
+fn ensure_same_storage_location(
+    previous: &StorageConfig,
+    next: &StorageConfig,
+    active: StorageMode,
+) -> Result<(), ApiError> {
+    let unchanged = match (previous, next, active) {
+        (StorageConfig::Local, StorageConfig::Local, StorageMode::Local) => true,
+        (StorageConfig::Slate { s3: a }, StorageConfig::Slate { s3: b }, StorageMode::Slate) => {
+            a.endpoint == b.endpoint
+                && a.bucket == b.bucket
+                && a.payload_bucket == b.payload_bucket
+                && a.region == b.region
+        }
+        _ => false,
+    };
+    if !unchanged {
+        return Err(ApiError::Conflict("Live storage backend/location changes are disabled. Stop ingestion and perform a verified offline migration, or start a new deployment; no messages are migrated by this API.".into()));
+    }
+    Ok(())
+}
+
 /// Keep `cluster.nodes` in sync when the operator changes this node's public URL in the panel.
 fn patch_cluster_node_entry(cfg: &mut BetterMqConfig, previous_name: &str) {
     let Some(cluster) = cfg.cluster.as_mut() else {
@@ -554,7 +577,7 @@ pub async fn infra_update_storage(
         _ => None,
     };
 
-    cfg.storage = match body.mode.to_lowercase().as_str() {
+    let next_storage = match body.mode.to_lowercase().as_str() {
         "local" => StorageConfig::Local,
         "slate" | "s3" => {
             let s3 = body
@@ -571,17 +594,25 @@ pub async fn infra_update_storage(
             )))
         }
     };
+    let active = active_storage_mode(&state);
+    ensure_same_storage_location(&cfg.storage, &next_storage, active)?;
+    let credentials_changed = match (&cfg.storage, &next_storage) {
+        (StorageConfig::Slate { s3: a }, StorageConfig::Slate { s3: b }) => {
+            a.access_key != b.access_key || a.secret_key != b.secret_key
+        }
+        _ => false,
+    };
+    cfg.storage = next_storage;
     cfg.validate()
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     save_managed_config(&dir, &cfg).map_err(io_err)?;
 
-    let active = active_storage_mode(&state);
-    let needs_restart = pending_storage_label(&cfg, active).is_some();
+    let needs_restart = credentials_changed;
     Ok(Json(StorageUpdateResponse {
         saved: true,
         needs_restart,
         message: if needs_restart {
-            "Storage saved. Restart this broker (docker compose restart) to apply.".into()
+            "Storage credentials saved. Restart this broker to apply.".into()
         } else {
             "Storage settings saved.".into()
         },
@@ -1331,4 +1362,53 @@ pub fn protected_infra_routes() -> axum::Router<std::sync::Arc<AppState>> {
             "/v1/infra/cluster/remove-node",
             post(infra_cluster_remove_node),
         )
+}
+
+#[cfg(test)]
+mod storage_location_tests {
+    use super::*;
+
+    #[test]
+    fn only_same_store_credential_changes_are_allowed() {
+        let s3 = broker_config::S3Config {
+            endpoint: "https://s3.example.com".into(),
+            bucket: "wal".into(),
+            payload_bucket: Some("payload".into()),
+            region: "auto".into(),
+            access_key: "old-access".into(),
+            secret_key: "old-secret".into(),
+        };
+        let previous = StorageConfig::Slate { s3: s3.clone() };
+        let mut credentials = s3.clone();
+        credentials.access_key = "new-access".into();
+        credentials.secret_key = "new-secret".into();
+        assert!(ensure_same_storage_location(
+            &previous,
+            &StorageConfig::Slate { s3: credentials },
+            StorageMode::Slate
+        )
+        .is_ok());
+        for field in ["endpoint", "bucket", "payload", "region"] {
+            let mut changed = s3.clone();
+            match field {
+                "endpoint" => changed.endpoint = "https://other.example.com".into(),
+                "bucket" => changed.bucket = "other".into(),
+                "payload" => changed.payload_bucket = Some("other".into()),
+                _ => changed.region = "other".into(),
+            }
+            assert!(matches!(
+                ensure_same_storage_location(
+                    &previous,
+                    &StorageConfig::Slate { s3: changed },
+                    StorageMode::Slate
+                ),
+                Err(ApiError::Conflict(_))
+            ));
+        }
+        assert!(
+            ensure_same_storage_location(&previous, &StorageConfig::Local, StorageMode::Slate)
+                .is_err()
+        );
+        assert!(ensure_same_storage_location(&previous, &previous, StorageMode::Local).is_err());
+    }
 }
