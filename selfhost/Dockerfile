@@ -1,17 +1,18 @@
 # Self-host BetterMQ (local or Slate storage, panel auth — no Postgres).
-FROM rust:1-bookworm AS builder
+FROM rust:1.89.0-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     clang libclang-dev llvm-dev cmake build-essential pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY engine ./engine
 COPY tools ./tools
-RUN cargo build --release -p broker-server
+ARG CARGO_BUILD_JOBS=2
+RUN cargo build --locked --release -p broker-server
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 1000 bettermq \
