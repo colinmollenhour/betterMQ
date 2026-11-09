@@ -433,6 +433,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn destination_controls_report_only_confirmed_serving_node() {
+        let dir = tempdir().unwrap();
+        let state = Arc::new(test_state(&dir));
+        let axum::Json(blocked) = ops::block_host(
+            axum::extract::State(state.clone()),
+            axum::Json(ops::BlockHostRequest {
+                host: "https://example.com/hook".into(),
+                duration_ms: Some(60_000),
+            }),
+        )
+        .await
+        .unwrap();
+        let body = serde_json::to_value(blocked).unwrap();
+        assert_eq!(body["scope"], "serving_process");
+        assert_eq!(
+            body["applied_nodes"],
+            serde_json::json!([state.dispatch.process_id()])
+        );
+        let axum::Json(list) = ops::list_blocked_hosts(axum::extract::State(state.clone())).await;
+        assert_eq!(list.hosts.len(), 1);
+        assert_eq!(list.scope.applied_nodes.len(), 1);
+        let axum::Json(unblocked) = ops::unblock_host(
+            axum::extract::State(state.clone()),
+            axum::Json(ops::UnblockHostRequest {
+                host: "https://example.com".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unblocked.scope.applied_nodes,
+            vec![state.dispatch.process_id()]
+        );
+        assert!(state.dispatch.host_blocker().blocked_hosts().is_empty());
+        state.dispatch.shutdown_background().await;
+    }
+
+    #[tokio::test]
     async fn healthz_returns_ok() {
         let dir = tempdir().unwrap();
         let app = router(test_state(&dir));

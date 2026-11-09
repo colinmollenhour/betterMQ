@@ -85,6 +85,10 @@ fn merge_hosts(target: &mut HashMap<String, HostState>, incoming: HashMap<String
 }
 
 impl HostBlocker {
+    pub fn shared_metadata_enabled(&self) -> bool {
+        self.shared_path.is_some()
+    }
+
     pub fn new(cfg: HostBlockerConfig) -> Self {
         let shared_path = std::env::var("BETTERMQ_SHARED_META_DIR")
             .ok()

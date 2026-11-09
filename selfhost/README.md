@@ -265,6 +265,8 @@ Webhook connections use reusable short/long HTTP pools. DNS is policy-checked on
 
 With shared metadata, host-breaker snapshots merge per-host revisions under the shared file lock; clear markers prevent stale peers from resurrecting removed blocks. Only block/clear transitions persist, off the async delivery path. Keep broker clocks synchronized; clear markers are retained in shared metadata.
 
+Panel destination block/unblock controls acknowledge only the serving node (`scope: serving_process`, `applied_nodes` in the API response). They do not confirm application to peers or fleet workers. Shared-metadata nodes may observe changes asynchronously; Slate/fleet deployments without a shared metadata directory have process-local controls. Stopping all fleet delivery requires deployment-level controls, not this panel action.
+
 #### DLQ and group fan-out
 
 Fan-out vars are **group bookkeeping**, not DLQ TTL.

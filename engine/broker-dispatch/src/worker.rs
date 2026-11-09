@@ -327,6 +327,10 @@ impl DispatchEngine {
         self.workers_enabled
     }
 
+    pub fn process_id(&self) -> &str {
+        &self.local_holder
+    }
+
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::Acquire)
     }

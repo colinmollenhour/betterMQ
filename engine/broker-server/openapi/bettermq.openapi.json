@@ -1115,6 +1115,7 @@
       },
       "BlockedHostsResponse": {
         "type": "object",
+        "allOf": [{ "$ref": "#/components/schemas/DestinationControlScope" }],
         "properties": {
           "hosts": {
             "type": "array",
@@ -1123,6 +1124,21 @@
             }
           }
         }
+      },
+      "DestinationControlScope": {
+        "type": "object",
+        "required": ["scope", "applied_nodes", "shared_metadata"],
+        "properties": {
+          "scope": { "type": "string", "enum": ["serving_process"] },
+          "applied_nodes": { "type": "array", "items": { "type": "string" }, "description": "Nodes that confirmed this action; not a fleet-wide acknowledgement." },
+          "shared_metadata": { "type": "boolean", "description": "Shared-metadata peers may observe changes asynchronously." }
+        }
+      },
+      "DestinationControlResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/BlockedHostEntry" },
+          { "$ref": "#/components/schemas/DestinationControlScope" }
+        ]
       },
       "UnblockHostRequest": {
         "type": "object",
@@ -4093,7 +4109,7 @@
           "Ops"
         ],
         "operationId": "listBlockedHosts",
-        "summary": "List hosts blocked by the delivery circuit breaker",
+        "summary": "List hosts blocked on the serving node, with explicit application scope",
         "responses": {
           "200": {
             "description": "OK",
@@ -4114,7 +4130,7 @@
           "Ops"
         ],
         "operationId": "blockHost",
-        "summary": "Operator override — manually block a destination host",
+        "summary": "Block a destination host on the serving node (not fleet-wide)",
         "requestBody": {
           "required": true,
           "content": {
@@ -4127,11 +4143,11 @@
         },
         "responses": {
           "200": {
-            "description": "Blocked",
+            "description": "Confirmed on applied_nodes only; peers and fleet workers are not acknowledged",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BlockedHostEntry"
+                  "$ref": "#/components/schemas/DestinationControlResponse"
                 }
               }
             }
@@ -4145,7 +4161,7 @@
           "Ops"
         ],
         "operationId": "unblockHost",
-        "summary": "Operator override — unblock a host",
+        "summary": "Unblock a host on the serving node (not fleet-wide)",
         "requestBody": {
           "required": true,
           "content": {
@@ -4158,7 +4174,8 @@
         },
         "responses": {
           "200": {
-            "description": "Unblocked"
+            "description": "Confirmed on applied_nodes only",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DestinationControlResponse" } } }
           }
         }
       }

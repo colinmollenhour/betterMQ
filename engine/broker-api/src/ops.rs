@@ -44,6 +44,36 @@ pub struct BlockedHostEntry {
 #[derive(Debug, Serialize)]
 pub struct BlockedHostsResponse {
     pub hosts: Vec<BlockedHostEntry>,
+    #[serde(flatten)]
+    pub scope: DestinationControlScope,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DestinationControlScope {
+    pub scope: &'static str,
+    pub applied_nodes: Vec<String>,
+    pub shared_metadata: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DestinationControlResponse {
+    #[serde(flatten)]
+    pub host: BlockedHostEntry,
+    #[serde(flatten)]
+    pub scope: DestinationControlScope,
+}
+
+fn destination_scope(state: &AppState) -> DestinationControlScope {
+    let node = state
+        .cluster
+        .as_ref()
+        .map(|cluster| cluster.runtime.config().node_id.to_string())
+        .unwrap_or_else(|| state.dispatch.process_id().to_owned());
+    DestinationControlScope {
+        scope: "serving_process",
+        applied_nodes: vec![node],
+        shared_metadata: state.dispatch.host_blocker().shared_metadata_enabled(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,35 +299,53 @@ pub async fn list_blocked_hosts(State(state): State<Arc<AppState>>) -> Json<Bloc
         .into_iter()
         .map(|(host, remaining_ms)| BlockedHostEntry { host, remaining_ms })
         .collect();
-    Json(BlockedHostsResponse { hosts })
+    Json(BlockedHostsResponse {
+        hosts,
+        scope: destination_scope(&state),
+    })
 }
 
 pub async fn unblock_host(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UnblockHostRequest>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Json<DestinationControlResponse>, ApiError> {
     if body.host.trim().is_empty() {
         return Err(ApiError::BadRequest("host required".into()));
     }
-    state.dispatch.host_blocker().unblock(body.host.trim());
-    Ok(StatusCode::OK)
+    let blocker = state.dispatch.host_blocker();
+    let host = body.host.trim().to_owned();
+    let input = host.clone();
+    tokio::task::spawn_blocking(move || blocker.unblock(&input))
+        .await
+        .map_err(|_| ApiError::Unavailable("host control task failed".into()))?;
+    Ok(Json(DestinationControlResponse {
+        host: BlockedHostEntry {
+            host,
+            remaining_ms: 0,
+        },
+        scope: destination_scope(&state),
+    }))
 }
 
 pub async fn block_host(
     State(state): State<Arc<AppState>>,
     Json(body): Json<BlockHostRequest>,
-) -> Result<Json<BlockedHostEntry>, ApiError> {
+) -> Result<Json<DestinationControlResponse>, ApiError> {
     if body.host.trim().is_empty() {
         return Err(ApiError::BadRequest("host required".into()));
     }
     let duration_ms = body.duration_ms.unwrap_or(30 * 60 * 1000);
-    let key = state
-        .dispatch
-        .host_blocker()
-        .block_manual(body.host.trim(), duration_ms);
-    Ok(Json(BlockedHostEntry {
-        host: key,
-        remaining_ms: duration_ms,
+    let blocker = state.dispatch.host_blocker();
+    let host = body.host.trim().to_owned();
+    let key = tokio::task::spawn_blocking(move || blocker.block_manual(&host, duration_ms))
+        .await
+        .map_err(|_| ApiError::Unavailable("host control task failed".into()))?;
+    Ok(Json(DestinationControlResponse {
+        host: BlockedHostEntry {
+            host: key,
+            remaining_ms: duration_ms.max(1_000),
+        },
+        scope: destination_scope(&state),
     }))
 }
 
