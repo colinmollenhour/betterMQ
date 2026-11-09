@@ -15,6 +15,14 @@ fn validate_and_doctor_reject_invalid_v2_sections() {
         serde_json::json!({"panel": {"mode": "separateListener"}}),
         serde_json::json!({"panel": {"controller": "http://"}}),
         serde_json::json!({"replication": {"factor": 1, "minIsr": 2}}),
+        serde_json::json!({"typo": true}),
+        serde_json::json!({"node": {"name": "n", "publicUrl": "http://localhost", "typo": true}}),
+        serde_json::json!({"storage": {"mode": "local", "typo": true}}),
+        serde_json::json!({"auth": {"mode": "local", "typo": true}}),
+        serde_json::json!({"dispatch": {"httpTimeoutSec": 5}}),
+        serde_json::json!({"dispatch": {"retry": {"maxRetry": 5}}}),
+        serde_json::json!({"dispatch": {"retry": {"backoff": {"initialMsTypo": 5}}}}),
+        serde_json::json!({"listeners": {"publik": "127.0.0.1:8080"}}),
     ] {
         let data = tempfile::tempdir().unwrap();
         let path = data.path().join("bettermq.json");
@@ -41,4 +49,26 @@ fn validate_and_doctor_reject_invalid_v2_sections() {
             assert!(!output.status.success(), "accepted {invalid} with {args:?}");
         }
     }
+}
+
+#[test]
+fn schema_command_emits_a_real_schema_for_strict_config_types() {
+    let output = Command::new(env!("CARGO_BIN_EXE_bettermq"))
+        .args(["config", "schema"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let schema: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(schema["$schema"]
+        .as_str()
+        .unwrap()
+        .contains("json-schema.org"));
+    assert_eq!(schema["type"], "object");
+    assert_eq!(schema["additionalProperties"], false);
+    assert!(schema["properties"]["listeners"].is_object());
+    assert_eq!(
+        schema["$defs"]["DispatchConfigSection"]["additionalProperties"],
+        false
+    );
+    assert!(schema.get("templates").is_none());
 }

@@ -86,28 +86,10 @@ fn config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
 }
 
 fn config_schema() -> anyhow::Result<()> {
-    #[cfg(feature = "cloud")]
-    let examples = serde_json::json!({
-        "version": broker_config::CONFIG_VERSION,
-        "description": "BetterMQ configuration. Run: bettermq config init --template <local|slate|cluster|cloud>",
-        "templates": {
-            "local": BetterMqConfig::template_single_local(),
-            "slate": BetterMqConfig::template_single_slate(),
-            "cluster": BetterMqConfig::template_cluster_local(),
-            "cloud": BetterMqConfig::template_cloud(),
-        }
-    });
-    #[cfg(not(feature = "cloud"))]
-    let examples = serde_json::json!({
-        "version": broker_config::CONFIG_VERSION,
-        "description": "BetterMQ configuration. Run: bettermq config init --template <local|slate|cluster>",
-        "templates": {
-            "local": BetterMqConfig::template_single_local(),
-            "slate": BetterMqConfig::template_single_slate(),
-            "cluster": BetterMqConfig::template_cluster_local(),
-        }
-    });
-    println!("{}", serde_json::to_string_pretty(&examples)?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&broker_config::json_schema())?
+    );
     Ok(())
 }
 

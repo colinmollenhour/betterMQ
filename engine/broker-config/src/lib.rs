@@ -7,6 +7,12 @@ mod managed;
 mod resolve;
 mod types;
 
+/// JSON Schema generated from the same strict types used to load config files.
+/// Runtime validation additionally enforces cross-field and deployment rules.
+pub fn json_schema() -> schemars::Schema {
+    schemars::schema_for!(BetterMqConfig)
+}
+
 pub use broker_proto::HASH_VERSION;
 pub use cluster::{ensure_cluster_config, stable_node_id};
 pub use components::{

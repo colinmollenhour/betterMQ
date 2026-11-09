@@ -1,4 +1,5 @@
 use broker_proto::RetryDefaults;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
@@ -15,8 +16,8 @@ pub enum ConfigError {
     Invalid(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BetterMqConfig {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -50,8 +51,8 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from("./data")
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NodeSection {
     pub name: String,
     #[serde(default = "default_listen")]
@@ -63,8 +64,8 @@ fn default_listen() -> String {
     "0.0.0.0:8080".into()
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum StorageConfig {
     #[serde(alias = "rocksdb", alias = "wal")]
     #[default]
@@ -74,8 +75,28 @@ pub enum StorageConfig {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+impl<'de> Deserialize<'de> for StorageConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Serde's internally tagged *unit* variant ignores extra fields even
+        // with deny_unknown_fields. An empty struct variant enforces strictness.
+        #[derive(Deserialize)]
+        #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+        enum StrictStorage {
+            #[serde(alias = "rocksdb", alias = "wal")]
+            Local {},
+            Slate {
+                s3: S3Config,
+            },
+        }
+        Ok(match StrictStorage::deserialize(deserializer)? {
+            StrictStorage::Local {} => Self::Local,
+            StrictStorage::Slate { s3 } => Self::Slate { s3 },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct S3Config {
     pub endpoint: String,
     pub bucket: String,
@@ -91,8 +112,8 @@ fn default_region() -> String {
     "auto".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum AuthConfig {
     #[serde(alias = "panel")]
     Local {
@@ -111,15 +132,90 @@ impl Default for AuthConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DispatchConfigSection {
     #[serde(default = "default_http_timeout")]
     pub http_timeout_secs: u64,
     #[serde(default = "default_long_http_timeout")]
     pub long_http_timeout_secs: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_config_retry")]
+    #[schemars(with = "ConfigRetryDefaults")]
     pub retry: RetryDefaults,
+}
+
+// Config-only adapters keep strictness and schema in sync without changing the
+// shared per-message retry wire format.
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfigRetryDefaults {
+    #[serde(default = "default_config_max_retries")]
+    max_retries: u32,
+    #[serde(default)]
+    backoff: ConfigRetryBackoff,
+}
+
+fn default_config_max_retries() -> u32 {
+    RetryDefaults::default().max_retries
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfigRetryBackoff {
+    #[serde(default)]
+    kind: ConfigRetryKind,
+    #[serde(default = "default_initial_ms")]
+    initial_ms: u64,
+    #[serde(default = "default_max_ms")]
+    max_ms: u64,
+    #[serde(default = "default_multiplier")]
+    multiplier: f64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+enum ConfigRetryKind {
+    Fixed,
+    #[default]
+    Exponential,
+}
+
+fn default_initial_ms() -> u64 {
+    broker_proto::RetryBackoff::default().initial_ms
+}
+fn default_max_ms() -> u64 {
+    broker_proto::RetryBackoff::default().max_ms
+}
+fn default_multiplier() -> f64 {
+    broker_proto::RetryBackoff::default().multiplier
+}
+impl Default for ConfigRetryBackoff {
+    fn default() -> Self {
+        Self {
+            kind: ConfigRetryKind::default(),
+            initial_ms: default_initial_ms(),
+            max_ms: default_max_ms(),
+            multiplier: default_multiplier(),
+        }
+    }
+}
+
+fn deserialize_config_retry<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<RetryDefaults, D::Error> {
+    let retry = ConfigRetryDefaults::deserialize(deserializer)?;
+    Ok(RetryDefaults {
+        max_retries: retry.max_retries,
+        backoff: broker_proto::RetryBackoff {
+            kind: match retry.backoff.kind {
+                ConfigRetryKind::Fixed => broker_proto::RetryBackoffKind::Fixed,
+                ConfigRetryKind::Exponential => broker_proto::RetryBackoffKind::Exponential,
+            },
+            initial_ms: retry.backoff.initial_ms,
+            max_ms: retry.backoff.max_ms,
+            multiplier: retry.backoff.multiplier,
+        },
+    })
 }
 
 impl Default for DispatchConfigSection {
@@ -140,8 +236,8 @@ fn default_long_http_timeout() -> u64 {
     7200
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClusterConfigSection {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -156,8 +252,8 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClusterNode {
     pub name: String,
     pub public_url: String,
@@ -571,5 +667,22 @@ mod tests {
         cfg.validate().expect("v1 config loads");
         assert_eq!(cfg.version, 1);
         assert!(cfg.components.is_none());
+    }
+
+    #[test]
+    fn legacy_mode_aliases_remain_strict_and_readable() {
+        for mode in ["local", "rocksdb", "wal"] {
+            let storage: StorageConfig =
+                serde_json::from_value(serde_json::json!({"mode": mode})).unwrap();
+            assert!(matches!(storage, StorageConfig::Local));
+            assert!(serde_json::from_value::<StorageConfig>(
+                serde_json::json!({"mode": mode, "typo": true})
+            )
+            .is_err());
+        }
+        assert!(matches!(
+            serde_json::from_value::<AuthConfig>(serde_json::json!({"mode": "panel"})).unwrap(),
+            AuthConfig::Local { .. }
+        ));
     }
 }

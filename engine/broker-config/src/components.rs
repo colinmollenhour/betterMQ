@@ -4,6 +4,7 @@
 //! in-memory [`ComponentSet`] as an explicit V2 `profile: "all"` document.
 
 use crate::types::{BetterMqConfig, ConfigError};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -93,8 +94,8 @@ impl ComponentProfile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ComponentSpec {
     #[serde(default)]
     pub profile: Option<String>,
@@ -126,8 +127,8 @@ impl PanelMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PanelSection {
     #[serde(default)]
     pub mode: Option<String>,
@@ -137,8 +138,8 @@ pub struct PanelSection {
     pub controller: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ListenerSection {
     #[serde(default)]
     pub public: Option<String>,
@@ -148,8 +149,8 @@ pub struct ListenerSection {
     pub internal: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReplicationPolicyConfig {
     #[serde(default = "default_rf")]
     pub factor: u32,

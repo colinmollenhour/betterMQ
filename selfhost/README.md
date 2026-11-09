@@ -129,6 +129,8 @@ Configuration precedence is CLI flags, then supported environment variables,
 then the saved file, then defaults. `BETTERMQ_STORAGE`, `S3_*`, webhook timeout
 variables and `BETTERMQ_DEFAULT_MAX_RETRIES` override file values. Invalid values
 or incomplete Slate credentials fail startup rather than selecting local storage.
+See the [configuration reference](configuration.md) for V2 fields and how to
+generate the JSON Schema. Unknown configuration keys are rejected.
 
 Config saves use private (Unix `0600`) temporary files and atomic replacement,
 with file and directory sync. Newly created config directories are private
