@@ -1540,45 +1540,6 @@ async fn fire_scheduled_publish(
     }
 }
 
-/// Lets one warning through per interval and reports how many were
-/// suppressed since the last one.
-struct WarnRateLimit {
-    interval_ms: i64,
-    last_ms: std::sync::atomic::AtomicI64,
-    suppressed: std::sync::atomic::AtomicU64,
-}
-
-impl WarnRateLimit {
-    const fn new(interval: Duration) -> Self {
-        Self {
-            interval_ms: interval.as_millis() as i64,
-            last_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
-            suppressed: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    fn permit(&self) -> Option<u64> {
-        self.permit_at(Utc::now().timestamp_millis())
-    }
-
-    fn permit_at(&self, now_ms: i64) -> Option<u64> {
-        use std::sync::atomic::Ordering;
-        let last = self.last_ms.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(last) >= self.interval_ms
-            && self
-                .last_ms
-                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            return Some(self.suppressed.swap(0, Ordering::Relaxed));
-        }
-        self.suppressed.fetch_add(1, Ordering::Relaxed);
-        None
-    }
-}
-
-static FLEET_CLAIM_WARNINGS: WarnRateLimit = WarnRateLimit::new(Duration::from_secs(30));
-
 fn spawn_fleet_workers(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
     let Some(client) = broker_dispatch::LeaseClient::from_env() else {
         tracing::error!(
@@ -1586,59 +1547,18 @@ fn spawn_fleet_workers(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<(
         );
         return None;
     };
-    let concurrency = broker_dispatch::fleet_concurrency();
+    let options = broker_dispatch::FleetOptions::from_env();
     info!(
         holder = %client.holder(),
         brokers = ?client.broker_urls(),
-        concurrency,
+        concurrency = options.concurrency,
         "starting dispatch fleet workers"
     );
-    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    Some(tokio::spawn(async move {
-        let mut rr = 0usize;
-        let mut interval = tokio::time::interval(Duration::from_millis(250));
-        loop {
-            interval.tick().await;
-            let urls = client.broker_urls();
-            if urls.is_empty() {
-                continue;
-            }
-            rr = (rr + 1) % urls.len();
-            let broker = urls[rr].clone();
-            let permit = match sem.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => break,
-            };
-            let client = client.clone();
-            let dispatch = state.dispatch.clone();
-            tokio::spawn(async move {
-                let _permit = permit;
-                if dispatch.is_draining() {
-                    return;
-                }
-                let claimed = match client.claim(&broker, 4).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        broker_api::record_fleet_claim_failure();
-                        if let Some(suppressed) = FLEET_CLAIM_WARNINGS.permit() {
-                            tracing::warn!(
-                                error = %e,
-                                %broker,
-                                suppressed,
-                                "fleet claim failed (check BETTERMQ_BROKER_URLS and BETTERMQ_CLUSTER_SECRET)"
-                            );
-                        } else {
-                            tracing::debug!(error = %e, %broker, "fleet claim failed");
-                        }
-                        return;
-                    }
-                };
-                for job in claimed.jobs {
-                    broker_dispatch::deliver_claimed_job(&dispatch, &client, &broker, job).await;
-                }
-            });
-        }
-    }))
+    Some(broker_dispatch::spawn_fleet(
+        state.dispatch.clone(),
+        client,
+        options,
+    ))
 }
 
 #[cfg(test)]
@@ -1815,15 +1735,6 @@ mod tests {
         assert_eq!(LogFormat::parse(" Text "), Some(LogFormat::Text));
         assert_eq!(LogFormat::parse("JSON"), Some(LogFormat::Json));
         assert_eq!(LogFormat::parse("yaml"), None);
-    }
-
-    #[test]
-    fn warn_rate_limit_reports_suppressed_count() {
-        let limit = WarnRateLimit::new(Duration::from_secs(30));
-        assert_eq!(limit.permit_at(1_000), Some(0));
-        assert_eq!(limit.permit_at(2_000), None);
-        assert_eq!(limit.permit_at(30_999), None);
-        assert_eq!(limit.permit_at(31_000), Some(2));
     }
 
     #[tokio::test]

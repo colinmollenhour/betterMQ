@@ -162,7 +162,14 @@ async fn fleet_delivers_blob_backed_payload_intact() {
         "the broker loads and verifies the blob before issuing the claim"
     );
 
-    deliver_claimed_job(&h.fleet, &h.client, &h.broker_url, job.clone()).await;
+    deliver_claimed_job(
+        &h.fleet,
+        &h.client,
+        &h.broker_url,
+        job.clone(),
+        broker_dispatch::DEFAULT_HEARTBEAT_INTERVAL,
+    )
+    .await;
 
     let delivered = tokio::time::timeout(Duration::from_secs(5), h.received.recv())
         .await
@@ -222,7 +229,14 @@ async fn fleet_refuses_to_complete_a_lease_without_its_body() {
     // A claim from a broker that did not load the blob.
     job.message.as_mut().unwrap().payload.clear();
 
-    deliver_claimed_job(&h.fleet, &h.client, &h.broker_url, job.clone()).await;
+    deliver_claimed_job(
+        &h.fleet,
+        &h.client,
+        &h.broker_url,
+        job.clone(),
+        broker_dispatch::DEFAULT_HEARTBEAT_INTERVAL,
+    )
+    .await;
     assert!(
         h.received.try_recv().is_err(),
         "no empty body was delivered"

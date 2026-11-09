@@ -1073,7 +1073,7 @@ impl DispatchEngine {
                 cursor_key: lane_key,
                 message: None,
             };
-            if !leases.try_insert(self.local_holder.clone(), claimed) {
+            if !leases.try_insert_held(self.local_holder.clone(), claimed) {
                 return Ok(());
             }
             Some(id)

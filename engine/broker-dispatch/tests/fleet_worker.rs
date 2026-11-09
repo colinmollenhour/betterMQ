@@ -1,0 +1,165 @@
+//! Fleet worker loop against a mocked broker lease API.
+
+use broker_dispatch::{
+    spawn_fleet, ClaimResponse, ClaimedJob, DispatchConfig, DispatchEngine, FleetOptions,
+    LeaseClient,
+};
+use broker_partition::{Broker, BrokerConfig};
+use broker_storage::StoredMessage;
+use std::sync::Once;
+use std::time::Duration;
+use uuid::Uuid;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+fn allow_wiremock_localhost() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("BETTERMQ_ALLOW_PRIVATE_DESTINATIONS", "1");
+    });
+}
+
+fn job(offset: u64, url: &str) -> ClaimedJob {
+    let message_id = Uuid::new_v4();
+    ClaimedJob {
+        lease_id: Uuid::new_v4(),
+        topic: "__direct".into(),
+        partition: 0,
+        offset,
+        message_id,
+        expires_at_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+        generation: 0,
+        committed_hwm: offset + 100,
+        cursor_key: "lane".into(),
+        message: Some(StoredMessage {
+            id: message_id,
+            tenant_id: "default".into(),
+            topic: "__direct".into(),
+            partition: 0,
+            offset,
+            routing_key: format!("key-{offset}"),
+            payload: b"body".to_vec(),
+            published_at_ms: 0,
+            priority: 4,
+            flow_parallelism: None,
+            flow_key: None,
+            flow_rate: None,
+            flow_period_secs: None,
+            queue_id: None,
+            group_id: None,
+            group_member_id: None,
+            flow_profile_id: None,
+            destination_url: Some(url.into()),
+            destination_secret: Some("whsec_test".into()),
+            max_retries: 3,
+            retry_backoff: None,
+            http_method: None,
+            http_headers_json: None,
+            http_sign: None,
+            payload_ref_json: None,
+        }),
+    }
+}
+
+fn fleet_engine() -> (DispatchEngine, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+    (
+        DispatchEngine::new_broker_only(broker, DispatchConfig::default()),
+        dir,
+    )
+}
+
+async fn requests_to(server: &MockServer, route: &str) -> Vec<Request> {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.url.path() == route)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_claimed_lease_is_heartbeated_while_deliveries_run() {
+    allow_wiremock_localhost();
+    let destination = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/slow"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(1500)))
+        .mount(&destination)
+        .await;
+    let hook = format!("{}/slow", destination.uri());
+
+    let broker = MockServer::start().await;
+    let jobs = vec![job(1, &hook), job(2, &hook)];
+    let lease_ids: Vec<Uuid> = jobs.iter().map(|j| j.lease_id).collect();
+    Mock::given(method("POST"))
+        .and(path("/internal/v1/lease/claim"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ClaimResponse { jobs }))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&broker)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/internal/v1/lease/claim"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ClaimResponse { jobs: vec![] }))
+        .with_priority(2)
+        .mount(&broker)
+        .await;
+    for route in [
+        "/internal/v1/lease/heartbeat",
+        "/internal/v1/lease/complete",
+    ] {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&broker)
+            .await;
+    }
+
+    let (engine, _dir) = fleet_engine();
+    let client = LeaseClient::new(vec![broker.uri()], "fleet-test".into());
+    let fleet = spawn_fleet(
+        engine,
+        client,
+        FleetOptions {
+            concurrency: 2,
+            heartbeat_interval: Duration::from_millis(100),
+        },
+    );
+
+    // Both webhooks are still in flight (they take 1.5 s).
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let claims = requests_to(&broker, "/internal/v1/lease/claim").await;
+    let first: serde_json::Value = serde_json::from_slice(&claims[0].body).unwrap();
+    assert_eq!(first["max_jobs"], 2, "claim is sized to the free permits");
+    let heartbeats = requests_to(&broker, "/internal/v1/lease/heartbeat").await;
+    for lease_id in &lease_ids {
+        let renewed = heartbeats
+            .iter()
+            .filter(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                body["lease_id"] == lease_id.to_string()
+            })
+            .count();
+        assert!(
+            renewed >= 2,
+            "lease {lease_id} was renewed {renewed} times while its job waited"
+        );
+    }
+    assert_eq!(
+        destination.received_requests().await.unwrap().len(),
+        2,
+        "claimed jobs are delivered concurrently, not one after another"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(
+        requests_to(&broker, "/internal/v1/lease/complete")
+            .await
+            .len(),
+        2
+    );
+    fleet.abort();
+}

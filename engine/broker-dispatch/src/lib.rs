@@ -18,14 +18,14 @@ pub use egress::{
     pin_destination_addr, validate_destination_url, validate_destination_url_resolved, EgressError,
 };
 pub use fairness::TenantFairQueue;
-pub use fleet::deliver_claimed_job;
+pub use fleet::{deliver_claimed_job, spawn_fleet, FleetOptions, DEFAULT_HEARTBEAT_INTERVAL};
 
 pub use flow_control::{FlowControlInfo, FlowController, FlowKey, GlobalParallelismInfo};
 pub use host_blocker::{HostBlocker, HostBlockerConfig};
 pub use lease::{
     claim_from_broker, fleet_concurrency, long_wait_tier_secs, ClaimRequest, ClaimResponse,
     ClaimedJob, CompleteRequest, FailRequest, HeartbeatRequest, LeaseClient, LeaseError,
-    LeaseTable,
+    LeaseTable, MAX_CLAIM_JOBS,
 };
 pub use memory_guard::{
     sample_process_resources, MemoryGuard, MemoryGuardConfig, ProcessResourceStats,

@@ -58,6 +58,9 @@ pub struct ClaimRequest {
     pub partition: Option<u32>,
 }
 
+/// Upper bound on jobs handed out by one claim.
+pub const MAX_CLAIM_JOBS: usize = 64;
+
 fn default_max_jobs() -> usize {
     8
 }
@@ -113,6 +116,8 @@ pub struct FailRequest {
 struct LeaseEntry {
     job: ClaimedJob,
     holder: String,
+    /// In-process lease released only by its owner, never by expiry.
+    held: bool,
 }
 
 type LeasedOffsetKey = (String, u32, u64);
@@ -149,6 +154,18 @@ impl LeaseTable {
 
     /// Atomically claim an offset. Returns false if another holder already leased it.
     pub fn try_insert(&self, holder: String, job: ClaimedJob) -> bool {
+        self.insert_entry(holder, job, false)
+    }
+
+    /// Lease an offset for an in-process delivery. The lease is held until its
+    /// owner releases it with [`LeaseTable::take`] (the dispatch guard does so on
+    /// drop), however long the job waits in a flow lane or for rate tokens, so it
+    /// never lapses under a job that is still queued locally.
+    pub fn try_insert_held(&self, holder: String, job: ClaimedJob) -> bool {
+        self.insert_entry(holder, job, true)
+    }
+
+    fn insert_entry(&self, holder: String, job: ClaimedJob, held: bool) -> bool {
         let id = job.lease_id;
         let key = (job.topic.clone(), job.partition, job.offset);
         let mut inner = self.inner.lock();
@@ -157,7 +174,7 @@ impl LeaseTable {
             return false;
         }
         offsets.insert(key, id);
-        inner.insert(id, LeaseEntry { job, holder });
+        inner.insert(id, LeaseEntry { job, holder, held });
         true
     }
 
@@ -208,7 +225,7 @@ impl LeaseTable {
         let mut offsets = self.leased_offsets.lock();
         let expired: Vec<Uuid> = map
             .iter()
-            .filter(|(_, e)| e.job.expires_at_ms <= now)
+            .filter(|(_, e)| !e.held && e.job.expires_at_ms <= now)
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
@@ -274,7 +291,7 @@ pub fn claim_from_broker(
     is_leader: &dyn Fn(u32) -> bool,
     generation: &dyn Fn(u32) -> u64,
 ) -> ClaimResponse {
-    let max = max_jobs.clamp(1, 64);
+    let max = max_jobs.clamp(1, MAX_CLAIM_JOBS);
     let ttl = lease_ttl_ms.max(5_000);
     let now = Utc::now().timestamp_millis();
     let mut jobs = Vec::new();
@@ -644,6 +661,35 @@ mod tests {
         assert!(table.heartbeat(id, "other", 30_000).is_err());
         assert!(table.take(id, "w1").is_ok());
         assert!(!table.is_offset_leased("t", 0, 1));
+    }
+
+    #[test]
+    fn held_local_lease_outlives_its_ttl_until_released() {
+        let table = LeaseTable::new();
+        let id = Uuid::new_v4();
+        let job = ClaimedJob {
+            lease_id: id,
+            topic: "t".into(),
+            partition: 0,
+            offset: 7,
+            message_id: Uuid::new_v4(),
+            // A job parked in a flow lane longer than the lease TTL.
+            expires_at_ms: Utc::now().timestamp_millis() - 120_000,
+            generation: 0,
+            committed_hwm: 8,
+            cursor_key: "t".into(),
+            message: None,
+        };
+        assert!(table.try_insert_held("local".into(), job.clone()));
+        assert!(table.is_offset_leased("t", 0, 7));
+        let mut other = job.clone();
+        other.lease_id = Uuid::new_v4();
+        assert!(
+            !table.try_insert("fleet".into(), other),
+            "a queued local job keeps its offset"
+        );
+        table.take(id, "local").unwrap();
+        assert!(!table.is_offset_leased("t", 0, 7));
     }
 
     #[test]
