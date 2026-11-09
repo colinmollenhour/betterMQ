@@ -51,6 +51,8 @@ broker before sending traffic. Fleet workers retry while brokers are unready.
 Free self-hosted BetterMQ. **No config files required** — install the CLI or run Docker, then use the panel.
 
 Shared engine code lives in [`../engine/`](../engine/). This folder is the self-host product (Docker + docs only).
+For node loss, replacement, seed loss, drain/rebalance and controller changes,
+use the [HA operations runbook](OPERATIONS.md).
 
 ### Panel build contract
 
