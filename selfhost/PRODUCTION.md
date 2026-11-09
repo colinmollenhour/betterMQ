@@ -2,6 +2,16 @@
 
 These are release gates, not current benchmark claims.
 
+CI runs the real three-process replicated HTTP gate with:
+
+```bash
+cargo test -p broker-server --test replicated_http -- --ignored --nocapture
+```
+
+It checks keyed and keyless single/batch ingest, idempotent retries, acknowledged
+IDs in recovered replica WALs after leader SIGKILL, failover, restart, and refusal
+without quorum. This correctness check does not replace the hardware soak below.
+
 ## Before launch
 
 - `bettermq doctor --data-dir <data-dir>` passes on every broker.

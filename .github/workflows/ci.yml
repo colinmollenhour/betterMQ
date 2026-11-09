@@ -177,6 +177,10 @@ jobs:
       - name: durable WAL fsync truth gate
         run: cargo test -p broker-storage --test durable_wal_truth_gate -- --nocapture
 
+      - name: replicated HTTP ingest and SIGKILL failover gate
+        timeout-minutes: 10
+        run: cargo test -p broker-server --test replicated_http -- --ignored --nocapture
+
       - name: ingest microbenches (smoke)
         run: cargo bench -p broker-proto --bench encode -- --sample-size 10
 
