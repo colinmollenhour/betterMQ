@@ -76,6 +76,7 @@ const restartMsg = ref("");
 const rfMsg = ref("");
 const infraStatus = ref<Record<string, unknown> | null>(null);
 const joinToken = ref("");
+const hasMembership = ref<boolean | null>(null);
 
 const createOpen = ref(false);
 const editingCell = ref(false);
@@ -271,10 +272,12 @@ async function loadInfra() {
   try {
     const cfg = await apiGet<{
       node?: { name?: string; publicUrl?: string };
+      cluster?: { id?: string; nodes?: unknown[] } | null;
       storage?: { mode?: string; s3?: Record<string, string> };
     }>(publicUrl("/v1/infra/config"));
     nodeForm.name = cfg.node?.name || "";
     nodeForm.publicUrl = cfg.node?.publicUrl || "";
+    hasMembership.value = Boolean(cfg.cluster?.id || cfg.cluster?.nodes?.length || session.cluster?.enabled);
     if (cfg.storage?.mode === "slate" && cfg.storage.s3) {
       storage.mode = "slate";
       storage.endpoint = cfg.storage.s3.endpoint || "";
@@ -370,6 +373,8 @@ async function attachNode() {
 }
 
 async function createCluster() {
+  if (hasMembership.value !== false || isStandalone()) return;
+  if (!confirm("Create a new cluster seed on this unclustered node? Existing deployments must be joined, not replaced.")) return;
   clusterStatus.reset();
   try {
     const res = await apiPost<{ join_token?: string; message?: string; needs_restart?: boolean }>(
@@ -753,7 +758,7 @@ function openAddNode() {
                 </span>
               </p>
               <div v-if="!isStandalone()" class="flex flex-wrap items-center gap-2">
-                <Button size="sm" @click="createCluster">Create cluster</Button>
+                <Button v-if="hasMembership === false" size="sm" @click="createCluster">Create cluster</Button>
                 <Button size="sm" variant="outline" @click="syncCluster">Re-sync</Button>
                 <ActionMessage :error="clusterStatus.error" :ok="clusterStatus.ok" />
               </div>

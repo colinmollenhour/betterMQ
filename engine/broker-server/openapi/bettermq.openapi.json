@@ -4502,6 +4502,7 @@
         ],
         "operationId": "infraClusterCreate",
         "summary": "Create HA cluster and issue join token",
+        "description": "Initialize an unclustered node only. Existing saved, active or runtime membership cannot be replaced.",
         "responses": {
           "200": {
             "description": "OK",
@@ -4512,6 +4513,9 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Cluster membership already exists"
           }
         }
       }

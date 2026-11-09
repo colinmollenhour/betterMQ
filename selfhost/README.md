@@ -172,6 +172,10 @@ use only that cell credential, never the panel login bearer or cluster secret.
 If a cell reports "cell credential not configured", edit its entry to supply the
 token. Rotating a cell's token requires updating its saved credential here.
 
+Infrastructure's **Create cluster** initializes only an unclustered node and
+requires confirmation. The API returns 409 if saved or active membership already
+exists; it never replaces a cluster. Join an existing cluster instead.
+
 ### `bettermq config`
 
 ```bash

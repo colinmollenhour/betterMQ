@@ -494,6 +494,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cluster_create_refuses_existing_membership_and_runtime_file() {
+        let dir = tempdir().unwrap();
+        let state = Arc::new(test_state(&dir));
+        let _ = infra::infra_cluster_create(axum::extract::State(state.clone()))
+            .await
+            .unwrap();
+        let before = std::fs::read(broker_config::managed_config_path(dir.path())).unwrap();
+        let error = infra::infra_cluster_create(axum::extract::State(state.clone()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, routes::ApiError::Conflict(_)));
+        assert_eq!(
+            before,
+            std::fs::read(broker_config::managed_config_path(dir.path())).unwrap()
+        );
+        let cfg = broker_config::BetterMqConfig::template_single_local();
+        broker_config::save_managed_config(dir.path(), &cfg).unwrap();
+        std::fs::write(dir.path().join("cluster-config.json"), "{}").unwrap();
+        let error = infra::infra_cluster_create(axum::extract::State(state))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, routes::ApiError::Conflict(_)));
+    }
+
+    #[tokio::test]
     async fn healthz_returns_ok() {
         let dir = tempdir().unwrap();
         let app = router(test_state(&dir));

@@ -630,6 +630,17 @@ pub async fn infra_cluster_create(
     let dir = data_dir(&state);
     let mut cfg = load_or_default_config(&state)?;
     let cluster_id = Uuid::new_v4();
+    if state.cluster.is_some()
+        || cfg
+            .cluster
+            .as_ref()
+            .is_some_and(|c| c.id.is_some() || !c.nodes.is_empty())
+        || dir.join("cluster-config.json").exists()
+    {
+        return Err(ApiError::Conflict(
+            "cluster membership already exists; create cannot replace it".into(),
+        ));
+    }
     let token = format!("join_{}", Uuid::new_v4().simple());
     let expires = Utc::now().timestamp_millis() + JOIN_TOKEN_TTL_MS;
 
