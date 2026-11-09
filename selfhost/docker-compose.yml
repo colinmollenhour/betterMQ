@@ -27,6 +27,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    stop_grace_period: ${BETTERMQ_STOP_GRACE_PERIOD:-120s}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/readyz"]
       interval: 10s

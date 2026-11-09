@@ -1,5 +1,15 @@
 # BetterMQ self-host
 
+### Shutdown grace
+
+Compose gives broker, fleet and panel services 120 seconds to stop. The broker's
+`BETTERMQ_SHUTDOWN_TIMEOUT_SECS` (default 30, maximum 300) is a **per-phase**
+budget for HTTP drain, dispatch drain and WAL flush, followed by up to 5 seconds
+of task joining. Set `BETTERMQ_STOP_GRACE_PERIOD` above `3 × timeout + 5s` if
+raising that budget (for example `920s` for 300). For Docker run use
+`--stop-timeout 120`; Kubernetes needs `terminationGracePeriodSeconds: 120`
+(plus any preStop-hook time). Do not override Compose with `stop -t 10`.
+
 HA Compose isolates `/internal/v1/*` on Docker-network port **9080**, which is
 never published. Fleet workers use that private endpoint; host ports 8081–8083
 are for public API/panel access only. Generate the shared cluster secret with
@@ -295,7 +305,7 @@ The public repo reads **92** `BETTERMQ_*` names used by self-host. **16** are CL
 | `BETTERMQ_INLINE_MAX_BYTES` | Inline payload threshold before blob store (default 256 KiB) |
 | `BETTERMQ_MAX_PAYLOAD_BLOB_BYTES` | Hard cap for blob payloads (default 256 MiB) |
 | `BETTERMQ_CORS_ORIGINS` | CORS allowlist (`*` or comma-separated origins) |
-| `BETTERMQ_SHUTDOWN_TIMEOUT_SECS` | HTTP/WAL graceful drain bound (default 30 seconds) |
+| `BETTERMQ_SHUTDOWN_TIMEOUT_SECS` | Per-phase HTTP, dispatch and WAL drain bound (default 30 seconds each, maximum 300); see Shutdown grace |
 
 #### Dispatch / delivery
 

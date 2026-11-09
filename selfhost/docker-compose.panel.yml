@@ -26,3 +26,4 @@ services:
         "${BETTERMQ_CONTROLLER:-http://broker1:8080}",
       ]
     restart: unless-stopped
+    stop_grace_period: ${BETTERMQ_STOP_GRACE_PERIOD:-120s}
