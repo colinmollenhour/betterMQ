@@ -46,8 +46,8 @@ fn http_body_limit_bytes() -> usize {
     {
         return n;
     }
-    // Self-host / default: 64 MiB (was unbounded — DoS risk).
-    64 * 1024 * 1024
+    // Match the documented batch wire cap unless explicitly overridden.
+    ingest::MAX_BATCH_BYTES
 }
 
 pub use admin::{
@@ -154,6 +154,10 @@ fn data_plane_routes(shared: Arc<AppState>) -> Router<Arc<AppState>> {
             )
             .merge(infra::protected_infra_routes())
             .route("/v1/ops/aggregate", get(ops::aggregate_ops_status))
+            .route_layer(axum::middleware::from_fn_with_state(
+                shared.clone(),
+                admission::buffer_ingest_body,
+            ))
             .route_layer(axum::middleware::from_fn_with_state(
                 shared.clone(),
                 auth::check_ingest_limits,
@@ -371,6 +375,7 @@ pub fn gateway_only_router(state: GatewayOnlyState) -> Router {
             "/v1/ingest/ndjson",
             axum::routing::post(gateway::gateway_only_ndjson),
         )
+        .route_layer(axum::middleware::from_fn(admission::buffer_gateway_body))
         .route_layer(axum::middleware::from_fn_with_state(
             shared.clone(),
             gateway::gateway_only_auth,
