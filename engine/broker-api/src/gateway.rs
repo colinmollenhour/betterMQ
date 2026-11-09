@@ -78,6 +78,33 @@ pub struct GatewayOnlyState {
 
 const ROUTE_TTL: Duration = Duration::from_secs(30);
 
+fn gateway_layout(shards: Option<&str>, version: Option<&str>) -> Result<(u32, u32), String> {
+    let version = version
+        .map(str::parse::<u32>)
+        .transpose()
+        .map_err(|_| "BETTERMQ_GATEWAY_LAYOUT_VERSION must be 1 or 2")?
+        .unwrap_or(broker_partition::LAYOUT_V1);
+    if !matches!(
+        version,
+        broker_partition::LAYOUT_V1 | broker_partition::LAYOUT_V2
+    ) {
+        return Err("BETTERMQ_GATEWAY_LAYOUT_VERSION must be 1 or 2".into());
+    }
+    let shards = shards
+        .map(str::parse::<u32>)
+        .transpose()
+        .map_err(|_| "BETTERMQ_GATEWAY_SHARD_COUNT must be an integer in 1..=65536")?
+        .unwrap_or(if version == broker_partition::LAYOUT_V2 {
+            broker_partition::DEFAULT_V2_SHARDS
+        } else {
+            broker_partition::DEFAULT_PARTITIONS
+        });
+    if !(1..=65_536).contains(&shards) {
+        return Err("BETTERMQ_GATEWAY_SHARD_COUNT must be in 1..=65536".into());
+    }
+    Ok((shards, version))
+}
+
 #[derive(Clone)]
 struct CachedRoute {
     leader: String,
@@ -122,15 +149,14 @@ impl GatewayOnlyState {
         if seeds.is_empty() {
             return Err("BETTERMQ_BROKER_URLS must contain at least one broker URL".into());
         }
-        let shard_count = std::env::var("BETTERMQ_GATEWAY_SHARD_COUNT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(broker_partition::DEFAULT_V2_SHARDS)
-            .clamp(1, 65_536);
-        let layout_version = std::env::var("BETTERMQ_GATEWAY_LAYOUT_VERSION")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(broker_partition::LAYOUT_V2);
+        let (shard_count, layout_version) = gateway_layout(
+            std::env::var("BETTERMQ_GATEWAY_SHARD_COUNT")
+                .ok()
+                .as_deref(),
+            std::env::var("BETTERMQ_GATEWAY_LAYOUT_VERSION")
+                .ok()
+                .as_deref(),
+        )?;
         let tenant = std::env::var("BETTERMQ_GATEWAY_TENANT").unwrap_or_else(|_| "default".into());
         let local_token = std::env::var("BETTERMQ_GATEWAY_TOKEN")
             .ok()
@@ -1182,6 +1208,34 @@ mod tests {
     use broker_raft_meta::{ClusterConfig, ClusterRuntime, NodeConfig};
     use broker_schedule::{CronRegistry, ScheduleQueue};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn gateway_defaults_match_new_brokers_and_reject_invalid_layouts() {
+        assert_eq!(
+            gateway_layout(None, None).unwrap(),
+            (
+                broker_partition::DEFAULT_PARTITIONS,
+                broker_partition::LAYOUT_V1
+            )
+        );
+        assert_eq!(
+            gateway_layout(None, Some("2")).unwrap(),
+            (
+                broker_partition::DEFAULT_V2_SHARDS,
+                broker_partition::LAYOUT_V2
+            )
+        );
+        assert_eq!(gateway_layout(Some("8"), Some("1")).unwrap(), (8, 1));
+        for (shards, version) in [
+            (Some("0"), None),
+            (Some("65537"), None),
+            (Some("bad"), None),
+            (None, Some("3")),
+            (None, Some("bad")),
+        ] {
+            assert!(gateway_layout(shards, version).is_err());
+        }
+    }
 
     fn test_state(dir: &tempfile::TempDir) -> Arc<AppState> {
         let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();

@@ -10,12 +10,26 @@ BETTERMQ_CLUSTER_SECRET=shared-internal-secret \
 bettermq serve --gateway-only --listen 0.0.0.0:8080
 ```
 
-Routing defaults to layout V2 with 256 physical shards. Override this only to
-match an existing cell:
+Routing defaults to layout V1 with four shards, matching new default broker
+cells. Match the cell's persisted `shard-layout.json`, not its initial environment:
 
 - `BETTERMQ_GATEWAY_LAYOUT_VERSION=1|2`
 - `BETTERMQ_GATEWAY_SHARD_COUNT=<count>`
 - `BETTERMQ_GATEWAY_TENANT=default` for self-hosted routing
+
+For a fresh V2 cell, initialize **every broker** with `BETTERMQ_SHARD_LAYOUT=v2`
+(256 shards by default), then run the gateway with matching settings:
+
+```bash
+BETTERMQ_BROKER_URLS=http://broker-1:8080,http://broker-2:8080 \
+BETTERMQ_GATEWAY_LAYOUT_VERSION=2 BETTERMQ_GATEWAY_SHARD_COUNT=256 \
+BETTERMQ_GATEWAY_TOKEN=replace-me BETTERMQ_CLUSTER_SECRET=shared-internal-secret \
+bettermq serve --gateway-only --listen 0.0.0.0:8080
+```
+
+For existing V1 cells with a nondefault partition count, set
+`BETTERMQ_GATEWAY_LAYOUT_VERSION=1` and `BETTERMQ_GATEWAY_SHARD_COUNT` to that
+persisted count. Invalid counts or unsupported versions stop gateway startup.
 
 The gateway keeps pooled connections and learns authoritative leader addresses
 and expires learned routes after 30 seconds. It refreshes the leader map from
