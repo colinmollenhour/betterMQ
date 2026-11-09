@@ -10,6 +10,15 @@ BETTERMQ_CLUSTER_SECRET=shared-internal-secret \
 bettermq serve --gateway-only --listen 0.0.0.0:8080
 ```
 
+`BETTERMQ_BROKER_URLS` must use the broker's **internal** listener addresses.
+For split listeners (for example, public `:8080` and `--internal-listen :8082`),
+set `BETTERMQ_BROKER_URLS=http://broker-1:8082,http://broker-2:8082`. A collapsed
+listener serves both operations at `:8080`. Both probes and forwarding authenticate
+with `BETTERMQ_CLUSTER_SECRET`; `/internal/v1/readyz` is available on the internal
+listener even though public `/healthz` is not. Do not expose internal listeners
+publicly. A credential rejection returns `cluster_auth_failed`; pointing at the
+public listener returns `internal_route_not_found`, not a JSON decode error.
+
 Routing defaults to layout V1 with four shards, matching new default broker
 cells. Match the cell's persisted `shard-layout.json`, not its initial environment:
 

@@ -573,6 +573,26 @@ fn failed_metadata(
         .collect()
 }
 
+fn internal_route_error(
+    items: &[GatewayForwardItem],
+    status: StatusCode,
+) -> Option<Vec<GatewayForwardResult>> {
+    let (code, message) = match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ("cluster_auth_failed", "cluster secret missing or mismatched; configure the same BETTERMQ_CLUSTER_SECRET on gateway and brokers"),
+        StatusCode::NOT_FOUND => ("internal_route_not_found", "internal gateway route not found; BETTERMQ_BROKER_URLS must point to the broker internal listener"),
+        _ => return None,
+    };
+    let mut results = failed_results(items, message);
+    for result in &mut results {
+        result.failure = Some(crate::ingest::IngestFailure {
+            code: code.into(),
+            retryable: false,
+            retry_after_ms: None,
+        });
+    }
+    Some(results)
+}
+
 async fn forward_shard(
     state: Arc<AppState>,
     shard: u32,
@@ -610,6 +630,9 @@ async fn forward_shard(
             }
         };
         let status = response.status();
+        if let Some(results) = internal_route_error(&request.items, status) {
+            return results;
+        }
         let decoded = response.json::<GatewayForwardResponse>().await;
         let decoded = match decoded {
             Ok(decoded) => decoded,
@@ -702,6 +725,10 @@ async fn forward_gateway_only_shard(
             }
         };
         let status = response.status();
+        if let Some(results) = internal_route_error(&request.items, status) {
+            state.record_forward(shard, status.as_u16(), started.elapsed(), true);
+            return results;
+        }
         let decoded = match response.json::<GatewayForwardResponse>().await {
             Ok(decoded) => decoded,
             Err(error) => {
@@ -1736,6 +1763,51 @@ mod tests {
         );
         assert!(text.contains("duration_seconds_sum{shard=\"2\",status=\"503\"} 0.025"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn gateway_reports_bare_internal_auth_and_wrong_listener_errors() {
+        for (status, code) in [
+            (StatusCode::UNAUTHORIZED, "cluster_auth_failed"),
+            (StatusCode::NOT_FOUND, "internal_route_not_found"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let app = axum::Router::new().route(
+                "/internal/v1/gateway/ingest",
+                axum::routing::post(move || async move { status }),
+            );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let state = Arc::new(GatewayOnlyState {
+                seeds: Arc::new(vec![base]),
+                route_overrides: Arc::new(RwLock::new(HashMap::new())),
+                shard_count: 4,
+                layout_version: broker_partition::LAYOUT_V1,
+                tenant: Arc::new("default".into()),
+                local_token: Some(Arc::new("token".into())),
+                metrics: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                #[cfg(feature = "cloud")]
+                auth: None,
+                #[cfg(feature = "cloud")]
+                control_plane: None,
+            });
+            let request: PublishRequest =
+                serde_json::from_value(serde_json::json!({"payload":"x"})).unwrap();
+            let results = forward_gateway_only_shard(
+                state,
+                0,
+                vec![GatewayForwardItem { index: 0, request }],
+                None,
+            )
+            .await;
+            let failure = results[0].failure.as_ref().unwrap();
+            assert_eq!(failure.code, code);
+            assert!(!failure.retryable);
+            assert!(!results[0].error.as_ref().unwrap().contains("decode"));
+            server.abort();
+        }
     }
 
     #[tokio::test]
