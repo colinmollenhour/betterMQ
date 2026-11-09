@@ -256,6 +256,10 @@ fn internal_cluster_route_table() -> Router<Arc<AppState>> {
         )
         .route("/internal/v1/readyz", axum::routing::get(ops::readyz))
         .route(
+            "/internal/v1/gateway/routes",
+            axum::routing::get(gateway::internal_gateway_routes),
+        )
+        .route(
             "/internal/v1/lease/claim",
             axum::routing::post(lease::lease_claim),
         )
@@ -396,6 +400,7 @@ fn internal_cluster_route_table() -> Router<Arc<AppState>> {
 /// never opens broker storage, WAL, indexes, schedules, dispatch, or archives.
 pub fn gateway_only_router(state: GatewayOnlyState) -> Router {
     let shared = Arc::new(state);
+    shared.spawn_route_refresh();
     let protected = Router::new()
         .route(
             "/v1/gateway/enqueue",

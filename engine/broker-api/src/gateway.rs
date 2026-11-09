@@ -16,7 +16,7 @@ use broker_partition::{PublishRequest, ScheduledInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 use uuid::Uuid;
@@ -65,7 +65,7 @@ fn routing_queue_id(request: &PublishRequest) -> Option<Uuid> {
 #[derive(Clone)]
 pub struct GatewayOnlyState {
     seeds: Arc<Vec<String>>,
-    route_overrides: Arc<RwLock<HashMap<u32, (String, u64)>>>,
+    route_overrides: Arc<RwLock<HashMap<u32, CachedRoute>>>,
     shard_count: u32,
     layout_version: u32,
     tenant: Arc<String>,
@@ -74,6 +74,40 @@ pub struct GatewayOnlyState {
     auth: Option<broker_control_plane::ApiKeyValidator>,
     #[cfg(feature = "cloud")]
     control_plane: Option<broker_control_plane::ControlPlanePool>,
+}
+
+const ROUTE_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct CachedRoute {
+    leader: String,
+    generation: u64,
+    learned_at: Instant,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct GatewayRoutes {
+    routes: Vec<(u32, String, u64)>,
+}
+
+pub(crate) async fn internal_gateway_routes(
+    State(state): State<Arc<AppState>>,
+) -> Json<GatewayRoutes> {
+    let routes = state
+        .cluster
+        .as_ref()
+        .map(|cluster| {
+            (0..state.broker.shard_count())
+                .filter_map(|shard| {
+                    cluster
+                        .runtime
+                        .leader_http_base_for_shard(shard)
+                        .map(|leader| (shard, leader, cluster.runtime.shard_generation(shard)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Json(GatewayRoutes { routes })
 }
 
 impl GatewayOnlyState {
@@ -148,9 +182,13 @@ impl GatewayOnlyState {
     }
 
     async fn route_for(&self, shard: u32) -> (String, u64) {
-        if let Some(route) = self.route_overrides.read().await.get(&shard) {
-            return route.clone();
+        let mut routes = self.route_overrides.write().await;
+        if let Some(route) = routes.get(&shard) {
+            if route.learned_at.elapsed() < ROUTE_TTL {
+                return (route.leader.clone(), route.generation);
+            }
         }
+        routes.remove(&shard);
         (self.seeds[shard as usize % self.seeds.len()].clone(), 0)
     }
 
@@ -158,7 +196,70 @@ impl GatewayOnlyState {
         self.route_overrides
             .write()
             .await
-            .insert(shard, (leader, generation));
+            .entry(shard)
+            .and_modify(|route| {
+                if generation >= route.generation || route.learned_at.elapsed() >= ROUTE_TTL {
+                    *route = CachedRoute {
+                        leader: leader.clone(),
+                        generation,
+                        learned_at: Instant::now(),
+                    };
+                }
+            })
+            .or_insert(CachedRoute {
+                leader,
+                generation,
+                learned_at: Instant::now(),
+            });
+    }
+
+    async fn forget_route(&self, shard: u32, failed: &str) {
+        let mut routes = self.route_overrides.write().await;
+        if routes
+            .get(&shard)
+            .is_some_and(|route| route.leader == failed)
+        {
+            routes.remove(&shard);
+        }
+    }
+
+    async fn refresh_routes(&self) {
+        for seed in self.seeds.iter() {
+            let response = crate::cluster_auth::apply_cluster_secret(
+                gateway_http_client()
+                    .get(format!("{seed}/internal/v1/gateway/routes"))
+                    .timeout(Duration::from_secs(2)),
+            )
+            .send()
+            .await;
+            let Ok(response) = response else { continue };
+            if !response.status().is_success() {
+                continue;
+            }
+            let Ok(routes) = response.json::<GatewayRoutes>().await else {
+                continue;
+            };
+            for (shard, leader, generation) in routes.routes {
+                if shard < self.shard_count {
+                    self.remember_route(shard, leader, generation).await;
+                }
+            }
+            break;
+        }
+    }
+
+    pub(crate) fn spawn_route_refresh(self: &Arc<Self>) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(ROUTE_TTL);
+            loop {
+                interval.tick().await;
+                if crate::admission::is_shutting_down() {
+                    break;
+                }
+                state.refresh_routes().await;
+            }
+        });
     }
 
     async fn healthy_brokers(&self) -> usize {
@@ -445,17 +546,27 @@ async fn forward_shard(
 async fn forward_gateway_only_shard(
     state: Arc<GatewayOnlyState>,
     shard: u32,
-    items: Vec<GatewayForwardItem>,
+    mut items: Vec<GatewayForwardItem>,
     tenant_id: Option<Uuid>,
 ) -> Vec<GatewayForwardResult> {
     let (mut target, mut generation) = state.route_for(shard).await;
+    // A transport failure can have an unknown outcome. Protect internal retries
+    // even when a producer did not provide an idempotency key.
+    for item in &mut items {
+        if item.request.idempotency_key.is_none() {
+            item.request.idempotency_key = Some(format!("gateway:{}", Uuid::new_v4()));
+        }
+    }
     let mut request = GatewayForwardRequest {
         shard,
         leader_generation: generation,
         tenant_id,
         items,
     };
-    for attempt in 0..=1 {
+    let mut attempted = HashSet::new();
+    // Cached leader -> alternate seed -> redirected leader, at most.
+    for attempt in 0..=2 {
+        attempted.insert(target.clone());
         let url = format!(
             "{}/internal/v1/gateway/ingest",
             target.trim_end_matches('/')
@@ -468,6 +579,14 @@ async fn forward_gateway_only_shard(
         let response = match response {
             Ok(response) => response,
             Err(error) => {
+                state.forget_route(shard, &target).await;
+                if attempt < 2 {
+                    if let Some(seed) = state.seeds.iter().find(|seed| !attempted.contains(*seed)) {
+                        target = seed.clone();
+                        request.leader_generation = 0;
+                        continue;
+                    }
+                }
                 return failed_results(
                     &request.items,
                     format!("gateway forward failed for shard {shard}: {error}"),
@@ -484,7 +603,7 @@ async fn forward_gateway_only_shard(
                 );
             }
         };
-        if status == StatusCode::CONFLICT && decoded.stale_leader && attempt == 0 {
+        if status == StatusCode::CONFLICT && decoded.stale_leader && attempt < 2 {
             if let Some(leader) = decoded.leader {
                 target = leader;
             }
@@ -1292,6 +1411,88 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].index, 7);
         assert!(results[0].accepted);
+    }
+
+    #[tokio::test]
+    async fn gateway_only_evicts_dead_leader_and_preserves_retry_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_base = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        let app = axum::Router::new().route(
+            "/internal/v1/gateway/ingest",
+            axum::routing::post(|Json(request): Json<GatewayForwardRequest>| async move {
+                assert_eq!(
+                    request.items[0].request.idempotency_key.as_deref(),
+                    Some("keep-me")
+                );
+                assert!(request.items[0].request.routing_id.is_some());
+                Json(GatewayForwardResponse {
+                    stale_leader: false,
+                    leader: None,
+                    leader_generation: 2,
+                    results: request
+                        .items
+                        .iter()
+                        .map(|item| GatewayForwardResult {
+                            index: item.index,
+                            accepted: true,
+                            message_id: Some(Uuid::new_v4()),
+                            topic: item.request.topic.clone(),
+                            partition: Some(request.shard),
+                            offset: Some(0),
+                            duplicate: false,
+                            commit_epoch: Some(1),
+                            scheduled: None,
+                            error: None,
+                            failure: None,
+                        })
+                        .collect(),
+                })
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = Arc::new(GatewayOnlyState {
+            seeds: Arc::new(vec![base.clone()]),
+            route_overrides: Arc::new(RwLock::new(HashMap::new())),
+            shard_count: 4,
+            layout_version: broker_partition::LAYOUT_V1,
+            tenant: Arc::new("default".into()),
+            local_token: Some(Arc::new("token".into())),
+            #[cfg(feature = "cloud")]
+            auth: None,
+            #[cfg(feature = "cloud")]
+            control_plane: None,
+        });
+        state.remember_route(0, dead_base.clone(), 1).await;
+        let mut request: PublishRequest = serde_json::from_value(serde_json::json!({
+            "payload":"x", "idempotency_key":"keep-me"
+        }))
+        .unwrap();
+        request.ensure_routing_id();
+        let results = forward_gateway_only_shard(
+            state.clone(),
+            0,
+            vec![GatewayForwardItem { index: 9, request }],
+            None,
+        )
+        .await;
+        assert!(results[0].accepted);
+        assert_eq!(results[0].index, 9);
+        assert_eq!(state.route_for(0).await, (base.clone(), 2));
+        state.route_overrides.write().await.insert(
+            0,
+            CachedRoute {
+                leader: dead_base,
+                generation: 1,
+                learned_at: Instant::now() - ROUTE_TTL,
+            },
+        );
+        assert_eq!(state.route_for(0).await, (base, 0));
+        server.abort();
     }
 
     #[tokio::test]

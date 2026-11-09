@@ -18,6 +18,12 @@ match an existing cell:
 - `BETTERMQ_GATEWAY_TENANT=default` for self-hosted routing
 
 The gateway keeps pooled connections and learns authoritative leader addresses
+and expires learned routes after 30 seconds. It refreshes the leader map from
+authenticated seeds every 30 seconds. On a transport failure it evicts the failed
+route and retries through another seed, allowing one redirect to the new leader
+(at most three attempts). All attempts retain the same routing and idempotency
+identities; requests without an idempotency key receive a gateway-local key.
+The gateway learns generations
 and terms from stale-leader responses. `/readyz` requires configured auth and
 at least one healthy broker. `/v1/gateway/status` reports routing readiness.
 
