@@ -2597,6 +2597,35 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Another request holding the same idempotency key is still being published (waited up to 10 s). Retry after the Retry-After interval; the retry returns the original message as a duplicate once it commits.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "idempotency_in_flight"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "description": "Provide either url+secret (1:1) or group_id (fan-out). Shared options: delay, retries, idempotency, priority, outbound HTTP fields."
@@ -2713,6 +2742,35 @@
           },
           "400": {
             "description": "Missing/disabled query secret or invalid destination"
+          },
+          "409": {
+            "description": "Another request holding the same idempotency key is still being published (waited up to 10 s). Retry after the Retry-After interval; the retry returns the original message as a duplicate once it commits.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "idempotency_in_flight"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -2753,6 +2811,35 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AcceptResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another request holding the same idempotency key is still being published (waited up to 10 s). Retry after the Retry-After interval; the retry returns the original message as a duplicate once it commits.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "idempotency_in_flight"
+                      ]
+                    }
+                  }
                 }
               }
             }
@@ -2806,6 +2893,35 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AcceptResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another request holding the same idempotency key is still being published (waited up to 10 s). Retry after the Retry-After interval; the retry returns the original message as a duplicate once it commits.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "idempotency_in_flight"
+                      ]
+                    }
+                  }
                 }
               }
             }

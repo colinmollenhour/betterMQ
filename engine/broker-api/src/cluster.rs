@@ -309,16 +309,20 @@ async fn publish_on_leader(
     let body_bytes = meter
         .map(|m| m.body_bytes)
         .unwrap_or_else(|| req.payload.len() as u64);
-    let idempotency_key = req.idempotency_key.clone();
-    let mut resp = if state
+    // In a replicated cell the idempotency key stays reserved until quorum, so
+    // a same-key retry waits for this request instead of appending a copy.
+    let (mut resp, pending_dedup) = if state
         .cluster
         .as_ref()
         .is_some_and(|c| c.runtime.config().node_count() > 1)
         && state.broker.config().storage != StorageMode::Slate
     {
-        state.broker.publish_defer_dedup(req)?
+        state.broker.publish_defer_dedup(req).await?
     } else {
-        state.broker.publish(req)?
+        (
+            state.broker.publish_async(req).await?,
+            broker_partition::PendingDedup::default(),
+        )
     };
     let topic = resp.topic.clone();
     let wait = {
@@ -338,21 +342,7 @@ async fn publish_on_leader(
     };
     let epoch = replicate_if_needed(state, &mut resp, wait).await?;
     resp.commit_epoch = Some(epoch);
-    if let (Some(key), false) = (idempotency_key.as_deref(), resp.duplicate) {
-        if let (Some(message_id), Some(offset), Some(partition)) =
-            (resp.message_id, resp.offset, resp.partition)
-        {
-            state.broker.commit_publish_dedup(
-                key,
-                broker_partition::DedupEntry::new(
-                    message_id,
-                    offset,
-                    partition,
-                    resp.topic.clone(),
-                ),
-            )?;
-        }
-    }
+    state.broker.commit_publish_dedup(pending_dedup)?;
     if let Some(m) = meter {
         if !resp.duplicate {
             crate::metering::record_ingest(state, m.tenant_id, body_bytes).await;

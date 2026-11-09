@@ -18,12 +18,14 @@ use broker_storage::{
     StorageMode, StoredMessage,
 };
 use chrono::Utc;
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 pub const DEFAULT_TENANT: &str = "default";
@@ -93,6 +95,8 @@ pub enum BrokerError {
     InvalidName(#[from] broker_proto::PathSegmentError),
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+    #[error("idempotency key {0} is in flight on another request; retry shortly")]
+    IdempotencyInFlight(String),
 }
 
 /// Returns `Some(generation)` when this node is leader for the shard (Slate fence).
@@ -223,17 +227,60 @@ struct ReservationKey {
     idempotency_key: String,
 }
 
+/// How long an async publish waits for another request holding the same
+/// idempotency key before giving up with [`BrokerError::IdempotencyInFlight`].
+pub const DEDUP_IN_FLIGHT_WAIT: Duration = Duration::from_secs(10);
+
+/// In-flight idempotency keys. Each entry owns a `watch` sender that is never
+/// written; dropping it on release wakes every async waiter. Nothing here
+/// blocks a thread, so waiters cannot starve the runtime that must poll the
+/// reservation holder.
 #[derive(Default)]
 struct DedupReservations {
-    pending: Mutex<HashSet<ReservationKey>>,
-    changed: Condvar,
+    pending: Mutex<HashMap<ReservationKey, watch::Sender<()>>>,
 }
 
 impl DedupReservations {
-    fn release(&self, key: &ReservationKey) {
-        if self.pending.lock().remove(key) {
-            self.changed.notify_all();
+    fn try_acquire(
+        self: &Arc<Self>,
+        key: ReservationKey,
+    ) -> Result<ReservationToken, DedupInFlight> {
+        let mut pending = self.pending.lock();
+        if let Some(sender) = pending.get(&key) {
+            return Err(DedupInFlight {
+                idempotency_key: key.idempotency_key,
+                released: sender.subscribe(),
+            });
         }
+        pending.insert(key.clone(), watch::channel(()).0);
+        Ok(ReservationToken {
+            reservations: Arc::clone(self),
+            key,
+            release_on_drop: true,
+        })
+    }
+
+    fn release(&self, key: &ReservationKey) {
+        // Dropping the sender closes the channel and wakes all waiters.
+        drop(self.pending.lock().remove(key));
+    }
+}
+
+/// Another request currently owns this idempotency key.
+struct DedupInFlight {
+    idempotency_key: String,
+    released: watch::Receiver<()>,
+}
+
+impl DedupInFlight {
+    /// Resolves once the owning request releases the key.
+    async fn released(mut self) {
+        // The sender is never written, so `changed` only returns once it is dropped.
+        let _ = self.released.changed().await;
+    }
+
+    fn into_error(self) -> BrokerError {
+        BrokerError::IdempotencyInFlight(self.idempotency_key)
     }
 }
 
@@ -261,6 +308,26 @@ impl Drop for ReservationToken {
 enum ReservationOutcome {
     Existing(DedupEntry),
     Acquired(ReservationToken),
+}
+
+/// Idempotency reservations kept past the local append until replication
+/// quorum resolves. [`Broker::commit_publish_dedup`] records the mappings and
+/// releases the keys; dropping it releases the keys without recording them, so
+/// a retry after a failed quorum appends again.
+#[must_use = "dropping PendingDedup releases idempotency keys without recording them"]
+#[derive(Default)]
+pub struct PendingDedup {
+    entries: Vec<(ReservationToken, DedupEntry)>,
+}
+
+impl PendingDedup {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -321,11 +388,17 @@ enum PreparedSlot {
 pub struct PreparedPublishBatch {
     slots: Vec<PreparedSlot>,
     shard_batches: Vec<PreparedShardBatch>,
+    deferred_dedup: PendingDedup,
 }
 
 impl PreparedPublishBatch {
     pub fn take_shard_batches(&mut self) -> Vec<PreparedShardBatch> {
         std::mem::take(&mut self.shard_batches)
+    }
+
+    /// Reservations retained by `finalize_prepared_batch(.., commit_dedup = false)`.
+    pub fn take_pending_dedup(&mut self) -> PendingDedup {
+        std::mem::take(&mut self.deferred_dedup)
     }
 
     pub fn len(&self) -> usize {
@@ -1113,11 +1186,79 @@ impl Broker {
 
     /// Normalize an engine-facing batch without appending. Existing and
     /// within-batch duplicates retain their input slots.
+    ///
+    /// Never blocks: if another request holds one of the batch's idempotency
+    /// keys, every reservation taken so far is released and
+    /// [`BrokerError::IdempotencyInFlight`] is returned. Async callers should
+    /// use [`Broker::prepare_publish_batch_waiting`].
     pub fn prepare_publish_batch(
         &self,
         requests: Vec<PublishRequest>,
     ) -> Result<PreparedPublishBatch, BrokerError> {
         let tenant_id = self.tenant();
+        let reservations = self
+            .try_reserve_batch_dedup(&tenant_id, &requests)?
+            .map_err(DedupInFlight::into_error)?;
+        self.prepare_reserved_batch(requests, reservations)
+    }
+
+    /// Like [`Broker::prepare_publish_batch`], but waits asynchronously (up to
+    /// [`DEDUP_IN_FLIGHT_WAIT`]) for in-flight requests that own one of the
+    /// batch's idempotency keys, so a retry resolves to the original message.
+    pub async fn prepare_publish_batch_waiting(
+        &self,
+        requests: Vec<PublishRequest>,
+    ) -> Result<PreparedPublishBatch, BrokerError> {
+        let tenant_id = self.tenant();
+        let deadline = tokio::time::Instant::now() + DEDUP_IN_FLIGHT_WAIT;
+        loop {
+            match self.try_reserve_batch_dedup(&tenant_id, &requests)? {
+                Ok(reservations) => return self.prepare_reserved_batch(requests, reservations),
+                Err(in_flight) => {
+                    let key = in_flight.idempotency_key.clone();
+                    if tokio::time::timeout_at(deadline, in_flight.released())
+                        .await
+                        .is_err()
+                    {
+                        return Err(BrokerError::IdempotencyInFlight(key));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve every distinct idempotency key of a batch without waiting. On
+    /// conflict the keys acquired so far are released before returning, so a
+    /// batch never holds some keys while waiting for others (no lock-order
+    /// deadlock between `[A, B]` and `[B, A]`).
+    fn try_reserve_batch_dedup(
+        &self,
+        tenant_id: &str,
+        requests: &[PublishRequest],
+    ) -> Result<Result<HashMap<String, ReservationOutcome>, DedupInFlight>, BrokerError> {
+        let mut reservations = HashMap::new();
+        for key in requests
+            .iter()
+            .filter_map(|request| request.idempotency_key.as_ref())
+        {
+            if reservations.contains_key(key) {
+                continue;
+            }
+            match self.try_reserve_dedup(tenant_id, key)? {
+                Ok(outcome) => {
+                    reservations.insert(key.clone(), outcome);
+                }
+                Err(in_flight) => return Ok(Err(in_flight)),
+            }
+        }
+        Ok(Ok(reservations))
+    }
+
+    fn prepare_reserved_batch(
+        &self,
+        requests: Vec<PublishRequest>,
+        mut reservations: HashMap<String, ReservationOutcome>,
+    ) -> Result<PreparedPublishBatch, BrokerError> {
         let mut slots = Vec::with_capacity(requests.len());
         let mut groups: Vec<PreparedShardBatch> = Vec::new();
         let mut group_indexes: HashMap<PreparedShardKey, usize> = HashMap::new();
@@ -1136,21 +1277,26 @@ impl Broker {
                     });
                     continue;
                 }
-                match self.reserve_dedup(&tenant_id, key)? {
-                    ReservationOutcome::Existing(entry) => {
-                        slots.push(PreparedSlot::Existing(PublishResponse {
-                            message_id: Some(entry.message_id),
-                            topic: original_topic,
-                            partition: Some(entry.partition),
-                            offset: Some(entry.offset),
-                            duplicate: true,
-                            scheduled: None,
-                            commit_epoch: None,
-                            replication_frame: None,
-                        }));
-                        continue;
+                if let Some(ReservationOutcome::Existing(entry)) = reservations.get(key) {
+                    slots.push(PreparedSlot::Existing(PublishResponse {
+                        message_id: Some(entry.message_id),
+                        topic: original_topic,
+                        partition: Some(entry.partition),
+                        offset: Some(entry.offset),
+                        duplicate: true,
+                        scheduled: None,
+                        commit_epoch: None,
+                        replication_frame: None,
+                    }));
+                    continue;
+                }
+                match reservations.remove(key) {
+                    Some(ReservationOutcome::Acquired(token)) => Some(token),
+                    _ => {
+                        return Err(BrokerError::InvalidConfig(format!(
+                            "idempotency key {key} was not reserved for this batch"
+                        )))
                     }
-                    ReservationOutcome::Acquired(token) => Some(token),
                 }
             } else {
                 None
@@ -1193,6 +1339,7 @@ impl Broker {
         Ok(PreparedPublishBatch {
             slots,
             shard_batches: groups,
+            deferred_dedup: PendingDedup::default(),
         })
     }
 
@@ -1236,6 +1383,10 @@ impl Broker {
 
     /// Finalize one appended shard group and atomically publish all dedup
     /// mappings for that group in one RocksDB WriteBatch.
+    ///
+    /// With `commit_dedup = false` nothing is recorded and the reservations
+    /// stay held; collect them with [`PreparedPublishBatch::take_pending_dedup`]
+    /// and pass them to [`Broker::commit_publish_dedup`] after quorum.
     pub fn finalize_prepared_batch(
         &self,
         prepared: &mut PreparedPublishBatch,
@@ -1301,12 +1452,22 @@ impl Broker {
 
         let mut responses = HashMap::with_capacity(batch.appended.len());
         for (record, (stored, frame)) in batch.records.iter_mut().zip(batch.appended) {
-            if commit_dedup {
-                if let Some(reservation) = record.reservation.take() {
+            if let Some(reservation) = record.reservation.take() {
+                if commit_dedup {
                     reservation.release();
+                } else {
+                    // Keep the key reserved until replication quorum resolves;
+                    // releasing here would let a retry append a second copy.
+                    prepared.deferred_dedup.entries.push((
+                        reservation,
+                        DedupEntry::new(
+                            stored.id,
+                            stored.offset,
+                            stored.partition,
+                            record.topic.clone(),
+                        ),
+                    ));
                 }
-            } else if let Some(reservation) = record.reservation.take() {
-                reservation.release();
             }
             responses.insert(
                 record.message_id,
@@ -1387,29 +1548,50 @@ impl Broker {
             .map_err(BrokerError::Payload)
     }
 
+    /// Publish one record. Never blocks on another request's idempotency
+    /// reservation: a concurrent same-key publish fails fast with
+    /// [`BrokerError::IdempotencyInFlight`]. Async callers that want to wait
+    /// for the owner and receive its result should use [`Broker::publish_async`].
     pub fn publish(&self, req: PublishRequest) -> Result<PublishResponse, BrokerError> {
-        self.publish_inner(req, true)
+        let prepared = self.prepare_publish_batch(vec![req])?;
+        let (response, _) = self.publish_prepared(prepared, true)?;
+        Ok(response)
+    }
+
+    /// [`Broker::publish`] that waits asynchronously for an in-flight request
+    /// holding the same idempotency key, then returns its duplicate result.
+    pub async fn publish_async(&self, req: PublishRequest) -> Result<PublishResponse, BrokerError> {
+        let prepared = self.prepare_publish_batch_waiting(vec![req]).await?;
+        let (response, _) = self.publish_prepared(prepared, true)?;
+        Ok(response)
     }
 
     /// Append without recording idempotency until replication quorum succeeds.
-    pub fn publish_defer_dedup(&self, req: PublishRequest) -> Result<PublishResponse, BrokerError> {
-        self.publish_inner(req, false)
-    }
-
-    fn publish_inner(
+    /// The key stays reserved in the returned [`PendingDedup`] so a retry
+    /// during replication waits for this request instead of appending again.
+    pub async fn publish_defer_dedup(
         &self,
         req: PublishRequest,
+    ) -> Result<(PublishResponse, PendingDedup), BrokerError> {
+        let prepared = self.prepare_publish_batch_waiting(vec![req]).await?;
+        self.publish_prepared(prepared, false)
+    }
+
+    fn publish_prepared(
+        &self,
+        mut prepared: PreparedPublishBatch,
         commit_dedup: bool,
-    ) -> Result<PublishResponse, BrokerError> {
-        let mut prepared = self.prepare_publish_batch(vec![req])?;
+    ) -> Result<(PublishResponse, PendingDedup), BrokerError> {
         for shard_batch in prepared.take_shard_batches() {
             let appended = self.append_prepared_batch(shard_batch)?;
             self.finalize_prepared_batch(&mut prepared, appended, commit_dedup)?;
         }
-        prepared
+        let pending = prepared.take_pending_dedup();
+        let response = prepared
             .finish()?
             .pop()
-            .ok_or_else(|| BrokerError::InvalidConfig("empty single publish result".into()))
+            .ok_or_else(|| BrokerError::InvalidConfig("empty single publish result".into()))?;
+        Ok((response, pending))
     }
 
     fn prepare_record(
@@ -1543,46 +1725,41 @@ impl Broker {
         Ok(())
     }
 
-    fn reserve_dedup(
+    /// Take the in-memory reservation first, then consult the dedup index.
+    /// Dedup rows are only written by a reservation holder, so reading the
+    /// index while holding the key cannot race with a concurrent commit.
+    fn try_reserve_dedup(
         &self,
         tenant_id: &str,
         idempotency_key: &str,
-    ) -> Result<ReservationOutcome, BrokerError> {
+    ) -> Result<Result<ReservationOutcome, DedupInFlight>, BrokerError> {
         let key = ReservationKey {
             tenant_id: tenant_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
         };
-        loop {
-            {
-                let mut pending = self.inner.dedup_reservations.pending.lock();
-                while pending.contains(&key) {
-                    self.inner.dedup_reservations.changed.wait(&mut pending);
+        let token = match self.inner.dedup_reservations.try_acquire(key) {
+            Ok(token) => token,
+            Err(in_flight) => return Ok(Err(in_flight)),
+        };
+        if let Some(entry) = self.inner.metadata.get_dedup(tenant_id, idempotency_key)? {
+            if let Some(topic) = self.verify_dedup_hit(tenant_id, &entry)? {
+                if entry.topic.is_empty() && !topic.is_empty() {
+                    let mut migrated = entry.clone();
+                    migrated.topic = topic;
+                    self.inner
+                        .metadata
+                        .put_dedup(tenant_id, idempotency_key, &migrated)?;
                 }
+                token.release();
+                return Ok(Ok(ReservationOutcome::Existing(entry)));
             }
-            if let Some(entry) = self.inner.metadata.get_dedup(tenant_id, idempotency_key)? {
-                if let Some(topic) = self.verify_dedup_hit(tenant_id, &entry)? {
-                    if entry.topic.is_empty() && !topic.is_empty() {
-                        let mut migrated = entry.clone();
-                        migrated.topic = topic;
-                        self.inner
-                            .metadata
-                            .put_dedup(tenant_id, idempotency_key, &migrated)?;
-                    }
-                    return Ok(ReservationOutcome::Existing(entry));
-                }
-                self.inner
-                    .metadata
-                    .delete_dedup(tenant_id, idempotency_key)?;
-            }
-            let mut pending = self.inner.dedup_reservations.pending.lock();
-            if pending.insert(key.clone()) {
-                return Ok(ReservationOutcome::Acquired(ReservationToken {
-                    reservations: Arc::clone(&self.inner.dedup_reservations),
-                    key,
-                    release_on_drop: true,
-                }));
-            }
+            // Provably stale (its record is absent or belongs to another
+            // message): drop it and publish as new under the held key.
+            self.inner
+                .metadata
+                .delete_dedup(tenant_id, idempotency_key)?;
         }
+        Ok(Ok(ReservationOutcome::Acquired(token)))
     }
 
     /// Record idempotency after replication quorum (or immediately on a single node).
@@ -1675,53 +1852,24 @@ impl Broker {
         Ok(topics)
     }
 
-    pub fn commit_publish_dedup(
-        &self,
-        idempotency_key: &str,
-        entry: DedupEntry,
-    ) -> Result<(), BrokerError> {
-        let tenant_id = self.tenant();
+    /// Record deferred idempotency mappings after replication quorum, then
+    /// release their keys. On error the keys are released unrecorded.
+    pub fn commit_publish_dedup(&self, pending: PendingDedup) -> Result<(), BrokerError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
         let mut batch = MetadataWriteBatch::default();
-        batch.put_dedup(tenant_id.clone(), idempotency_key, entry);
-        self.inner.metadata.write_batch(batch)?;
-        self.inner.dedup_reservations.release(&ReservationKey {
-            tenant_id,
-            idempotency_key: idempotency_key.to_string(),
-        });
-        Ok(())
-    }
-
-    pub fn commit_publish_dedup_batch(
-        &self,
-        entries: impl IntoIterator<Item = (String, DedupEntry)>,
-    ) -> Result<(), BrokerError> {
-        let tenant_id = self.tenant();
-        let mut batch = MetadataWriteBatch::default();
-        let mut keys = Vec::new();
-        for (key, entry) in entries {
-            batch.put_dedup(tenant_id.clone(), key.clone(), entry);
-            keys.push(key);
+        for (token, entry) in &pending.entries {
+            batch.put_dedup(
+                token.key.tenant_id.clone(),
+                token.key.idempotency_key.clone(),
+                entry.clone(),
+            );
         }
         self.inner.metadata.write_batch(batch)?;
-        for key in keys {
-            self.inner.dedup_reservations.release(&ReservationKey {
-                tenant_id: tenant_id.clone(),
-                idempotency_key: key,
-            });
+        for (token, _) in pending.entries {
+            token.release();
         }
-        Ok(())
-    }
-
-    /// Remove an idempotency mapping (used when replication quorum fails after local append).
-    pub fn clear_publish_dedup(&self, idempotency_key: &str) -> Result<(), BrokerError> {
-        let tenant_id = self.tenant();
-        self.inner
-            .metadata
-            .delete_dedup(&tenant_id, idempotency_key)?;
-        self.inner.dedup_reservations.release(&ReservationKey {
-            tenant_id,
-            idempotency_key: idempotency_key.to_string(),
-        });
         Ok(())
     }
 
@@ -3186,31 +3334,30 @@ mod tests {
         assert_eq!(responses[1].offset, responses[3].offset);
     }
 
-    #[test]
-    fn concurrent_same_key_reservation_allows_one_append() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_key_reservation_allows_one_append() {
         let dir = tempdir().unwrap();
         let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
-        let barrier = Arc::new(std::sync::Barrier::new(16));
-        let responses = std::thread::scope(|scope| {
-            let mut threads = Vec::new();
-            for index in 0..16 {
-                let broker = broker.clone();
-                let barrier = Arc::clone(&barrier);
-                threads.push(scope.spawn(move || {
-                    barrier.wait();
-                    broker
-                        .publish(direct_request(
-                            format!("candidate-{index}"),
-                            Some("race-key".into()),
-                        ))
-                        .unwrap()
-                }));
-            }
-            threads
-                .into_iter()
-                .map(|thread| thread.join().unwrap())
-                .collect::<Vec<_>>()
-        });
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let mut tasks = Vec::new();
+        for index in 0..16 {
+            let broker = broker.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                broker
+                    .publish_async(direct_request(
+                        format!("candidate-{index}"),
+                        Some("race-key".into()),
+                    ))
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut responses = Vec::new();
+        for task in tasks {
+            responses.push(task.await.unwrap());
+        }
         assert_eq!(
             responses
                 .iter()
@@ -3283,6 +3430,167 @@ mod tests {
             .publish(direct_request("retry", Some("retry-after-failure".into())))
             .unwrap();
         assert!(!response.duplicate);
+    }
+
+    #[test]
+    fn sync_publish_fails_fast_on_in_flight_key() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let held = broker
+            .prepare_publish_batch(vec![direct_request("owner", Some("busy".into()))])
+            .unwrap();
+        let error = broker
+            .publish(direct_request("retry", Some("busy".into())))
+            .unwrap_err();
+        assert!(matches!(error, BrokerError::IdempotencyInFlight(ref key) if key == "busy"));
+        drop(held);
+        assert!(
+            !broker
+                .publish(direct_request("retry", Some("busy".into())))
+                .unwrap()
+                .duplicate
+        );
+    }
+
+    /// A single runtime worker must keep polling the reservation owner while
+    /// same-key waiters are parked (the old Condvar wait deadlocked here).
+    #[test]
+    fn waiters_do_not_block_the_reservation_owner_on_one_worker() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut prepared = broker
+                .prepare_publish_batch(vec![direct_request("owner", Some("slow".into()))])
+                .unwrap();
+            let waiters: Vec<_> = (0..8)
+                .map(|index| {
+                    let broker = broker.clone();
+                    tokio::spawn(async move {
+                        broker
+                            .publish_async(direct_request(
+                                format!("retry-{index}"),
+                                Some("slow".into()),
+                            ))
+                            .await
+                            .unwrap()
+                    })
+                })
+                .collect();
+            // Let every waiter run up to its await point.
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            for shard_batch in prepared.take_shard_batches() {
+                let appended = broker.append_prepared_batch(shard_batch).unwrap();
+                broker
+                    .finalize_prepared_batch(&mut prepared, appended, true)
+                    .unwrap();
+            }
+            let owner = prepared.finish().unwrap().pop().unwrap();
+            for waiter in waiters {
+                let response = waiter.await.unwrap();
+                assert!(response.duplicate);
+                assert_eq!(response.message_id, owner.message_id);
+                assert_eq!(response.offset, owner.offset);
+            }
+        });
+    }
+
+    #[test]
+    fn opposite_key_order_batches_do_not_hold_partial_reservations() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let held = broker
+            .prepare_publish_batch(vec![
+                direct_request("a", Some("A".into())),
+                direct_request("b", Some("B".into())),
+            ])
+            .unwrap();
+        // [C, B] acquires C, conflicts on B and must roll C back.
+        let error = match broker.prepare_publish_batch(vec![
+            direct_request("c", Some("C".into())),
+            direct_request("b2", Some("B".into())),
+        ]) {
+            Err(error) => error,
+            Ok(_) => panic!("conflicting batch unexpectedly prepared"),
+        };
+        assert!(matches!(error, BrokerError::IdempotencyInFlight(ref key) if key == "B"));
+        assert!(
+            !broker
+                .publish(direct_request("c", Some("C".into())))
+                .unwrap()
+                .duplicate
+        );
+        drop(held);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let prepared = runtime
+            .block_on(broker.prepare_publish_batch_waiting(vec![
+                direct_request("b", Some("B".into())),
+                direct_request("a", Some("A".into())),
+            ]))
+            .unwrap();
+        assert_eq!(prepared.len(), 2);
+    }
+
+    #[test]
+    fn deferred_dedup_holds_key_until_commit() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (first, pending) = runtime
+            .block_on(broker.publish_defer_dedup(direct_request("one", Some("ha".into()))))
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        // Replication is still in flight: a retry must not append a second copy.
+        assert!(matches!(
+            broker.publish(direct_request("two", Some("ha".into()))),
+            Err(BrokerError::IdempotencyInFlight(_))
+        ));
+        // Callers record dedup only once the record is committed; a row above
+        // the visible HWM is treated as stale.
+        runtime
+            .block_on(broker.wait_committed(
+                &first.topic,
+                first.partition.unwrap(),
+                first.offset.unwrap(),
+            ))
+            .unwrap();
+        broker.commit_publish_dedup(pending).unwrap();
+        let retry = broker
+            .publish(direct_request("two", Some("ha".into())))
+            .unwrap();
+        assert!(retry.duplicate);
+        assert_eq!(retry.message_id, first.message_id);
+        assert_eq!(retry.offset, first.offset);
+    }
+
+    #[test]
+    fn deferred_dedup_dropped_after_failed_quorum_releases_unrecorded() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (first, pending) = runtime
+            .block_on(broker.publish_defer_dedup(direct_request("one", Some("lost".into()))))
+            .unwrap();
+        drop(pending);
+        let retry = broker
+            .publish(direct_request("two", Some("lost".into())))
+            .unwrap();
+        assert!(!retry.duplicate);
+        assert_ne!(retry.message_id, first.message_id);
     }
 
     #[test]

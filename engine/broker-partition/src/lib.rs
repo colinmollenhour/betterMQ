@@ -28,9 +28,9 @@ pub use priority::{
 
 pub use broker::{
     AppendedRecordRef, AppendedShardBatch, Broker, BrokerConfig, BrokerError,
-    CreateSubscriptionRequest, CreateSubscriptionResponse, DestinationSnapshot,
+    CreateSubscriptionRequest, CreateSubscriptionResponse, DestinationSnapshot, PendingDedup,
     PreparedPublishBatch, PreparedShardBatch, PreparedShardKey, PublishRequest, PublishResponse,
-    ScheduledInfo, TopicMessagePage, DEFAULT_PARTITIONS, DEFAULT_TENANT,
+    ScheduledInfo, TopicMessagePage, DEDUP_IN_FLIGHT_WAIT, DEFAULT_PARTITIONS, DEFAULT_TENANT,
 };
 pub use flows::{FlowProfile, FlowProfileError, FlowProfileRegistry};
 pub use groups::{DispatchGroup, GroupError, GroupMember, GroupRegistry};

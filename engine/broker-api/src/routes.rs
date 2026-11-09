@@ -353,6 +353,21 @@ impl IntoResponse for ApiError {
                 }
                 resp
             }
+            ApiError::Broker(BrokerError::IdempotencyInFlight(key)) => {
+                let mut resp = (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "idempotency key {key} is still being published by another request; retry shortly"
+                        ),
+                        "code": "idempotency_in_flight",
+                    })),
+                )
+                    .into_response();
+                resp.headers_mut()
+                    .insert("retry-after", axum::http::HeaderValue::from_static("1"));
+                resp
+            }
             ApiError::Broker(e) => {
                 let (status, code, msg) = match &e {
                     BrokerError::Index(_) => (
@@ -445,6 +460,14 @@ mod tests {
         )))
         .into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn in_flight_idempotency_key_is_retryable_conflict() {
+        let response =
+            ApiError::Broker(BrokerError::IdempotencyInFlight("k".into())).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "1");
     }
 
     #[test]

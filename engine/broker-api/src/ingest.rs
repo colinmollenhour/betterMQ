@@ -425,7 +425,7 @@ async fn submit_local_leader_batch(
         return rejected;
     }
 
-    let mut prepared = match state.broker.prepare_publish_batch(requests) {
+    let mut prepared = match state.broker.prepare_publish_batch_waiting(requests).await {
         Ok(prepared) => prepared,
         Err(error) => {
             rejected.extend(failed_outcomes(&admitted, ApiError::from(error)));
