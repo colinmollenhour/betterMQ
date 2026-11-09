@@ -185,6 +185,26 @@ impl PartitionBackend {
         }
     }
 
+    /// First retained offset; records below it were collected.
+    pub fn base_offset(&self) -> u64 {
+        match self {
+            Self::Local(log) => log.base_offset(),
+            #[cfg(feature = "slate")]
+            Self::Slate(_) => 0,
+        }
+    }
+
+    /// Continue an empty or fully-below-`base` log at `base`.
+    pub fn reset_base(&mut self, base: u64) -> Result<(), LogError> {
+        match self {
+            Self::Local(log) => log.reset_base(base),
+            #[cfg(feature = "slate")]
+            Self::Slate(_) => Err(LogError::Slate(
+                "reset_base is not supported for Slate storage".into(),
+            )),
+        }
+    }
+
     pub fn sync(&mut self) -> Result<(), LogError> {
         match self {
             Self::Local(log) => log.sync(),

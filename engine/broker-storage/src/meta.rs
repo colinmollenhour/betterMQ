@@ -53,6 +53,15 @@ pub struct LogMeta {
     /// Highest offset whose sealed segments may be physically deleted.
     #[serde(default)]
     pub gc_watermark: u64,
+    /// First offset still retained by this log. Everything below it was
+    /// removed by GC (or never copied here, see `PartitionLog::reset_base`),
+    /// and recovery numbers the surviving records from here instead of 0.
+    #[serde(default)]
+    pub base_offset: u64,
+    /// Roll number of the first retained sealed segment. Segment files with a
+    /// lower number are deletion leftovers and are removed on open.
+    #[serde(default)]
+    pub base_segment: u64,
 }
 
 impl LogMeta {

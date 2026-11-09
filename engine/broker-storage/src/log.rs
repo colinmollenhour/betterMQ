@@ -275,7 +275,15 @@ impl PartitionLog {
     fn rebuild_from_disk(&mut self) -> Result<(), LogError> {
         self.index.clear();
         self.sealed_indexes.clear();
-        let mut next = 0u64;
+        let leftovers = self.remove_segments_below_base()?;
+        if leftovers > 0 {
+            tracing::warn!(
+                dir = %self.dir.display(),
+                leftovers,
+                base_segment = self.meta.base_segment,
+                "removed sealed segments left behind by an interrupted GC"
+            );
+        }
 
         let mut segment_files: Vec<PathBuf> = std::fs::read_dir(self.dir.join(SEGMENTS_DIR))?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -290,7 +298,15 @@ impl PartitionLog {
             self.meta.segment_roll_count =
                 self.meta.segment_roll_count.max(highest.saturating_add(1));
         }
+        self.meta.segment_roll_count = self.meta.segment_roll_count.max(self.meta.base_segment);
+        if let Some(lowest) = segment_files.iter().filter_map(|p| segment_index(p)).min() {
+            if lowest > self.meta.base_segment {
+                self.recover_missing_base(&segment_files, lowest)?;
+            }
+        }
 
+        // Offsets are absolute: a GC'd prefix must not renumber survivors.
+        let mut next = self.meta.base_offset;
         for path in &segment_files {
             let first = next;
             next = self.scan_file(path, next, false)?;
@@ -312,6 +328,84 @@ impl PartitionLog {
         Ok(())
     }
 
+    /// The lowest sealed segment on disk is newer than `meta.base_segment`,
+    /// so a prefix was deleted without a matching base (meta.json lost or
+    /// reset, or a GC from before the base was persisted). V2 epochs carry
+    /// absolute offsets, so the base is read back from the first one. V1
+    /// frames carry none; guessing would silently renumber records.
+    fn recover_missing_base(
+        &mut self,
+        segment_files: &[PathBuf],
+        lowest: u64,
+    ) -> Result<(), LogError> {
+        let Some(first_path) = segment_files
+            .iter()
+            .find(|path| segment_index(path) == Some(lowest))
+        else {
+            return Ok(());
+        };
+        if self.manifest.wal_format_version != WAL_FORMAT_V2 {
+            return Err(LogError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "sealed segments before {} are missing and V1 frames carry no offsets; \
+                     restore meta.json (base_offset) or the missing segments",
+                    first_path.display()
+                ),
+            )));
+        }
+        let (epoch, _) = decode_epoch(&mut BufReader::new(File::open(first_path)?))?;
+        if epoch.first_offset < self.meta.base_offset {
+            return Err(LogError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} starts at offset {} below the retained base {}",
+                    first_path.display(),
+                    epoch.first_offset,
+                    self.meta.base_offset
+                ),
+            )));
+        }
+        tracing::warn!(
+            dir = %self.dir.display(),
+            base_offset = epoch.first_offset,
+            base_segment = lowest,
+            "sealed-segment prefix missing from meta; recovered base from the first epoch"
+        );
+        self.meta.base_offset = epoch.first_offset;
+        self.meta.base_segment = lowest;
+        Ok(())
+    }
+
+    /// Delete sealed segments numbered below `meta.base_segment`. A GC or
+    /// [`Self::reset_base`] persisted the new base first and then failed or
+    /// crashed before unlinking them.
+    fn remove_segments_below_base(&mut self) -> Result<usize, LogError> {
+        let base = self.meta.base_segment;
+        if base == 0 {
+            return Ok(0);
+        }
+        let segments = self.dir.join(SEGMENTS_DIR);
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(&segments)? {
+            let path = entry?.path();
+            if segment_index(&path).is_none_or(|index| index >= base) {
+                continue;
+            }
+            if let Ok(mut cache) = self.reader_cache.lock() {
+                cache.remove(&path);
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if removed > 0 {
+            File::open(&segments)?.sync_all()?;
+        }
+        Ok(removed)
+    }
     fn build_sparse_index(
         &self,
         path: &Path,
@@ -1028,8 +1122,18 @@ impl PartitionLog {
         self.fail_next_sync = true;
     }
 
-    /// Delete sealed segments whose last offset is at or below `watermark`.
-    /// The active WAL is never deleted. Watermark only moves forward.
+    /// First offset still retained (everything below was collected).
+    pub fn base_offset(&self) -> u64 {
+        self.meta.base_offset
+    }
+
+    /// Delete the leading sealed segments that end at or below `watermark`
+    /// (exclusive offset). The active WAL is never deleted. Watermark only
+    /// moves forward.
+    ///
+    /// The new retained base is fsynced to meta.json before any file is
+    /// unlinked, so a crash leaves deletable leftovers (removed on the next
+    /// open) and never renumbered records.
     pub fn gc_sealed_below(&mut self, watermark: u64) -> Result<usize, LogError> {
         let current = self.meta.gc_watermark;
         if watermark < current {
@@ -1038,30 +1142,89 @@ impl PartitionLog {
                 format!("gc watermark {watermark} is below durable {current}"),
             )));
         }
+        let condemned = self
+            .sealed_indexes
+            .iter()
+            .take_while(|segment| segment.last_offset <= watermark)
+            .count();
+        let previous = self.meta.clone();
+        self.meta.gc_watermark = watermark;
+        if condemned > 0 {
+            let last = &self.sealed_indexes[condemned - 1];
+            let last_roll = segment_index(&last.path).ok_or_else(|| {
+                LogError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("non-canonical sealed segment name {}", last.path.display()),
+                ))
+            })?;
+            self.set_base(last.last_offset, last_roll + 1);
+        }
+        if let Err(error) = self.meta.save_with(&self.dir, true) {
+            self.meta = previous;
+            return Err(error.into());
+        }
+
+        let doomed: Vec<SegmentIndex> = self.sealed_indexes.drain(..condemned).collect();
+        self.index
+            .retain(|_, pos| !doomed.iter().any(|seg| seg.path == pos.path));
         let mut deleted = 0usize;
-        let mut kept = Vec::new();
-        for segment in self.sealed_indexes.drain(..) {
-            if segment.last_offset <= watermark && segment.last_offset > 0 {
-                if let Ok(mut cache) = self.reader_cache.lock() {
-                    cache.remove(&segment.path);
-                }
-                match std::fs::remove_file(&segment.path) {
-                    Ok(()) => deleted += 1,
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => deleted += 1,
-                    Err(err) => {
-                        kept.push(segment);
-                        return Err(err.into());
-                    }
-                }
-            } else {
-                kept.push(segment);
+        for segment in &doomed {
+            if let Ok(mut cache) = self.reader_cache.lock() {
+                cache.remove(&segment.path);
+            }
+            match std::fs::remove_file(&segment.path) {
+                Ok(()) => deleted += 1,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => deleted += 1,
+                // The base is already durable: the rest is removed on the
+                // next GC or open.
+                Err(err) => return Err(err.into()),
             }
         }
-        self.sealed_indexes = kept;
-        self.meta.gc_watermark = watermark;
-        self.meta
-            .save_with(&self.dir, self.config.fsync != FsyncMode::Os)?;
+        // Also sweeps leftovers from an earlier interrupted GC.
+        self.remove_segments_below_base()?;
         Ok(deleted)
+    }
+
+    /// Discard a log that holds nothing at or above `base` and continue at
+    /// `base`, for a follower whose leader has already collected the prefix
+    /// it is missing. Fails if any local record is at or above `base`.
+    pub fn reset_base(&mut self, base: u64) -> Result<(), LogError> {
+        if self.meta.next_offset > base {
+            return Err(LogError::OffsetMismatch {
+                have: self.meta.next_offset,
+                want: base,
+            });
+        }
+        // Seal the active WAL first so every local record lives in a segment
+        // below the new base segment; a crash at any later point leaves only
+        // leftovers, never old records numbered from the new base.
+        self.roll_segment()?;
+        let previous = self.meta.clone();
+        let roll = self.meta.segment_roll_count;
+        self.set_base(base, roll);
+        self.meta.next_offset = base;
+        self.meta.gc_watermark = self.meta.gc_watermark.max(base);
+        if let Err(error) = self.meta.save_with(&self.dir, true) {
+            self.meta = previous;
+            return Err(error.into());
+        }
+        for segment in self.sealed_indexes.drain(..) {
+            if let Ok(mut cache) = self.reader_cache.lock() {
+                cache.remove(&segment.path);
+            }
+        }
+        self.index.clear();
+        self.active_base_offset = base;
+        self.committed_hwm = base;
+        self.remove_segments_below_base()?;
+        Ok(())
+    }
+
+    fn set_base(&mut self, base_offset: u64, base_segment: u64) {
+        self.meta.base_offset = self.meta.base_offset.max(base_offset);
+        self.meta.base_segment = self.meta.base_segment.max(base_segment);
+        // Tombstones below the base refer to records that no longer exist.
+        self.meta.purged_offsets = self.meta.purged_offsets.split_off(&self.meta.base_offset);
     }
 
     /// Tombstone a record: drop from the index and persist the offset in [`LogMeta`].
@@ -1812,5 +1975,220 @@ mod tests {
         assert!(log.is_dirty());
         log.sync().unwrap();
         assert_eq!(log.committed_hwm(), 1);
+    }
+
+    fn gc_cfg() -> PartitionLogConfig {
+        PartitionLogConfig {
+            segment_max_bytes: 1024,
+            fsync: FsyncMode::Group,
+            group_interval: Duration::from_secs(60),
+        }
+    }
+
+    fn offset_payload(offset: u64) -> Vec<u8> {
+        vec![(offset % 251) as u8; 32]
+    }
+
+    fn open_gc_log(dir: &Path, format: u16) -> PartitionLog {
+        PartitionLog::open_for_shard(dir, gc_cfg(), 0, format).unwrap()
+    }
+
+    /// Append until at least `sealed` segments exist and the active WAL holds
+    /// `active_records` records.
+    fn fill_gc_log(log: &mut PartitionLog, sealed: usize, active_records: u64) {
+        while log.sealed_indexes.len() < sealed {
+            let offset = log.high_watermark();
+            log.append(0, sample_record("gc"), offset_payload(offset))
+                .unwrap();
+        }
+        for _ in 0..active_records {
+            let offset = log.high_watermark();
+            log.append(0, sample_record("gc"), offset_payload(offset))
+                .unwrap();
+        }
+        assert_eq!(log.sealed_indexes.len(), sealed, "active WAL rolled");
+        log.sync().unwrap();
+    }
+
+    fn assert_retained(log: &PartitionLog, base: u64, next: u64) {
+        assert_eq!(log.base_offset(), base);
+        assert_eq!(log.high_watermark(), next);
+        let msgs = log.read_range(0, 0, 10_000).unwrap();
+        let offsets: Vec<u64> = msgs.iter().map(|m| m.offset).collect();
+        assert_eq!(offsets, (base..next).collect::<Vec<_>>());
+        for msg in &msgs {
+            assert_eq!(
+                msg.payload,
+                offset_payload(msg.offset),
+                "offset {}",
+                msg.offset
+            );
+        }
+    }
+
+    #[test]
+    fn partial_prefix_gc_survives_reopen() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            let mut log = open_gc_log(dir.path(), format);
+            fill_gc_log(&mut log, 4, 1);
+            let base = log.sealed_indexes[1].last_offset;
+            let next = log.high_watermark();
+            assert_eq!(log.gc_sealed_below(base).unwrap(), 2);
+            assert_retained(&log, base, next);
+            drop(log);
+
+            let mut log = open_gc_log(dir.path(), format);
+            assert_retained(&log, base, next);
+            let appended = log
+                .append(0, sample_record("gc"), offset_payload(next))
+                .unwrap();
+            assert_eq!(appended.0.offset, next);
+            log.sync().unwrap();
+            drop(log);
+            assert_retained(&open_gc_log(dir.path(), format), base, next + 1);
+        }
+    }
+
+    #[test]
+    fn full_prefix_gc_survives_reopen_with_and_without_active_records() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            for active_records in [0, 2] {
+                let dir = tempdir().unwrap();
+                let mut log = open_gc_log(dir.path(), format);
+                fill_gc_log(&mut log, 3, active_records);
+                let base = log.active_base_offset;
+                let next = log.high_watermark();
+                assert_eq!(log.gc_sealed_below(next).unwrap(), 3);
+                assert!(segment_names(dir.path()).is_empty());
+                drop(log);
+
+                let mut log = open_gc_log(dir.path(), format);
+                assert_retained(&log, base, next);
+                let appended = log
+                    .append(0, sample_record("gc"), offset_payload(next))
+                    .unwrap();
+                assert_eq!(appended.0.offset, next, "offsets are never reused");
+                log.sync().unwrap();
+                drop(log);
+                assert_retained(&open_gc_log(dir.path(), format), base, next + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn crash_between_gc_meta_write_and_unlink_leaves_only_leftovers() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            let mut log = open_gc_log(dir.path(), format);
+            fill_gc_log(&mut log, 3, 1);
+            let doomed: Vec<(PathBuf, Vec<u8>)> = log.sealed_indexes[..2]
+                .iter()
+                .map(|seg| (seg.path.clone(), std::fs::read(&seg.path).unwrap()))
+                .collect();
+            let base = log.sealed_indexes[1].last_offset;
+            let next = log.high_watermark();
+            log.gc_sealed_below(base).unwrap();
+            drop(log);
+            // Meta with the new base is durable; the unlinks never happened.
+            for (path, bytes) in &doomed {
+                std::fs::write(path, bytes).unwrap();
+            }
+
+            let log = open_gc_log(dir.path(), format);
+            assert_retained(&log, base, next);
+            for (path, _) in &doomed {
+                assert!(!path.exists(), "leftover {} not removed", path.display());
+            }
+        }
+    }
+
+    #[test]
+    fn failed_gc_meta_write_deletes_nothing() {
+        let dir = tempdir().unwrap();
+        let mut log = open_gc_log(dir.path(), WAL_FORMAT_V2);
+        fill_gc_log(&mut log, 2, 0);
+        let before = segment_names(dir.path());
+        // meta.json.tmp as a directory makes the atomic meta write fail.
+        std::fs::create_dir(dir.path().join("meta.json.tmp")).unwrap();
+        let next = log.high_watermark();
+        assert!(log.gc_sealed_below(next).is_err());
+        assert_eq!(segment_names(dir.path()), before);
+        assert_eq!(log.base_offset(), 0);
+        assert_retained(&log, 0, next);
+    }
+
+    #[test]
+    fn gc_prunes_purge_tombstones_below_base() {
+        let dir = tempdir().unwrap();
+        let mut log = open_gc_log(dir.path(), WAL_FORMAT_V2);
+        fill_gc_log(&mut log, 2, 1);
+        let base = log.sealed_indexes[0].last_offset;
+        assert!(log.purge_offset(0));
+        assert!(log.purge_offset(base));
+        log.gc_sealed_below(base).unwrap();
+        let purged: Vec<u64> = log.meta.purged_offsets.iter().copied().collect();
+        assert_eq!(purged, vec![base]);
+        drop(log);
+        let log = open_gc_log(dir.path(), WAL_FORMAT_V2);
+        assert_eq!(log.read_range(0, 0, 1).unwrap()[0].offset, base + 1);
+    }
+
+    #[test]
+    fn missing_meta_after_gc_recovers_v2_base_and_refuses_v1() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            let mut log = open_gc_log(dir.path(), format);
+            fill_gc_log(&mut log, 3, 1);
+            let base = log.sealed_indexes[0].last_offset;
+            let next = log.high_watermark();
+            log.gc_sealed_below(base).unwrap();
+            drop(log);
+            std::fs::remove_file(LogMeta::path(dir.path())).unwrap();
+
+            let reopened = PartitionLog::open_for_shard(dir.path(), gc_cfg(), 0, format);
+            if format == WAL_FORMAT_V2 {
+                assert_retained(&reopened.unwrap(), base, next);
+            } else {
+                assert!(reopened.is_err(), "V1 must not renumber after a lost base");
+            }
+        }
+    }
+
+    #[test]
+    fn reset_base_discards_a_fully_below_base_log() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            let mut log = open_gc_log(dir.path(), format);
+            fill_gc_log(&mut log, 1, 2);
+            let next = log.high_watermark();
+            assert!(matches!(
+                log.reset_base(next - 1),
+                Err(LogError::OffsetMismatch { .. })
+            ));
+
+            log.reset_base(500).unwrap();
+            assert_retained(&log, 500, 500);
+            assert!(segment_names(dir.path()).is_empty());
+            let mut frame = Vec::new();
+            encode_frame(&sample_record("gc"), &offset_payload(500), &mut frame).unwrap();
+            assert_eq!(
+                log.append_raw_frame(0, &frame, Some(500)).unwrap().offset,
+                500
+            );
+            log.sync().unwrap();
+            drop(log);
+            assert_retained(&open_gc_log(dir.path(), format), 500, 501);
+        }
+    }
+
+    #[test]
+    fn reset_base_on_empty_log_survives_reopen() {
+        let dir = tempdir().unwrap();
+        let mut log = open_gc_log(dir.path(), WAL_FORMAT_V2);
+        log.reset_base(42).unwrap();
+        drop(log);
+        let log = open_gc_log(dir.path(), WAL_FORMAT_V2);
+        assert_retained(&log, 42, 42);
     }
 }
