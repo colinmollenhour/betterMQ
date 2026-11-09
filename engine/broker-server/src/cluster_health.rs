@@ -67,7 +67,7 @@ async fn recover_gained_shard(
     cluster: &Cluster,
     state: &AppState,
     shard: u32,
-) -> Result<(), String> {
+) -> Result<(), CatchUpError> {
     match ShardRecovery::for_storage(state.broker.config().storage) {
         ShardRecovery::ReplicaCatchUp => catch_up_shard(cluster, state, shard).await,
         ShardRecovery::SharedStorage => {
@@ -76,6 +76,7 @@ async fn recover_gained_shard(
             tokio::task::spawn_blocking(move || reopen_shared_shard(&broker, &topics, shard))
                 .await
                 .map_err(|e| format!("shard {shard}: shared-storage reopen task failed: {e}"))?
+                .map_err(CatchUpError::Retryable)
         }
     }
 }
@@ -146,7 +147,106 @@ async fn probe_replicas(
     answers
 }
 
-async fn catch_up_shard(cluster: &Cluster, state: &AppState, shard: u32) -> Result<(), String> {
+/// Why a gained shard could not be unfenced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CatchUpError {
+    /// Storage, transport or quorum failure; a later attempt may succeed.
+    Retryable(String),
+    /// This node's log holds records past every answering replica's durable
+    /// HWM. They may be unacknowledged, but cannot be proven so.
+    LocalTailAhead {
+        topic: String,
+        local_leo: u64,
+        replica_hwm: u64,
+    },
+    /// Two logs hold different records at the same offset.
+    Divergent {
+        topic: String,
+        offset: u64,
+        detail: String,
+    },
+}
+
+impl CatchUpError {
+    /// True when retrying cannot help: the shard stays fenced until the
+    /// conflicting tail is reconciled under the leader fence (decision D5,
+    /// fenced truncation) or leadership moves to a replica with the
+    /// authoritative log.
+    fn needs_tail_reconciliation(&self) -> bool {
+        matches!(self, Self::LocalTailAhead { .. } | Self::Divergent { .. })
+    }
+}
+
+impl std::fmt::Display for CatchUpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(message) => f.write_str(message),
+            Self::LocalTailAhead {
+                topic,
+                local_leo,
+                replica_hwm,
+            } => write!(
+                f,
+                "{topic}: local LEO {local_leo} exceeds every answering replica's committed HWM \
+                 {replica_hwm}; refusing to serve or overwrite an unverified tail"
+            ),
+            Self::Divergent {
+                topic,
+                offset,
+                detail,
+            } => write!(f, "{topic}: divergent record at offset {offset}: {detail}"),
+        }
+    }
+}
+
+impl From<String> for CatchUpError {
+    fn from(message: String) -> Self {
+        Self::Retryable(message)
+    }
+}
+
+fn frame_message_id(bytes: &[u8]) -> Option<Uuid> {
+    broker_proto::decode_frame(&mut std::io::Cursor::new(bytes))
+        .ok()
+        .map(|(header, _)| header.id)
+}
+
+/// Every answering replica must agree with the chosen source on the offsets
+/// both returned; otherwise the replicas disagree about the prefix and copying
+/// from either one could discard an acknowledged record.
+fn verify_answers_agree(
+    topic: &str,
+    source: &ReplicateCatchUpRange,
+    others: &[&ReplicateCatchUpRange],
+) -> Result<(), CatchUpError> {
+    let expected: HashMap<u64, Option<Uuid>> = source
+        .frames
+        .iter()
+        .map(|frame| (frame.offset, frame_message_id(&frame.bytes)))
+        .collect();
+    for other in others {
+        for frame in &other.frames {
+            let Some(want) = expected.get(&frame.offset) else {
+                continue;
+            };
+            let have = frame_message_id(&frame.bytes);
+            if want.is_none() || have != *want {
+                return Err(CatchUpError::Divergent {
+                    topic: topic.to_string(),
+                    offset: frame.offset,
+                    detail: "replicas disagree on the record at this offset".into(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn catch_up_shard(
+    cluster: &Cluster,
+    state: &AppState,
+    shard: u32,
+) -> Result<(), CatchUpError> {
     // Probe the shard's replica set directly instead of trusting this node's
     // health view: a briefly "dead" replica may hold acknowledged records.
     let node_id = cluster.runtime.config().node_id;
@@ -192,25 +292,31 @@ async fn catch_up_shard(cluster: &Cluster, state: &AppState, shard: u32) -> Resu
         // of this attempt; the next monitor cycle starts over.
         peers.retain(|peer| !failed.contains(&peer.id));
         if answered.len() < required {
-            return Err(format!(
+            return Err(CatchUpError::Retryable(format!(
                 "{topic}/{shard}: {} of {required} required replicas answered the catch-up probe \
                  (RF {}, minISR {min_isr}); cannot prove the committed prefix",
                 answered.len(),
                 replicas.len().max(1),
-            ));
+            )));
         }
-        let Some((source, mut page)) = answered
-            .into_iter()
-            .max_by_key(|(_, range)| range.committed_hwm)
+        let Some(source_index) = answered
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (_, range))| range.committed_hwm)
+            .map(|(index, _)| index)
         else {
             // This node's own log already covers every acknowledged record.
             continue;
         };
+        let (source, mut page) = answered.swap_remove(source_index);
+        let others: Vec<_> = answered.iter().map(|(_, range)| range).collect();
+        verify_answers_agree(&topic, &page, &others)?;
         if local_leo > page.committed_hwm {
-            return Err(format!(
-                "{topic}/{shard}: local LEO {local_leo} exceeds replica committed HWM {}; refusing to overwrite a divergent/uncommitted tail",
-                page.committed_hwm
-            ));
+            return Err(CatchUpError::LocalTailAhead {
+                topic,
+                local_leo,
+                replica_hwm: page.committed_hwm,
+            });
         }
 
         loop {
@@ -219,11 +325,18 @@ async fn catch_up_shard(cluster: &Cluster, state: &AppState, shard: u32) -> Resu
                 state
                     .broker
                     .append_replicated_frame(&topic, shard, &frame.bytes, Some(frame.offset))
-                    .map_err(|e| {
-                        format!(
-                            "{topic}/{shard}: divergent frame at offset {}: {e}",
+                    .map_err(|e| match e {
+                        broker_partition::BrokerError::Storage(
+                            broker_storage::LogError::OffsetMismatch { .. },
+                        ) => CatchUpError::Divergent {
+                            topic: topic.clone(),
+                            offset: frame.offset,
+                            detail: e.to_string(),
+                        },
+                        other => CatchUpError::Retryable(format!(
+                            "{topic}/{shard}: apply catch-up frame at offset {}: {other}",
                             frame.offset
-                        )
+                        )),
                     })?;
                 last_appended = Some(frame.offset);
             }
@@ -254,10 +367,10 @@ async fn catch_up_shard(cluster: &Cluster, state: &AppState, shard: u32) -> Resu
                 .await
                 .map_err(|e| format!("{topic}/{shard}: continue catch-up: {e}"))?;
             if page.frames.is_empty() && local_leo < page.committed_hwm {
-                return Err(format!(
+                return Err(CatchUpError::Retryable(format!(
                     "{topic}/{shard}: source reported HWM {} but returned no frame at {local_leo}",
                     page.committed_hwm
-                ));
+                )));
             }
         }
     }
@@ -404,7 +517,17 @@ pub fn spawn_cluster_health_monitor(
                         Err(error) => {
                             runtime.set_shard_ready(shard, false);
                             prev_leaders.remove(&shard);
-                            warn!(shard, %error, "failover catch-up failed; shard remains fenced");
+                            if error.needs_tail_reconciliation() {
+                                tracing::error!(
+                                    shard,
+                                    %error,
+                                    "failover catch-up found a log tail replicas do not confirm; \
+                                     shard remains fenced until the tail is reconciled or \
+                                     leadership moves"
+                                );
+                            } else {
+                                warn!(shard, %error, "failover catch-up failed; shard remains fenced");
+                            }
                         }
                     }
                 }
@@ -613,7 +736,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (state, cluster, _) = three_node_state(&dir, [UNREACHABLE, UNREACHABLE]);
         let error = catch_up_shard(&cluster, &state, 0).await.unwrap_err();
-        assert!(error.contains("0 of 1 required replicas"), "{error}");
+        assert!(!error.needs_tail_reconciliation());
+        assert!(
+            error.to_string().contains("0 of 1 required replicas"),
+            "{error}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -623,5 +750,88 @@ mod tests {
         let peer = catch_up_peer(catch_up_body(shard, 0, Vec::new())).await;
         let (state, cluster, _) = three_node_state(&dir, [&peer.uri(), UNREACHABLE]);
         catch_up_shard(&cluster, &state, shard).await.unwrap();
+    }
+
+    async fn committed_publish(broker: &Broker, payload: &str) -> (u32, Vec<u8>) {
+        let resp = broker.publish(direct_publish(payload)).unwrap();
+        let shard = resp.partition.unwrap();
+        broker
+            .wait_committed(&resp.topic, shard, resp.offset.unwrap())
+            .await
+            .unwrap();
+        (shard, resp.replication_frame.unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uncommitted_local_tail_stays_fenced_without_being_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = catch_up_body(0, 0, Vec::new());
+        let (a, b) = (
+            catch_up_peer(empty.clone()).await,
+            catch_up_peer(empty).await,
+        );
+        let (state, cluster, _) = three_node_state(&dir, [&a.uri(), &b.uri()]);
+        let (shard, _) = committed_publish(&state.broker, "local-only").await;
+
+        let error = catch_up_shard(&cluster, &state, shard).await.unwrap_err();
+        assert!(error.needs_tail_reconciliation(), "{error}");
+        assert_eq!(
+            error,
+            CatchUpError::LocalTailAhead {
+                topic: broker_partition::DIRECT_TOPIC.into(),
+                local_leo: 1,
+                replica_hwm: 0,
+            }
+        );
+        let kept = state
+            .broker
+            .read_message(broker_partition::DIRECT_TOPIC, shard, 0)
+            .unwrap();
+        assert_eq!(kept.payload, b"local-only");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn divergent_replica_record_keeps_the_shard_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let other =
+            Broker::open(broker_partition::BrokerConfig::new(other_dir.path().into())).unwrap();
+        let (shard, foreign) = committed_publish(&other, "replica").await;
+        let peer = catch_up_peer(catch_up_body(shard, 1, vec![(0, foreign)])).await;
+        let (state, cluster, _) = three_node_state(&dir, [&peer.uri(), UNREACHABLE]);
+        committed_publish(&state.broker, "local").await;
+
+        let error = catch_up_shard(&cluster, &state, shard).await.unwrap_err();
+        assert!(
+            matches!(&error, CatchUpError::Divergent { offset: 0, .. }),
+            "{error}"
+        );
+        assert!(error.needs_tail_reconciliation());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replicas_that_disagree_on_the_prefix_are_not_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (x_dir, y_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let x = Broker::open(broker_partition::BrokerConfig::new(x_dir.path().into())).unwrap();
+        let y = Broker::open(broker_partition::BrokerConfig::new(y_dir.path().into())).unwrap();
+        let (shard, x_frame) = committed_publish(&x, "x").await;
+        let (_, y_frame) = committed_publish(&y, "y").await;
+        let a = catch_up_peer(catch_up_body(shard, 1, vec![(0, x_frame)])).await;
+        let b = catch_up_peer(catch_up_body(shard, 1, vec![(0, y_frame)])).await;
+        let (state, cluster, _) = three_node_state(&dir, [&a.uri(), &b.uri()]);
+
+        let error = catch_up_shard(&cluster, &state, shard).await.unwrap_err();
+        assert!(
+            matches!(&error, CatchUpError::Divergent { offset: 0, .. }),
+            "{error}"
+        );
+        assert_eq!(
+            state
+                .broker
+                .partition_high_watermark(broker_partition::DIRECT_TOPIC, shard)
+                .unwrap(),
+            0
+        );
     }
 }
