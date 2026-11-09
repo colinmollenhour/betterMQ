@@ -167,6 +167,36 @@ impl std::fmt::Display for ApiError {
     }
 }
 
+impl ApiError {
+    pub(crate) fn failure(&self) -> crate::ingest::IngestFailure {
+        let (code, retryable, retry_after_ms) = match self {
+            Self::BadRequest(_) => ("invalid_request", false, None),
+            Self::Unauthorized(_) => ("unauthorized", false, None),
+            Self::NotFound(_) => ("not_found", false, None),
+            Self::Conflict(_) => ("conflict", false, None),
+            Self::Unavailable(_) => ("unavailable", true, None),
+            Self::ReplicationFailed(_) => ("replication_failed", true, None),
+            Self::Overloaded { retry_after_ms, .. } => ("saturated", true, Some(*retry_after_ms)),
+            Self::TooManyRequests { retry_after_ms, .. } => {
+                ("tenant_saturated", true, Some(*retry_after_ms))
+            }
+            Self::Broker(BrokerError::QueueNotFound(_) | BrokerError::FlowProfileNotFound(_)) => {
+                ("not_found", false, None)
+            }
+            Self::Broker(BrokerError::InvalidName(_) | BrokerError::InvalidConfig(_)) => {
+                ("invalid_request", false, None)
+            }
+            Self::Broker(BrokerError::NotShardLeader(_)) => ("not_shard_leader", true, None),
+            Self::Broker(_) => ("internal_error", true, None),
+        };
+        crate::ingest::IngestFailure {
+            code: code.into(),
+            retryable,
+            retry_after_ms,
+        }
+    }
+}
+
 impl From<BrokerError> for ApiError {
     fn from(e: BrokerError) -> Self {
         match e {
@@ -291,6 +321,27 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use axum::http::header::RETRY_AFTER;
+
+    #[test]
+    fn per_item_retry_classification_is_stable() {
+        let bad = ApiError::BadRequest("bad body".into());
+        assert!(!bad.failure().retryable);
+        assert_eq!(bad.failure().code, "invalid_request");
+        let busy = ApiError::Overloaded {
+            retry_after_ms: 1500,
+            message: "busy".into(),
+        };
+        let value = serde_json::to_value(busy.failure()).unwrap();
+        assert_eq!(value["code"], "saturated");
+        assert_eq!(value["retryable"], true);
+        assert_eq!(value["retry_after_ms"], 1500);
+        assert!(
+            ApiError::ReplicationFailed("quorum".into())
+                .failure()
+                .retryable
+        );
+        assert!(ApiError::Unavailable("fsync".into()).failure().retryable);
+    }
 
     #[test]
     fn retry_after_is_whole_seconds_not_milliseconds() {

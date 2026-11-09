@@ -103,6 +103,7 @@ async fn enqueue_batch_inner(
                     commit_epoch: resp.commit_epoch,
                     scheduled: resp.scheduled.clone(),
                     error: None,
+                    failure: None,
                 });
             }
             Err(error) => {
@@ -117,7 +118,8 @@ async fn enqueue_batch_inner(
                     duplicate: false,
                     commit_epoch: None,
                     scheduled: None,
-                    error: Some(format!("{error:?}")),
+                    failure: Some(error.failure()),
+                    error: Some(error.to_string()),
                 });
             }
         }

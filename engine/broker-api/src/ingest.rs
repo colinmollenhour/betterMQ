@@ -99,6 +99,18 @@ mod tests {
         assert_eq!(batch.records[1].req.delay_ms, None);
     }
 
+    #[test]
+    fn infrastructure_batch_failures_are_retryable() {
+        let records = [(7, "topic".into(), 1)];
+        let transient = failed_outcomes(&records, "batch commit failed: fsync", true);
+        let error = transient[0].result.as_ref().unwrap_err();
+        assert_eq!(transient[0].index, 7);
+        assert_eq!(error.failure().code, "unavailable");
+        assert!(error.failure().retryable);
+        let invalid = failed_outcomes(&records, "invalid request", false);
+        assert!(!invalid[0].result.as_ref().unwrap_err().failure().retryable);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn local_api_batch_uses_one_shard_commit_epoch() {
         let dir = tempfile::tempdir().unwrap();
@@ -164,6 +176,16 @@ pub struct IngestItemResult {
     pub scheduled: Option<broker_partition::ScheduledInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(flatten)]
+    pub failure: Option<IngestFailure>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IngestFailure {
+    pub code: String,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 pub(crate) async fn ingest_one_validated(
@@ -245,6 +267,7 @@ pub struct IngestOutcome {
 fn failed_outcomes(
     records: &[(usize, String, usize)],
     error: impl Into<String>,
+    retryable: bool,
 ) -> Vec<IngestOutcome> {
     let error = error.into();
     records
@@ -254,7 +277,11 @@ fn failed_outcomes(
             IngestOutcome {
                 index: *index,
                 topic: topic.clone(),
-                result: Err(ApiError::BadRequest(error.clone())),
+                result: Err(if retryable {
+                    ApiError::Unavailable(error.clone())
+                } else {
+                    ApiError::BadRequest(error.clone())
+                }),
             }
         })
         .collect()
@@ -306,9 +333,11 @@ async fn submit_local_leader_batch(
     let mut prepared = match state.broker.prepare_publish_batch(requests) {
         Ok(prepared) => prepared,
         Err(error) => {
+            let error = ApiError::from(error);
             rejected.extend(failed_outcomes(
                 &admitted,
                 format!("batch preparation failed: {error}"),
+                error.failure().retryable,
             ));
             return rejected;
         }
@@ -333,7 +362,7 @@ async fn submit_local_leader_batch(
         }
     }
     if let Some(error) = append_error {
-        rejected.extend(failed_outcomes(&admitted, error));
+        rejected.extend(failed_outcomes(&admitted, error, true));
         return rejected;
     }
 
@@ -394,6 +423,7 @@ async fn submit_local_leader_batch(
                     rejected.extend(failed_outcomes(
                         &admitted,
                         format!("batch replication encoding failed: {error}"),
+                        true,
                     ));
                     return rejected;
                 }
@@ -431,7 +461,7 @@ async fn submit_local_leader_batch(
         }
     }
     if let Some(error) = commit_error {
-        rejected.extend(failed_outcomes(&admitted, error));
+        rejected.extend(failed_outcomes(&admitted, error, true));
         return rejected;
     }
 
@@ -444,6 +474,7 @@ async fn submit_local_leader_batch(
             rejected.extend(failed_outcomes(
                 &admitted,
                 format!("batch finalize failed: {error}"),
+                true,
             ));
             return rejected;
         }
@@ -458,6 +489,7 @@ async fn submit_local_leader_batch(
             rejected.extend(failed_outcomes(
                 &admitted,
                 format!("batch response finalization failed: {error}"),
+                true,
             ));
             return rejected;
         }

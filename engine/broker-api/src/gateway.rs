@@ -171,6 +171,8 @@ struct GatewayForwardResult {
     commit_epoch: Option<u64>,
     scheduled: Option<ScheduledInfo>,
     error: Option<String>,
+    #[serde(flatten)]
+    failure: Option<crate::ingest::IngestFailure>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -217,6 +219,7 @@ fn failed_results(
             commit_epoch: None,
             scheduled: None,
             error: Some(error.clone()),
+            failure: Some(ApiError::Unavailable(error.clone()).failure()),
         })
         .collect()
 }
@@ -239,6 +242,7 @@ fn failed_metadata(
             commit_epoch: None,
             scheduled: None,
             error: Some(error.clone()),
+            failure: Some(ApiError::Unavailable(error.clone()).failure()),
         })
         .collect()
 }
@@ -300,6 +304,9 @@ async fn forward_shard(
             continue;
         }
         if !status.is_success() {
+            if !decoded.results.is_empty() {
+                return decoded.results;
+            }
             let detail = decoded
                 .results
                 .first()
@@ -370,6 +377,9 @@ async fn forward_gateway_only_shard(
             continue;
         }
         if !status.is_success() {
+            if !decoded.results.is_empty() {
+                return decoded.results;
+            }
             let detail = decoded
                 .results
                 .first()
@@ -422,6 +432,10 @@ fn aggregate_results(
             commit_epoch: outcome.commit_epoch,
             scheduled: outcome.scheduled,
             error: outcome.error,
+            failure: outcome.failure.or_else(|| {
+                (!outcome.accepted)
+                    .then(|| ApiError::Unavailable("legacy gateway error".into()).failure())
+            }),
         });
     }
     results.sort_by_key(|result| result.index);
@@ -745,6 +759,10 @@ pub async fn gateway_enqueue(
             commit_epoch: outcome.commit_epoch,
             scheduled: outcome.scheduled,
             error: outcome.error,
+            failure: outcome.failure.or_else(|| {
+                (!outcome.accepted)
+                    .then(|| ApiError::Unavailable("legacy gateway error".into()).failure())
+            }),
         });
     }
     results.sort_by_key(|r| r.index);
@@ -844,7 +862,13 @@ pub(crate) async fn internal_gateway_ingest(
                     stale_leader: false,
                     leader: None,
                     leader_generation: generation,
-                    results: failed_metadata(&metadata, format!("{error:?}")),
+                    results: failed_metadata(&metadata, error.to_string())
+                        .into_iter()
+                        .map(|mut result| {
+                            result.failure = Some(error.failure());
+                            result
+                        })
+                        .collect(),
                 }),
             )
                 .into_response();
@@ -879,6 +903,7 @@ pub(crate) async fn internal_gateway_ingest(
                     commit_epoch: response.commit_epoch,
                     scheduled: response.scheduled,
                     error: None,
+                    failure: None,
                 });
             }
             Err(error) => {
@@ -893,7 +918,8 @@ pub(crate) async fn internal_gateway_ingest(
                     duplicate: false,
                     commit_epoch: None,
                     scheduled: None,
-                    error: Some(format!("{error:?}")),
+                    failure: Some(error.failure()),
+                    error: Some(error.to_string()),
                 });
             }
         }
@@ -1058,6 +1084,7 @@ mod tests {
                             commit_epoch: Some(2),
                             scheduled: None,
                             error: None,
+                            failure: None,
                         })
                         .collect();
                     (

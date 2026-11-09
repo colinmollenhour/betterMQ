@@ -727,7 +727,7 @@ async fn publish_to_group(
                 deliveries.push(to_group_delivery_ref(member_id, &inner));
             }
             Err(error) => {
-                let error = format!("{error:?}");
+                let error = error.to_string();
                 let attempts = command
                     .outcomes
                     .get(&member_id)
@@ -978,7 +978,7 @@ async fn replay_fanout_command(
                 }
                 Err(error) => crate::fanout::FanoutMemberOutcome {
                     response: None,
-                    error: Some(format!("{error:?}")),
+                    error: Some(error.to_string()),
                     attempts,
                     next_attempt_at_ms: Some(now_ms.saturating_add(
                         1_000i64.saturating_mul(1i64 << attempts.saturating_sub(1).min(6)),

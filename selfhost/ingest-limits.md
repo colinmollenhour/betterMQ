@@ -25,3 +25,9 @@ Single-message failures increment `bettermq_ingest_rejected_total` exactly once
 at the canonical single-record boundary, including validation, admission and
 replication errors. `bettermq_ingest_single_rejected_total{reason="..."}` provides
 a bounded reason breakdown without request identifiers or free-form messages.
+
+Batch 207 responses preserve each input's zero-based `index`. Failed items carry
+a stable `code`, `retryable`, human-readable `error`, and optionally
+`retry_after_ms`. Retry only retryable failures, retaining idempotency keys:
+commit or replication failures can have an ambiguous durable outcome. Invalid
+input is not retryable; availability, storage, quorum and saturation failures are.
