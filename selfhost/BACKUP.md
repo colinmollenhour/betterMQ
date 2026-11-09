@@ -52,9 +52,21 @@ smoke test verifies a fresh HA volume can be written by the runtime user.
 
 1. Run `bettermq doctor --data-dir /var/lib/bettermq --json`.
 2. Confirm `BETTERMQ_CLUSTER_SECRET` / panel token still match.
-3. Start one node and wait for `/readyz` (not only `/healthz`).
-4. For clusters, start peers one at a time and require `/readyz` before the next.
+3. For a standalone broker, start it and require `/readyz` (not only `/healthz`).
+4. For a **cold cluster restore**, restore every member's own matching snapshot
+   and shared/object-store state first, then start enough original members to
+   form controller quorum (at least two voters in a three-voter cell). Start
+   the remaining restored members promptly. Do **not** wait for `/readyz` on
+   the first isolated member before starting its peers: readiness needs quorum.
+   Use `/healthz` only to check startup progress, then require `/readyz` and
+   healthy replica/ISR state on all members before resuming traffic. Do not
+   replace missing voters with empty data directories or bootstrap a new cell.
 5. Publish an idempotent canary, confirm delivery, then restore normal traffic.
+
+This differs from a **rolling restart** of a live cell: there, maintain quorum
+throughout and wait for the restarted member's `/readyz` before stopping the
+next one. If original quorum cannot be recovered, keep traffic stopped and
+follow the seed/quorum-loss escalation in [OPERATIONS.md](OPERATIONS.md).
 
 ## Restore drill gate
 
