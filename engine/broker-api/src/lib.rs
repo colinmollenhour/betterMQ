@@ -864,6 +864,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn regenerated_token_revokes_the_old_one_immediately() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(broker_local_auth::LocalAuthStore::open(dir.path()).unwrap());
+        let old = store.setup("password1234").unwrap();
+        let mut state = test_state(&dir);
+        state.local_auth = Some(store.clone());
+        let app = router(state);
+        let get = |token: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/v1/queues")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        assert_eq!(get(old.clone()).await, StatusCode::OK);
+        assert_eq!(get("x".repeat(64 * 1024)).await, StatusCode::UNAUTHORIZED);
+        let new = store.regenerate("password1234").unwrap();
+        assert_eq!(get(old).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(get(new).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn missing_local_auth_is_401_fail_closed() {
         let dir = tempdir().unwrap();
         let app = router(test_state(&dir));

@@ -5,15 +5,23 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use parking_lot::RwLock;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
 
 const FILE_NAME: &str = "local-auth.json";
 const TOKEN_PREFIX: &str = "sk_local_";
+/// Longest bearer value worth hashing; real tokens are 73 bytes.
+const MAX_TOKEN_LEN: usize = 256;
+/// How long an in-memory snapshot is trusted before the file is re-checked
+/// (it may be shared with other processes through `BETTERMQ_LOCAL_AUTH_FILE`).
+const DEFAULT_REFRESH: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Error)]
 pub enum LocalAuthError {
@@ -46,8 +54,47 @@ pub struct AuthCredentials {
     pub api_key_hash: String,
 }
 
+/// Identity of the credentials file, to notice replacement by another process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl FileStamp {
+    fn of(meta: &fs::Metadata) -> Self {
+        Self {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+            #[cfg(unix)]
+            ino: std::os::unix::fs::MetadataExt::ino(meta),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Loaded {
+    Missing,
+    Ready(Arc<Stored>),
+    Corrupt(String),
+}
+
+#[derive(Debug)]
+struct Snapshot {
+    loaded: Loaded,
+    stamp: Option<FileStamp>,
+    checked_at: Option<Instant>,
+}
+
+/// Credentials live in one small JSON file. Verification runs against an
+/// in-memory copy (refreshed after our own writes, and at most every
+/// `refresh` from disk), so per-request auth costs one SHA-256, not a file read.
 pub struct LocalAuthStore {
     path: PathBuf,
+    refresh: Duration,
+    snapshot: RwLock<Snapshot>,
 }
 
 impl LocalAuthStore {
@@ -61,11 +108,64 @@ impl LocalAuthStore {
                 fs::create_dir_all(parent)?;
             }
         }
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            refresh: DEFAULT_REFRESH,
+            snapshot: RwLock::new(Snapshot {
+                loaded: Loaded::Missing,
+                stamp: None,
+                checked_at: None,
+            }),
+        })
+    }
+
+    /// Current credentials, from memory when fresh, else re-checked on disk.
+    fn current(&self) -> Loaded {
+        {
+            let snap = self.snapshot.read();
+            if snap
+                .checked_at
+                .is_some_and(|at| at.elapsed() < self.refresh)
+            {
+                return snap.loaded.clone();
+            }
+        }
+        let mut snap = self.snapshot.write();
+        let stamp = match fs::metadata(&self.path) {
+            Ok(meta) if meta.is_file() => Some(FileStamp::of(&meta)),
+            _ => None,
+        };
+        let unchanged = snap.checked_at.is_some()
+            && stamp == snap.stamp
+            && !matches!(snap.loaded, Loaded::Corrupt(_));
+        if !unchanged {
+            snap.loaded = match &stamp {
+                None => Loaded::Missing,
+                Some(_) => match fs::read_to_string(&self.path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|raw| serde_json::from_str::<Stored>(&raw).map_err(|e| e.to_string()))
+                {
+                    Ok(stored) => Loaded::Ready(Arc::new(stored)),
+                    Err(error) => Loaded::Corrupt(error),
+                },
+            };
+            snap.stamp = stamp;
+        }
+        snap.checked_at = Some(Instant::now());
+        snap.loaded.clone()
+    }
+
+    /// Record credentials this process just wrote, so they apply immediately.
+    fn remember(&self, stored: Stored) {
+        let stamp = fs::metadata(&self.path).ok().map(|m| FileStamp::of(&m));
+        let mut snap = self.snapshot.write();
+        snap.loaded = Loaded::Ready(Arc::new(stored));
+        snap.stamp = stamp;
+        snap.checked_at = Some(Instant::now());
     }
 
     pub fn is_configured(&self) -> bool {
-        self.path.is_file()
+        !matches!(self.current(), Loaded::Missing)
     }
 
     pub fn setup(&self, password: &str) -> Result<String, LocalAuthError> {
@@ -79,6 +179,7 @@ impl LocalAuthStore {
             api_key_hash: hash_token(&token),
         };
         write_atomic(&self.path, &stored)?;
+        self.remember(stored);
         Ok(token)
     }
 
@@ -93,15 +194,19 @@ impl LocalAuthStore {
             api_key_hash: hash_token(&token),
         };
         write_atomic(&self.path, &updated)?;
+        self.remember(updated);
         Ok(token)
     }
 
     pub fn verify_token(&self, token: &str) -> Result<bool, LocalAuthError> {
-        if !self.is_configured() {
+        if token.len() > MAX_TOKEN_LEN {
             return Ok(false);
         }
-        let stored = self.load()?;
-        Ok(constant_time_eq(&hash_token(token), &stored.api_key_hash))
+        match self.current() {
+            Loaded::Missing => Ok(false),
+            Loaded::Ready(stored) => Ok(constant_time_eq(&hash_token(token), &stored.api_key_hash)),
+            Loaded::Corrupt(error) => Err(LocalAuthError::Io(std::io::Error::other(error))),
+        }
     }
 
     /// Admin operations use the same local API token as the data plane.
@@ -138,17 +243,18 @@ impl LocalAuthStore {
             }
             return Err(LocalAuthError::AlreadyConfigured);
         }
-        write_atomic(
-            &self.path,
-            &Stored {
-                password_hash: creds.password_hash.clone(),
-                api_key_hash: creds.api_key_hash.clone(),
-            },
-        )
+        let stored = Stored {
+            password_hash: creds.password_hash.clone(),
+            api_key_hash: creds.api_key_hash.clone(),
+        };
+        write_atomic(&self.path, &stored)?;
+        self.remember(stored);
+        Ok(())
     }
 
+    /// Fresh read from disk for mutations (never the cached copy).
     fn load(&self) -> Result<Stored, LocalAuthError> {
-        if !self.is_configured() {
+        if !self.path.is_file() {
             return Err(LocalAuthError::NotConfigured);
         }
         let raw = fs::read_to_string(&self.path)?;
@@ -254,6 +360,43 @@ mod tests {
         assert_ne!(t1, t2);
         assert!(!store.verify_token(&t1).unwrap());
         assert!(store.verify_token(&t2).unwrap());
+    }
+
+    #[test]
+    fn verify_uses_memory_and_rejects_oversized_tokens() {
+        let dir = tempdir().unwrap();
+        let store = LocalAuthStore::open(dir.path()).unwrap();
+        let token = store.setup("password1234").unwrap();
+        assert!(!store.verify_token(&"x".repeat(MAX_TOKEN_LEN + 1)).unwrap());
+        // Unlinking the file is not seen until the refresh interval passes:
+        // verification is served from memory, not a per-request file read.
+        fs::remove_file(dir.path().join(FILE_NAME)).unwrap();
+        assert!(store.verify_token(&token).unwrap());
+    }
+
+    #[test]
+    fn picks_up_rotation_by_another_process_sharing_the_file() {
+        let dir = tempdir().unwrap();
+        let mut a = LocalAuthStore::open(dir.path()).unwrap();
+        a.refresh = Duration::ZERO;
+        let b = LocalAuthStore::open(dir.path()).unwrap();
+        let t1 = a.setup("password1234").unwrap();
+        assert!(b.verify_token(&t1).unwrap());
+        let t2 = b.regenerate("password1234").unwrap();
+        assert!(
+            !a.verify_token(&t1).unwrap(),
+            "revoked token must stop working"
+        );
+        assert!(a.verify_token(&t2).unwrap());
+    }
+
+    #[test]
+    fn corrupt_file_is_an_error_not_an_open_door() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(FILE_NAME), b"{ not json").unwrap();
+        let store = LocalAuthStore::open(dir.path()).unwrap();
+        assert!(store.is_configured());
+        assert!(store.verify_token("sk_local_x").is_err());
     }
 
     #[test]
