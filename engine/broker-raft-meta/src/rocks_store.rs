@@ -38,6 +38,8 @@ use rocksdb::ColumnFamily;
 use rocksdb::ColumnFamilyDescriptor;
 use rocksdb::Direction;
 use rocksdb::Options;
+use rocksdb::WriteBatch;
+use rocksdb::WriteOptions;
 use rocksdb::DB;
 use serde::Deserialize;
 use serde::Serialize;
@@ -164,17 +166,17 @@ impl RocksStateMachine {
             })
     }
 
-    fn set_last_membership(
+    fn stage_last_membership(
         &self,
-        membership: StoredMembership<RocksNodeId, BasicNode>,
+        batch: &mut WriteBatch,
+        membership: &StoredMembership<RocksNodeId, BasicNode>,
     ) -> StorageResult<()> {
-        self.db
-            .put_cf(
-                self.cf_sm_meta(),
-                "last_membership".as_bytes(),
-                serde_json::to_vec(&membership).map_err(sm_w_err)?,
-            )
-            .map_err(sm_w_err)
+        batch.put_cf(
+            self.cf_sm_meta(),
+            "last_membership".as_bytes(),
+            serde_json::to_vec(membership).map_err(sm_w_err)?,
+        );
+        Ok(())
     }
 
     fn get_last_applied_log(&self) -> StorageResult<Option<LogId<RocksNodeId>>> {
@@ -188,41 +190,53 @@ impl RocksStateMachine {
             })
     }
 
-    fn set_last_applied_log(&self, log_id: LogId<RocksNodeId>) -> StorageResult<()> {
-        self.db
-            .put_cf(
-                self.cf_sm_meta(),
-                "last_applied_log".as_bytes(),
-                serde_json::to_vec(&log_id).map_err(sm_w_err)?,
-            )
-            .map_err(sm_w_err)
+    fn stage_last_applied_log(
+        &self,
+        batch: &mut WriteBatch,
+        log_id: &LogId<RocksNodeId>,
+    ) -> StorageResult<()> {
+        batch.put_cf(
+            self.cf_sm_meta(),
+            "last_applied_log".as_bytes(),
+            serde_json::to_vec(log_id).map_err(sm_w_err)?,
+        );
+        Ok(())
     }
 
-    fn from_serializable(sm: SerializableRocksStateMachine, db: Arc<DB>) -> StorageResult<Self> {
-        let r = Self { db };
+    /// Commit staged state-machine writes as one atomic, WAL-synced batch, so
+    /// the applied log id never lands without the data and membership it
+    /// covers (or the other way round).
+    fn commit(&self, batch: WriteBatch) -> StorageResult<()> {
+        let mut options = WriteOptions::default();
+        options.set_sync(true);
+        self.db.write_opt(batch, &options).map_err(sm_w_err)
+    }
 
-        for (key, value) in sm.data {
-            r.db.put_cf(r.cf_sm_data(), key.as_bytes(), value.as_bytes())
-                .map_err(sm_w_err)?;
+    /// Replace the whole state machine with a snapshot in one atomic batch.
+    /// Keys that are absent from the snapshot are removed rather than left
+    /// behind from the previous state.
+    fn replace_with(&self, sm: SerializableRocksStateMachine) -> StorageResult<()> {
+        let mut batch = WriteBatch::default();
+        for item in self
+            .db
+            .iterator_cf(self.cf_sm_data(), rocksdb::IteratorMode::Start)
+        {
+            let (key, _) = item.map_err(sm_r_err)?;
+            batch.delete_cf(self.cf_sm_data(), key);
         }
-
-        if let Some(log_id) = sm.last_applied_log {
-            r.set_last_applied_log(log_id)?;
+        for (key, value) in &sm.data {
+            batch.put_cf(self.cf_sm_data(), key.as_bytes(), value.as_bytes());
         }
-
-        r.set_last_membership(sm.last_membership)?;
-
-        Ok(r)
+        match &sm.last_applied_log {
+            Some(log_id) => self.stage_last_applied_log(&mut batch, log_id)?,
+            None => batch.delete_cf(self.cf_sm_meta(), "last_applied_log".as_bytes()),
+        }
+        self.stage_last_membership(&mut batch, &sm.last_membership)?;
+        self.commit(batch)
     }
 
     fn new(db: Arc<DB>) -> RocksStateMachine {
         Self { db }
-    }
-
-    fn insert(&self, key: String, value: String) -> StorageResult<()> {
-        self.db
-            .put_cf(self.cf_sm_data(), key.as_bytes(), value.as_bytes())
-            .map_err(|e| StorageIOError::write(&e).into())
     }
 
     pub fn get(&self, key: &str) -> StorageResult<Option<String>> {
@@ -240,6 +254,11 @@ pub struct RocksStore {
 
     /// The Raft state machine.
     pub state_machine: RwLock<RocksStateMachine>,
+
+    /// Test-only fault injection: fail the next state-machine commit after
+    /// every write of the batch has been staged.
+    #[cfg(test)]
+    fail_next_commit: std::sync::atomic::AtomicBool,
 }
 type StorageResult<T> = Result<T, StorageError<RocksNodeId>>;
 
@@ -563,31 +582,43 @@ impl RaftStorage<TypeConfig> for Arc<RocksStore> {
         let mut res = Vec::with_capacity(entries.len());
 
         let sm = self.state_machine.write().await;
+        let mut batch = WriteBatch::default();
 
         for entry in entries {
             tracing::debug!(%entry.log_id, "replicate to sm");
 
-            sm.set_last_applied_log(entry.log_id)?;
+            sm.stage_last_applied_log(&mut batch, &entry.log_id)?;
 
             match entry.payload {
                 EntryPayload::Blank => res.push(RocksResponse { value: None }),
                 EntryPayload::Normal(ref req) => match req {
                     RocksRequest::Set { key, value } => {
-                        sm.insert(key.clone(), value.clone())?;
+                        batch.put_cf(sm.cf_sm_data(), key.as_bytes(), value.as_bytes());
                         res.push(RocksResponse {
                             value: Some(value.clone()),
                         })
                     }
                 },
                 EntryPayload::Membership(ref mem) => {
-                    sm.set_last_membership(StoredMembership::new(Some(entry.log_id), mem.clone()))?;
+                    sm.stage_last_membership(
+                        &mut batch,
+                        &StoredMembership::new(Some(entry.log_id), mem.clone()),
+                    )?;
                     res.push(RocksResponse { value: None })
                 }
             };
         }
-        self.db
-            .flush_wal(true)
-            .map_err(|e| StorageIOError::write_logs(&e))?;
+        #[cfg(test)]
+        if self
+            .fail_next_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageIOError::write_state_machine(AnyError::error(
+                "injected crash before state-machine commit",
+            ))
+            .into());
+        }
+        sm.commit(batch)?;
         Ok(res)
     }
 
@@ -620,9 +651,8 @@ impl RaftStorage<TypeConfig> for Arc<RocksStore> {
                 serde_json::from_slice(&new_snapshot.data).map_err(|e| {
                     StorageIOError::read_snapshot(Some(new_snapshot.meta.signature()), &e)
                 })?;
-            let mut state_machine = self.state_machine.write().await;
-            *state_machine =
-                RocksStateMachine::from_serializable(updated_state_machine, self.db.clone())?;
+            let state_machine = self.state_machine.write().await;
+            state_machine.replace_with(updated_state_machine)?;
         }
 
         self.put_meta::<meta::Snapshot>(&new_snapshot)?;
@@ -673,12 +703,114 @@ impl RocksStore {
 
         let db = Arc::new(db);
         let state_machine = RwLock::new(RocksStateMachine::new(db.clone()));
-        Arc::new(RocksStore { db, state_machine })
+        Arc::new(RocksStore {
+            db,
+            state_machine,
+            #[cfg(test)]
+            fail_next_commit: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 }
 
 fn read_logs_err(e: impl Error + 'static) -> StorageError<RocksNodeId> {
     StorageError::IO {
         source: StorageIOError::read_logs(&e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::CommittedLeaderId;
+    use openraft::Membership;
+    use std::collections::BTreeSet;
+
+    fn entry(index: u64, payload: EntryPayload<TypeConfig>) -> Entry<TypeConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+            payload,
+        }
+    }
+
+    fn set(index: u64, value: &str) -> Entry<TypeConfig> {
+        entry(
+            index,
+            EntryPayload::Normal(RocksRequest::Set {
+                key: "k".into(),
+                value: value.into(),
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn crash_before_commit_leaves_applied_index_and_data_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = RocksStore::new(dir.path()).await;
+            store
+                .apply_to_state_machine(&[set(1, "one")])
+                .await
+                .unwrap();
+            store
+                .fail_next_commit
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let membership = Membership::<RocksNodeId, BasicNode>::new(
+                vec![BTreeSet::from([1])],
+                BTreeMap::from([(1, BasicNode::new("http://n1"))]),
+            );
+            assert!(store
+                .apply_to_state_machine(&[
+                    set(2, "two"),
+                    entry(3, EntryPayload::Membership(membership))
+                ])
+                .await
+                .is_err());
+        }
+        let mut reopened = RocksStore::new(dir.path()).await;
+        let (applied, membership) = reopened.last_applied_state().await.unwrap();
+        assert_eq!(applied.map(|log_id| log_id.index), Some(1));
+        assert_eq!(membership.log_id(), &None);
+        let value = reopened.state_machine.read().await.get("k").unwrap();
+        assert_eq!(value.as_deref(), Some("one"));
+    }
+
+    #[tokio::test]
+    async fn installed_snapshot_replaces_previous_state_machine_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RocksStore::new(dir.path()).await;
+        store
+            .apply_to_state_machine(&[entry(
+                1,
+                EntryPayload::Normal(RocksRequest::Set {
+                    key: "stale".into(),
+                    value: "old".into(),
+                }),
+            )])
+            .await
+            .unwrap();
+        let snapshot = SerializableRocksStateMachine {
+            last_applied_log: Some(LogId::new(CommittedLeaderId::new(2, 1), 9)),
+            last_membership: StoredMembership::default(),
+            data: BTreeMap::from([("fresh".to_string(), "new".to_string())]),
+        };
+        let meta = SnapshotMeta {
+            last_log_id: snapshot.last_applied_log,
+            last_membership: StoredMembership::default(),
+            snapshot_id: "test".into(),
+        };
+        store
+            .install_snapshot(
+                &meta,
+                Box::new(Cursor::new(serde_json::to_vec(&snapshot).unwrap())),
+            )
+            .await
+            .unwrap();
+        let sm = store.state_machine.read().await;
+        assert_eq!(sm.get("stale").unwrap(), None);
+        assert_eq!(sm.get("fresh").unwrap().as_deref(), Some("new"));
+        assert_eq!(
+            sm.get_last_applied_log().unwrap().map(|id| id.index),
+            Some(9)
+        );
     }
 }
