@@ -7,6 +7,7 @@ import { localBrokerSelected, session } from "@/lib/session";
 import { useRoute } from "vue-router";
 import { isStandalone } from "@/lib/config";
 import { catalog } from "@/lib/catalog";
+import { navigationError } from "@/router";
 const route = useRoute();
 </script>
 
@@ -22,6 +23,7 @@ const route = useRoute();
         </AlertDescription>
       </Alert>
       <AppHeader />
+      <Alert v-if="navigationError" variant="destructive"><AlertTitle>Navigation unavailable</AlertTitle><AlertDescription>{{ navigationError }}</AlertDescription></Alert>
       <div class="flex-1 overflow-auto p-4">
         <p class="mb-3 text-xs text-muted-foreground">Local API target: {{ session.apiBase }}</p>
         <Alert v-if="session.cellsError || session.clusterError || Object.values(catalog.errors).some(Boolean)" variant="destructive" class="mb-3">

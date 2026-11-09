@@ -44,6 +44,10 @@ pub fn filesystem_router(dir: PathBuf) -> Router {
         .not_found_service(tower_http::services::ServeFile::new(dir.join("index.html")));
     Router::new()
         .route("/panel-config.js", get(panel_config_js))
+        .nest_service(
+            "/assets",
+            tower_http::services::ServeDir::new(dir.join("assets")),
+        )
         .fallback_service(service)
         .layer(axum::middleware::from_fn(
             crate::security::panel_security_headers,
@@ -87,6 +91,10 @@ async fn serve(path: String) -> Response {
         return asset_response(key, file);
     }
 
+    if key == "assets" || key.starts_with("assets/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     if let Some(file) = PanelAssets::get("index.html") {
         return asset_response("index.html", file);
     }
@@ -102,4 +110,47 @@ fn asset_response(path: &str, file: rust_embed::EmbeddedFile) -> Response {
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from(file.data.into_owned()))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn missing_chunks_are_404_but_spa_routes_still_load() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<html>panel</html>").unwrap();
+        for app in [
+            embedded_router(),
+            filesystem_router(dir.path().to_path_buf()),
+        ] {
+            let missing = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/assets/removed-hash.js")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+            let route = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/queues")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // ServeDir's not_found_service may retain 404 while serving the SPA body.
+            let body = axum::body::to_bytes(route.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("<html"));
+        }
+    }
 }
