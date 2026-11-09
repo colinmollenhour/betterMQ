@@ -314,6 +314,9 @@ impl DispatchEngine {
             engine.spawn_defer_scheduler(defer_rx);
             engine.replay_lifecycle_state();
             engine.replay_retry_state();
+        } else {
+            // Fleet brokers still need a durable backlog baseline after restart.
+            engine.backfill_pending();
         }
         engine
     }
@@ -519,6 +522,9 @@ impl DispatchEngine {
         self.telemetry
             .record_committed_range(to_offset.saturating_sub(from_offset));
         for offset in from_offset..to_offset {
+            if let Ok(msg) = self.broker.read_message(topic, partition, offset) {
+                self.observe_pending(&msg, to_offset);
+            }
             self.enqueue(DeliveryJob::live(
                 topic.to_string(),
                 partition,
@@ -531,9 +537,6 @@ impl DispatchEngine {
     /// Re-enqueue undelivered messages after restart (CP2.5 / CP7a).
     /// Pages per partition from cursor → high-water mark (no global 50k cliff).
     pub fn backfill_pending(&self) {
-        if !self.workers_enabled {
-            return;
-        }
         if self.memory_guard.is_critical() {
             info!("dispatch backfill skipped: memory critical");
             return;
@@ -605,6 +608,7 @@ impl DispatchEngine {
                         if msg.offset >= hwm {
                             continue;
                         }
+                        self.observe_pending(msg, hwm);
                         self.enqueue(DeliveryJob::live(
                             msg.topic.clone(),
                             msg.partition,
@@ -622,6 +626,28 @@ impl DispatchEngine {
         if enqueued > 0 {
             info!(enqueued, "dispatch backfill enqueued pending messages");
         }
+    }
+
+    fn observe_pending(&self, msg: &StoredMessage, hwm: u64) {
+        if msg
+            .destination_url
+            .as_ref()
+            .is_none_or(|url| url.is_empty())
+        {
+            return;
+        }
+        let lane = broker_partition::flow_lane_owner(msg).to_string();
+        let tenant = if msg.tenant_id.is_empty() {
+            self.broker.tenant()
+        } else {
+            msg.tenant_id.clone()
+        };
+        let cursor = self
+            .broker
+            .dispatch_offset(&tenant, &lane, msg.partition)
+            .unwrap_or(0);
+        self.telemetry
+            .record_pending(msg.partition, &lane, cursor, hwm);
     }
 }
 
@@ -1873,6 +1899,36 @@ mod tests {
         })
         .await
         .expect("the other lane must wake without resubmission");
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn broker_only_telemetry_seeds_backlog_without_completions() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let first = publish_test_message(&broker, "https://example.com/hook");
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        assert!(engine
+            .telemetry_snapshot()
+            .shards
+            .iter()
+            .any(|shard| shard.completion_gap_records > 0));
+        let second = publish_test_message(&broker, "https://example.com/hook");
+        engine.notify_committed_range(
+            &second.topic,
+            second.partition,
+            second.offset,
+            second.offset + 1,
+            second.id,
+        );
+        let gap = engine
+            .telemetry_snapshot()
+            .shards
+            .iter()
+            .map(|shard| shard.completion_gap_records)
+            .sum::<u64>();
+        assert!(gap >= 2);
+        assert_eq!(first.partition, second.partition);
         engine.shutdown_background().await;
     }
 

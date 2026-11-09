@@ -130,13 +130,23 @@ impl DispatchTelemetry {
         counters
             .cursor_advanced_records
             .fetch_add(new_cursor.saturating_sub(old_cursor), Ordering::Relaxed);
+        self.record_pending(shard, lane, new_cursor, committed_hwm);
+    }
+
+    pub(crate) fn record_pending(&self, shard: u32, lane: &str, cursor: u64, committed_hwm: u64) {
+        if shard as usize >= self.shards.len() {
+            self.dropped_cursor_lanes.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let mut lanes = self
             .cursor_lanes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = (shard, lane.to_string());
         if lanes.contains_key(&key) || lanes.len() < MAX_DISPATCH_CURSOR_LANES {
-            lanes.insert(key, (new_cursor, committed_hwm));
+            let entry = lanes.entry(key).or_insert((cursor, committed_hwm));
+            entry.0 = entry.0.max(cursor);
+            entry.1 = entry.1.max(committed_hwm);
         } else {
             self.dropped_cursor_lanes.fetch_add(1, Ordering::Relaxed);
         }
@@ -307,5 +317,21 @@ mod tests {
         assert_eq!(shard.cursor_max_offset, 12);
         assert_eq!(shard.completion_gap_records, 10);
         assert_eq!(shard.tracked_cursor_lanes, 2);
+    }
+
+    #[test]
+    fn committed_work_grows_gap_without_any_completion() {
+        let telemetry = DispatchTelemetry::new();
+        telemetry.record_completion(0, "lane", 0, 1, 1, true);
+        telemetry.record_pending(0, "lane", 1, 5);
+        assert_eq!(telemetry.snapshot().shards[0].completion_gap_records, 4);
+        telemetry.record_pending(1, "new-lane", 0, 3);
+        assert_eq!(telemetry.snapshot().shards[1].completion_gap_records, 3);
+        telemetry.record_completion(0, "lane", 0, 1, 1, false);
+        assert_eq!(
+            telemetry.snapshot().shards[0].completion_gap_records,
+            4,
+            "stale completion must not roll HWM back"
+        );
     }
 }
