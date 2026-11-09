@@ -39,6 +39,14 @@ Free self-hosted BetterMQ. **No config files required** — install the CLI or r
 
 Shared engine code lives in [`../engine/`](../engine/). This folder is the self-host product (Docker + docs only).
 
+### Panel build contract
+
+Rust builds and Docker images package the committed `engine/panel/dist` only;
+Cargo never runs npm. When editing panel sources, use the CI-pinned Node
+26.13.0, run `npm ci && npm run build` in `engine/panel`, and commit the generated
+assets with the source changes. CI requires the build/typecheck and dependency
+audit to pass and rejects any difference between generated and committed assets.
+
 ## Install CLI (recommended)
 
 Downloads the latest release binary from GitHub — no Rust toolchain or Docker required.

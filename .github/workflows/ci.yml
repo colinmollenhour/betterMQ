@@ -17,6 +17,28 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  panel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.13.0'
+          cache: npm
+          cache-dependency-path: engine/panel/package-lock.json
+      - name: Build, typecheck and audit panel
+        working-directory: engine/panel
+        run: |
+          npm ci
+          npm run build
+          npm audit --omit=dev
+      - name: Reject stale or untracked panel assets
+        run: |
+          git diff --exit-code -- engine/panel/dist
+          test -z "$(git status --porcelain -- engine/panel/dist)"
+
   rust:
     runs-on: ubuntu-latest
     steps:
@@ -68,7 +90,7 @@ jobs:
 
   release-gates:
     runs-on: ubuntu-latest
-    needs: [rust, selfhost-compose-validate]
+    needs: [rust, panel, selfhost-compose-validate]
     steps:
       - uses: actions/checkout@v4
         with:
