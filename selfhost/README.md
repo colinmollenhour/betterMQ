@@ -116,6 +116,9 @@ the public socket; internal routes remain on public unless `--internal-listen`
 is also set. An explicit `--admin-listen` takes precedence over the panel alias.
 For the public bind address, CLI/env `--listen` or `--port` wins over
 `listeners.public`; `node.listen` remains the compatibility fallback.
+`config validate` and `doctor` check V2 component dependencies, panel modes and
+all listener addresses. Invalid listener strings fail instead of falling back
+to a potentially public socket. Separate-panel mode needs a panel/admin address.
 
 Examples:
 

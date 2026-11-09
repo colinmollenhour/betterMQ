@@ -180,6 +180,52 @@ impl BetterMqConfig {
             return Err(ConfigError::Invalid("node.public_url is required".into()));
         }
         parse_listen(&self.node.listen)?;
+        crate::components::resolve_component_set(self, None, &[], false, false, false, false)?;
+        if let Some(listeners) = &self.listeners {
+            for (name, value) in [
+                ("public", &listeners.public),
+                ("admin", &listeners.admin),
+                ("internal", &listeners.internal),
+            ] {
+                if let Some(value) = value {
+                    validate_listen(&format!("listeners.{name}"), value)?;
+                }
+            }
+        }
+        if let Some(panel) = &self.panel {
+            let mode = crate::components::resolve_panel_mode(self, None, false, false)?;
+            if let Some(value) = &panel.listen {
+                validate_listen("panel.listen", value)?;
+            }
+            if mode == crate::components::PanelMode::SeparateListener
+                && panel.listen.is_none()
+                && self
+                    .listeners
+                    .as_ref()
+                    .and_then(|s| s.admin.as_ref())
+                    .is_none()
+            {
+                return Err(ConfigError::Invalid(
+                    "panel separateListener mode requires panel.listen or listeners.admin".into(),
+                ));
+            }
+            if let Some(controller) = &panel.controller {
+                if !url::Url::parse(controller)
+                    .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+                {
+                    return Err(ConfigError::Invalid(
+                        "panel.controller must be an HTTP(S) URL".into(),
+                    ));
+                }
+            }
+        }
+        if let Some(policy) = &self.replication {
+            if policy.factor == 0 || policy.min_isr == 0 || policy.min_isr > policy.factor {
+                return Err(ConfigError::Invalid(
+                    "replication requires 1 <= minIsr <= factor".into(),
+                ));
+            }
+        }
 
         match &self.storage {
             StorageConfig::Local => {}
@@ -293,9 +339,16 @@ pub(crate) fn validate_s3(s3: &S3Config) -> Result<(), ConfigError> {
 }
 
 pub fn parse_listen(listen: &str) -> Result<std::net::SocketAddr, ConfigError> {
+    validate_listen("node.listen", listen)
+}
+
+pub(crate) fn validate_listen(
+    field: &str,
+    listen: &str,
+) -> Result<std::net::SocketAddr, ConfigError> {
     listen
         .parse()
-        .map_err(|e| ConfigError::Invalid(format!("invalid node.listen '{listen}': {e}")))
+        .map_err(|e| ConfigError::Invalid(format!("invalid {field} '{listen}': {e}")))
 }
 
 impl BetterMqConfig {

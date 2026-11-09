@@ -131,6 +131,7 @@ fn resolve_serve_with_env(
     let mut base = file_cfg
         .cloned()
         .unwrap_or_else(BetterMqConfig::template_single_local);
+    base.validate()?;
     apply_runtime_env(&mut base, &env)?;
 
     let configured_public = base
@@ -194,27 +195,27 @@ fn resolve_serve_with_env(
         overrides.no_panel,
         overrides.standalone_panel,
     )?;
-    let mut panel_listen = overrides.panel_listen.or_else(|| {
-        base.panel
-            .as_ref()
-            .and_then(|section| section.listen.as_deref())
-            .and_then(|value| parse_listen(value).ok())
-    });
+    let mut panel_listen = overrides.panel_listen.or(base
+        .panel
+        .as_ref()
+        .and_then(|section| section.listen.as_deref())
+        .map(|v| crate::types::validate_listen("panel.listen", v))
+        .transpose()?);
     if panel_mode == PanelMode::Disabled {
         panel_listen = None;
     }
-    let admin_listen = overrides.admin_listen.or_else(|| {
-        base.listeners
-            .as_ref()
-            .and_then(|section| section.admin.as_deref())
-            .and_then(|value| parse_listen(value).ok())
-    });
-    let internal_listen = overrides.internal_listen.or_else(|| {
-        base.listeners
-            .as_ref()
-            .and_then(|section| section.internal.as_deref())
-            .and_then(|value| parse_listen(value).ok())
-    });
+    let admin_listen = overrides.admin_listen.or(base
+        .listeners
+        .as_ref()
+        .and_then(|section| section.admin.as_deref())
+        .map(|v| crate::types::validate_listen("listeners.admin", v))
+        .transpose()?);
+    let internal_listen = overrides.internal_listen.or(base
+        .listeners
+        .as_ref()
+        .and_then(|section| section.internal.as_deref())
+        .map(|v| crate::types::validate_listen("listeners.internal", v))
+        .transpose()?);
     let listeners = resolve_listeners(
         listen,
         admin_listen,
