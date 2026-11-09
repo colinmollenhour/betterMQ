@@ -17,7 +17,7 @@ use broker_config::{
 };
 use broker_dispatch::{DispatchConfig, DispatchEngine};
 use broker_partition::{Broker, BrokerConfig, PublishRequest};
-use broker_raft_meta::{ClusterConfig, ClusterRuntime, NodeConfig};
+use broker_raft_meta::ClusterRuntime;
 use broker_schedule::{CronRegistry, ScheduleQueue};
 use broker_storage::StorageMode;
 use chrono::Utc;
@@ -393,73 +393,12 @@ fn inventory_files(root: &std::path::Path, limit: usize) -> Vec<serde_json::Valu
         .collect()
 }
 
-fn cluster_init(args: ClusterInitArgs) -> anyhow::Result<()> {
-    std::fs::create_dir_all(&args.data_dir)?;
-    let node_id = args.node_id.unwrap_or_else(|| stable_node_id(&args.addr));
-    let mut nodes = Vec::new();
-    for peer in &args.peers {
-        nodes.push(NodeConfig {
-            id: stable_node_id(peer),
-            addr: peer.clone(),
-        });
-    }
-    if !args.peers.iter().any(|p| p == &args.addr) {
-        nodes.push(NodeConfig {
-            id: node_id,
-            addr: args.addr.clone(),
-        });
-    }
-    let config = ClusterConfig {
-        cluster_id: Uuid::new_v4(),
-        nodes,
-        node_id,
-        generation: 1,
-        hash_version: 1,
-    };
-    ClusterRuntime::init_cluster_file(&args.data_dir, &config)?;
-    let cfg_path = args.data_dir.join("cluster-config.json");
-    broker_proto::write_secret_atomic(&cfg_path, &serde_json::to_vec_pretty(&config)?)?;
-    info!(node_id = %node_id, peers = args.peers.len(), "cluster initialized");
-    Ok(())
+fn cluster_init(_args: ClusterInitArgs) -> anyhow::Result<()> {
+    anyhow::bail!("cluster init is retired: use bettermq config init --template cluster and named cluster.nodes for initial configuration, or Panel → Infrastructure to create a cluster; no files were changed")
 }
 
-async fn cluster_join(args: ClusterJoinArgs) -> anyhow::Result<()> {
-    std::fs::create_dir_all(&args.data_dir)?;
-    let client = reqwest::Client::new();
-    let url = format!("{}/internal/v1/cluster", args.seed.trim_end_matches('/'));
-    let req = broker_api::cluster_auth::apply_cluster_secret(client.get(&url));
-    let remote: ClusterConfig = req
-        .send()
-        .await
-        .context("fetch cluster from seed")?
-        .error_for_status()
-        .context("seed cluster endpoint")?
-        .json()
-        .await
-        .context("decode cluster config")?;
-
-    let node_id = args.node_id.unwrap_or_else(Uuid::new_v4);
-    let mut nodes = remote.nodes;
-    nodes.push(NodeConfig {
-        id: node_id,
-        addr: args.addr.clone(),
-    });
-    let config = ClusterConfig {
-        cluster_id: remote.cluster_id,
-        nodes,
-        node_id,
-        generation: remote.generation + 1,
-        hash_version: remote.hash_version.max(broker_config::HASH_VERSION),
-    };
-    let cfg_path = args.data_dir.join("cluster-config.json");
-    broker_proto::write_secret_atomic(&cfg_path, &serde_json::to_vec_pretty(&config)?)?;
-    ClusterRuntime::init_cluster_file(&args.data_dir, &config)?;
-    info!(node_id = %node_id, "joined cluster");
-    Ok(())
-}
-
-fn stable_node_id(addr: &str) -> Uuid {
-    broker_config::stable_node_id(addr)
+async fn cluster_join(_args: ClusterJoinArgs) -> anyhow::Result<()> {
+    anyhow::bail!("cluster join is retired: use Panel → Infrastructure enrollment (POST /v1/infra/cluster/enroll with a seed join token); copying seed membership does not enroll a node; no files were changed")
 }
 
 #[cfg(feature = "cloud")]

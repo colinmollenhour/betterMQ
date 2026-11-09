@@ -82,8 +82,8 @@ Verified from `bettermq --help` / `bettermq <cmd> --help` on the self-host binar
 | `bettermq config schema` | Print JSON Schema for editors |
 | `bettermq doctor` | Check config compatibility, WAL frames, and data-dir access |
 | `bettermq support-bundle` | Write a redacted JSON diagnostic bundle |
-| `bettermq cluster init` | Legacy: initialize cluster files in the data dir |
-| `bettermq cluster join` | Legacy: join via seed URL |
+| `bettermq cluster init` | Retired: exits with migration instructions; no files changed |
+| `bettermq cluster join` | Retired: use Infrastructure enrollment; no files changed |
 
 Prefer creating/joining a cluster from the **panel → Infrastructure**. `cluster` subcommands remain for scripting.
 
@@ -173,16 +173,17 @@ bettermq config schema
 | `slate` | Single node, SlateDB + S3-compatible store |
 | `cluster` | Three-node HA cluster (local storage) template |
 
-### `bettermq cluster` (legacy)
+### `bettermq cluster` (retired)
 
-```bash
-bettermq cluster init --addr <URL> [--data-dir ./data] [--peers <URL,URL,...>] [--node-id <UUID>]
-bettermq cluster join --addr <URL> --seed <URL> [--data-dir ./data] [--node-id <UUID>]
-```
+`cluster init` and `cluster join` now exit nonzero with migration instructions
+without contacting a seed or modifying membership files. The old commands used
+inconsistent node IDs and a local-only join did not register the new member.
 
-- `--addr` — this node’s public HTTP base URL (e.g. `http://broker1:8080`)
-- `--peers` — comma-separated peer base URLs (including this node) for `init`
-- `--seed` — seed broker URL for `join`
+For initial static configuration, run `bettermq config init --template cluster`,
+set named `cluster.nodes` and each host's `node.name`, then validate before serving.
+For enrollment into an existing cluster, use Panel → Infrastructure with a seed
+join token (the `POST /v1/infra/cluster/enroll` flow), which registers membership
+instead of merely copying a seed's local file.
 
 ### `bettermq panel`
 

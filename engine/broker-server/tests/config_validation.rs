@@ -72,3 +72,43 @@ fn schema_command_emits_a_real_schema_for_strict_config_types() {
     );
     assert!(schema.get("templates").is_none());
 }
+
+#[test]
+fn retired_cluster_commands_leave_membership_untouched() {
+    for cmd in ["init", "join"] {
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join("cluster-config.json");
+        let original = b"existing membership must not change";
+        std::fs::write(&path, original).unwrap();
+        let mut args = vec![
+            "cluster",
+            cmd,
+            "--addr",
+            "http://localhost:8080",
+            "--data-dir",
+            data.path().to_str().unwrap(),
+        ];
+        if cmd == "join" {
+            args.extend(["--seed", "http://127.0.0.1:9"]);
+        } else {
+            args.extend([
+                "--peers",
+                "http://localhost:8080,http://localhost:8081",
+                "--node-id",
+                "00000000-0000-0000-0000-000000000001",
+            ]);
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_bettermq"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("retired") && stderr.contains("Infrastructure"),
+            "{stderr}"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        assert_eq!(std::fs::read_dir(data.path()).unwrap().count(), 1);
+    }
+}
