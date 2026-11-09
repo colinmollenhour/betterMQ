@@ -438,6 +438,7 @@ fn to_publish_enqueue(req: EnqueueRequest) -> Result<PublishRequest, ApiError> {
         )));
     }
     let mut pr = PublishRequest {
+        routing_id: None,
         topic: req.queue,
         queue_id: req.queue_id,
         group_id: None,
@@ -488,6 +489,7 @@ fn to_publish_job(req: PublishJobRequest) -> Result<PublishRequest, ApiError> {
 
     if has_group {
         let mut pr = PublishRequest {
+            routing_id: None,
             topic: String::new(),
             queue_id: None,
             group_id: req.group_id,
@@ -523,6 +525,7 @@ fn to_publish_job(req: PublishJobRequest) -> Result<PublishRequest, ApiError> {
         ));
     }
     let mut pr = PublishRequest {
+        routing_id: None,
         topic: broker_partition::DIRECT_TOPIC.to_string(),
         queue_id: None,
         group_id: None,
@@ -1203,6 +1206,7 @@ mod fanout_tests {
             control_plane: None,
         });
         let base = PublishRequest {
+            routing_id: None,
             topic: String::new(),
             queue_id: None,
             group_id: Some(group.id),

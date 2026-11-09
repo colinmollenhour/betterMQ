@@ -250,6 +250,10 @@ fn internal_cluster_routes() -> Router<Arc<AppState>> {
 
 fn internal_cluster_route_table() -> Router<Arc<AppState>> {
     Router::new()
+        .route(
+            "/internal/v1/gateway/queue-topics",
+            axum::routing::post(gateway::internal_gateway_queue_topics),
+        )
         .route("/internal/v1/readyz", axum::routing::get(ops::readyz))
         .route(
             "/internal/v1/lease/claim",

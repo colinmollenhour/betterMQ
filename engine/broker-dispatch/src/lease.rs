@@ -592,6 +592,7 @@ mod tests {
         let publish = |lane: &str| {
             broker
                 .publish(PublishRequest {
+                    routing_id: None,
                     topic: String::new(),
                     queue_id: None,
                     group_id: None,

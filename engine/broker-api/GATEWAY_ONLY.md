@@ -23,6 +23,14 @@ at least one healthy broker. `/v1/gateway/status` reports routing readiness.
 
 Supported ingest routes:
 
+Keyless requests receive a routing-only UUID before shard selection. Forwarding
+preserves that identity without enabling FIFO delivery or changing the message key.
+Routing uses the canonical storage topic: direct URLs use the direct topic and
+queue IDs resolve to their queue name. A gateway batch containing queue IDs makes
+one authenticated metadata lookup (IDs/names only, no destination secrets) before
+splitting by shard. This extra round trip avoids routing V1 queue-ID requests by
+an empty or caller-supplied topic.
+
 - `POST /v1/gateway/enqueue`
 - `POST /v1/ingest/batch`
 - `POST /v1/ingest/ndjson`

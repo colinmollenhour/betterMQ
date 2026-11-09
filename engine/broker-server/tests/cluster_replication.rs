@@ -34,6 +34,7 @@ fn replicated_frame_is_readable_on_follower() {
 
     let resp = broker_l
         .publish(PublishRequest {
+            routing_id: None,
             topic: "jobs".into(),
             routing_key: "k1".into(),
             payload: "hello".into(),
@@ -220,6 +221,7 @@ fn divergent_follower_tail_is_rejected_without_overwrite() {
     let publish = |broker: &Broker, payload: &str| {
         broker
             .publish(PublishRequest {
+                routing_id: None,
                 topic: DIRECT_TOPIC.into(),
                 routing_key: "same-shard".into(),
                 payload: payload.into(),

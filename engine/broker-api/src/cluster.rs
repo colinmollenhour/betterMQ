@@ -203,7 +203,9 @@ impl ClusterHandle {
 }
 
 fn shard_for_request(state: &AppState, req: &PublishRequest) -> u32 {
-    state.broker.assign_shard(&req.topic, &req.routing_key)
+    state
+        .broker
+        .assign_shard(&req.topic, &req.shard_routing_key())
 }
 
 /// Enqueue push dispatch when this broker leads the message shard.
@@ -379,6 +381,7 @@ pub async fn publish_with_cluster(
     mut req: PublishRequest,
     meter: Option<crate::metering::IngestMeter>,
 ) -> Result<PublishResponse, ApiError> {
+    state.broker.canonicalize_routing(&mut req)?;
     if let Some(cluster) = &state.cluster {
         if cluster.runtime.config().node_count() > 1 {
             let shard = shard_for_request(state, &req);

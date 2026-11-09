@@ -72,6 +72,7 @@ async fn publish_triggers_webhook_with_signature() {
 
     let resp = broker
         .publish(PublishRequest {
+            routing_id: None,
             topic: "hooks".into(),
             queue_id: None,
             group_id: None,

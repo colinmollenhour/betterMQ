@@ -48,9 +48,12 @@ impl IngestBatch {
         Ok(Self {
             records: reqs
                 .into_iter()
-                .map(|req| IngestEnvelope {
-                    body_bytes: req.payload.len(),
-                    req,
+                .map(|mut req| {
+                    req.ensure_routing_id();
+                    IngestEnvelope {
+                        body_bytes: req.payload.len(),
+                        req,
+                    }
                 })
                 .collect(),
         })
@@ -66,6 +69,7 @@ mod tests {
 
     fn sample(delay: Option<u64>) -> PublishRequest {
         PublishRequest {
+            routing_id: None,
             topic: String::new(),
             queue_id: None,
             group_id: None,
@@ -89,6 +93,50 @@ mod tests {
             sign: None,
             request: None,
         }
+    }
+
+    #[test]
+    fn keyless_identity_survives_forwarding_and_storage_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        for key in ["", "  ", " keyed "] {
+            let mut request = sample(None);
+            request.topic = broker_partition::DIRECT_TOPIC.into();
+            request.routing_key = key.into();
+            request.url = Some("https://example.com/hook".into());
+            let batch = IngestBatch::from_requests(vec![request]).unwrap();
+            let request = &batch.records[0].req;
+            let shard = broker.assign_shard(&request.topic, &request.shard_routing_key());
+            broker.set_shard_leader_check(Arc::new(move |candidate| {
+                (candidate == shard).then_some(1)
+            }));
+            let mut forwarded: PublishRequest =
+                serde_json::from_slice(&serde_json::to_vec(request).unwrap()).unwrap();
+            forwarded.ensure_routing_id();
+            assert_eq!(forwarded.routing_id, request.routing_id);
+            let response = broker.publish(forwarded).unwrap();
+            assert_eq!(response.partition, Some(shard));
+            let stored = broker
+                .list_topic_messages(broker_partition::DIRECT_TOPIC, 10)
+                .unwrap();
+            let message = stored
+                .iter()
+                .find(|message| Some(message.id) == response.message_id)
+                .unwrap();
+            assert_eq!(message.routing_key, key);
+            assert!(!broker_partition::delivery_uses_flow_control(message));
+        }
+    }
+
+    #[test]
+    fn keyless_idempotent_retries_choose_the_same_shard_identity() {
+        let mut first = sample(None);
+        first.routing_key.clear();
+        first.idempotency_key = Some("retry-me".into());
+        let mut retry = first.clone();
+        first.ensure_routing_id();
+        retry.ensure_routing_id();
+        assert_eq!(first.routing_id, retry.routing_id);
     }
 
     #[test]
@@ -546,13 +594,22 @@ pub async fn submit_batch(
     }
     let mut locally_led = Vec::new();
     let mut forwarded = Vec::new();
-    for (index, env) in immediate {
+    for (index, mut env) in immediate {
+        if let Err(error) = state.broker.canonicalize_routing(&mut env.req) {
+            record_rejected();
+            out.push(IngestOutcome {
+                index,
+                topic: env.req.topic,
+                result: Err(ApiError::Broker(error)),
+            });
+            continue;
+        }
         let is_local = state.cluster.as_ref().is_none_or(|cluster| {
             cluster.runtime.config().node_count() <= 1
                 || cluster.runtime.is_leader_for_shard(
                     state
                         .broker
-                        .assign_shard(&env.req.topic, &env.req.routing_key),
+                        .assign_shard(&env.req.topic, &env.req.shard_routing_key()),
                 )
         });
         if is_local {

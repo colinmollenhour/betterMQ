@@ -757,6 +757,7 @@ mod tests {
 
     fn request() -> PublishRequest {
         PublishRequest {
+            routing_id: None,
             topic: "__direct".into(),
             queue_id: None,
             group_id: None,

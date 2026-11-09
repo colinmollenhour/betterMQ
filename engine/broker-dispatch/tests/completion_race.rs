@@ -45,6 +45,7 @@ async fn duplicate_enqueue_does_not_double_deliver_or_lose_record() {
     let url = format!("{}/hook", mock.uri());
     let resp = broker
         .publish(PublishRequest {
+            routing_id: None,
             topic: String::new(),
             queue_id: None,
             group_id: None,

@@ -56,6 +56,7 @@ async fn accepted_body_above_a_lowered_limit_still_moves_to_dlq() {
     let body = "x".repeat(BODY);
     let resp = broker
         .publish(PublishRequest {
+            routing_id: None,
             topic: "jobs".into(),
             queue_id: None,
             group_id: None,

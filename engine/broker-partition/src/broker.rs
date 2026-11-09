@@ -108,6 +108,10 @@ pub struct DestinationSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishRequest {
+    /// Routing identity for keyless requests, preserved across internal forwarding.
+    /// Does not enable FIFO delivery or replace the message's routing key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_id: Option<Uuid>,
     /// Queue name (omit when `queue_id` or direct `url` is set).
     #[serde(default)]
     pub topic: String,
@@ -161,6 +165,30 @@ pub struct PublishRequest {
     pub sign: Option<bool>,
     #[serde(default)]
     pub request: Option<crate::http_delivery::HttpDeliveryInput>,
+}
+
+impl PublishRequest {
+    /// Select once, before choosing a leader. Repeated forwarding preserves it.
+    pub fn ensure_routing_id(&mut self) {
+        if self.routing_key.trim().is_empty() && self.routing_id.is_none() {
+            self.routing_id = Some(
+                self.idempotency_key
+                    .as_ref()
+                    .map_or_else(Uuid::new_v4, |key| {
+                        Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes())
+                    }),
+            );
+        }
+    }
+
+    pub fn shard_routing_key(&self) -> String {
+        let key = self.routing_key.trim();
+        if key.is_empty() {
+            self.routing_id.map(|id| id.to_string()).unwrap_or_default()
+        } else {
+            key.to_string()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1297,14 +1325,11 @@ impl Broker {
         let (max_retries, retry_backoff) =
             resolve_delivery_retry(&req, queue_sub.as_ref(), &self.inner.config.retry_defaults);
 
-        let partition_key = {
-            let rk = req.routing_key.trim();
-            if !rk.is_empty() {
-                rk.to_string()
-            } else {
-                message_id.to_string()
-            }
-        };
+        // API-selected identity must survive leader selection and forwarding.
+        if req.routing_key.trim().is_empty() && req.routing_id.is_none() {
+            req.routing_id = Some(message_id);
+        }
+        let partition_key = req.shard_routing_key();
         let partition = self
             .inner
             .layout
@@ -1877,6 +1902,31 @@ impl Broker {
         Ok(false)
     }
 
+    /// Resolve the routing identity and storage topic before choosing a leader.
+    pub fn canonicalize_routing(&self, req: &mut PublishRequest) -> Result<(), BrokerError> {
+        req.ensure_routing_id();
+        if is_dlq_topic(&req.topic) {
+            return Ok(());
+        }
+        if let Some(destination) = &req.destination {
+            req.topic = match destination.queue_id {
+                Some(id) => self
+                    .get_queue_by_id(id)?
+                    .map(|queue| queue.topic)
+                    .unwrap_or_else(|| DIRECT_TOPIC.into()),
+                None => DIRECT_TOPIC.into(),
+            };
+        } else if req.url.is_some() && req.secret.is_some() {
+            req.topic = DIRECT_TOPIC.into();
+        } else if let Some(id) = req.queue_id {
+            req.topic = self
+                .get_queue_by_id(id)?
+                .ok_or_else(|| BrokerError::QueueNotFound(id.to_string()))?
+                .topic;
+        }
+        Ok(())
+    }
+
     /// Freeze flow limits and queue destination from this broker's catalog before forwarding to a shard leader.
     pub fn prepare_for_cluster_forward(&self, req: &mut PublishRequest) -> Result<(), BrokerError> {
         let tenant_id = self.tenant();
@@ -2027,6 +2077,7 @@ impl Broker {
             .as_ref()
             .map(|k| format!("{k}:{}", member.id));
         PublishRequest {
+            routing_id: None,
             topic: group_topic(group_id),
             queue_id: None,
             group_id: Some(group_id),
@@ -2262,6 +2313,7 @@ mod tests {
 
         let published = broker
             .publish(PublishRequest {
+                routing_id: None,
                 topic: "orders".into(),
                 queue_id: None,
                 group_id: None,
@@ -2314,6 +2366,7 @@ mod tests {
 
         let keyed = broker
             .publish(PublishRequest {
+                routing_id: None,
                 topic: "jobs".into(),
                 queue_id: None,
                 group_id: None,
@@ -2347,6 +2400,7 @@ mod tests {
 
         let plain = broker
             .publish(PublishRequest {
+                routing_id: None,
                 topic: "jobs".into(),
                 queue_id: None,
                 group_id: None,
@@ -2397,6 +2451,7 @@ mod tests {
         let body = "x".repeat(2048);
         let published = broker
             .publish(PublishRequest {
+                routing_id: None,
                 topic: "big".into(),
                 queue_id: None,
                 group_id: None,
@@ -2458,6 +2513,7 @@ mod tests {
             .unwrap();
 
         let req = PublishRequest {
+            routing_id: None,
             topic: "t".into(),
             queue_id: None,
             group_id: None,
@@ -2510,6 +2566,7 @@ mod tests {
                     for n in 0..25 {
                         broker
                             .publish(PublishRequest {
+                                routing_id: None,
                                 topic: "orders".into(),
                                 queue_id: None,
                                 group_id: None,
@@ -2554,6 +2611,7 @@ mod tests {
         idempotency_key: Option<String>,
     ) -> PublishRequest {
         PublishRequest {
+            routing_id: None,
             topic: String::new(),
             queue_id: None,
             group_id: None,
@@ -3090,6 +3148,7 @@ mod tests {
         for key in ["a", "b"] {
             broker
                 .publish(PublishRequest {
+                    routing_id: None,
                     topic: topic.into(),
                     queue_id: None,
                     group_id: None,

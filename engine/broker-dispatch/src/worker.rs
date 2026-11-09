@@ -1478,6 +1478,7 @@ impl DispatchEngine {
             "body": String::from_utf8_lossy(&msg.payload),
         });
         let dlq_response = self.broker.publish_immediate(PublishRequest {
+            routing_id: None,
             topic: dlq,
             routing_key: msg.id.to_string(),
             payload: payload.to_string(),
@@ -2057,6 +2058,7 @@ mod tests {
         let publish = |body: &str| {
             broker
                 .publish(PublishRequest {
+                    routing_id: None,
                     topic: String::new(),
                     queue_id: None,
                     group_id: None,
@@ -2140,6 +2142,7 @@ mod tests {
         let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
         let response = broker
             .publish(PublishRequest {
+                routing_id: None,
                 topic: String::new(),
                 queue_id: None,
                 group_id: None,

@@ -682,6 +682,7 @@ mod tests {
 
     fn direct_publish(payload: &str) -> broker_partition::PublishRequest {
         broker_partition::PublishRequest {
+            routing_id: None,
             topic: broker_partition::DIRECT_TOPIC.into(),
             routing_key: "same-shard".into(),
             payload: payload.into(),

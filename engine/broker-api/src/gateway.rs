@@ -21,6 +21,47 @@ use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
+#[derive(Serialize, Deserialize)]
+pub(crate) struct GatewayQueueTopicsRequest {
+    tenant_id: Option<Uuid>,
+    queue_ids: Vec<Uuid>,
+}
+
+pub(crate) async fn internal_gateway_queue_topics(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<GatewayQueueTopicsRequest>,
+) -> Result<Json<HashMap<Uuid, String>>, ApiError> {
+    if request.queue_ids.len() > MAX_HT_BATCH_MESSAGES {
+        return Err(ApiError::BadRequest(
+            "too many queue routing lookups".into(),
+        ));
+    }
+    let resolve = async {
+        let mut topics = HashMap::new();
+        for id in request.queue_ids {
+            let queue = state.broker.get_queue_by_id(id)?.ok_or_else(|| {
+                ApiError::Broker(broker_partition::BrokerError::QueueNotFound(id.to_string()))
+            })?;
+            topics.insert(id, queue.topic);
+        }
+        Ok(Json(topics))
+    };
+    match request.tenant_id {
+        Some(tenant_id) => broker_partition::scope_tenant(tenant_id.to_string(), resolve).await,
+        None => resolve.await,
+    }
+}
+
+fn routing_queue_id(request: &PublishRequest) -> Option<Uuid> {
+    if let Some(destination) = &request.destination {
+        destination.queue_id
+    } else if request.url.is_some() && request.secret.is_some() {
+        None
+    } else {
+        request.queue_id
+    }
+}
+
 #[derive(Clone)]
 pub struct GatewayOnlyState {
     seeds: Arc<Vec<String>>,
@@ -144,6 +185,81 @@ impl GatewayOnlyState {
 
     fn auth_configured(&self) -> bool {
         self.uses_cloud_auth() || self.local_token.is_some() || insecure_no_auth()
+    }
+
+    async fn canonicalize_topics(
+        &self,
+        batch: &mut IngestBatch,
+        tenant_id: Option<Uuid>,
+    ) -> Result<(), ApiError> {
+        let queue_ids: HashSet<_> = batch
+            .records
+            .iter()
+            .filter_map(|record| routing_queue_id(&record.req))
+            .collect();
+        let mut topics = HashMap::new();
+        if !queue_ids.is_empty() {
+            let request = GatewayQueueTopicsRequest {
+                tenant_id,
+                queue_ids: queue_ids.into_iter().collect(),
+            };
+            let mut resolved = false;
+            let mut missing_queue = None;
+            let mut failure = "cannot resolve queue routing topics from internal broker seeds";
+            for seed in self.seeds.iter() {
+                let response = crate::cluster_auth::apply_cluster_secret(
+                    gateway_http_client()
+                        .post(format!("{seed}/internal/v1/gateway/queue-topics"))
+                        .timeout(Duration::from_secs(2))
+                        .json(&request),
+                )
+                .send()
+                .await;
+                let Ok(response) = response else { continue };
+                if !response.status().is_success() {
+                    match response.status() {
+                        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                            failure = "queue routing lookup rejected: cluster secret missing or mismatched";
+                        }
+                        StatusCode::NOT_FOUND => {
+                            failure = "queue routing lookup route not found: BROKER_URLS must use internal listeners";
+                            if let Ok(body) = response.json::<serde_json::Value>().await {
+                                if body["code"] == "not_found" {
+                                    missing_queue = body["error"].as_str().map(str::to_string);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                if let Ok(map) = response.json::<HashMap<Uuid, String>>().await {
+                    topics = map;
+                    resolved = true;
+                    break;
+                }
+            }
+            if !resolved {
+                return Err(missing_queue
+                    .map_or_else(|| ApiError::Unavailable(failure.into()), ApiError::NotFound));
+            }
+        }
+        for record in &mut batch.records {
+            let request = &mut record.req;
+            if broker_partition::is_dlq_topic(&request.topic) {
+                continue;
+            }
+            if let Some(id) = routing_queue_id(request) {
+                request.topic = topics.get(&id).cloned().ok_or_else(|| {
+                    ApiError::Broker(broker_partition::BrokerError::QueueNotFound(id.to_string()))
+                })?;
+            } else if request.destination.is_some()
+                || (request.url.is_some() && request.secret.is_some())
+            {
+                request.topic = broker_partition::DIRECT_TOPIC.into();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -469,21 +585,27 @@ async fn gateway_only_submit(
             "batch exceeds max size of {MAX_HT_BATCH_MESSAGES}"
         )));
     }
-    let batch = IngestBatch::from_requests(body.messages)?;
+    let mut batch = IngestBatch::from_requests(body.messages)?;
     let tenant_name = ingest
         .map(|auth| auth.tenant_id.to_string())
         .unwrap_or_else(|| state.tenant.as_ref().clone());
     let tenant_id = ingest.map(|auth| auth.tenant_id);
-    let mut groups: HashMap<u32, Vec<GatewayForwardItem>> = HashMap::new();
-    let mut input_metadata = Vec::with_capacity(batch.records.len());
     let mut guards = Vec::with_capacity(batch.records.len());
-    for (index, envelope) in batch.records.into_iter().enumerate() {
+    for envelope in &batch.records {
         guards.push(crate::admission::check_gateway_admission(
             tenant_id,
             envelope.body_bytes,
         )?);
-        let shard =
-            state.assign_shard(&tenant_name, &envelope.req.topic, &envelope.req.routing_key);
+    }
+    state.canonicalize_topics(&mut batch, tenant_id).await?;
+    let mut groups: HashMap<u32, Vec<GatewayForwardItem>> = HashMap::new();
+    let mut input_metadata = Vec::with_capacity(batch.records.len());
+    for (index, envelope) in batch.records.into_iter().enumerate() {
+        let shard = state.assign_shard(
+            &tenant_name,
+            &envelope.req.topic,
+            &envelope.req.shard_routing_key(),
+        );
         input_metadata.push((index, envelope.req.topic.clone()));
         groups.entry(shard).or_default().push(GatewayForwardItem {
             index,
@@ -699,10 +821,11 @@ pub async fn gateway_enqueue(
 
     let mut by_shard: HashMap<u32, Vec<GatewayForwardItem>> = HashMap::new();
     let mut input_metadata = Vec::with_capacity(batch.records.len());
-    for (index, env) in batch.records.into_iter().enumerate() {
+    for (index, mut env) in batch.records.into_iter().enumerate() {
+        state.broker.canonicalize_routing(&mut env.req)?;
         let shard = state
             .broker
-            .assign_shard(&env.req.topic, &env.req.routing_key);
+            .assign_shard(&env.req.topic, &env.req.shard_routing_key());
         input_metadata.push((index, env.req.topic.clone()));
         by_shard.entry(shard).or_default().push(GatewayForwardItem {
             index,
@@ -826,7 +949,7 @@ pub(crate) async fn internal_gateway_ingest(
     if body.items.iter().any(|item| {
         state
             .broker
-            .assign_shard(&item.request.topic, &item.request.routing_key)
+            .assign_shard(&item.request.topic, &item.request.shard_routing_key())
             != body.shard
     }) {
         return (
@@ -969,6 +1092,7 @@ mod tests {
         let state = test_state(&dir);
         let schedule = state.schedule.clone();
         let request = PublishRequest {
+            routing_id: None,
             topic: String::new(),
             queue_id: None,
             group_id: None,
@@ -1132,6 +1256,7 @@ mod tests {
         let mut state = (*base_state).clone();
         state.cluster = Some(crate::Cluster::new(runtime));
         let request = PublishRequest {
+            routing_id: None,
             topic: "jobs".into(),
             queue_id: None,
             group_id: None,

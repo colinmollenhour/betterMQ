@@ -141,6 +141,7 @@ fn messages_survive_graceful_reopen() {
         for i in 0..100 {
             let resp = broker
                 .publish(PublishRequest {
+                    routing_id: None,
                     topic: "events".into(),
                     queue_id: None,
                     group_id: None,
@@ -198,6 +199,7 @@ fn ten_thousand_messages_durable() {
         for i in 0..10_000 {
             broker
                 .publish(PublishRequest {
+                    routing_id: None,
                     topic: "load".into(),
                     queue_id: None,
                     group_id: None,

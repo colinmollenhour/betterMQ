@@ -63,6 +63,7 @@ async fn failed_delivery_moves_to_dlq_after_retries() {
 
     let resp = broker
         .publish(PublishRequest {
+            routing_id: None,
             topic: "jobs".into(),
             queue_id: None,
             group_id: None,
@@ -146,6 +147,7 @@ async fn fleet_delivery_honors_message_retries_before_dlq() {
 
     let response = broker
         .publish(PublishRequest {
+            routing_id: None,
             topic: String::new(),
             queue_id: None,
             group_id: None,

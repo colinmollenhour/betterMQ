@@ -27,6 +27,7 @@ async fn graceful_drain_waits_for_active_http() {
         .await;
     let response = broker
         .publish(PublishRequest {
+            routing_id: None,
             topic: String::new(),
             queue_id: None,
             group_id: None,

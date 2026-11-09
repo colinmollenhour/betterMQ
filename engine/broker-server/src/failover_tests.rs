@@ -181,6 +181,7 @@ async fn webhook_bodies(hook: &MockServer) -> Vec<String> {
 
 async fn publish_on(node: &Node, hook: &MockServer, payload: &str) -> PublishResponse {
     let request = PublishRequest {
+        routing_id: None,
         topic: DIRECT_TOPIC.into(),
         routing_key: "failover".into(),
         payload: payload.into(),

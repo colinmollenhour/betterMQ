@@ -1308,6 +1308,7 @@ async fn fire_scheduled_publish(
     pending: broker_schedule::ScheduledPublishRequest,
 ) -> bool {
     let req = PublishRequest {
+        routing_id: None,
         topic: pending.topic,
         routing_key: pending.routing_key,
         payload: pending.payload,
@@ -1578,6 +1579,7 @@ mod tests {
         let broker = Broker::open(cfg).unwrap();
         let resp = broker
             .publish(PublishRequest {
+                routing_id: None,
                 topic: broker_partition::DIRECT_TOPIC.into(),
                 routing_key: "k".into(),
                 payload: "x".into(),

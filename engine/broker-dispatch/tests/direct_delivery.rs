@@ -48,6 +48,7 @@ async fn direct_publish_delivers_without_flow_delay() {
     for i in 0..2u32 {
         let resp = broker
             .publish(PublishRequest {
+                routing_id: None,
                 topic: String::new(),
                 queue_id: None,
                 group_id: None,
