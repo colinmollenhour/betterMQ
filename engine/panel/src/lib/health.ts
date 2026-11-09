@@ -6,3 +6,7 @@ export function readinessLabel(ready: boolean | null, observedAt: number, now: n
 export function memberHealthLabel(healthy?: boolean): string {
   return healthy === undefined ? "Unknown (registered)" : healthy ? "Healthy" : "Down";
 }
+
+export function serverVersion(body: { version?: unknown }): string | null {
+  return typeof body.version === "string" && body.version.trim() ? body.version : null;
+}

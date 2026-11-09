@@ -32,7 +32,7 @@ async function refreshAll() {
 <template>
   <header class="flex h-12 shrink-0 items-center gap-2 border-b px-4">
     <SidebarTrigger />
-    <Badge variant="outline" class="font-mono text-xs">0.4.0</Badge>
+    <Badge variant="outline" class="font-mono text-xs" title="Version reported by the local server">{{ session.version || "Version unknown" }}</Badge>
     <Badge
       :variant="readiness === 'Not ready' ? 'destructive' : 'outline'"
       :class="readiness === 'Ready' ? 'border-transparent bg-success/15 text-success' : ''"

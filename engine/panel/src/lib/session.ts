@@ -2,6 +2,7 @@ import { reactive } from "vue";
 import { isExternalAuth, isStandalone } from "@/lib/config";
 import { ApiError, adminUrl, apiGet, apiPost, isAuthRejection, onAuthRejected, publicUrl, setBrokerAccessGuard } from "@/lib/api";
 import { isLocalCell } from "@/lib/targets";
+import { serverVersion } from "@/lib/health";
 import { refreshFlows, refreshGroups, refreshQueues } from "@/lib/catalog";
 import {
   applyTheme,
@@ -68,6 +69,7 @@ export const session = reactive({
   revealedToken: "",
   auth: null as AuthConfig | null,
   health: "…",
+  version: null as string | null,
   healthOk: false,
   ready: null as boolean | null,
   readyAt: 0,
@@ -257,14 +259,16 @@ export async function refreshCells() {
 export async function pollHealth() {
   const live = (async () => {
     try {
-    const r = await fetch(publicUrl("/healthz"), { signal: AbortSignal.timeout(5000) });
-    session.healthOk = r.ok;
-    const j = (await r.json().catch(() => ({}))) as { status?: string; version?: string };
-    session.health = j.version || (r.ok ? "ok" : "down");
-  } catch {
-    session.healthOk = false;
-    session.health = "down";
-  }
+      const r = await fetch(publicUrl("/healthz"), { signal: AbortSignal.timeout(5000) });
+      session.healthOk = r.ok;
+      const j = (await r.json().catch(() => ({}))) as { status?: string; version?: string };
+      session.version = r.ok ? serverVersion(j) : null;
+      session.health = j.version || (r.ok ? "ok" : "down");
+    } catch {
+      session.healthOk = false;
+      session.health = "down";
+      session.version = null;
+    }
   })();
   const readiness = (async () => {
     try {

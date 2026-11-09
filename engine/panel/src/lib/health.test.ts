@@ -1,8 +1,14 @@
 import { expect, it } from "vitest";
-import { memberHealthLabel, readinessLabel } from "./health";
+import { memberHealthLabel, readinessLabel, serverVersion } from "./health";
 it("never calls an unprobed member healthy", () => {
   expect(memberHealthLabel()).toBe("Unknown (registered)");
   expect(memberHealthLabel(false)).toBe("Down");
+});
+
+it("only displays a server-reported version", () => {
+  expect(serverVersion({ version: "0.6.2" })).toBe("0.6.2");
+  expect(serverVersion({})).toBeNull();
+  expect(serverVersion({ version: 123 })).toBeNull();
 });
 it("distinguishes not ready, unknown and stale observations", () => {
   expect(readinessLabel(true, 1000, 2000)).toBe("Ready");
