@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -428,6 +429,20 @@ pub struct LeaseClient {
     holder: String,
 }
 
+const LEASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_FLEET_RPC_TIMEOUT_SECS: u64 = 10;
+
+/// Timeout for one lease RPC (`BETTERMQ_FLEET_RPC_TIMEOUT_SECS`, default 10 s).
+pub fn fleet_rpc_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("BETTERMQ_FLEET_RPC_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(DEFAULT_FLEET_RPC_TIMEOUT_SECS),
+    )
+}
+
 impl LeaseClient {
     pub fn from_env() -> Option<Self> {
         let urls = std::env::var("BETTERMQ_BROKER_URLS").ok()?;
@@ -445,16 +460,17 @@ impl LeaseClient {
     }
 
     pub fn new(broker_urls: Vec<String>, holder: String) -> Self {
-        let timeout_secs = long_wait_tier_secs()
-            .or_else(|| {
-                std::env::var("BETTERMQ_LONG_HTTP_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-            })
-            .unwrap_or(30);
+        Self::with_rpc_timeout(broker_urls, holder, fleet_rpc_timeout())
+    }
+
+    /// Lease RPCs (claim, heartbeat, complete, fail) get their own short
+    /// timeout, independent of the webhook timeouts, so a stalled broker
+    /// cannot hold a delivery permit for the webhook long-wait budget.
+    pub fn with_rpc_timeout(broker_urls: Vec<String>, holder: String, timeout: Duration) -> Self {
         Self {
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(timeout_secs.max(30)))
+                .connect_timeout(LEASE_CONNECT_TIMEOUT.min(timeout))
+                .timeout(timeout)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("lease client"),

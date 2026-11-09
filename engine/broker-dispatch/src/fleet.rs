@@ -1,7 +1,7 @@
 //! Dispatch fleet (`--dispatch-fleet`): deliver jobs claimed from broker lease APIs.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
@@ -63,18 +63,33 @@ pub fn spawn_fleet(
     let sem = Arc::new(Semaphore::new(options.concurrency.max(1)));
     let claim_batch = options.claim_batch.clamp(1, MAX_CLAIM_JOBS);
     tokio::spawn(async move {
+        let mut brokers: Vec<BrokerHealth> = client
+            .broker_urls()
+            .iter()
+            .map(|url| BrokerHealth::new(url.clone()))
+            .collect();
         let mut rr = 0usize;
         let mut empty_streak = 0usize;
         loop {
-            let urls = client.broker_urls();
-            if urls.is_empty() || dispatch.is_draining() {
+            if brokers.is_empty() || dispatch.is_draining() {
                 tokio::time::sleep(options.idle_poll).await;
                 continue;
             }
-            if empty_streak >= urls.len() {
+            if empty_streak >= brokers.len() {
                 empty_streak = 0;
                 tokio::time::sleep(options.idle_poll).await;
             }
+            // Skip brokers that recently failed; wait only if all of them did.
+            let now = Instant::now();
+            let Some(index) = (0..brokers.len())
+                .map(|step| (rr + 1 + step) % brokers.len())
+                .find(|&i| brokers[i].retry_at <= now)
+            else {
+                let next = brokers.iter().map(|b| b.retry_at).min().unwrap_or(now);
+                tokio::time::sleep_until(next.into()).await;
+                continue;
+            };
+            rr = index;
             let Ok(first) = sem.clone().acquire_owned().await else {
                 break;
             };
@@ -85,16 +100,77 @@ pub fn spawn_fleet(
                     Err(_) => break,
                 }
             }
-            rr = (rr + 1) % urls.len();
-            let broker = urls[rr].clone();
-            let claimed = claim_and_deliver(&dispatch, &client, &broker, permits, &options).await;
-            if claimed == 0 {
-                empty_streak += 1;
-            } else {
-                empty_streak = 0;
+            let broker = &mut brokers[index];
+            match claim_and_deliver(&dispatch, &client, &broker.url, permits, &options).await {
+                Ok(0) => {
+                    broker.record_success();
+                    empty_streak += 1;
+                }
+                Ok(_) => {
+                    broker.record_success();
+                    empty_streak = 0;
+                }
+                Err(error) => {
+                    broker.record_failure(&error);
+                    empty_streak += 1;
+                }
             }
         }
     })
+}
+
+const BROKER_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const BROKER_BACKOFF_MAX: Duration = Duration::from_secs(60);
+const CLAIM_FAILURE_WARN_EVERY: Duration = Duration::from_secs(60);
+
+/// Per-broker claim back-off and rate-limited failure logging.
+struct BrokerHealth {
+    url: String,
+    retry_at: Instant,
+    failures: u32,
+    last_warn: Option<Instant>,
+}
+
+impl BrokerHealth {
+    fn new(url: String) -> Self {
+        Self {
+            url,
+            retry_at: Instant::now(),
+            failures: 0,
+            last_warn: None,
+        }
+    }
+
+    fn record_success(&mut self) {
+        if self.failures > 0 {
+            tracing::info!(broker = %self.url, failures = self.failures, "fleet claims recovered");
+        }
+        self.failures = 0;
+        self.retry_at = Instant::now();
+    }
+
+    fn record_failure(&mut self, error: &str) {
+        self.failures = self.failures.saturating_add(1);
+        let exponent = self.failures.saturating_sub(1).min(5);
+        let backoff = (BROKER_BACKOFF_MIN * 2u32.pow(exponent)).min(BROKER_BACKOFF_MAX);
+        let now = Instant::now();
+        self.retry_at = now + backoff;
+        let warn = self
+            .last_warn
+            .is_none_or(|at| now.duration_since(at) >= CLAIM_FAILURE_WARN_EVERY);
+        if warn {
+            self.last_warn = Some(now);
+            tracing::warn!(
+                broker = %self.url,
+                %error,
+                failures = self.failures,
+                backoff_ms = backoff.as_millis() as u64,
+                "fleet claim failed; skipping broker until back-off expires"
+            );
+        } else {
+            tracing::debug!(broker = %self.url, %error, failures = self.failures, "fleet claim failed");
+        }
+    }
 }
 
 /// Claim up to `permits.len()` jobs and start one delivery task per job.
@@ -105,14 +181,8 @@ async fn claim_and_deliver(
     broker: &str,
     mut permits: Vec<OwnedSemaphorePermit>,
     options: &FleetOptions,
-) -> usize {
-    let claimed = match client.claim(broker, permits.len()).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::debug!(error = %e, %broker, "fleet claim");
-            return 0;
-        }
-    };
+) -> Result<usize, String> {
+    let claimed = client.claim(broker, permits.len()).await?;
     let count = claimed.jobs.len();
     for job in claimed.jobs {
         let Some(permit) = permits.pop() else {
@@ -130,7 +200,7 @@ async fn claim_and_deliver(
             deliver_claimed_job(&dispatch, &client, &broker, job, heartbeat_interval).await;
         });
     }
-    count
+    Ok(count)
 }
 
 /// Deliver one claimed job and report the outcome to the broker that leased it.

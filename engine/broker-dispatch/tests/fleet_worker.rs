@@ -252,3 +252,82 @@ async fn fleet_keeps_claiming_while_brokers_return_work() {
     assert!(idle_claims <= 6, "{idle_claims} claims in one idle second");
     fleet.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_broker_does_not_halt_claims_on_healthy_brokers() {
+    allow_wiremock_localhost();
+    let destination = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/fast"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&destination)
+        .await;
+    let hook = format!("{}/fast", destination.uri());
+
+    // Accepts connections but never answers claims in time.
+    let stalled = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+        .mount(&stalled)
+        .await;
+
+    let healthy = MockServer::start().await;
+    const JOBS: usize = 20;
+    let queue = Arc::new(Mutex::new(
+        (0..JOBS as u64).map(|offset| job(offset, &hook)).collect(),
+    ));
+    Mock::given(method("POST"))
+        .and(path("/internal/v1/lease/claim"))
+        .respond_with(ClaimQueue(queue))
+        .mount(&healthy)
+        .await;
+    for route in [
+        "/internal/v1/lease/heartbeat",
+        "/internal/v1/lease/complete",
+    ] {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&healthy)
+            .await;
+    }
+
+    let (engine, _dir) = fleet_engine();
+    let client = LeaseClient::with_rpc_timeout(
+        vec![stalled.uri(), healthy.uri()],
+        "fleet-test".into(),
+        Duration::from_millis(300),
+    );
+    let started = std::time::Instant::now();
+    let fleet = spawn_fleet(
+        engine,
+        client,
+        FleetOptions {
+            concurrency: 1,
+            claim_batch: 4,
+            idle_poll: Duration::from_millis(50),
+            heartbeat_interval: Duration::from_secs(10),
+        },
+    );
+    loop {
+        let done = requests_to(&healthy, "/internal/v1/lease/complete")
+            .await
+            .len();
+        if done == JOBS {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "only {done}/{JOBS} delivered while one broker stalls"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stalled_claims = requests_to(&stalled, "/internal/v1/lease/claim")
+        .await
+        .len();
+    assert!(
+        stalled_claims <= 3,
+        "stalled broker should be backed off, got {stalled_claims} claims"
+    );
+    fleet.abort();
+}

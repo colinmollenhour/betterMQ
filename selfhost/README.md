@@ -347,7 +347,8 @@ Background loops export these `/metrics` series: `bettermq_scheduler_failures_to
 | `BETTERMQ_FLEET_CONCURRENCY` | Fleet in-flight jobs (default `1`) |
 | `BETTERMQ_FLEET_CLAIM_BATCH` | Most jobs one fleet claim requests, `1`–`64` (default `16`). Each claim asks for the free in-flight slots up to this cap; the fleet keeps claiming while brokers return work and polls every 250 ms when they are idle |
 | `BETTERMQ_FLEET_HOLDER` | Optional fleet worker id |
-| `BETTERMQ_LONG_WAIT_TIER` | Fleet long HTTP wait: `15m` \| `1h` \| `6h` \| `12h` |
+| `BETTERMQ_FLEET_RPC_TIMEOUT_SECS` | Timeout for each fleet lease call to a broker (claim, heartbeat, complete, fail), default `10`; connect timeout 2 s. A broker whose claims fail is skipped with exponential back-off (1 s to 60 s) and logged at `warn` at most once a minute |
+| `BETTERMQ_LONG_WAIT_TIER` | Fleet long webhook wait: `15m` \| `1h` \| `6h` \| `12h` (webhook calls only; lease calls use `BETTERMQ_FLEET_RPC_TIMEOUT_SECS`) |
 | `BETTERMQ_NODE_NAME` | Node display name (also set from config) |
 | `BETTERMQ_NODE_PUBLIC_URL` | Node public HTTP URL (also set from config) |
 | `BETTERMQ_CELL_LABEL` | Cell label in panel bootstrap and admin (default `local`) |
