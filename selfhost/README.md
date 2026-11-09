@@ -269,6 +269,8 @@ Panel destination block/unblock controls acknowledge only the serving node (`sco
 
 Dispatch metrics include `bettermq_dispatch_delivery_outcomes_total` (bounded HTTP class, transport error, or policy block), `bettermq_dispatch_webhook_duration_seconds` (attempt to response headers/failure), `bettermq_dispatch_flow_errors_total`, and per-shard `bettermq_dispatch_oldest_pending_age_seconds`. Pending age grows while delivery is stalled and is reconstructed from durable pending work on backfill/startup. It covers the bounded tracked cursor lanes; monitor `bettermq_dispatch_dropped_cursor_lanes_total` for coverage loss. No destination URLs or routing keys are metric labels.
 
+Queue rejection, deferral, and delivery-failure logs are aggregated into at most one pressure summary per 30 seconds. Exact rejection/deferral totals remain available as `bettermq_dispatch_queue_rejected_total`, `bettermq_dispatch_deferred_total`, and `bettermq_dispatch_defer_rejected_total`. Per-message delivery details require debug logging; logged destinations contain only scheme, host and port, not credentials, paths or query strings.
+
 #### DLQ and group fan-out
 
 Fan-out vars are **group bookkeeping**, not DLQ TTL.

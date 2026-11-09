@@ -227,7 +227,7 @@ impl HostBlocker {
         };
         {
             let mut hosts = self.hosts.lock();
-            let state = hosts.entry(key).or_insert_with(|| HostState {
+            let state = hosts.entry(key.clone()).or_insert_with(|| HostState {
                 failures: 0,
                 blocked_until_ms: None,
                 cooldown_ms: self.cfg.initial_cooldown_ms,
@@ -245,7 +245,7 @@ impl HostBlocker {
                     as u64;
                 touch(state);
                 tracing::warn!(
-                    destination = %url,
+                    destination = %key,
                     cooldown_ms = wait,
                     "host blocked after transport failures"
                 );
@@ -278,7 +278,7 @@ impl HostBlocker {
         };
         touch(&mut state);
         self.hosts.lock().insert(key.clone(), state);
-        tracing::warn!(host = %key, cooldown_ms = wait, "host manually blocked");
+        tracing::warn!(host = %Self::host_key(&key).unwrap_or_else(|| "<invalid destination>".into()), cooldown_ms = wait, "host manually blocked");
         self.persist_shared();
         key
     }

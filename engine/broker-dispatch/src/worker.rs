@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Cap concurrent in-flight delivery tasks (HA M1). Override with BETTERMQ_DISPATCH_MAX_IN_FLIGHT.
@@ -40,6 +40,34 @@ fn dispatch_queue_cap() -> usize {
 }
 
 const WEBHOOK_RESPONSE_BODY_CAP: usize = 64 * 1024;
+
+#[derive(Default)]
+struct PressureLogs {
+    last_log_ms: AtomicU64,
+    events: [AtomicU64; 4],
+}
+
+impl PressureLogs {
+    fn record(&self, event: usize, now_ms: u64) -> Option<[u64; 4]> {
+        self.events[event].fetch_add(1, Ordering::Relaxed);
+        let last = self.last_log_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < 30_000
+            || self
+                .last_log_ms
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return None;
+        }
+        Some(std::array::from_fn(|index| {
+            self.events[index].swap(0, Ordering::Relaxed)
+        }))
+    }
+}
+
+fn redacted_destination(url: &str) -> String {
+    HostBlocker::host_key(url).unwrap_or_else(|| "<invalid destination>".into())
+}
 
 #[derive(Debug, Clone)]
 pub struct DispatchConfig {
@@ -237,6 +265,7 @@ pub struct DispatchEngine {
     retry_state: RetryState,
     lifecycle: LifecycleStore,
     telemetry: Arc<crate::telemetry::DispatchTelemetry>,
+    pressure_logs: Arc<PressureLogs>,
     background: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
 }
 
@@ -304,6 +333,7 @@ impl DispatchEngine {
             retry_state,
             lifecycle,
             telemetry: Arc::new(crate::telemetry::DispatchTelemetry::new()),
+            pressure_logs: Arc::new(PressureLogs::default()),
             background: Arc::new(parking_lot::Mutex::new(Vec::new())),
         };
         if let Some(handle) = engine.memory_guard.spawn_monitor() {
@@ -437,6 +467,8 @@ impl DispatchEngine {
             committed_ready_records: counters.committed_ready_records,
             queue_depth: counters.queue_depth,
             queue_rejected: counters.queue_rejected,
+            deferred_jobs: counters.deferred_jobs,
+            defer_rejected: counters.defer_rejected,
             in_flight_deliveries: self.in_flight_jobs.lock().len() as u64,
             active_http_deliveries: self.active_http.load(Ordering::Acquire),
             retries_pending: retries.len() as u64,
@@ -497,7 +529,7 @@ impl DispatchEngine {
                 self.in_flight_jobs
                     .lock()
                     .remove(&(job.topic, job.partition, job.offset));
-                warn!("dispatch queue full; message will be retried on backfill");
+                self.record_pressure(0);
             }
             Err(mpsc::error::TrySendError::Closed(job)) => {
                 self.telemetry.record_queue_rejected();
@@ -652,6 +684,21 @@ impl DispatchEngine {
         self.telemetry
             .record_pending_age(msg.partition, &lane, msg.offset, msg.published_at_ms);
     }
+
+    fn record_pressure(&self, event: usize) {
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        if let Some([queue_rejected, deferred, defer_rejected, delivery_failures]) =
+            self.pressure_logs.record(event, now)
+        {
+            warn!(
+                queue_rejected,
+                deferred,
+                defer_rejected,
+                delivery_failures,
+                "dispatch pressure summary (at most once per 30 seconds; totals are in metrics)"
+            );
+        }
+    }
 }
 
 impl DispatchEngine {
@@ -685,7 +732,8 @@ impl DispatchEngine {
                                 jobs: engine.in_flight_jobs.clone(), notify: engine.drain_notify.clone(), lease: None };
                             let result = engine.deliver_job(job, ownership).await;
                             if let Err(e) = result {
-                                warn!(error = %e, "delivery job failed");
+                                engine.record_pressure(3);
+                                debug!(error = %e, "delivery job failed");
                             }
                         });
                     }
@@ -867,7 +915,9 @@ impl DispatchEngine {
 
     /// Re-enqueue after a delay without advancing the dispatch cursor (pause / host block).
     fn defer_job(&self, job: DeliveryJob, delay: Duration, reason: &'static str) {
-        info!(
+        self.telemetry.record_deferred();
+        self.record_pressure(1);
+        debug!(
             topic = %job.topic,
             partition = job.partition,
             offset = job.offset,
@@ -883,7 +933,9 @@ impl DispatchEngine {
         match self.defer_tx.try_send(deferred) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(job)) => {
-                warn!(
+                self.telemetry.record_defer_rejected();
+                self.record_pressure(2);
+                debug!(
                     topic = %job.job.topic,
                     offset = job.job.offset,
                     reason,
@@ -1107,7 +1159,8 @@ impl DispatchEngine {
         }
         let mut delivery_msg = msg.clone();
         if let Err(e) = self.broker.hydrate_message_payload(&mut delivery_msg) {
-            warn!(
+            self.record_pressure(3);
+            debug!(
                 error = %e,
                 message_id = %msg.id,
                 "delivery deferred: could not load payload blob"
@@ -1167,10 +1220,10 @@ impl DispatchEngine {
                     let _ = self
                         .broker
                         .try_purge_message(&msg.topic, msg.partition, msg.offset);
-                    info!(
+                    debug!(
                         lane_owner = %lane_owner,
                         queue = %msg.topic,
-                        destination = %url,
+                        destination = %redacted_destination(url),
                         partition = msg.partition,
                         offset = msg.offset,
                         routing_key = %msg.routing_key,
@@ -1184,10 +1237,11 @@ impl DispatchEngine {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     last_failure = format!("HTTP {status} from destination");
-                    warn!(
+                    self.record_pressure(3);
+                    debug!(
                         status = %resp.status(),
                         lane_owner = %lane_owner,
-                        destination = %url,
+                        destination = %redacted_destination(url),
                         attempt,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "webhook non-success"
@@ -1220,12 +1274,14 @@ impl DispatchEngine {
                     return Ok(());
                 }
                 Err(e) => {
+                    let e = e.without_url();
                     self.host_blocker.record_transport_failure_async(url).await;
                     last_failure = format!("transport error: {e}");
-                    warn!(
+                    self.record_pressure(3);
+                    debug!(
                         error = %e,
                         lane_owner = %lane_owner,
-                        destination = %url,
+                        destination = %redacted_destination(url),
                         attempt,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "webhook request failed"
@@ -1453,7 +1509,7 @@ impl DispatchEngine {
                 .wait_committed(&dlq_response.topic, partition, offset)
                 .await?;
         }
-        warn!(
+        debug!(
             queue = %msg.topic,
             message_id = %msg.id,
             "message moved to DLQ"
@@ -1542,6 +1598,7 @@ impl DispatchEngine {
                 ));
             }
             Err(error) => {
+                let error = error.without_url();
                 retry_after_ms = None;
                 self.host_blocker.record_transport_failure_async(url).await;
                 format!("transport error: {error}")
@@ -1651,6 +1708,24 @@ async fn discard_body_capped(resp: reqwest::Response) {
 mod tests {
     use super::*;
     use broker_partition::BrokerConfig;
+
+    #[test]
+    fn pressure_logs_are_aggregated_and_destination_credentials_are_redacted() {
+        let logs = PressureLogs::default();
+        assert_eq!(logs.record(0, 30_000), Some([1, 0, 0, 0]));
+        for _ in 0..10_000 {
+            assert!(logs.record(1, 30_001).is_none());
+        }
+        assert_eq!(logs.record(2, 60_000), Some([0, 10_000, 1, 0]));
+        assert_eq!(
+            redacted_destination("https://user:password@example.com/secret/path?token=abc#private"),
+            "https://example.com:443"
+        );
+        assert_eq!(
+            redacted_destination("not a URL with a secret"),
+            "<invalid destination>"
+        );
+    }
 
     fn publish_test_message(broker: &Broker, url: &str) -> StoredMessage {
         let request = serde_json::from_value(serde_json::json!({

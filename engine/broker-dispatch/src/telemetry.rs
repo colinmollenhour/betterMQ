@@ -32,6 +32,8 @@ pub(crate) struct DispatchTelemetry {
     committed_ready_records: AtomicU64,
     queue_depth: AtomicU64,
     queue_rejected: AtomicU64,
+    deferred_jobs: AtomicU64,
+    defer_rejected: AtomicU64,
     retries_scheduled: AtomicU64,
     retries_due: AtomicU64,
     retries_exhausted: AtomicU64,
@@ -169,6 +171,13 @@ impl DispatchTelemetry {
         self.queue_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn record_deferred(&self) {
+        self.deferred_jobs.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn record_defer_rejected(&self) {
+        self.defer_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_retry_scheduled(&self) {
         self.retries_scheduled.fetch_add(1, Ordering::Relaxed);
     }
@@ -302,6 +311,8 @@ impl DispatchTelemetry {
             committed_ready_records: self.committed_ready_records.load(Ordering::Relaxed),
             queue_depth: self.queue_depth.load(Ordering::Relaxed),
             queue_rejected: self.queue_rejected.load(Ordering::Relaxed),
+            deferred_jobs: self.deferred_jobs.load(Ordering::Relaxed),
+            defer_rejected: self.defer_rejected.load(Ordering::Relaxed),
             retries_scheduled: self.retries_scheduled.load(Ordering::Relaxed),
             retries_due: self.retries_due.load(Ordering::Relaxed),
             retries_exhausted: self.retries_exhausted.load(Ordering::Relaxed),
@@ -344,6 +355,8 @@ pub(crate) struct DispatchCounterSnapshot {
     pub committed_ready_records: u64,
     pub queue_depth: u64,
     pub queue_rejected: u64,
+    pub deferred_jobs: u64,
+    pub defer_rejected: u64,
     pub retries_scheduled: u64,
     pub retries_due: u64,
     pub retries_exhausted: u64,
@@ -404,6 +417,8 @@ pub struct DispatchTelemetrySnapshot {
     pub committed_ready_records: u64,
     pub queue_depth: u64,
     pub queue_rejected: u64,
+    pub deferred_jobs: u64,
+    pub defer_rejected: u64,
     pub in_flight_deliveries: u64,
     pub active_http_deliveries: u64,
     pub retries_pending: u64,
@@ -461,6 +476,8 @@ mod tests {
         telemetry.record_committed_range(4);
         telemetry.record_queue_enqueue();
         telemetry.record_queue_dequeue();
+        telemetry.record_deferred();
+        telemetry.record_defer_rejected();
         telemetry.record_retry_scheduled();
         telemetry.record_retry_due();
         telemetry.record_completion(3, "private-lane-a", 10, 12, 20, true);
@@ -469,6 +486,8 @@ mod tests {
         assert_eq!(snapshot.committed_ready_ranges, 1);
         assert_eq!(snapshot.committed_ready_records, 4);
         assert_eq!(snapshot.queue_depth, 0);
+        assert_eq!(snapshot.deferred_jobs, 1);
+        assert_eq!(snapshot.defer_rejected, 1);
         assert_eq!(snapshot.retries_scheduled, 1);
         assert_eq!(snapshot.retries_due, 1);
         let shard = &snapshot.shards[0];

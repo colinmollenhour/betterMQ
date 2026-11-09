@@ -515,6 +515,18 @@ fn append_dispatch_metrics(
         snapshot.queue_rejected
     );
     metric!(
+        "Delivery jobs deferred for retry or policy waits",
+        "counter",
+        "bettermq_dispatch_deferred_total",
+        snapshot.deferred_jobs
+    );
+    metric!(
+        "Deferred jobs rejected by the bounded scheduler",
+        "counter",
+        "bettermq_dispatch_defer_rejected_total",
+        snapshot.defer_rejected
+    );
+    metric!(
         "Queued or executing dispatch jobs",
         "gauge",
         "bettermq_dispatch_in_flight_deliveries",
@@ -849,6 +861,8 @@ mod tests {
                 committed_ready_records: 16,
                 queue_depth: 3,
                 queue_rejected: 1,
+                deferred_jobs: 3,
+                defer_rejected: 1,
                 in_flight_deliveries: 5,
                 active_http_deliveries: 2,
                 retries_pending: 6,
