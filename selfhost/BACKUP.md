@@ -27,6 +27,16 @@ tar -czf shared-meta.tgz -C /cluster-shared meta
 ```
 
 Restore that path on the volume every broker mounts before starting nodes.
+The image initializes fresh volumes for UID/GID 1000. For an older root-owned
+volume, stop **all** brokers, then repair ownership before restarting:
+
+```bash
+docker compose -f docker-compose.ha.yml run --rm --no-deps --user 0 \
+  --entrypoint chown broker1 -R 1000:1000 /cluster-shared/meta
+```
+
+Do not change ownership while a broker is writing shared metadata. CI's image
+smoke test verifies a fresh HA volume can be written by the runtime user.
 
 ## Slate + S3/MinIO
 
