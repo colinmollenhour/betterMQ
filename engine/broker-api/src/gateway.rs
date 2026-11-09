@@ -527,19 +527,7 @@ pub async fn gateway_only_ndjson(
     ingest: Option<axum::extract::Extension<crate::metering::IngestAuth>>,
     request: Request,
 ) -> Result<(StatusCode, Json<BatchEnqueueResponse>), ApiError> {
-    if request
-        .headers()
-        .get(axum::http::header::CONTENT_ENCODING)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            let value = value.trim();
-            !value.is_empty() && !value.eq_ignore_ascii_case("identity")
-        })
-    {
-        return Err(ApiError::BadRequest(
-            "compressed NDJSON is not accepted".into(),
-        ));
-    }
+    crate::batch::validate_ndjson_content_encoding(request.headers())?;
     let body = crate::batch::parse_ndjson_stream(request.into_body()).await?;
     gateway_only_submit(state, ingest.map(|value| value.0), body).await
 }
