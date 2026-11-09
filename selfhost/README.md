@@ -423,9 +423,9 @@ Fan-out vars are **group bookkeeping**, not DLQ TTL.
 | `BETTERMQ_ARCHIVE_QUEUE_CAPACITY` | Bounded sealed-segment archive queue (default 128) |
 | `BETTERMQ_ARCHIVE_BUCKET` | S3/R2 bucket for sealed-segment archive (aliases `S3_ARCHIVE_BUCKET` / `R2_ARCHIVE_BUCKET`) |
 | `BETTERMQ_ARCHIVE_PREFIX` | Object-key prefix inside the archive bucket |
-| `BETTERMQ_ARCHIVE_MAX_RETRIES` | Archive upload retries (default `5`) |
+| `BETTERMQ_ARCHIVE_MAX_RETRIES` | Attempts before a failing segment blocks ingest (default `5`); background retries continue until recovery |
 | `BETTERMQ_ARCHIVE_MAX_QUEUED_BYTES` | Archive queue byte cap (default 4 GiB) |
-| `BETTERMQ_ARCHIVE_MAX_LAG_MS` | Archive lag before health degrades (default 5 minutes) |
+| `BETTERMQ_ARCHIVE_MAX_LAG_MS` | Oldest outstanding archive age before ingest blocks (default 5 minutes) |
 
 S3/R2 credentials for Slate and archive are **not** `BETTERMQ_*`: `S3_ENDPOINT` or `R2_ENDPOINT`, plus `S3_ACCESS_KEY` / `R2_ACCESS_KEY` / `AWS_ACCESS_KEY_ID`, matching secret and region vars, and `S3_BUCKET` / `R2_BUCKET` (payload blobs: `S3_PAYLOAD_BUCKET` / `R2_PAYLOAD_BUCKET`). See [`engine/broker-storage/ARCHIVE.md`](../engine/broker-storage/ARCHIVE.md).
 

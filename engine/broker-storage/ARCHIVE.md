@@ -6,8 +6,21 @@ blocks new ingest when configured lag limits are exceeded.
 
 Each sealed segment has durable pending/completion markers beside the local
 segment. Normal broker startup initializes the archive worker and streams every
-unfinished segment back through the bounded queue, including jobs whose retries
-were exhausted before a restart.
+unfinished segment back through the bounded queue. Failed jobs remain in the
+worker and retry indefinitely with exponential backoff capped at 30 seconds.
+After `BETTERMQ_ARCHIVE_MAX_RETRIES` consecutive attempts, the segment counts as
+currently failing and ingest stays blocked until it archives successfully. Backend
+recovery clears this failure automatically; a restart is not required. The one
+worker retains a failed job ahead of later jobs, keeping memory bounded and
+preserving backpressure during an outage.
+
+Monitor `bettermq_archive_failing_segments` and `bettermq_archive_failing_bytes`
+as gauges of outstanding failures. The older `bettermq_archive_failures_total`
+and `bettermq_archive_failed_bytes_total` names remain deprecated gauge aliases;
+they are not cumulative counters and decrease when recovery succeeds.
+
+Ingest also blocks at 75% of queue capacity (including the in-flight job), or when
+queued bytes or oldest outstanding age reach the configured limits below.
 
 Local archive:
 
@@ -37,7 +50,8 @@ explicitly starts with `http://`.
 Relevant limits:
 
 - `BETTERMQ_ARCHIVE_QUEUE_CAPACITY` (default 128 segments)
-- `BETTERMQ_ARCHIVE_MAX_RETRIES` (default 5)
+- `BETTERMQ_ARCHIVE_MAX_RETRIES` (default 5; attempts before failure blocks ingest,
+  not a limit on background recovery retries)
 - `BETTERMQ_ARCHIVE_MAX_QUEUED_BYTES` (default 4 GiB)
 - `BETTERMQ_ARCHIVE_MAX_LAG_MS` (default 5 minutes)
 

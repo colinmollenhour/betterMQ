@@ -603,12 +603,28 @@ fn append_archive_metrics(out: &mut String, snapshot: &broker_storage::ArchiveLa
         "bettermq_archive_oldest_pending_age_seconds {}\n",
         snapshot.oldest_age_ms as f64 / 1_000.0
     ));
-    out.push_str("# HELP bettermq_archive_failures_total Failed segment archive attempts\n");
-    out.push_str("# TYPE bettermq_archive_failures_total counter\n");
+    out.push_str("# HELP bettermq_archive_failing_segments Currently failing segment archives\n");
+    out.push_str("# TYPE bettermq_archive_failing_segments gauge\n");
+    out.push_str(&format!(
+        "bettermq_archive_failing_segments {}\n",
+        snapshot.failed_records
+    ));
+    out.push_str(
+        "# HELP bettermq_archive_failing_bytes Bytes in currently failing segment archives\n",
+    );
+    out.push_str("# TYPE bettermq_archive_failing_bytes gauge\n");
+    out.push_str(&format!(
+        "bettermq_archive_failing_bytes {}\n",
+        snapshot.failed_bytes
+    ));
+    out.push_str("# HELP bettermq_archive_failures_total Deprecated alias of bettermq_archive_failing_segments\n");
+    out.push_str("# TYPE bettermq_archive_failures_total gauge\n");
     out.push_str(&format!(
         "bettermq_archive_failures_total {}\n",
         snapshot.failed_records
     ));
+    out.push_str("# HELP bettermq_archive_failed_bytes_total Deprecated alias of bettermq_archive_failing_bytes\n");
+    out.push_str("# TYPE bettermq_archive_failed_bytes_total gauge\n");
     out.push_str(&format!(
         "bettermq_archive_failed_bytes_total {}\n",
         snapshot.failed_bytes
@@ -1146,6 +1162,10 @@ mod tests {
         assert!(output.contains("bettermq_controller_term 13"));
         assert!(output.contains("bettermq_controller_quorum_ready 1"));
         assert!(output.contains("bettermq_archive_queue_headroom_segments 124"));
+        assert!(output.contains("# TYPE bettermq_archive_failing_segments gauge"));
+        assert!(output.contains("bettermq_archive_failing_segments 1"));
+        assert!(output.contains("bettermq_archive_failing_bytes 1024"));
+        assert!(!output.contains("# TYPE bettermq_archive_failures_total counter"));
         assert!(output.contains("bettermq_dispatch_committed_ready_depth 3"));
         assert!(output.contains("bettermq_dispatch_retries_scheduled_total 9"));
         assert!(output.contains("bettermq_dispatch_dlq_failures_total 1"));

@@ -207,6 +207,10 @@ pub fn archive_lag_status() -> ArchiveLagStatus {
             admission_blocked: false,
         };
     };
+    service_lag_status(service)
+}
+
+fn service_lag_status(service: &ArchiveService) -> ArchiveLagStatus {
     let records = service.counters.queued_records.load(Ordering::Acquire);
     let bytes = service.counters.queued_bytes.load(Ordering::Acquire);
     let failed_records = service.counters.failed_records.load(Ordering::Acquire);
@@ -382,55 +386,65 @@ fn archive_worker(
             .expect("archive object-store runtime")
     });
     while let Ok(job) = receiver.recv() {
-        let mut delay = Duration::from_millis(100);
-        let mut archived = false;
-        for attempt in 1..=retries {
-            let result = match &backend {
+        retry_archive_job(
+            &job,
+            retries,
+            &counters,
+            Duration::from_millis(100),
+            || match &backend {
                 ArchiveBackend::Local(root) => archive_local_once(&job.path, root),
                 #[cfg(feature = "s3")]
                 ArchiveBackend::Object { store, prefix } => runtime
                     .as_ref()
                     .expect("object backend runtime")
                     .block_on(archive_object_once(store, prefix, &job.path)),
-            };
-            match result {
-                Ok(manifest) => {
-                    if let Err(error) = mark_archive_complete(&job, &manifest) {
-                        warn!(
-                            segment = %job.path.display(),
-                            %error,
-                            "archive completed but durable completion marker failed"
-                        );
-                        continue;
-                    }
-                    info!(
-                        src = %job.path.display(),
-                        bytes = manifest.bytes,
-                        sha256 = %manifest.sha256,
-                        "archived sealed segment"
-                    );
-                    archived = true;
-                    break;
+            },
+        );
+    }
+}
+
+/// Keep the current job in the bounded worker until it succeeds. The pending
+/// marker is the durable retry set across restarts; retaining the job here avoids
+/// both an unbounded in-memory failure queue and a permanently latched failure.
+fn retry_archive_job(
+    job: &ArchiveJob,
+    retries: usize,
+    counters: &ArchiveCounters,
+    initial_delay: Duration,
+    mut archive: impl FnMut() -> Result<ArchiveManifest, ArchiveError>,
+) {
+    let mut delay = initial_delay;
+    let mut attempt = 0usize;
+    let mut failing = false;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match archive().and_then(|manifest| {
+            mark_archive_complete(job, &manifest)?;
+            Ok(manifest)
+        }) {
+            Ok(manifest) => {
+                if failing {
+                    counters.failed_records.fetch_sub(1, Ordering::AcqRel);
+                    counters.failed_bytes.fetch_sub(job.bytes, Ordering::AcqRel);
                 }
-                Err(error) if attempt < retries => {
-                    warn!(
-                        segment = %job.path.display(),
-                        attempt,
-                        error = %error,
-                        "archive attempt failed; retrying"
-                    );
-                    std::thread::sleep(delay);
-                    delay = delay.saturating_mul(2).min(Duration::from_secs(5));
+                finish_job(counters, job.bytes, false);
+                info!(src = %job.path.display(), bytes = manifest.bytes,
+                    sha256 = %manifest.sha256, "archived sealed segment");
+                return;
+            }
+            Err(error) => {
+                if attempt >= retries && !failing {
+                    counters.failed_records.fetch_add(1, Ordering::AcqRel);
+                    counters.failed_bytes.fetch_add(job.bytes, Ordering::AcqRel);
+                    failing = true;
                 }
-                Err(error) => warn!(
-                    segment = %job.path.display(),
-                    attempts = retries,
-                    error = %error,
-                    "archive retries exhausted; segment remains on local disk"
-                ),
+                warn!(segment = %job.path.display(), attempt, %error,
+                    retry_in_ms = delay.as_millis(),
+                    "archive attempt failed; retaining segment for retry");
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2).min(Duration::from_secs(30));
             }
         }
-        finish_job(&counters, job.bytes, !archived);
     }
 }
 
@@ -869,6 +883,57 @@ pub async fn restore_object_archive_until(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn exhausted_archive_recovers_without_restart() {
+        let source = tempdir().unwrap();
+        let destination = tempdir().unwrap();
+        let segment = source.path().join("segment-000000.log");
+        std::fs::write(&segment, b"retry-me").unwrap();
+        // A file where the archive directory should be injects a real I/O error.
+        let archive = destination.path().join("archive");
+        std::fs::write(&archive, b"unavailable").unwrap();
+        let job = ArchiveJob {
+            pending_marker: write_pending_marker(&segment).unwrap(),
+            path: segment,
+            bytes: 8,
+        };
+        let counters = Arc::new(ArchiveCounters::default());
+        counters.queued_records.store(1, Ordering::Release);
+        counters.queued_bytes.store(8, Ordering::Release);
+        counters.oldest_unix_ms.store(unix_ms(), Ordering::Release);
+        let (sender, _receiver) = mpsc::sync_channel(128);
+        let service = ArchiveService {
+            sender,
+            counters: counters.clone(),
+            capacity: 128,
+        };
+        let mut attempts = 0;
+        retry_archive_job(&job, 2, &counters, Duration::ZERO, || {
+            attempts += 1;
+            if attempts == 3 {
+                let status = service_lag_status(&service);
+                assert!(status.admission_blocked);
+                assert_eq!(status.failed_records, 1);
+                assert_eq!(status.failed_bytes, 8);
+                assert_eq!(status.queued_records, 1);
+                assert!(job.pending_marker.exists());
+                std::fs::remove_file(&archive).unwrap();
+                std::fs::create_dir(&archive).unwrap();
+            }
+            archive_local_once(&job.path, &archive)
+        });
+        assert_eq!(attempts, 3);
+        let status = service_lag_status(&service);
+        assert!(!status.admission_blocked);
+        assert_eq!(status.failed_records, 0);
+        assert_eq!(status.failed_bytes, 0);
+        assert_eq!(status.queued_records, 0);
+        assert_eq!(status.queued_bytes, 0);
+        assert_eq!(status.oldest_age_ms, 0);
+        assert!(!job.pending_marker.exists());
+        assert!(complete_marker(&job.path).exists());
+    }
 
     #[test]
     fn archive_writes_checksum_manifest() {
