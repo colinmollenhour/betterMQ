@@ -8,8 +8,10 @@
 #
 #   open http://localhost:8080/panel/
 #
-# The container listens on 0.0.0.0:8080 (published to the host). For internet
-# exposure, put a reverse proxy in front and prefer binding the host to 127.0.0.1.
+# The container listens on 0.0.0.0:8080; the host publishes it on 127.0.0.1
+# only. First-boot setup asks for the setup code printed by
+# `docker compose logs bettermq`. For remote access use an SSH tunnel or a TLS
+# reverse proxy (or change the binding to "8080:8080" deliberately).
 #
 # Configure storage and cluster from Panel → Infrastructure (no config file mount).
 
@@ -20,7 +22,7 @@ services:
       context: ..
       dockerfile: selfhost/Dockerfile
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - bettermq-data:/data
     command: ["serve", "--data-dir", "/data"]

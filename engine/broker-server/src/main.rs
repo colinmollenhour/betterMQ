@@ -1052,13 +1052,15 @@ fn start_first_boot_setup(data_dir: &std::path::Path) -> Option<JoinHandle<()>> 
         return None;
     }
 
-    open_setup_window(Duration::from_secs(secs));
+    let code = open_setup_window(Duration::from_secs(secs));
     let mins = secs.div_ceil(60);
     info!(
         minutes = mins,
-        "local auth not configured — setup window open"
+        "local auth not configured — setup window open (setup code printed to stderr)"
     );
     eprintln!("Set a panel password at /panel/ (open for {mins} minutes).");
+    eprintln!("Setup code: {code}");
+    eprintln!("The panel asks for this code; only someone who can read this log can claim admin.");
     eprintln!("After that, restart this process to open setup again.");
     Some(tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(secs)).await;

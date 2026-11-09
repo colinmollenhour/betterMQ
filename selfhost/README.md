@@ -124,9 +124,13 @@ Panel: http://localhost:8080/panel/
 
 ### First-time setup
 
-Open **http://localhost:8080/panel/** and set a panel password. Copy the `sk_local_…` API token shown once.
+Open **http://localhost:8080/panel/**, enter the **setup code** and set a panel password. Copy the `sk_local_…` API token shown once.
 
-Setup is open for **15 minutes** after the process starts. If the window closes, restart the process. `BETTERMQ_ALLOW_OPEN_SETUP=1` keeps it open until a password is set. `BETTERMQ_SETUP_WINDOW_SECS` changes the duration (`0` locks setup).
+The setup code is printed to the process's stderr when it starts unconfigured (`Setup code: XXXX-XXXX-XXXX-XXXX`; with Docker: `docker logs bettermq`). It is kept in memory only, so someone who can reach the port but cannot read your logs cannot claim the broker. `BETTERMQ_SETUP_CODE` presets the code for scripted installs.
+
+Setup is open for **15 minutes** after the process starts. If the window closes, restart the process (which also prints a new code). `BETTERMQ_ALLOW_OPEN_SETUP=1` keeps it open until a password is set **and skips the setup code** — only for trusted networks. `BETTERMQ_SETUP_WINDOW_SECS` changes the duration (`0` locks setup).
+
+On a remote server, prefer publishing the port on loopback (`-p 127.0.0.1:8080:8080`, as `docker-compose.yml` does) and open the panel through an SSH tunnel (`ssh -L 8080:127.0.0.1:8080 server`) or a TLS reverse proxy.
 
 Data (queues, WAL, schedules) is stored under `./data` in the current directory unless you pass `--data-dir`.
 
@@ -311,7 +315,8 @@ The public repo reads **92** `BETTERMQ_*` names used by self-host. **16** are CL
 
 | Env | Used for |
 |-----|----------|
-| `BETTERMQ_ALLOW_OPEN_SETUP` | Keep setup open until a password is set (no time window) |
+| `BETTERMQ_ALLOW_OPEN_SETUP` | Keep setup open until a password is set (no time window, no setup code) |
+| `BETTERMQ_SETUP_CODE` | Preset the first-boot setup code (default: random, printed to stderr) |
 | `BETTERMQ_SETUP_WINDOW_SECS` | First-boot open-setup duration (default `900`; `0` locks until restart or allow-open) |
 | `BETTERMQ_INSECURE_NO_AUTH` | Skip auth (`1`/`true`/`yes`). Local development only |
 | `BETTERMQ_LOCAL_AUTH_FILE` | Path to local auth file (also set from config) |

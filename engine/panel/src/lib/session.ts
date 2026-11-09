@@ -39,6 +39,7 @@ export type AuthConfig = {
   configured: boolean;
   setup_open?: boolean;
   setup_closes_in_secs?: number | null;
+  setup_code_required?: boolean;
 };
 
 export type ClusterNode = {
@@ -196,8 +197,11 @@ export async function initAuth() {
   }
 }
 
-export async function setupPassword(password: string) {
-  const res = await apiPost<{ token: string }>(publicUrl("/v1/local-auth/setup"), { password });
+export async function setupPassword(password: string, setupCode: string) {
+  const res = await apiPost<{ token: string }>(publicUrl("/v1/local-auth/setup"), {
+    password,
+    setup_code: setupCode.trim() || undefined,
+  });
   setToken(res.token);
   session.revealedToken = res.token;
   session.phase = "reveal";

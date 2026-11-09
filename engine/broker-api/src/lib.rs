@@ -905,29 +905,76 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    async fn post_setup(app: Router, body: serde_json::Value) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/local-auth/setup")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
     #[tokio::test]
-    async fn setup_during_open_window_succeeds() {
+    async fn setup_during_open_window_requires_the_setup_code() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("BETTERMQ_ALLOW_OPEN_SETUP");
-        open_setup_window(std::time::Duration::from_secs(60));
+        std::env::remove_var("BETTERMQ_SETUP_CODE");
+        let code = open_setup_window(std::time::Duration::from_secs(60));
         let dir = tempdir().unwrap();
-        let store = broker_local_auth::LocalAuthStore::open(dir.path()).unwrap();
+        let store = Arc::new(broker_local_auth::LocalAuthStore::open(dir.path()).unwrap());
         let mut state = test_state(&dir);
-        state.local_auth = Some(Arc::new(store));
+        state.local_auth = Some(store.clone());
         let app = router(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/local-auth/setup")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"password":"password1234"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let missing = post_setup(
+            app.clone(),
+            serde_json::json!({ "password": "password1234" }),
+        )
+        .await;
+        let wrong = post_setup(
+            app.clone(),
+            serde_json::json!({ "password": "password1234", "setup_code": "0000-0000-0000-0000" }),
+        )
+        .await;
+        let configured_after_bad = store.is_configured();
+        // Codes are case- and dash-insensitive so they survive retyping.
+        let typed = code.replace('-', "").to_ascii_lowercase();
+        let ok = post_setup(
+            app,
+            serde_json::json!({ "password": "password1234", "setup_code": typed }),
+        )
+        .await;
         close_setup_window();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(missing, StatusCode::UNAUTHORIZED);
+        assert_eq!(wrong, StatusCode::UNAUTHORIZED);
+        assert!(
+            !configured_after_bad,
+            "a caller without the code must not claim the broker"
+        );
+        assert_eq!(ok, StatusCode::OK);
+        assert!(store.is_configured());
+    }
+
+    #[test]
+    fn setup_codes_are_random_and_readable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("BETTERMQ_SETUP_CODE");
+        let a = open_setup_window(std::time::Duration::from_secs(60));
+        let b = open_setup_window(std::time::Duration::from_secs(60));
+        std::env::set_var("BETTERMQ_SETUP_CODE", "  preset-code-1234 ");
+        let preset = open_setup_window(std::time::Duration::from_secs(60));
+        std::env::remove_var("BETTERMQ_SETUP_CODE");
+        close_setup_window();
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 19);
+        assert!(a
+            .chars()
+            .all(|c| c == '-' || "0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(c)));
+        assert_eq!(preset, "preset-code-1234");
     }
 
     #[tokio::test]

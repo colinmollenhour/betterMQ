@@ -50,9 +50,12 @@ and incompatible persisted configurations fail explicitly at startup.
 **Docker**
 
 ```bash
-docker run -d --name bettermq -p 8080:8080 -v bettermq-data:/data \
+docker run -d --name bettermq -p 127.0.0.1:8080:8080 -v bettermq-data:/data \
   ghcr.io/colinmollenhour/bettermq:latest serve --data-dir /data
+docker logs bettermq   # shows the one-time setup code the panel asks for
 ```
+
+The port is published on loopback. On a remote server, open the panel through an SSH tunnel (`ssh -L 8080:127.0.0.1:8080 server`) or put a TLS reverse proxy in front.
 
 **Compose**
 
@@ -72,7 +75,7 @@ cd betterMQ/selfhost && docker compose up -d
 | **API docs** | `http://localhost:8080/docs` |
 | **Railway / any host** | `https://<your-domain>/panel/` |
 
-First visit: set a panel password and copy the `sk_local_…` API token. Create a queue in the panel, then:
+First visit: enter the setup code from the startup log, set a panel password and copy the `sk_local_…` API token. Create a queue in the panel, then:
 
 ```bash
 export TOKEN=sk_local_…

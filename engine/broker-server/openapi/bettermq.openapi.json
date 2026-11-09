@@ -1639,6 +1639,10 @@
             "type": "integer",
             "format": "uint64",
             "description": "Seconds left on the first-boot window"
+          },
+          "setup_code_required": {
+            "type": "boolean",
+            "description": "Setup needs the one-time setup code printed in the startup log"
           }
         }
       },
@@ -1661,6 +1665,22 @@
         "properties": {
           "password": {
             "type": "string"
+          }
+        }
+      },
+      "LocalAuthSetupBody": {
+        "type": "object",
+        "required": [
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string",
+            "minLength": 12
+          },
+          "setup_code": {
+            "type": "string",
+            "description": "One-time code printed to stderr when the setup window opens (or BETTERMQ_SETUP_CODE). Case and dashes are ignored. Not needed with BETTERMQ_ALLOW_OPEN_SETUP."
           }
         }
       },
@@ -4422,7 +4442,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/LocalAuthPasswordBody"
+                "$ref": "#/components/schemas/LocalAuthSetupBody"
               }
             }
           }
@@ -4437,6 +4457,9 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "Setup window closed, or setup code missing or wrong"
           }
         }
       }
