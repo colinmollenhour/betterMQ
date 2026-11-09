@@ -463,6 +463,9 @@ impl Broker {
         }
         let layout = ShardLayout::load_or_create(&config.data_dir, config.partitions)
             .map_err(|e| BrokerError::InvalidConfig(format!("shard layout: {e}")))?;
+        layout
+            .validate_storage(config.storage)
+            .map_err(|error| BrokerError::InvalidConfig(error.to_string()))?;
         let mut config = config;
         config.partitions = layout.shard_count;
         let rocks_path = config.data_dir.join("rocksdb");

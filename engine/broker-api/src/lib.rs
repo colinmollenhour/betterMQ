@@ -567,6 +567,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn storage_api_rejects_slate_on_v2_without_saving() {
+        let dir = tempdir().unwrap();
+        let layout = broker_partition::ShardLayout {
+            version: broker_partition::LAYOUT_V2,
+            shard_count: 1,
+            route_hash_version: broker_proto::HASH_VERSION_V2,
+        };
+        std::fs::write(
+            broker_partition::ShardLayout::path(dir.path()),
+            serde_json::to_vec(&layout).unwrap(),
+        )
+        .unwrap();
+        let state = Arc::new(test_state(&dir));
+        let result = infra::infra_update_storage(
+            axum::extract::State(state),
+            Json(infra::StorageUpdateRequest {
+                mode: "slate".into(),
+                s3: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(routes::ApiError::BadRequest(message)) if message.contains("physical shard layout V2"))
+        );
+        assert!(!broker_config::managed_config_path(dir.path()).exists());
+    }
+
+    #[tokio::test]
     async fn missing_bearer_is_401_when_auth_configured() {
         let dir = tempdir().unwrap();
         let store = broker_local_auth::LocalAuthStore::open(dir.path()).unwrap();

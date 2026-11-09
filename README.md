@@ -39,6 +39,10 @@ memory budget (four times serialized request bytes plus 4 KiB per member).
 The outbox stores the body once, executes at most eight member attempts at a time,
 and preserves the original delivery deadline across retries and restarts.
 
+Slate storage supports only the legacy V1 shard layout. V2 cells must retain
+local storage: unsupported changes are rejected before configuration is saved,
+and incompatible persisted configurations fail explicitly at startup.
+
 ---
 
 ## Quick start

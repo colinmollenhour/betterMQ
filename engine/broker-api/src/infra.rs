@@ -602,6 +602,11 @@ pub async fn infra_update_storage(
     let next_storage = match body.mode.to_lowercase().as_str() {
         "local" => StorageConfig::Local,
         "slate" | "s3" => {
+            state
+                .broker
+                .layout()
+                .validate_storage(broker_storage::StorageMode::Slate)
+                .map_err(|error| ApiError::BadRequest(error.to_string()))?;
             let s3 = body
                 .s3
                 .ok_or_else(|| ApiError::BadRequest("s3 config required for slate mode".into()))?;
