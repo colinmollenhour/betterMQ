@@ -571,21 +571,10 @@ fn spawn_lane_drainer(
                 continue;
             }
 
-            let now_ms = Utc::now().timestamp_millis();
-            if !lane.rate.lock().await.try_acquire(now_ms) {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if stop.load(AtomicOrdering::Acquire) {
-                    break;
-                }
-                lane.notify.notify_one();
-                continue;
-            }
-
-            let next = {
-                let mut heap = lane.waitlist.lock().await;
-                heap.pop(parallelism == 1)
-            };
-            let Some(ordered) = next else {
+            // Only this drainer removes work. Check for work before touching the
+            // rate window, without nesting waitlist -> rate locks (inspection
+            // takes them in the other order). Empty notifications spend no quota.
+            if lane.waitlist.lock().await.len() == 0 {
                 if tokio::time::timeout(IDLE_LANE_TTL, lane.notify.notified())
                     .await
                     .is_err()
@@ -594,7 +583,7 @@ fn spawn_lane_drainer(
                     break;
                 }
                 continue;
-            };
+            }
 
             // Semaphore waiters are global and FIFO; releasing one slot wakes
             // another lane without requiring a lane-specific submission event.
@@ -608,19 +597,31 @@ fn spawn_lane_drainer(
             };
 
             // Operator controls may have changed while global capacity was
-            // unavailable. Requeue reserved work if a lane was paused meanwhile.
+            // unavailable. Do not dequeue or spend quota until they are rechecked.
             if *lane.paused.lock().await
                 || memory_guard.is_critical()
                 || stop.load(AtomicOrdering::Acquire)
             {
-                lane.waitlist.lock().await.push(ordered);
                 continue;
             }
             let parallelism = lane.limits.lock().await.parallelism;
             if lane.active.load(AtomicOrdering::Relaxed) >= parallelism {
-                lane.waitlist.lock().await.push(ordered);
                 continue;
             }
+            let now_ms = Utc::now().timestamp_millis();
+            if !lane.rate.lock().await.try_acquire(now_ms) {
+                drop(global_permit);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if stop.load(AtomicOrdering::Acquire) {
+                    break;
+                }
+                lane.notify.notify_one();
+                continue;
+            }
+            let next = lane.waitlist.lock().await.pop(parallelism == 1);
+            let Some(ordered) = next else {
+                continue;
+            };
 
             lane.active.fetch_add(1, AtomicOrdering::Relaxed);
             global_active.fetch_add(1, AtomicOrdering::Relaxed);
@@ -747,6 +748,59 @@ mod tests {
         assert_eq!(engine.telemetry_snapshot().queue_rejected, 1);
         engine.shutdown_background().await;
         assert_eq!(engine.flow.pending_capacity.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_notifications_and_idle_rollover_do_not_spend_rate_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = broker_partition::Broker::open(broker_partition::BrokerConfig::new(
+            dir.path().to_path_buf(),
+        ))
+        .unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "url": "http://169.254.169.254/hook", "secret": "secret", "payload": "test"
+        }))
+        .unwrap();
+        let response = broker.publish(request).unwrap();
+        broker.flush_wal().unwrap();
+        let msg = broker
+            .read_message(
+                &response.topic,
+                response.partition.unwrap(),
+                response.offset.unwrap(),
+            )
+            .unwrap();
+        let engine = DispatchEngine::new_broker_only(broker, crate::DispatchConfig::default());
+        let owner = Uuid::new_v4();
+        let limits = ResolvedFlow {
+            key: "rate".into(),
+            parallelism: 1,
+            rate: 1,
+            period_secs: 3600,
+        };
+        engine.flow.ensure_lane(owner, "rate", limits.clone()).await;
+        let lane = engine.flow.lane_ref(owner, "rate").await.unwrap();
+        // Move the wall-clock window across a boundary explicitly rather than
+        // waiting an hour; keep the lane alive while observing the drainer.
+        lane.rate.lock().await.period_start_ms = Utc::now().timestamp_millis() - 3_600_001;
+        for _ in 0..3 {
+            lane.notify.notify_one();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(lane.rate.lock().await.count, 0);
+        }
+        engine
+            .flow
+            .submit(engine.clone(), owner, msg, limits, false)
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while engine.telemetry_snapshot().dlq_committed == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first post-idle job must not wait another rate period");
+        assert_eq!(lane.rate.lock().await.count, 1);
+        engine.shutdown_background().await;
     }
 
     #[tokio::test]
