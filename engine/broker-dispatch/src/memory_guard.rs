@@ -31,6 +31,7 @@ pub struct ProcessResourceStats {
 #[derive(Default)]
 pub struct MemoryGuard {
     critical: AtomicBool,
+    sample_unavailable: AtomicBool,
     stop: AtomicBool,
     stop_notify: Notify,
     cfg: MemoryGuardConfig,
@@ -40,6 +41,7 @@ impl MemoryGuard {
     pub fn new(cfg: MemoryGuardConfig) -> Self {
         Self {
             critical: AtomicBool::new(false),
+            sample_unavailable: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             stop_notify: Notify::new(),
             cfg,
@@ -79,7 +81,13 @@ impl MemoryGuard {
         let Some(limit_mb) = self.cfg.limit_mb else {
             return;
         };
-        let rss_mb = sample_process_resources().rss_mb.unwrap_or(0);
+        let Some(rss_mb) = sample_process_resources().rss_mb else {
+            if !self.sample_unavailable.swap(true, Ordering::Relaxed) {
+                tracing::warn!("process RSS unavailable; retaining previous memory-pressure state");
+            }
+            return;
+        };
+        self.sample_unavailable.store(false, Ordering::Relaxed);
         let threshold = limit_mb.saturating_mul(self.cfg.fetch_limit_percent as u64) / 100;
         let is_critical = rss_mb >= threshold;
         let was = self.critical.swap(is_critical, Ordering::SeqCst);
@@ -131,6 +139,19 @@ impl MemoryGuard {
 
 /// RSS + CPU for the broker process (best-effort; used by `/metrics` and the panel).
 pub fn sample_process_resources() -> ProcessResourceStats {
+    #[cfg(target_os = "linux")]
+    {
+        ProcessResourceStats {
+            rss_mb: linux_rss_mb(),
+            cpu_percent: None,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    sample_non_linux_resources()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sample_non_linux_resources() -> ProcessResourceStats {
     #[cfg(unix)]
     {
         let pid = std::process::id();
@@ -141,26 +162,23 @@ pub fn sample_process_resources() -> ProcessResourceStats {
         if let Some(out) = out {
             if out.status.success() {
                 let line = String::from_utf8_lossy(&out.stdout);
-                let mut parts = line.split(',');
-                let rss_kb: Option<u64> = parts.next().and_then(|s| s.trim().parse().ok());
-                let cpu: Option<f32> = parts.next().and_then(|s| s.trim().parse().ok());
-                return ProcessResourceStats {
-                    rss_mb: rss_kb.map(|kb| kb / 1024),
-                    cpu_percent: cpu,
-                };
+                if let Some(stats) = parse_ps_resources(&line) {
+                    return stats;
+                }
             }
         }
     }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(rss) = linux_rss_mb() {
-            return ProcessResourceStats {
-                rss_mb: Some(rss),
-                cpu_percent: None,
-            };
-        }
-    }
     ProcessResourceStats::default()
+}
+
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+fn parse_ps_resources(line: &str) -> Option<ProcessResourceStats> {
+    let mut parts = line.split_whitespace();
+    let rss_kb: u64 = parts.next()?.parse().ok()?;
+    Some(ProcessResourceStats {
+        rss_mb: Some(rss_kb / 1024),
+        cpu_percent: parts.next().and_then(|value| value.parse().ok()),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -173,4 +191,30 @@ fn linux_rss_mb() -> Option<u64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_real_ps_columns_and_rejects_missing_rss() {
+        let stats = parse_ps_resources("  91234  3.1\n").unwrap();
+        assert_eq!(stats.rss_mb, Some(89));
+        assert_eq!(stats.cpu_percent, Some(3.1));
+        assert!(parse_ps_resources("RSS %CPU").is_none());
+        assert!(parse_ps_resources("").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reports_positive_rss_and_enforces_memory_limit() {
+        assert!(sample_process_resources().rss_mb.unwrap() > 0);
+        let guard = MemoryGuard::new(MemoryGuardConfig {
+            fetch_limit_percent: 75,
+            limit_mb: Some(1),
+        });
+        guard.sample();
+        assert!(guard.is_critical());
+    }
 }
