@@ -537,12 +537,11 @@ pub fn catalog_peer_urls(state: &AppState) -> Vec<String> {
     if let Ok(Some(cfg)) = load_managed_config(&dir) {
         if cfg.cluster_enabled() {
             if let Some(cluster) = &cfg.cluster {
-                let self_norm = normalize_peer_url(&cfg.node.public_url);
                 return cluster
                     .nodes
                     .iter()
-                    .map(|n| n.public_url.trim().trim_end_matches('/').to_string())
-                    .filter(|u| normalize_peer_url(u) != self_norm)
+                    .filter(|n| n.name != cfg.node.name)
+                    .map(|n| n.internal_base().to_owned())
                     .collect();
             }
         }
@@ -555,13 +554,13 @@ pub fn catalog_peer_urls(state: &AppState) -> Vec<String> {
             .nodes
             .iter()
             .filter(|n| n.id != self_id)
-            .map(|n| n.addr.trim().trim_end_matches('/').to_string())
+            .map(|n| n.internal_base().to_owned())
             .collect();
     }
     Vec::new()
 }
 
-/// `(node_id, public_url)` for every peer in the saved cluster config.
+/// `(node_id, internal_url)` for every peer in the saved cluster config.
 pub fn catalog_peer_targets(state: &AppState) -> Vec<(Uuid, String)> {
     let dir = state.broker.config().data_dir.clone();
     if let Ok(Some(cfg)) = load_managed_config(&dir) {
@@ -572,12 +571,7 @@ pub fn catalog_peer_targets(state: &AppState) -> Vec<(Uuid, String)> {
                     .nodes
                     .iter()
                     .filter(|n| normalize_peer_url(&n.public_url) != self_norm)
-                    .map(|n| {
-                        (
-                            stable_node_id(&n.name),
-                            n.public_url.trim().trim_end_matches('/').to_string(),
-                        )
-                    })
+                    .map(|n| (stable_node_id(&n.name), n.internal_base().to_owned()))
                     .collect();
             }
         }
@@ -590,7 +584,7 @@ pub fn catalog_peer_targets(state: &AppState) -> Vec<(Uuid, String)> {
             .nodes
             .iter()
             .filter(|n| n.id != self_id)
-            .map(|n| (n.id, n.addr.trim().trim_end_matches('/').to_string()))
+            .map(|n| (n.id, n.internal_base().to_owned()))
             .collect();
     }
     Vec::new()
@@ -1886,10 +1880,12 @@ mod tests {
             cluster_id: Uuid::new_v4(),
             nodes: vec![
                 NodeConfig {
+                    internal_url: None,
                     id: leader,
                     addr: "http://leader".into(),
                 },
                 NodeConfig {
+                    internal_url: None,
                     id: follower,
                     addr: "http://follower".into(),
                 },

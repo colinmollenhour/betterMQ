@@ -60,6 +60,8 @@ pub struct NodeUpdateRequest {
     pub name: String,
     pub public_url: String,
     #[serde(default)]
+    pub internal_url: Option<String>,
+    #[serde(default)]
     pub listen: Option<String>,
 }
 
@@ -79,6 +81,8 @@ pub struct ClusterMembershipResponse {
 pub struct ClusterNodeUpdateRequest {
     pub node_name: String,
     pub public_url: String,
+    #[serde(default)]
+    pub internal_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +134,8 @@ pub struct ClusterJoinRequest {
     pub seed_url: String,
     pub join_token: String,
     pub public_url: String,
+    #[serde(default)]
+    pub internal_url: Option<String>,
     pub node_name: String,
 }
 
@@ -145,6 +151,8 @@ pub struct ClusterJoinResponse {
 pub struct ClusterRegisterRequest {
     pub join_token: String,
     pub public_url: String,
+    #[serde(default)]
+    pub internal_url: Option<String>,
     pub node_name: String,
 }
 
@@ -159,6 +167,8 @@ pub struct ClusterRegisterResponse {
 pub struct ClusterNodeInfo {
     pub name: String,
     pub public_url: String,
+    #[serde(default)]
+    pub internal_url: Option<String>,
     pub id: Uuid,
 }
 
@@ -260,6 +270,11 @@ fn patch_cluster_node_entry(cfg: &mut BetterMqConfig, previous_name: &str) {
         if n.name == previous_name || n.name == name {
             n.name = name;
             n.public_url = url;
+            n.internal_url = cfg
+                .node
+                .internal_url
+                .clone()
+                .or_else(|| n.internal_url.clone());
             return;
         }
     }
@@ -293,9 +308,11 @@ fn resolve_cluster_membership(
                 if !urls_match(&n.public_url, &peer.addr) {
                     n.public_url = peer.addr.clone();
                 }
+                n.internal_url = n.internal_url.clone().or_else(|| peer.internal_url.clone());
                 continue;
             }
             nodes.push(ClusterNode {
+                internal_url: peer.internal_url.clone(),
                 name: peer.addr.clone(),
                 public_url: peer.addr.clone(),
             });
@@ -379,7 +396,7 @@ async fn propagate_membership_to_peers(
             continue;
         }
         let mut delivered = false;
-        for base in crate::cluster::peer_fanout_urls(&peer.public_url) {
+        for base in crate::cluster::peer_fanout_urls(peer.internal_base()) {
             let url = format!(
                 "{}/internal/v1/cluster/apply-membership",
                 base.trim_end_matches('/')
@@ -420,7 +437,7 @@ async fn push_node_url_to_seed(cfg: &BetterMqConfig) -> Result<(), String> {
     if seed.name == cfg.node.name {
         return Ok(());
     }
-    let seed_url = seed.public_url.trim().trim_end_matches('/');
+    let seed_url = seed.internal_base();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
@@ -431,6 +448,7 @@ async fn push_node_url_to_seed(cfg: &BetterMqConfig) -> Result<(), String> {
     .json(&ClusterNodeUpdateRequest {
         node_name: cfg.node.name.clone(),
         public_url: cfg.node.public_url.clone(),
+        internal_url: cfg.node.internal_url.clone(),
     })
     .send()
     .await
@@ -446,6 +464,7 @@ fn load_or_default_config(state: &AppState) -> Result<BetterMqConfig, ApiError> 
         return Ok(cfg);
     }
     let mut cfg = BetterMqConfig::template_single_local();
+    broker_config::apply_node_env_overrides(&mut cfg);
     cfg.data_dir = dir;
     Ok(cfg)
 }
@@ -534,6 +553,9 @@ pub async fn infra_update_node(
     let previous_name = cfg.node.name.clone();
     cfg.node.name = body.name.trim().to_string();
     cfg.node.public_url = body.public_url.trim().trim_end_matches('/').to_string();
+    if body.internal_url.is_some() {
+        cfg.node.internal_url = body.internal_url;
+    }
     if let Some(listen) = body.listen {
         cfg.node.listen = listen;
     }
@@ -680,6 +702,7 @@ pub async fn infra_cluster_create(
         enabled: true,
         id: Some(cluster_id.to_string()),
         nodes: vec![ClusterNode {
+            internal_url: cfg.node.internal_url.clone(),
             name: cfg.node.name.clone(),
             public_url: cfg.node.public_url.clone(),
         }],
@@ -775,6 +798,7 @@ pub async fn infra_join_bootstrap(
         .map(|n| ClusterNodeInfo {
             name: n.name.clone(),
             public_url: n.public_url.clone(),
+            internal_url: n.internal_url.clone(),
             id: stable_node_id(&n.name),
         })
         .collect();
@@ -815,6 +839,7 @@ pub async fn infra_cluster_register(
             return Err(ApiError::BadRequest("node already registered".into()));
         }
         cluster.nodes.push(ClusterNode {
+            internal_url: body.internal_url.clone(),
             name: node_name.clone(),
             public_url: url,
         });
@@ -830,6 +855,7 @@ pub async fn infra_cluster_register(
                 .map(|n| ClusterNodeInfo {
                     name: n.name.clone(),
                     public_url: n.public_url.clone(),
+                    internal_url: n.internal_url.clone(),
                     id: stable_node_id(&n.name),
                 })
                 .collect()
@@ -887,11 +913,14 @@ pub async fn infra_cluster_join(
         .map_err(|e| ApiError::BadRequest(format!("invalid bootstrap response: {e}")))?;
 
     let public_url = body.public_url.trim().trim_end_matches('/').to_string();
+    let local_cfg = load_or_default_config(&state)?;
+    let internal_url = body.internal_url.clone().or(local_cfg.node.internal_url);
     let node_name = body.node_name.trim().to_string();
     let register_url = format!("{seed}/v1/infra/cluster/register");
     let registered: ClusterRegisterResponse = client
         .post(&register_url)
         .json(&ClusterRegisterRequest {
+            internal_url: internal_url.clone(),
             join_token: body.join_token,
             public_url: public_url.clone(),
             node_name: node_name.clone(),
@@ -909,6 +938,7 @@ pub async fn infra_cluster_join(
         .nodes
         .iter()
         .map(|n| ClusterNode {
+            internal_url: n.internal_url.clone(),
             name: n.name.clone(),
             public_url: n.public_url.clone(),
         })
@@ -917,6 +947,7 @@ pub async fn infra_cluster_join(
     let mut cfg = load_or_default_config(&state)?;
     cfg.node.name = node_name;
     cfg.node.public_url = public_url;
+    cfg.node.internal_url = internal_url;
     cfg.cluster = Some(ClusterConfigSection {
         enabled: true,
         id: Some(bootstrap.cluster_id.to_string()),
@@ -930,8 +961,12 @@ pub async fn infra_cluster_join(
     save_managed_config(&dir, &cfg).map_err(io_err)?;
     ensure_cluster_config(&cfg, &dir).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    let peer_bases: Vec<String> = nodes.iter().map(|n| n.public_url.clone()).collect();
-    if let Err(e) = crate::cluster::pull_auth_from_seed(&state, seed).await {
+    let peer_bases: Vec<String> = nodes.iter().map(|n| n.internal_base().to_owned()).collect();
+    let seed_internal = nodes
+        .first()
+        .map(ClusterNode::internal_base)
+        .unwrap_or(seed);
+    if let Err(e) = crate::cluster::pull_auth_from_seed(&state, seed_internal).await {
         tracing::warn!(error = ?e, "auth pull from seed failed during join");
     }
     let catalog_note = match crate::cluster::merge_catalog_from_peers(&state, &peer_bases).await {
@@ -1066,7 +1101,7 @@ pub async fn infra_cluster_sync(
     let seed_url = cluster
         .nodes
         .first()
-        .map(|n| n.public_url.clone())
+        .map(|n| n.internal_base().to_owned())
         .ok_or_else(|| ApiError::BadRequest("no seed node".into()))?;
     let seed_base = seed_url.trim().trim_end_matches('/');
     let client = reqwest::Client::new();
@@ -1104,6 +1139,7 @@ pub async fn infra_cluster_sync(
                         .map(|c| c.name.clone())
                         .unwrap_or_else(|| n.addr.clone());
                     ClusterNode {
+                        internal_url: n.internal_url.clone(),
                         name,
                         public_url: n.addr.clone(),
                     }
@@ -1116,6 +1152,11 @@ pub async fn infra_cluster_sync(
         if n.name == cfg.node.name {
             n.name = cfg.node.name.clone();
             n.public_url = cfg.node.public_url.clone();
+            n.internal_url = cfg
+                .node
+                .internal_url
+                .clone()
+                .or_else(|| n.internal_url.clone());
         }
     }
 
@@ -1131,6 +1172,7 @@ pub async fn infra_cluster_sync(
         .map(|n| ClusterNodeInfo {
             name: n.name.clone(),
             public_url: n.public_url.clone(),
+            internal_url: n.internal_url.clone(),
             id: stable_node_id(&n.name),
         })
         .collect();
@@ -1138,7 +1180,7 @@ pub async fn infra_cluster_sync(
     let runtime =
         ClusterRuntime::load_config(&dir).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    let peer_bases: Vec<String> = nodes.iter().map(|n| n.public_url.clone()).collect();
+    let peer_bases: Vec<String> = nodes.iter().map(|n| n.internal_base().to_owned()).collect();
     if let Err(e) = crate::cluster::pull_auth_from_seed(&state, seed_base).await {
         tracing::warn!(error = ?e, "auth pull from seed failed during sync");
     }
@@ -1203,7 +1245,12 @@ pub async fn internal_cluster_apply_membership(
     let peer_bases: Vec<String> = cfg
         .cluster
         .as_ref()
-        .map(|c| c.nodes.iter().map(|n| n.public_url.clone()).collect())
+        .map(|c| {
+            c.nodes
+                .iter()
+                .map(|n| n.internal_base().to_owned())
+                .collect()
+        })
         .unwrap_or_default();
     if !peer_bases.is_empty() {
         if let Err(e) = crate::cluster::merge_catalog_from_peers(&state, &peer_bases).await {
@@ -1242,6 +1289,9 @@ pub async fn internal_cluster_update_node(
         )));
     };
     entry.public_url = public_url.to_string();
+    if let Some(internal_url) = body.internal_url {
+        entry.internal_url = Some(internal_url);
+    }
     cfg.validate()
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     save_managed_config(&dir, &cfg).map_err(io_err)?;

@@ -32,6 +32,7 @@ mod tests {
         let runtime = ClusterRuntime::from_config_only(ClusterConfig {
             cluster_id: Uuid::new_v4(),
             nodes: vec![NodeConfig {
+                internal_url: None,
                 id: node_id,
                 addr: "http://127.0.0.1:8080".into(),
             }],

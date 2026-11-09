@@ -17,7 +17,8 @@ x-broker: &broker
   build:
     context: ..
     dockerfile: selfhost/Dockerfile
-  environment:
+  environment: &broker-env
+    BETTERMQ_INTERNAL_LISTEN: 0.0.0.0:9080
     BETTERMQ_CLUSTER_SECRET: ${BETTERMQ_CLUSTER_SECRET:?set BETTERMQ_CLUSTER_SECRET}
     BETTERMQ_SHARED_META_DIR: /cluster-shared/meta
     BETTERMQ_METRICS_TOKEN: ${BETTERMQ_METRICS_TOKEN:?set BETTERMQ_METRICS_TOKEN}
@@ -34,6 +35,9 @@ x-broker: &broker
 services:
   broker1:
     <<: *broker
+    environment:
+      <<: *broker-env
+      BETTERMQ_INTERNAL_URL: http://broker1:9080
     ports:
       - "8081:8080"
     volumes:
@@ -50,6 +54,9 @@ services:
 
   broker2:
     <<: *broker
+    environment:
+      <<: *broker-env
+      BETTERMQ_INTERNAL_URL: http://broker2:9080
     ports:
       - "8082:8080"
     volumes:
@@ -66,6 +73,9 @@ services:
 
   broker3:
     <<: *broker
+    environment:
+      <<: *broker-env
+      BETTERMQ_INTERNAL_URL: http://broker3:9080
     ports:
       - "8083:8080"
     volumes:

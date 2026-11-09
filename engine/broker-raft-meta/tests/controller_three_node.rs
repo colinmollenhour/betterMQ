@@ -73,6 +73,7 @@ async fn three_node_http_cluster_commits_and_snapshots_controller_state() {
         .iter()
         .enumerate()
         .map(|(index, id)| NodeConfig {
+            internal_url: None,
             id: *id,
             addr: addresses[index].clone(),
         })

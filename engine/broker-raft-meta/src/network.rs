@@ -9,6 +9,7 @@ use openraft::raft::{
 use openraft::BasicNode;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::error::Error;
 use std::io;
 use std::time::Duration;
@@ -18,6 +19,7 @@ use crate::controller::{NodeId, TypeConfig};
 #[derive(Clone)]
 pub struct HttpNetworkFactory {
     client: reqwest::Client,
+    private_peers: HashMap<NodeId, String>,
 }
 
 impl HttpNetworkFactory {
@@ -27,7 +29,23 @@ impl HttpNetworkFactory {
                 .pool_idle_timeout(Duration::from_secs(90))
                 .timeout(Duration::from_secs(5))
                 .build()?,
+            private_peers: HashMap::new(),
         })
+    }
+
+    pub fn with_config(mut self, config: &crate::ClusterConfig) -> Self {
+        self.private_peers = config
+            .nodes
+            .iter()
+            .filter(|node| node.internal_url.is_some())
+            .map(|node| {
+                (
+                    crate::controller::raft_id(node.id),
+                    node.internal_base().to_owned(),
+                )
+            })
+            .collect();
+        self
     }
 }
 
@@ -43,7 +61,11 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetworkFactory {
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
         HttpNetworkConnection {
             target,
-            addr: node.addr.trim_end_matches('/').to_string(),
+            addr: self
+                .private_peers
+                .get(&target)
+                .cloned()
+                .unwrap_or_else(|| node.addr.trim_end_matches('/').to_string()),
             client: self.client.clone(),
         }
     }

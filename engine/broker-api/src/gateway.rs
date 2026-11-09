@@ -1082,10 +1082,12 @@ mod tests {
             cluster_id: Uuid::new_v4(),
             nodes: vec![
                 NodeConfig {
+                    internal_url: None,
                     id: local_id,
                     addr: "http://127.0.0.1:1".into(),
                 },
                 NodeConfig {
+                    internal_url: None,
                     id: peer_id,
                     addr: base.clone(),
                 },

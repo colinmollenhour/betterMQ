@@ -141,7 +141,7 @@ impl ControllerState {
                 ControllerNode {
                     id: node.id,
                     raft_id,
-                    addr: node.addr.clone(),
+                    addr: node.internal_base().to_owned(),
                 },
             );
         }
@@ -150,7 +150,7 @@ impl ControllerState {
             .iter()
             .map(|node| DataNodeRecord {
                 id: node.id,
-                addr: node.addr.clone(),
+                addr: node.internal_base().to_owned(),
                 rack: None,
                 region: None,
                 broker: true,
@@ -325,7 +325,8 @@ impl OpenRaftController {
         let durable_store = DurableRocksStore::new(Arc::clone(&store));
         let (log_store, state_machine) = Adaptor::new(durable_store);
         let network = HttpNetworkFactory::new()
-            .map_err(|error| ControllerError::Transport(error.to_string()))?;
+            .map_err(|error| ControllerError::Transport(error.to_string()))?
+            .with_config(&config);
         let raft_config = Config {
             cluster_name: config.cluster_id.to_string(),
             heartbeat_interval: 250,
@@ -388,7 +389,7 @@ impl OpenRaftController {
             .nodes
             .iter()
             .filter(|node| voter_ids.contains(&node.id))
-            .map(|node| (raft_id(node.id), BasicNode::new(&node.addr)))
+            .map(|node| (raft_id(node.id), BasicNode::new(node.internal_base())))
             .collect();
         self.raft
             .initialize(members)
@@ -473,7 +474,14 @@ impl OpenRaftController {
             .read()
             .nodes
             .get(&leader)
-            .map(|node| node.addr.clone())
+            .map(|node| {
+                self.config
+                    .nodes
+                    .iter()
+                    .find(|entry| entry.id == node.id)
+                    .map(|entry| entry.internal_base().to_owned())
+                    .unwrap_or_else(|| node.addr.clone())
+            })
             .ok_or(ControllerError::NoLeader)?;
         let url = format!(
             "{}/internal/v1/controller/command",
@@ -577,7 +585,7 @@ impl OpenRaftController {
         }
         let mut node_by_raft: BTreeMap<NodeId, String> = BTreeMap::new();
         for node in &self.config.nodes {
-            node_by_raft.insert(raft_id(node.id), node.addr.clone());
+            node_by_raft.insert(raft_id(node.id), node.internal_base().to_owned());
         }
         for node in state.data_nodes.values() {
             node_by_raft
@@ -1084,6 +1092,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, id)| crate::cluster::NodeConfig {
+                    internal_url: None,
                     id: *id,
                     addr: format!("http://n{index}"),
                 })
@@ -1116,6 +1125,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, id)| crate::cluster::NodeConfig {
+                    internal_url: None,
                     id: *id,
                     addr: format!("http://n{index}"),
                 })
@@ -1188,6 +1198,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, id)| crate::cluster::NodeConfig {
+                    internal_url: None,
                     id: *id,
                     addr: format!("http://n{index}"),
                 })
@@ -1215,6 +1226,7 @@ mod tests {
         let config = ClusterConfig {
             cluster_id: Uuid::new_v4(),
             nodes: vec![crate::cluster::NodeConfig {
+                internal_url: None,
                 id,
                 addr: "http://n0".into(),
             }],
@@ -1261,6 +1273,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, id)| crate::cluster::NodeConfig {
+                    internal_url: None,
                     id: *id,
                     addr: format!("http://n{index}"),
                 })
@@ -1316,6 +1329,7 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(index, id)| crate::cluster::NodeConfig {
+                    internal_url: None,
                     id: *id,
                     addr: format!("http://n{index}"),
                 })

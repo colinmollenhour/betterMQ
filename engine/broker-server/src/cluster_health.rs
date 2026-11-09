@@ -74,7 +74,7 @@ async fn catch_up_shard(cluster: &Cluster, state: &AppState, shard: u32) -> Resu
             };
             match cluster
                 .replication
-                .catch_up_from(&peer.addr, &request)
+                .catch_up_from(peer.internal_base(), &request)
                 .await
             {
                 Ok(response)
@@ -82,7 +82,7 @@ async fn catch_up_shard(cluster: &Cluster, state: &AppState, shard: u32) -> Resu
                         response.committed_hwm > current.committed_hwm
                     }) =>
                 {
-                    best = Some((peer.addr.clone(), response));
+                    best = Some((peer.internal_base().to_owned(), response));
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -191,8 +191,16 @@ pub fn spawn_cluster_health_monitor(
                 if peer.id == node_id {
                     continue;
                 }
-                let url = format!("{}/healthz", peer.addr.trim_end_matches('/'));
-                match client.get(&url).send().await {
+                let path = if peer.internal_url.is_some() {
+                    "/internal/v1/cluster"
+                } else {
+                    "/healthz"
+                };
+                let url = format!("{}{path}", peer.internal_base());
+                match broker_api::cluster_auth::apply_cluster_secret(client.get(&url))
+                    .send()
+                    .await
+                {
                     Ok(resp) if resp.status().is_success() => {
                         runtime.record_peer_alive(peer.id, now);
                     }
@@ -227,10 +235,7 @@ pub fn spawn_cluster_health_monitor(
                 if peer.id == node_id {
                     continue;
                 }
-                let url = format!(
-                    "{}/internal/v1/cluster/gossip",
-                    peer.addr.trim_end_matches('/')
-                );
+                let url = format!("{}/internal/v1/cluster/gossip", peer.internal_base());
                 let req =
                     broker_api::cluster_auth::apply_cluster_secret(client.post(&url)).json(&gossip);
                 match req.send().await {
@@ -319,6 +324,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, id)| NodeConfig {
+                internal_url: None,
                 id: *id,
                 addr: format!("http://b{i}:8080"),
             })

@@ -683,10 +683,7 @@ impl ReplicationClient {
         let (peers, quorum) = self.targets_for_shard(req.partition);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(peers.len().max(1));
         for peer in peers {
-            let url = format!(
-                "{}/internal/v1/replicate/batch",
-                peer.addr.trim_end_matches('/')
-            );
+            let url = format!("{}/internal/v1/replicate/batch", peer.internal_base());
             let http = self.http.clone();
             let body = encoded.clone();
             let tx = tx.clone();
@@ -1069,6 +1066,7 @@ mod tests {
         let client = ReplicationClient::new(ClusterConfig {
             cluster_id: Uuid::new_v4(),
             nodes: vec![broker_raft_meta::NodeConfig {
+                internal_url: None,
                 id: node_id,
                 addr: "http://127.0.0.1:8080".into(),
             }],
@@ -1089,6 +1087,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replication_calls_private_url_and_falls_back_for_legacy_members() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for private in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let leader = Uuid::new_v4();
+            let follower = Uuid::new_v4();
+            let req = request(vec![b"frame".to_vec()]);
+            let hwm = req.end_offset().unwrap();
+            let ack = serde_json::to_string(&ReplicateBatchAck {
+                node_id: follower,
+                partition: req.partition,
+                leader_epoch: req.leader_epoch,
+                durable_hwm: hwm,
+            })
+            .unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut received = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    received.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = received.windows(4).position(|s| s == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&received[..end]);
+                        assert!(headers.starts_with("POST /internal/v1/replicate/batch "));
+                        let size = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        if received.len() >= end + 4 + size {
+                            break;
+                        }
+                    }
+                }
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ack}", ack.len()).as_bytes()).await.unwrap();
+            });
+            let client = ReplicationClient::new(ClusterConfig {
+                cluster_id: Uuid::new_v4(),
+                node_id: leader,
+                generation: 1,
+                hash_version: 1,
+                nodes: vec![
+                    broker_raft_meta::NodeConfig {
+                        id: leader,
+                        addr: "http://127.0.0.1:1".into(),
+                        internal_url: None,
+                    },
+                    broker_raft_meta::NodeConfig {
+                        id: follower,
+                        addr: if private {
+                            "http://127.0.0.1:1".into()
+                        } else {
+                            base.clone()
+                        },
+                        internal_url: private.then_some(base),
+                    },
+                ],
+            });
+            let result =
+                tokio::time::timeout(Duration::from_secs(3), client.replicate_batch(req, hwm))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(result.durable_acks, 2);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn local_fsync_overlaps_replica_fanout() {
         let leader = Uuid::new_v4();
         let follower = Uuid::new_v4();
@@ -1096,10 +1169,12 @@ mod tests {
             cluster_id: Uuid::new_v4(),
             nodes: vec![
                 broker_raft_meta::NodeConfig {
+                    internal_url: None,
                     id: leader,
                     addr: "http://127.0.0.1:1".into(),
                 },
                 broker_raft_meta::NodeConfig {
+                    internal_url: None,
                     id: follower,
                     addr: "http://127.0.0.1:1".into(),
                 },

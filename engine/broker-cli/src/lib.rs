@@ -193,6 +193,9 @@ pub struct ServeArgs {
     /// Internal cluster/replication listener.
     #[arg(long, env = "BETTERMQ_INTERNAL_LISTEN")]
     pub internal_listen: Option<SocketAddr>,
+    /// Advertised private peer URL (defaults to the public node URL).
+    #[arg(long, env = "BETTERMQ_INTERNAL_URL")]
+    pub internal_url: Option<String>,
 }
 
 /// Shared `bettermq serve` flags (cloud build).
@@ -258,6 +261,9 @@ pub struct ServeArgs {
     /// Internal cluster/replication listener.
     #[arg(long, env = "BETTERMQ_INTERNAL_LISTEN")]
     pub internal_listen: Option<SocketAddr>,
+    /// Advertised private peer URL (defaults to the public node URL).
+    #[arg(long, env = "BETTERMQ_INTERNAL_URL")]
+    pub internal_url: Option<String>,
 }
 
 #[derive(Debug, Parser)]

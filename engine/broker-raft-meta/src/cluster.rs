@@ -52,6 +52,48 @@ pub enum ClusterError {
 pub struct NodeConfig {
     pub id: Uuid,
     pub addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_url: Option<String>,
+}
+
+impl NodeConfig {
+    pub fn internal_base(&self) -> &str {
+        self.internal_url
+            .as_deref()
+            .unwrap_or(&self.addr)
+            .trim()
+            .trim_end_matches('/')
+    }
+}
+
+#[cfg(test)]
+mod internal_url_tests {
+    use super::*;
+
+    #[test]
+    fn internal_transport_overrides_without_changing_public_addresses() {
+        let mut node: NodeConfig = serde_json::from_value(serde_json::json!({
+            "id": Uuid::nil(), "addr": "http://public.test:8080/"
+        }))
+        .unwrap();
+        assert_eq!(node.internal_base(), "http://public.test:8080");
+        node.internal_url = Some("http://private.test:9080/".into());
+        let config = ClusterConfig {
+            cluster_id: Uuid::nil(),
+            node_id: node.id,
+            nodes: vec![node],
+            generation: 1,
+            hash_version: 1,
+        };
+        assert_eq!(
+            config.node_addr(Uuid::nil()).as_deref(),
+            Some("http://public.test:8080/")
+        );
+        assert_eq!(
+            config.node_internal_addr(Uuid::nil()).as_deref(),
+            Some("http://private.test:9080")
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,7 +131,7 @@ impl ClusterConfig {
         self.nodes
             .iter()
             .filter(|n| n.id != self.node_id)
-            .map(|n| n.addr.clone())
+            .map(|n| n.internal_base().to_owned())
             .collect()
     }
 
@@ -110,6 +152,13 @@ impl ClusterConfig {
             .iter()
             .find(|n| n.id == id)
             .map(|n| n.addr.clone())
+    }
+
+    pub fn node_internal_addr(&self, id: Uuid) -> Option<String> {
+        self.nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.internal_base().to_owned())
     }
 }
 
@@ -492,7 +541,7 @@ impl ClusterRuntime {
 
     pub fn leader_http_base_for_shard(&self, shard: u32) -> Option<String> {
         let leader = self.elect_leader_for_shard(shard)?;
-        self.config.node_addr(leader)
+        self.config.node_internal_addr(leader)
     }
 
     /// Shards this node currently leads (for logging / tests).
@@ -1026,10 +1075,12 @@ mod tests {
             cluster_id: Uuid::new_v4(),
             nodes: vec![
                 NodeConfig {
+                    internal_url: None,
                     id: n1,
                     addr: "http://n1:8080".into(),
                 },
                 NodeConfig {
+                    internal_url: None,
                     id: n2,
                     addr: "http://n2:8080".into(),
                 },
@@ -1054,14 +1105,17 @@ mod tests {
         let n3 = Uuid::new_v4();
         let nodes = vec![
             NodeConfig {
+                internal_url: None,
                 id: n1,
                 addr: "http://n1:8080".into(),
             },
             NodeConfig {
+                internal_url: None,
                 id: n2,
                 addr: "http://n2:8080".into(),
             },
             NodeConfig {
+                internal_url: None,
                 id: n3,
                 addr: "http://n3:8080".into(),
             },
@@ -1095,10 +1149,12 @@ mod tests {
             cluster_id: Uuid::new_v4(),
             nodes: vec![
                 NodeConfig {
+                    internal_url: None,
                     id: n1,
                     addr: "http://n1:8080".into(),
                 },
                 NodeConfig {
+                    internal_url: None,
                     id: n2,
                     addr: "http://n2:8080".into(),
                 },
@@ -1135,6 +1191,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, id)| NodeConfig {
+                internal_url: None,
                 id: *id,
                 addr: format!("http://n{index}:8080"),
             })
@@ -1178,14 +1235,17 @@ mod tests {
         let (first, second, voter) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let nodes = vec![
             NodeConfig {
+                internal_url: None,
                 id: first,
                 addr: "http://n0".into(),
             },
             NodeConfig {
+                internal_url: None,
                 id: second,
                 addr: "http://n1".into(),
             },
             NodeConfig {
+                internal_url: None,
                 id: voter,
                 addr: "http://n2".into(),
             },

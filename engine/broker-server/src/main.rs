@@ -438,6 +438,9 @@ fn serve_overrides(args: &ServeArgs) -> ServeOverrides {
 }
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    if let Some(url) = &args.internal_url {
+        std::env::set_var("BETTERMQ_INTERNAL_URL", url);
+    }
     let overrides = serve_overrides(&args);
     let data_dir = overrides
         .data_dir

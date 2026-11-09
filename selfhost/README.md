@@ -1,5 +1,22 @@
 # BetterMQ self-host
 
+HA Compose isolates `/internal/v1/*` on Docker-network port **9080**, which is
+never published. Fleet workers use that private endpoint; host ports 8081–8083
+are for public API/panel access only. Generate the shared cluster secret with
+`openssl rand -hex 32`; never use example passwords in production. Keep peer
+traffic on a trusted private network (or encrypted VPN across hosts), and do
+not publish internal ports through a load balancer or reverse proxy.
+
+Each node has two advertised addresses: `publicUrl` remains the API/enrollment
+URL, while optional `internalUrl` selects the private peer transport. Set local
+`--internal-url` / `BETTERMQ_INTERNAL_URL` (Compose advertises
+`http://brokerN:9080`), or `node.internalUrl` and `cluster.nodes[].internalUrl`
+in managed JSON. Enrollment and membership propagation carry both URLs. Raft,
+replication/catch-up, peer health, catalog/auth sync and internal forwarding use
+`internalUrl`; old configurations without it fall back to the public URL.
+For fleet/gateway-only processes, explicitly configure `BETTERMQ_BROKER_URLS`
+with the internal endpoints. Reachable public enrollment URLs are still required.
+
 Free self-hosted BetterMQ. **No config files required** — install the CLI or run Docker, then use the panel.
 
 Shared engine code lives in [`../engine/`](../engine/). This folder is the self-host product (Docker + docs only).

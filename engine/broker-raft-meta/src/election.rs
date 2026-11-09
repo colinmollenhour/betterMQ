@@ -40,6 +40,7 @@ mod tests {
         ids.iter()
             .enumerate()
             .map(|(i, id)| NodeConfig {
+                internal_url: None,
                 id: *id,
                 addr: format!("http://n{i}:8080"),
             })

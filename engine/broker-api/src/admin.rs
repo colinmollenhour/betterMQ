@@ -1384,6 +1384,14 @@ async fn expand_replication(
     } else {
         Some(validate_attach_url(advertise_url)?)
     };
+    // Enrollment URLs stay public; controller/data-node transport is private.
+    let addr = broker_config::load_managed_config(&local.broker.config().data_dir)
+        .ok()
+        .flatten()
+        .and_then(|cfg| cfg.cluster)
+        .and_then(|cluster| cluster.nodes.into_iter().find(|n| n.name == node_name))
+        .map(|node| node.internal_base().to_owned())
+        .or(addr);
     if !node_name.is_empty() {
         if let Some(addr) = addr.clone() {
             let id = stable_node_id(node_name);

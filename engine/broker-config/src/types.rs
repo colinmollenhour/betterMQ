@@ -58,6 +58,8 @@ pub struct NodeSection {
     #[serde(default = "default_listen")]
     pub listen: String,
     pub public_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_url: Option<String>,
 }
 
 fn default_listen() -> String {
@@ -257,6 +259,18 @@ fn default_true() -> bool {
 pub struct ClusterNode {
     pub name: String,
     pub public_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_url: Option<String>,
+}
+
+impl ClusterNode {
+    pub fn internal_base(&self) -> &str {
+        self.internal_url
+            .as_deref()
+            .unwrap_or(&self.public_url)
+            .trim()
+            .trim_end_matches('/')
+    }
 }
 
 impl BetterMqConfig {
@@ -274,6 +288,16 @@ impl BetterMqConfig {
         }
         if self.node.public_url.trim().is_empty() {
             return Err(ConfigError::Invalid("node.public_url is required".into()));
+        }
+        if self
+            .node
+            .internal_url
+            .as_ref()
+            .is_some_and(|url| url.trim().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "node.internal_url must not be empty".into(),
+            ));
         }
         parse_listen(&self.node.listen)?;
         crate::components::resolve_component_set(self, None, &[], false, false, false, false)?;
@@ -357,6 +381,15 @@ impl BetterMqConfig {
                     if n.public_url.trim().is_empty() {
                         return Err(ConfigError::Invalid(format!(
                             "cluster node {} needs public_url",
+                            n.name
+                        )));
+                    }
+                    if n.internal_url
+                        .as_ref()
+                        .is_some_and(|url| url.trim().is_empty())
+                    {
+                        return Err(ConfigError::Invalid(format!(
+                            "cluster node {} needs a nonempty internal_url",
                             n.name
                         )));
                     }
@@ -453,6 +486,7 @@ impl BetterMqConfig {
         Self {
             version: CONFIG_VERSION,
             node: NodeSection {
+                internal_url: None,
                 name: "default".into(),
                 listen: default_listen(),
                 public_url: "http://localhost:8080".into(),
@@ -474,6 +508,7 @@ impl BetterMqConfig {
         Self {
             version: CONFIG_VERSION,
             node: NodeSection {
+                internal_url: None,
                 name: "default".into(),
                 listen: default_listen(),
                 public_url: "http://localhost:8080".into(),
@@ -504,6 +539,7 @@ impl BetterMqConfig {
         Self {
             version: CONFIG_VERSION,
             node: NodeSection {
+                internal_url: None,
                 name: "broker1".into(),
                 listen: default_listen(),
                 public_url: "http://broker1:8080".into(),
@@ -519,14 +555,17 @@ impl BetterMqConfig {
                 id: Some("selfhost-cluster".into()),
                 nodes: vec![
                     ClusterNode {
+                        internal_url: None,
                         name: "broker1".into(),
                         public_url: "http://broker1:8080".into(),
                     },
                     ClusterNode {
+                        internal_url: None,
                         name: "broker2".into(),
                         public_url: "http://broker2:8080".into(),
                     },
                     ClusterNode {
+                        internal_url: None,
                         name: "broker3".into(),
                         public_url: "http://broker3:8080".into(),
                     },
@@ -549,6 +588,7 @@ impl BetterMqConfig {
         Self {
             version: CONFIG_VERSION,
             node: NodeSection {
+                internal_url: None,
                 name: "broker1".into(),
                 listen: default_listen(),
                 public_url: "http://broker:8080".into(),
@@ -617,6 +657,7 @@ mod tests {
             enabled: true,
             id: Some("seed".into()),
             nodes: vec![ClusterNode {
+                internal_url: cfg.node.internal_url.clone(),
                 name: cfg.node.name.clone(),
                 public_url: cfg.node.public_url.clone(),
             }],

@@ -25,10 +25,12 @@ fn two_node_cluster(
         cluster_id: Uuid::new_v4(),
         nodes: vec![
             NodeConfig {
+                internal_url: None,
                 id: n1,
                 addr: "http://n1:8080".into(),
             },
             NodeConfig {
+                internal_url: None,
                 id: n2,
                 addr: "http://n2:8080".into(),
             },
@@ -195,14 +197,17 @@ fn replication_config(local: Uuid, peers: [(Uuid, String); 2]) -> ClusterConfig 
         cluster_id: Uuid::new_v4(),
         nodes: vec![
             NodeConfig {
+                internal_url: None,
                 id: local,
                 addr: "http://local.invalid".into(),
             },
             NodeConfig {
+                internal_url: None,
                 id: peers[0].0,
                 addr: peers[0].1.clone(),
             },
             NodeConfig {
+                internal_url: None,
                 id: peers[1].0,
                 addr: peers[1].1.clone(),
             },

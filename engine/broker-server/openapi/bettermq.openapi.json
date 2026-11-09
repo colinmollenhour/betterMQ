@@ -1624,6 +1624,10 @@
           "public_url": {
             "type": "string"
           },
+          "internal_url": {
+            "type": ["string", "null"],
+            "description": "Private peer URL; defaults to public_url when absent."
+          },
           "id": {
             "type": "string",
             "format": "uuid"
@@ -1667,6 +1671,10 @@
           },
           "public_url": {
             "type": "string"
+          },
+          "internal_url": {
+            "type": ["string", "null"],
+            "description": "Advertised private peer URL."
           },
           "node_name": {
             "type": "string"
@@ -1819,6 +1827,10 @@
           },
           "publicUrl": {
             "type": "string"
+          },
+          "internalUrl": {
+            "type": ["string", "null"],
+            "description": "Private peer URL; defaults to publicUrl when absent."
           }
         }
       },
@@ -1844,6 +1856,9 @@
                 },
                 "publicUrl": {
                   "type": "string"
+                },
+                "internalUrl": {
+                  "type": ["string", "null"]
                 }
               }
             }
@@ -1960,6 +1975,9 @@
           },
           "public_url": {
             "type": "string"
+          },
+          "internal_url": {
+            "type": ["string", "null"]
           },
           "listen": {
             "type": "string",
@@ -2108,6 +2126,10 @@
           },
           "public_url": {
             "type": "string"
+          },
+          "internal_url": {
+            "type": ["string", "null"],
+            "description": "Private peer URL advertised during enrollment; uses local configuration when omitted."
           },
           "node_name": {
             "type": "string"

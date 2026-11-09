@@ -9,6 +9,7 @@ fn three_node_runtime(this: usize) -> (ClusterRuntime, Vec<Uuid>) {
         .iter()
         .enumerate()
         .map(|(i, id)| NodeConfig {
+            internal_url: None,
             id: *id,
             addr: format!("http://broker{i}:8080"),
         })
