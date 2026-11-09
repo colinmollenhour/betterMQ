@@ -135,6 +135,11 @@ PITR filters archive timestamps, not individual message timestamps.
    using `restore.sh backup.tgz /var/lib --force` (retain the moved-aside tree);
    never open a data directory written by a newer incompatible format with an
    older binary.
+6. The cluster controller replicates individual commands rather than full
+   state snapshots. Older binaries cannot read these log entries, so the
+   first upgrade to this format cannot be rolled: stop every node, upgrade
+   them all, then start them as described above. A node left on the older
+   binary cannot replicate with the upgraded nodes.
 
 ## Host breaker note
 

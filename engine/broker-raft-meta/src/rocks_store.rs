@@ -45,6 +45,10 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::RwLock;
 
+use crate::controller::{
+    apply_replicated, ControllerCommand, ControllerRejection, ControllerState, STATE_KEY,
+};
+
 pub type RocksNodeId = u64;
 
 openraft::declare_raft_types!(
@@ -59,28 +63,71 @@ openraft::declare_raft_types!(
         AsyncRuntime = TokioRuntime
 );
 
-/**
- * Here you will set the types of request that will interact with the raft nodes.
- * For example the `Set` will be used to write data (key and value) to the raft database.
- * The `AddNode` will append a new node to the current existing shared list of nodes.
- * You will want to add any request that can write data in all nodes here.
- */
+/// Replicated state-machine requests.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum RocksRequest {
+    /// Legacy full-value write. Older controllers replicated the whole
+    /// controller state this way; entries still in the log are applied as-is.
     Set { key: String, value: String },
+    /// Install the initial controller state. A no-op once any controller
+    /// state has been committed, so racing bootstraps cannot overwrite it.
+    ControllerBootstrap { state: Box<ControllerState> },
+    /// One controller command, applied deterministically to the replicated
+    /// controller state by every node's state machine.
+    Controller { command: ControllerCommand },
 }
 
-/**
- * Here you will defined what type of answer you expect from reading the data of a node.
- * In this example it will return a optional value from a given key in
- * the `RocksRequest.Set`.
- *
- * TODO: Should we explain how to create multiple `AppDataResponse`?
- *
- */
+/// Result of applying one entry.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RocksResponse {
     pub value: Option<String>,
+    /// Set when a controller command was rejected by the state machine. The
+    /// entry is still applied (as a no-op) so every replica agrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<ControllerRejection>,
+}
+
+impl RocksResponse {
+    fn empty() -> Self {
+        Self {
+            value: None,
+            rejected: None,
+        }
+    }
+}
+
+/// Controller state staged while one batch of entries is applied, so later
+/// entries in the batch see the effects of earlier ones before the batch is
+/// committed.
+#[derive(Default)]
+struct StagedController {
+    loaded: bool,
+    state: Option<ControllerState>,
+    dirty: bool,
+    staged_json: Option<String>,
+}
+
+impl StagedController {
+    fn state(&mut self, sm: &RocksStateMachine) -> StorageResult<&mut Option<ControllerState>> {
+        if !self.loaded {
+            let json = match self.staged_json.take() {
+                Some(json) => Some(json),
+                None => sm.get(STATE_KEY)?,
+            };
+            self.state = json
+                .map(|json| serde_json::from_str(&json).map_err(sm_r_err))
+                .transpose()?;
+            self.loaded = true;
+        }
+        Ok(&mut self.state)
+    }
+
+    fn overwritten(&mut self, json: String) {
+        *self = Self {
+            staged_json: Some(json),
+            ..Self::default()
+        };
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -583,6 +630,7 @@ impl RaftStorage<TypeConfig> for Arc<RocksStore> {
 
         let sm = self.state_machine.write().await;
         let mut batch = WriteBatch::default();
+        let mut controller = StagedController::default();
 
         for entry in entries {
             tracing::debug!(%entry.log_id, "replicate to sm");
@@ -590,12 +638,48 @@ impl RaftStorage<TypeConfig> for Arc<RocksStore> {
             sm.stage_last_applied_log(&mut batch, &entry.log_id)?;
 
             match entry.payload {
-                EntryPayload::Blank => res.push(RocksResponse { value: None }),
+                EntryPayload::Blank => res.push(RocksResponse::empty()),
                 EntryPayload::Normal(ref req) => match req {
                     RocksRequest::Set { key, value } => {
                         batch.put_cf(sm.cf_sm_data(), key.as_bytes(), value.as_bytes());
+                        if key == STATE_KEY {
+                            controller.overwritten(value.clone());
+                        }
                         res.push(RocksResponse {
                             value: Some(value.clone()),
+                            rejected: None,
+                        })
+                    }
+                    RocksRequest::ControllerBootstrap { state } => {
+                        let current = controller.state(&sm)?;
+                        if current.is_none() {
+                            *current = Some(state.as_ref().clone());
+                            controller.dirty = true;
+                        }
+                        res.push(RocksResponse::empty())
+                    }
+                    RocksRequest::Controller { command } => {
+                        let rejected = match controller.state(&sm)? {
+                            None => Some(ControllerRejection::InvalidCommand(
+                                "controller state is not bootstrapped".into(),
+                            )),
+                            Some(state) => {
+                                match apply_replicated(
+                                    state,
+                                    command.clone(),
+                                    entry.log_id.leader_id.term,
+                                ) {
+                                    Ok(()) => {
+                                        controller.dirty = true;
+                                        None
+                                    }
+                                    Err(error) => Some(ControllerRejection::from(error)),
+                                }
+                            }
+                        };
+                        res.push(RocksResponse {
+                            value: None,
+                            rejected,
                         })
                     }
                 },
@@ -604,9 +688,15 @@ impl RaftStorage<TypeConfig> for Arc<RocksStore> {
                         &mut batch,
                         &StoredMembership::new(Some(entry.log_id), mem.clone()),
                     )?;
-                    res.push(RocksResponse { value: None })
+                    res.push(RocksResponse::empty())
                 }
             };
+        }
+        if controller.dirty {
+            if let Some(state) = &controller.state {
+                let value = serde_json::to_string(state).map_err(sm_w_err)?;
+                batch.put_cf(sm.cf_sm_data(), STATE_KEY.as_bytes(), value.as_bytes());
+            }
         }
         #[cfg(test)]
         if self

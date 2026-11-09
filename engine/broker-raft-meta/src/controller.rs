@@ -1,8 +1,9 @@
 //! OpenRaft-backed durable cluster controller.
 //!
-//! OpenRaft owns terms, votes, membership, replication, and snapshots. The
-//! application controller state is encoded as one versioned value in the
-//! official RocksDB state machine so every mutation is committed by Raft.
+//! OpenRaft owns terms, votes, membership, replication, and snapshots. Each
+//! controller mutation is replicated as a `ControllerCommand` log entry and
+//! applied deterministically by every node's state machine, so a command
+//! always builds on the latest committed state.
 
 use crate::cluster::{ClusterConfig, SchedulerLease};
 use crate::durable_store::DurableRocksStore;
@@ -35,7 +36,7 @@ pub type ControllerVoteResponse = openraft::raft::VoteResponse<NodeId>;
 pub type ControllerSnapshotRequest = openraft::raft::InstallSnapshotRequest<TypeConfig>;
 pub type ControllerSnapshotResponse = openraft::raft::InstallSnapshotResponse<NodeId>;
 
-const STATE_KEY: &str = "bettermq/controller-state/v1";
+pub(crate) const STATE_KEY: &str = "bettermq/controller-state/v1";
 const QUORUM_ACK_MAX_AGE_MS: u64 = 2_000;
 
 #[derive(Debug, Error)]
@@ -58,6 +59,32 @@ pub enum ControllerError {
     UnknownNode(Uuid),
     #[error("invalid controller command: {0}")]
     InvalidCommand(String),
+}
+
+/// Why the replicated state machine rejected a controller command.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ControllerRejection {
+    UnknownNode(Uuid),
+    InvalidCommand(String),
+}
+
+impl From<ControllerError> for ControllerRejection {
+    fn from(error: ControllerError) -> Self {
+        match error {
+            ControllerError::UnknownNode(id) => Self::UnknownNode(id),
+            ControllerError::InvalidCommand(message) => Self::InvalidCommand(message),
+            other => Self::InvalidCommand(other.to_string()),
+        }
+    }
+}
+
+impl From<ControllerRejection> for ControllerError {
+    fn from(rejection: ControllerRejection) -> Self {
+        match rejection {
+            ControllerRejection::UnknownNode(id) => Self::UnknownNode(id),
+            ControllerRejection::InvalidCommand(message) => Self::InvalidCommand(message),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -470,21 +497,7 @@ impl OpenRaftController {
                     *controller.state.write() = state;
                     controller.state_committed.store(true, Ordering::Release);
                 } else if controller.is_leader_with_quorum() {
-                    let _guard = controller.command_lock.lock().await;
-                    let result = async {
-                        controller
-                            .raft
-                            .ensure_linearizable()
-                            .await
-                            .map_err(|error| ControllerError::Raft(error.to_string()))?;
-                        if controller.read_store_state().await?.is_none() {
-                            let bootstrap = controller.state.read().clone();
-                            controller.write_state_local(bootstrap).await?;
-                        }
-                        Ok::<_, ControllerError>(())
-                    }
-                    .await;
-                    if let Err(error) = result {
+                    if let Err(error) = controller.bootstrap_local().await {
                         tracing::warn!(%error, "failed to commit migrated controller state");
                     }
                 }
@@ -510,19 +523,23 @@ impl OpenRaftController {
             .transpose()
     }
 
-    async fn write_state_local(
-        &self,
-        state: ControllerState,
-    ) -> Result<ControllerState, ControllerError> {
-        let value = serde_json::to_string(&state)
-            .map_err(|error| ControllerError::Storage(error.to_string()))?;
+    /// Commit the migrated V1 state as the initial controller state. The state
+    /// machine ignores this once any controller state exists.
+    async fn bootstrap_local(&self) -> Result<(), ControllerError> {
+        let bootstrap = self.state.read().clone();
         self.raft
-            .client_write(RocksRequest::Set {
-                key: STATE_KEY.to_string(),
-                value,
+            .client_write(RocksRequest::ControllerBootstrap {
+                state: Box::new(bootstrap),
             })
             .await
             .map_err(|error| ControllerError::Raft(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn committed_state(&self) -> Result<ControllerState, ControllerError> {
+        let state = self.read_store_state().await?.ok_or_else(|| {
+            ControllerError::Storage("controller state is not bootstrapped".into())
+        })?;
         *self.state.write() = state.clone();
         self.state_committed.store(true, Ordering::Release);
         Ok(state)
@@ -594,11 +611,6 @@ impl OpenRaftController {
         mut command: ControllerCommand,
     ) -> Result<ControllerState, ControllerError> {
         let _guard = self.command_lock.lock().await;
-        // The barrier must precede the read, under the same command lock.
-        self.raft
-            .ensure_linearizable()
-            .await
-            .map_err(|error| ControllerError::Raft(error.to_string()))?;
         let now = chrono::Utc::now().timestamp_millis();
         let term = self.term();
         match &mut command {
@@ -631,12 +643,33 @@ impl OpenRaftController {
             } => *controller_term = term,
             _ => {}
         }
-        let mut state = self
-            .read_store_state()
-            .await?
-            .unwrap_or_else(|| self.state.read().clone());
-        apply_command(&mut state, command)?;
-        self.write_state_local(state).await
+        // Barrier under the command lock, before the read: once it returns, this
+        // leader has applied every entry committed before the call, so the
+        // pre-check below sees current state.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|error| ControllerError::Raft(error.to_string()))?;
+        let mut probe = match self.read_store_state().await? {
+            Some(state) => state,
+            None => {
+                self.bootstrap_local().await?;
+                self.committed_state().await?
+            }
+        };
+        // Rejected commands are not written to the log. The command lock keeps
+        // other local commands from landing between this check and the write;
+        // the state machine still re-validates against the committed state.
+        apply_replicated(&mut probe, command.clone(), term)?;
+        let response = self
+            .raft
+            .client_write(RocksRequest::Controller { command })
+            .await
+            .map_err(|error| ControllerError::Raft(error.to_string()))?;
+        if let Some(rejected) = response.data.rejected {
+            return Err(rejected.into());
+        }
+        self.committed_state().await
     }
 
     async fn reconcile_membership(&self) -> Result<(), ControllerError> {
@@ -833,6 +866,33 @@ impl OpenRaftController {
     }
 }
 
+/// Apply a command from a log entry proposed in `log_term`. Term fences use
+/// the entry's own Raft term rather than whatever the proposer wrote, so every
+/// replica reaches the same result. On error the state is left unchanged.
+pub(crate) fn apply_replicated(
+    state: &mut ControllerState,
+    mut command: ControllerCommand,
+    log_term: u64,
+) -> Result<(), ControllerError> {
+    match &mut command {
+        ControllerCommand::AcceptFanout {
+            controller_term, ..
+        }
+        | ControllerCommand::ClaimFanout {
+            controller_term, ..
+        }
+        | ControllerCommand::UpdateFanout {
+            controller_term, ..
+        }
+        | ControllerCommand::GarbageCollectFanout {
+            controller_term, ..
+        } => *controller_term = log_term,
+        _ => {}
+    }
+    apply_command(state, command)
+}
+
+/// Validates fully before mutating, so an `Err` leaves `state` untouched.
 fn apply_command(
     state: &mut ControllerState,
     command: ControllerCommand,
@@ -1240,6 +1300,213 @@ pub fn raft_id(id: Uuid) -> NodeId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod replicated {
+        use super::*;
+        use crate::rocks_store::RocksResponse;
+        use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, RaftStorage};
+
+        fn config(count: usize) -> (ClusterConfig, Vec<Uuid>) {
+            let ids: Vec<_> = (0..count).map(|_| Uuid::new_v4()).collect();
+            let config = ClusterConfig {
+                cluster_id: Uuid::new_v4(),
+                nodes: ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| crate::cluster::NodeConfig {
+                        id: *id,
+                        addr: format!("http://n{index}"),
+                        internal_url: None,
+                    })
+                    .collect(),
+                node_id: ids[0],
+                generation: 1,
+                hash_version: 1,
+            };
+            (config, ids)
+        }
+
+        fn entry(term: u64, index: u64, request: RocksRequest) -> Entry<TypeConfig> {
+            Entry {
+                log_id: LogId::new(CommittedLeaderId::new(term, 1), index),
+                payload: EntryPayload::Normal(request),
+            }
+        }
+
+        fn command(term: u64, index: u64, command: ControllerCommand) -> Entry<TypeConfig> {
+            entry(term, index, RocksRequest::Controller { command })
+        }
+
+        async fn apply(
+            store: &mut Arc<RocksStore>,
+            entries: &[Entry<TypeConfig>],
+        ) -> Vec<RocksResponse> {
+            store.apply_to_state_machine(entries).await.unwrap()
+        }
+
+        async fn stored(store: &Arc<RocksStore>) -> ControllerState {
+            let json = store
+                .state_machine
+                .read()
+                .await
+                .get(STATE_KEY)
+                .unwrap()
+                .unwrap();
+            serde_json::from_str(&json).unwrap()
+        }
+
+        #[tokio::test]
+        async fn commands_from_successive_terms_build_on_committed_state() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = RocksStore::new(dir.path()).await;
+            let (config, ids) = config(3);
+            let bootstrap = ControllerState::from_v1(&config, 2, &HashMap::new(), None).unwrap();
+            apply(
+                &mut store,
+                &[entry(
+                    1,
+                    1,
+                    RocksRequest::ControllerBootstrap {
+                        state: Box::new(bootstrap.clone()),
+                    },
+                )],
+            )
+            .await;
+            // The old leader's last command and the new leader's first command
+            // were both proposed against the same view; both must survive.
+            apply(
+                &mut store,
+                &[command(
+                    1,
+                    2,
+                    ControllerCommand::AcquireShardLeadership {
+                        shard: 0,
+                        leader_id: ids[1],
+                    },
+                )],
+            )
+            .await;
+            apply(
+                &mut store,
+                &[
+                    command(
+                        2,
+                        3,
+                        ControllerCommand::PutCatalogRecord {
+                            kind: "queue".into(),
+                            key: "orders".into(),
+                            payload_json: "{}".into(),
+                            tombstone: false,
+                        },
+                    ),
+                    command(
+                        2,
+                        4,
+                        ControllerCommand::AcquireShardLeadership {
+                            shard: 0,
+                            leader_id: ids[2],
+                        },
+                    ),
+                ],
+            )
+            .await;
+            let state = stored(&store).await;
+            assert_eq!(state.shards[&0].leader_id, ids[2]);
+            assert_eq!(
+                state.shards[&0].leader_term, 2,
+                "shard terms are never reused"
+            );
+            assert!(state.catalog_records.contains_key("queue:orders"));
+
+            // A second bootstrap (another node's migrated V1 view) is ignored.
+            apply(
+                &mut store,
+                &[entry(
+                    2,
+                    5,
+                    RocksRequest::ControllerBootstrap {
+                        state: Box::new(bootstrap),
+                    },
+                )],
+            )
+            .await;
+            assert_eq!(stored(&store).await.shards[&0].leader_term, 2);
+        }
+
+        #[tokio::test]
+        async fn rejected_command_is_a_replicated_no_op() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = RocksStore::new(dir.path()).await;
+            let (config, _) = config(1);
+            let bootstrap = ControllerState::from_v1(&config, 1, &HashMap::new(), None).unwrap();
+            let stranger = Uuid::new_v4();
+            let responses = apply(
+                &mut store,
+                &[
+                    entry(
+                        1,
+                        1,
+                        RocksRequest::ControllerBootstrap {
+                            state: Box::new(bootstrap.clone()),
+                        },
+                    ),
+                    command(
+                        1,
+                        2,
+                        ControllerCommand::AcquireShardLeadership {
+                            shard: 0,
+                            leader_id: stranger,
+                        },
+                    ),
+                ],
+            )
+            .await;
+            assert_eq!(
+                responses[1].rejected,
+                Some(ControllerRejection::UnknownNode(stranger))
+            );
+            assert_eq!(stored(&store).await, bootstrap);
+            let (applied, _) = store.last_applied_state().await.unwrap();
+            assert_eq!(applied.map(|id| id.index), Some(2));
+        }
+
+        #[tokio::test]
+        async fn fanout_authority_term_comes_from_the_log_entry() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = RocksStore::new(dir.path()).await;
+            let (config, _) = config(1);
+            let bootstrap = ControllerState::from_v1(&config, 1, &HashMap::new(), None).unwrap();
+            let id = Uuid::new_v4();
+            apply(
+                &mut store,
+                &[
+                    // A legacy full-state write followed by a command in the same batch.
+                    entry(
+                        6,
+                        1,
+                        RocksRequest::Set {
+                            key: STATE_KEY.into(),
+                            value: serde_json::to_string(&bootstrap).unwrap(),
+                        },
+                    ),
+                    command(
+                        7,
+                        2,
+                        ControllerCommand::AcceptFanout {
+                            id,
+                            tenant_id: "tenant".into(),
+                            acceptance_hash: "hash".into(),
+                            payload_json: "{}".into(),
+                            created_at_ms: 1,
+                            controller_term: 0,
+                        },
+                    ),
+                ],
+            )
+            .await;
+            assert_eq!(stored(&store).await.fanout_outbox[&id].authority_term, 7);
+        }
+    }
 
     #[test]
     fn controller_commands_update_versioned_state() {

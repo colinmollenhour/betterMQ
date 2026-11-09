@@ -18,7 +18,7 @@ pub use cluster::{ClusterConfig, ClusterError, ClusterRuntime, NodeConfig, Sched
 pub use controller::{
     raft_id, ControllerAppendRequest, ControllerAppendResponse, ControllerCommand,
     ControllerCommandResponse, ControllerError, ControllerNode, ControllerRaft,
-    ControllerSnapshotRequest, ControllerSnapshotResponse, ControllerState,
+    ControllerRejection, ControllerSnapshotRequest, ControllerSnapshotResponse, ControllerState,
     ControllerVoteRequest as RaftVoteRequest, ControllerVoteResponse as RaftVoteResponse,
     DrainReport, FanoutOutboxEntry, GcWatermarkProposal, OpenRaftController, ShardPlacement,
     TypeConfig,
