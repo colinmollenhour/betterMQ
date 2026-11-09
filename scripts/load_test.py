@@ -8,6 +8,9 @@ Modes:
 
 Usage:
   python3 scripts/load_test.py --base http://127.0.0.1:18080 --token TOKEN --sink-url http://127.0.0.1:19090 --n 100000
+
+Exit status is nonzero for incomplete acceptance/delivery, sink errors, or
+ordering inversions with --ordered. The summary includes failures after drain.
 """
 
 from __future__ import annotations
@@ -149,7 +152,7 @@ def wait_delivered(sink_url: str, want: int, timeout_s: float, broker_pid: int |
     body = {}
     while time.time() - t0 < timeout_s:
         st, body = http_json("GET", f"{sink_url}/stats", None)
-        got = int(body.get("unique") or body.get("count") or 0)
+        got = int(body.get("unique", body.get("count", 0)) or 0)
         total = int(body.get("count") or 0)
         inv = int(body.get("inversions") or 0)
         rss = rss_mb(broker_pid) if broker_pid else None
@@ -265,7 +268,17 @@ def run_mode(args, mode: str, n: int, queue_id: str | None):
     timeout = args.drain_timeout if args.drain_timeout is not None else max(180.0, n / 8.0)
     stats, drain_s = wait_delivered(sink, n, timeout, args.broker_pid)
     inv = int(stats.get("inversions") or 0)
-    unique = int(stats.get("unique") or stats.get("count") or 0)
+    unique = int(stats.get("unique", stats.get("count", 0)) or 0)
+    sink_errors = int(stats.get("errors") or 0)
+    failures = []
+    if accepted != n:
+        failures.append(f"accepted {accepted}/{n}")
+    if unique != n:
+        failures.append(f"delivered {unique}/{n} unique messages (drain stalled or timed out)")
+    if sink_errors:
+        failures.append(f"sink errors: {sink_errors}")
+    if args.ordered and inv:
+        failures.append(f"ordering inversions: {inv}")
     print(
         f"  drain done: unique={unique} http={stats.get('count')} in {drain_s:.1f}s inversions={inv}",
         flush=True,
@@ -281,6 +294,9 @@ def run_mode(args, mode: str, n: int, queue_id: str | None):
         "delivered": stats.get("count"),
         "unique": unique,
         "inversions": inv,
+        "sink_errors": sink_errors,
+        "passed": not failures,
+        "failures": failures,
         "rss_mb": rss_mb(args.broker_pid) if args.broker_pid else None,
     }
 
@@ -350,7 +366,8 @@ def main():
 
     print("\n=== SUMMARY ===")
     print(json.dumps(results, indent=2))
+    return 0 if results and all(result["passed"] for result in results) else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

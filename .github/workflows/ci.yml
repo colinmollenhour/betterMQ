@@ -122,6 +122,7 @@ jobs:
           python3 tests/test_compose.py
           python3 tests/test_internal_compose.py
           python3 tests/test_installers.py
+          python3 ../scripts/test_load_test.py
           bash tests/test_backup_restore.sh
 
   release-gates:
