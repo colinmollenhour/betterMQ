@@ -19,6 +19,12 @@ def config(name):
 
 
 class ComposeTests(unittest.TestCase):
+    def test_default_broker_images_use_this_fork(self):
+        for path in SELFHOST.glob("docker-compose*.yml"):
+            for service in config(path.name)["services"].values():
+                if service.get("build"):
+                    self.assertTrue(service["image"].startswith("ghcr.io/colinmollenhour/bettermq:"))
+
     def test_fleet_bootstrap_gates_on_liveness(self):
         for name in ("docker-compose.ha-fleet.yml", "docker-compose.ha-slate-fleet.yml"):
             services = config(name)["services"]

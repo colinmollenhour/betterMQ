@@ -1,9 +1,9 @@
 # betterMQ installer for Windows (PowerShell).
 #
-#   powershell -ExecutionPolicy Bypass -c "irm https://bettermq.com/install.ps1 | iex"
+#   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/colinmollenhour/betterMQ/main/install.ps1 | iex"
 #
 # macOS / Linux / WSL / Git Bash:
-#   curl -fsSL https://bettermq.com/install | bash
+#   curl -fsSL https://raw.githubusercontent.com/colinmollenhour/betterMQ/main/install.sh | bash
 #
 # Downloads the latest bettermq-windows-amd64 binary from GitHub Releases,
 # verifies sha256 (when checksums.txt is published for the release), installs
@@ -16,7 +16,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$Repo = "betterMQ/betterMQ"
+$Repo = if ($env:BETTERMQ_REPO) { $env:BETTERMQ_REPO } else { "colinmollenhour/betterMQ" }
 $Asset = "bettermq-windows-amd64.exe"
 $InstallDir = if ($env:BETTERMQ_INSTALL_DIR) { $env:BETTERMQ_INSTALL_DIR } else { Join-Path $env:USERPROFILE ".bettermq" }
 $BinDir = Join-Path $InstallDir "bin"

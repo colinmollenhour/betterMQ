@@ -9,7 +9,7 @@
 # Fleet: no public ports; claims via BETTERMQ_BROKER_URLS
 
 x-broker: &broker
-  image: ghcr.io/bettermq/bettermq:latest
+  image: ${BETTERMQ_IMAGE:-ghcr.io/colinmollenhour/bettermq}:${BETTERMQ_TAG:-latest}
   build:
     context: ..
     dockerfile: selfhost/Dockerfile
@@ -91,7 +91,7 @@ services:
       ]
 
   fleet:
-    image: ghcr.io/bettermq/bettermq:latest
+    image: ${BETTERMQ_IMAGE:-ghcr.io/colinmollenhour/bettermq}:${BETTERMQ_TAG:-latest}
     build:
       context: ..
       dockerfile: selfhost/Dockerfile

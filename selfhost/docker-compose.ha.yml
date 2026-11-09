@@ -13,7 +13,7 @@
 # /cluster-shared/meta on every node.
 
 x-broker: &broker
-  image: ghcr.io/bettermq/bettermq:latest
+  image: ${BETTERMQ_IMAGE:-ghcr.io/colinmollenhour/bettermq}:${BETTERMQ_TAG:-latest}
   build:
     context: ..
     dockerfile: selfhost/Dockerfile

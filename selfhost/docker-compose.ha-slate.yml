@@ -10,7 +10,7 @@
 # bettermq-payloads) and create/join cluster from the panel.
 
 x-broker: &broker
-  image: ghcr.io/bettermq/bettermq:latest
+  image: ${BETTERMQ_IMAGE:-ghcr.io/colinmollenhour/bettermq}:${BETTERMQ_TAG:-latest}
   build:
     context: ..
     dockerfile: selfhost/Dockerfile

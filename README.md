@@ -4,20 +4,20 @@
 
 <img width="1200" height="630" alt="betterMQ — self-hosted HTTP message broker" src="./docs/assets/gh-banner.png" />
 
-[betterMQ.com](https://betterMQ.com) · [Install](https://betterMQ.com/install) · Open `/docs` on a running broker for the live API
+[betterMQ.com](https://betterMQ.com) · [Install this fork](./install.sh) · Open `/docs` on a running broker for the live API
 
 ---
 
 Enqueue over HTTP. Store durably. Deliver with signed callbacks. Same binary for a laptop, a 3-node cell, or a regional Cloud fleet.
 
 ```bash
-curl -fsSL https://betterMQ.com/install | bash
+curl -fsSL https://raw.githubusercontent.com/colinmollenhour/betterMQ/main/install.sh | bash
 bettermq serve
 ```
 
 Listens on **port 8080**. Panel: [http://localhost:8080/panel/](http://localhost:8080/panel/)
 
-Windows: `powershell -ExecutionPolicy Bypass -c "irm https://betterMQ.com/install.ps1 | iex"`
+Windows: `powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/colinmollenhour/betterMQ/main/install.ps1 | iex"`
 
 ---
 
@@ -42,13 +42,13 @@ Delivery is **at-least-once**. Handlers should be idempotent.
 
 ```bash
 docker run -d --name bettermq -p 8080:8080 -v bettermq-data:/data \
-  ghcr.io/bettermq/bettermq:latest serve --data-dir /data
+  ghcr.io/colinmollenhour/bettermq:latest serve --data-dir /data
 ```
 
 **Compose**
 
 ```bash
-git clone https://github.com/betterMQ/betterMQ.git
+git clone https://github.com/colinmollenhour/betterMQ.git
 cd betterMQ/selfhost && docker compose up -d
 ```
 

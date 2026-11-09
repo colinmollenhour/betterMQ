@@ -50,11 +50,16 @@ audit to pass and rejects any difference between generated and committed assets.
 ## Install CLI (recommended)
 
 Downloads the latest release binary from GitHub — no Rust toolchain or Docker required.
+Defaults target `colinmollenhour/betterMQ` releases and
+`ghcr.io/colinmollenhour/bettermq`, not upstream. Override `BETTERMQ_REPO` for
+installers or `BETTERMQ_IMAGE` (repository without tag) / `BETTERMQ_TAG` for
+Compose when mirroring artifacts. A missing fork release is an error, not a
+fallback to upstream. Source builds use the checkout's code with `--build`.
 
 ### macOS, Linux, WSL, Git Bash (Windows)
 
 ```bash
-curl -fsSL https://bettermq.com/install | bash
+curl -fsSL https://raw.githubusercontent.com/colinmollenhour/betterMQ/main/install.sh | bash
 ```
 
 Installs to `~/.bettermq/bin` and links `bettermq` into `~/.local/bin` (add that directory to your `PATH` if prompted).
@@ -74,7 +79,7 @@ The installer can offer to run `bettermq serve` immediately when run in an inter
 Stock Windows does not ship with `bash`. Use the PowerShell installer instead:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://bettermq.com/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/colinmollenhour/betterMQ/main/install.ps1 | iex"
 ```
 
 Then open a **new** terminal and run:
@@ -438,16 +443,16 @@ Panel: `https://<your-railway-domain>/panel/`
 Published image (recommended — no Rust build):
 
 ```bash
-docker pull ghcr.io/bettermq/bettermq:latest
+docker pull ghcr.io/colinmollenhour/bettermq:latest
 docker run -d --name bettermq -p 8080:8080 -v bettermq-data:/data \
-  ghcr.io/bettermq/bettermq:latest serve --data-dir /data
+  ghcr.io/colinmollenhour/bettermq:latest serve --data-dir /data
 open http://localhost:8080/panel/
 ```
 
 Or Compose (pulls the same image; use `--build` only if you want to compile locally):
 
 ```bash
-git clone https://github.com/betterMQ/betterMQ.git
+git clone https://github.com/colinmollenhour/betterMQ.git
 cd betterMQ/selfhost
 docker compose up -d
 open http://localhost:8080/panel/
@@ -455,8 +460,8 @@ open http://localhost:8080/panel/
 
 | Image | Notes |
 |-------|--------|
-| `ghcr.io/bettermq/bettermq:latest` | Latest release |
-| `ghcr.io/bettermq/bettermq:0.6.0` | Pin a version |
+| `ghcr.io/colinmollenhour/bettermq:latest` | Latest fork release |
+| `ghcr.io/colinmollenhour/bettermq:0.6.2` | Pin a fork release version (must exist) |
 
 1. Set a **panel password** and copy your API token.
 2. **Infrastructure** — storage (local or Slate + S3), optional cluster.
@@ -562,7 +567,7 @@ See [BACKUP.md](BACKUP.md) for backup/restore and host-breaker cold-start notes.
 If you prefer to compile yourself (or no prebuilt binary exists for your platform):
 
 ```bash
-git clone https://github.com/betterMQ/betterMQ.git
+git clone https://github.com/colinmollenhour/betterMQ.git
 cd BetterMQ
 cargo build --release -p broker-server
 ./target/release/bettermq serve
