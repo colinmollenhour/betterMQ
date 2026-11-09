@@ -5,7 +5,7 @@ use broker_storage::StoredMessage;
 use chrono::Utc;
 use serde::Serialize;
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify, Semaphore};
@@ -65,6 +65,7 @@ struct FlowWork {
     msg: Arc<StoredMessage>,
     backfill: bool,
     _pending_permit: tokio::sync::OwnedSemaphorePermit,
+    _ownership: Option<crate::worker::DeliveryOwnership>,
 }
 
 struct OrderedWork {
@@ -171,6 +172,7 @@ struct FlowLane {
     rate: Mutex<RateWindow>,
     paused: Mutex<bool>,
     pinned: Mutex<PinnedLimits>,
+    members: Mutex<HashSet<(String, u32, u64)>>,
     notify: Notify,
 }
 
@@ -223,6 +225,31 @@ impl FlowController {
         limits: ResolvedFlow,
         backfill: bool,
     ) {
+        self.submit_work(engine, lane_owner, msg, limits, backfill, None)
+            .await;
+    }
+
+    pub(crate) async fn submit_owned(
+        &self,
+        engine: DispatchEngine,
+        lane_owner: Uuid,
+        msg: StoredMessage,
+        limits: ResolvedFlow,
+        ownership: Option<crate::worker::DeliveryOwnership>,
+    ) {
+        self.submit_work(engine, lane_owner, msg, limits, false, ownership)
+            .await;
+    }
+
+    async fn submit_work(
+        &self,
+        engine: DispatchEngine,
+        lane_owner: Uuid,
+        msg: StoredMessage,
+        limits: ResolvedFlow,
+        backfill: bool,
+        ownership: Option<crate::worker::DeliveryOwnership>,
+    ) {
         let flow_key = limits.key.clone();
         // Bound aggregate hydrated flow work, not just each individual key's
         // waitlist. Reject before allocating a new lane; durable backfill retries.
@@ -235,11 +262,17 @@ impl FlowController {
             flow_key: flow_key.clone(),
         };
         let lane = self.get_or_create_lane(key, limits).await;
+        let member = (msg.topic.clone(), msg.partition, msg.offset);
+        let mut members = lane.members.lock().await;
+        if members.contains(&member) {
+            return;
+        }
         let work = FlowWork {
             engine,
             msg: Arc::new(msg),
             backfill,
             _pending_permit: pending_permit,
+            _ownership: ownership,
         };
         let mut heap = lane.waitlist.lock().await;
         let cap = std::env::var("BETTERMQ_FLOW_WAITLIST_CAP")
@@ -265,6 +298,7 @@ impl FlowController {
             seq: ENQUEUE_SEQ.fetch_add(1, AtomicOrdering::Relaxed),
             work,
         });
+        members.insert(member);
         lane.notify.notify_one();
     }
 
@@ -458,6 +492,7 @@ impl FlowController {
                 rate: None,
                 period_secs: None,
             }),
+            members: Mutex::new(HashSet::new()),
             notify: Notify::new(),
         });
         if !self.stop.load(AtomicOrdering::Acquire) {
@@ -571,12 +606,18 @@ fn spawn_lane_drainer(
             let lane2 = lane.clone();
             let global_active2 = global_active.clone();
             tokio::spawn(async move {
+                let member = (
+                    ordered.work.msg.topic.clone(),
+                    ordered.work.msg.partition,
+                    ordered.work.msg.offset,
+                );
                 ordered
                     .work
                     .engine
                     .deliver_message(&ordered.work.msg)
                     .await
                     .ok();
+                lane2.members.lock().await.remove(&member);
                 lane2.active.fetch_sub(1, AtomicOrdering::Relaxed);
                 global_active2.fetch_sub(1, AtomicOrdering::Relaxed);
                 lane2.notify.notify_one();

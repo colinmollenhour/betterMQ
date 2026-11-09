@@ -176,6 +176,20 @@ struct LeaseDrop {
     holder: String,
 }
 
+pub(crate) struct DeliveryOwnership {
+    key: (String, u32, u64),
+    jobs: InFlightSet,
+    notify: Arc<Notify>,
+    lease: Option<LeaseDrop>,
+}
+
+impl Drop for DeliveryOwnership {
+    fn drop(&mut self) {
+        self.jobs.lock().remove(&self.key);
+        self.notify.notify_waiters();
+    }
+}
+
 struct ActiveHttpGuard {
     active: Arc<AtomicU64>,
     notify: Arc<Notify>,
@@ -630,9 +644,9 @@ impl DispatchEngine {
                         tokio::spawn(async move {
                             let _permit = permit;
                             let key = (job.topic.clone(), job.partition, job.offset);
-                            let result = engine.deliver_job(job).await;
-                            engine.in_flight_jobs.lock().remove(&key);
-                            engine.drain_notify.notify_waiters();
+                            let ownership = DeliveryOwnership { key,
+                                jobs: engine.in_flight_jobs.clone(), notify: engine.drain_notify.clone(), lease: None };
+                            let result = engine.deliver_job(job, ownership).await;
                             if let Err(e) = result {
                                 warn!(error = %e, "delivery job failed");
                             }
@@ -843,7 +857,11 @@ impl DispatchEngine {
         }
     }
 
-    async fn deliver_job(&self, job: DeliveryJob) -> Result<(), DispatchError> {
+    async fn deliver_job(
+        &self,
+        job: DeliveryJob,
+        mut ownership: DeliveryOwnership,
+    ) -> Result<(), DispatchError> {
         if !self.shard_leader(job.partition) {
             return Ok(());
         }
@@ -913,11 +931,11 @@ impl DispatchEngine {
         } else {
             None
         };
-        let _lease_guard = LeaseDrop {
+        ownership.lease = Some(LeaseDrop {
             leases: self.leases.clone(),
             lease_id,
             holder: self.local_holder.clone(),
-        };
+        });
 
         if msg
             .destination_url
@@ -954,7 +972,13 @@ impl DispatchEngine {
         let limits = broker_partition::ResolvedFlow::for_delivery(&msg.routing_key, &msg);
         let lane_owner = broker_partition::flow_lane_owner(&msg);
         self.flow
-            .submit(self.clone(), lane_owner, msg.clone(), limits, false)
+            .submit_owned(
+                self.clone(),
+                lane_owner,
+                msg.clone(),
+                limits,
+                Some(ownership),
+            )
             .await;
         Ok(())
     }
@@ -1681,6 +1705,54 @@ mod tests {
         direct.destination_url = Some("https://example.net/other".into());
         assert!(engine.blocking_delivery_retry(&direct).is_none());
         engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn backfill_cannot_duplicate_work_waiting_in_a_flow_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "url": "https://example.com/hook", "secret": "secret", "payload": "test",
+            "routing_key": "lane", "flow": { "key": "a", "parallelism": 1, "rate": 1, "period_secs": 3600 }
+        })).unwrap();
+        let response = broker.publish(request).unwrap();
+        broker.flush_wal().unwrap();
+        let msg = broker
+            .read_message(
+                &response.topic,
+                response.partition.unwrap(),
+                response.offset.unwrap(),
+            )
+            .unwrap();
+        let owner = broker_partition::flow_lane_owner(&msg);
+        let engine = DispatchEngine::new(broker, DispatchConfig::default());
+        let limits = broker_partition::ResolvedFlow::for_delivery(&msg.routing_key, &msg);
+        engine.flow.ensure_lane(owner, "a", limits.clone()).await;
+        engine.flow.pause(owner, "a").await;
+        engine.enqueue(DeliveryJob::live(
+            &msg.topic,
+            msg.partition,
+            msg.offset,
+            msg.id,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.flow.get(owner, "a").await.unwrap().wait_list_size != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..5 {
+            engine.backfill_pending();
+            engine
+                .flow
+                .submit(engine.clone(), owner, msg.clone(), limits.clone(), true)
+                .await;
+        }
+        assert_eq!(engine.flow.get(owner, "a").await.unwrap().wait_list_size, 1);
+        assert_eq!(engine.in_flight_jobs.lock().len(), 1);
+        engine.shutdown_background().await;
+        assert!(engine.in_flight_jobs.lock().is_empty());
     }
 
     #[tokio::test]
