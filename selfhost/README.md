@@ -114,6 +114,8 @@ Listener roles sharing an address bind that socket only once. Setting only
 `--admin-listen` (or `--panel-listen`) moves admin routes, docs and the panel off
 the public socket; internal routes remain on public unless `--internal-listen`
 is also set. An explicit `--admin-listen` takes precedence over the panel alias.
+For the public bind address, CLI/env `--listen` or `--port` wins over
+`listeners.public`; `node.listen` remains the compatibility fallback.
 
 Examples:
 

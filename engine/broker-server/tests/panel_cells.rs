@@ -386,3 +386,30 @@ async fn partial_listener_splits_bind_once_and_isolate_roles() {
         }
     }
 }
+
+#[tokio::test]
+async fn configured_public_listener_is_the_actual_bind_address() {
+    let data = tempfile::tempdir().unwrap();
+    let public = free_addr();
+    let unused = free_addr();
+    let mut cfg = broker_config::BetterMqConfig::template_single_local();
+    cfg.node.listen = unused.to_string();
+    cfg.listeners = Some(broker_config::ListenerSection {
+        public: Some(public.to_string()),
+        ..Default::default()
+    });
+    let path = data.path().join("bettermq.json");
+    broker_config::write_config(&path, &cfg).unwrap();
+    let _guard = ChildGuard(spawn_serve(
+        &[
+            "serve",
+            "--config",
+            path.to_str().unwrap(),
+            "--data-dir",
+            data.path().to_str().unwrap(),
+        ],
+        data.path(),
+    ));
+    assert!(wait_health(&reqwest::Client::new(), &format!("http://{public}/healthz")).await);
+    assert!(tokio::net::TcpStream::connect(unused).await.is_err());
+}

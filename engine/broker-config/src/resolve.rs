@@ -133,6 +133,12 @@ fn resolve_serve_with_env(
         .unwrap_or_else(BetterMqConfig::template_single_local);
     apply_runtime_env(&mut base, &env)?;
 
+    let configured_public = base
+        .listeners
+        .as_ref()
+        .and_then(|s| s.public.as_deref())
+        .map(parse_listen)
+        .transpose()?;
     let listen = overrides
         .listen
         .or_else(|| {
@@ -140,6 +146,7 @@ fn resolve_serve_with_env(
                 .port
                 .map(|port| SocketAddr::from(([0, 0, 0, 0], port)))
         })
+        .or(configured_public)
         .or_else(|| parse_listen(&base.node.listen).ok())
         .unwrap_or_else(|| "0.0.0.0:8080".parse().expect("default listen"));
 
@@ -395,6 +402,26 @@ mod tests {
         .unwrap();
         assert_eq!(settings.replication.factor, 3);
         assert_eq!(settings.replication.min_isr, 2);
+    }
+
+    #[test]
+    fn public_listener_overrides_legacy_node_listen_but_not_cli() {
+        let cfg: BetterMqConfig = serde_json::from_value(serde_json::json!({
+            "version": 2, "node": {"name": "test", "listen": "0.0.0.0:8080", "publicUrl": "http://localhost:9000"},
+            "listeners": {"public": "127.0.0.1:9000"}
+        })).unwrap();
+        let resolved = resolve_serve(Some(&cfg), &ServeOverrides::default()).unwrap();
+        assert_eq!(resolved.listen, "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(resolved.listeners.public, resolved.listen);
+        let resolved = resolve_serve(
+            Some(&cfg),
+            &ServeOverrides {
+                port: Some(9100),
+                ..ServeOverrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.listen, "0.0.0.0:9100".parse().unwrap());
     }
 
     #[test]
