@@ -1786,6 +1786,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_capacity_release_wakes_another_lane() {
+        global_capacity_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn lane_paused_while_waiting_for_global_capacity_does_not_start() {
+        global_capacity_case(true).await;
+    }
+
+    async fn global_capacity_case(pause_waiter: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let mut first = publish_test_message(&broker, "https://example.com/one");
+        let mut second = publish_test_message(&broker, "https://example.com/two");
+        first.destination_url = Some("http://169.254.169.254/".into());
+        second.destination_url = first.destination_url.clone();
+        let mut engine = DispatchEngine::new_broker_only(broker, DispatchConfig::default());
+        engine.in_flight = Arc::new(Semaphore::new(0));
+        engine.flow = FlowController::new(Some(1), engine.memory_guard.clone());
+        let first_owner = Uuid::new_v4();
+        let second_owner = Uuid::new_v4();
+        for (owner, key, msg) in [(first_owner, "a", first), (second_owner, "b", second)] {
+            engine
+                .flow
+                .submit(
+                    engine.clone(),
+                    owner,
+                    msg,
+                    broker_partition::ResolvedFlow {
+                        key: key.into(),
+                        parallelism: 1,
+                        rate: 0,
+                        period_secs: 1,
+                    },
+                    false,
+                )
+                .await;
+            if key == "a" {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while engine.flow.global_parallelism().await.parallelism_count != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while engine.flow.global_parallelism().await.parallelism_count != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+        if pause_waiter {
+            engine.flow.pause(second_owner, "b").await;
+        }
+        engine.in_flight.add_permits(1);
+        if pause_waiter {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while engine.telemetry_snapshot().dlq_committed < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(engine.telemetry_snapshot().dlq_committed, 1);
+            assert_eq!(
+                engine
+                    .flow
+                    .get(second_owner, "b")
+                    .await
+                    .unwrap()
+                    .wait_list_size,
+                1
+            );
+            engine.flow.resume(second_owner, "b").await;
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.telemetry_snapshot().dlq_committed < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the other lane must wake without resubmission");
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
     async fn commit_cursor_reconstructs_completed_gap_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();

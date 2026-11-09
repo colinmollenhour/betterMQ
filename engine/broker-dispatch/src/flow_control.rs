@@ -180,6 +180,7 @@ struct FlowLane {
 pub struct FlowController {
     lanes: LaneMap,
     global_max_parallelism: Option<u32>,
+    global_capacity: Option<Arc<Semaphore>>,
     global_active: Arc<AtomicU32>,
     memory_guard: Arc<MemoryGuard>,
     stop: Arc<AtomicBool>,
@@ -192,6 +193,8 @@ impl FlowController {
         Self {
             lanes: Arc::new(Mutex::new(HashMap::new())),
             global_max_parallelism,
+            global_capacity: global_max_parallelism
+                .map(|max| Arc::new(Semaphore::new(max as usize))),
             global_active: Arc::new(AtomicU32::new(0)),
             memory_guard,
             stop: Arc::new(AtomicBool::new(false)),
@@ -499,7 +502,7 @@ impl FlowController {
             spawn_lane_drainer(
                 lane.clone(),
                 (key.clone(), self.lanes.clone()),
-                self.global_max_parallelism,
+                self.global_capacity.clone(),
                 self.global_active.clone(),
                 self.memory_guard.clone(),
                 self.stop.clone(),
@@ -530,7 +533,7 @@ impl FlowController {
 fn spawn_lane_drainer(
     lane: Arc<FlowLane>,
     registry: (FlowKey, LaneMap),
-    global_max: Option<u32>,
+    global_capacity: Option<Arc<Semaphore>>,
     global_active: Arc<AtomicU32>,
     memory_guard: Arc<MemoryGuard>,
     stop: Arc<AtomicBool>,
@@ -568,13 +571,6 @@ fn spawn_lane_drainer(
                 continue;
             }
 
-            if let Some(gmax) = global_max {
-                if global_active.load(AtomicOrdering::Relaxed) >= gmax {
-                    lane.notify.notified().await;
-                    continue;
-                }
-            }
-
             let now_ms = Utc::now().timestamp_millis();
             if !lane.rate.lock().await.try_acquire(now_ms) {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -600,12 +596,39 @@ fn spawn_lane_drainer(
                 continue;
             };
 
+            // Semaphore waiters are global and FIFO; releasing one slot wakes
+            // another lane without requiring a lane-specific submission event.
+            let global_permit = if let Some(capacity) = &global_capacity {
+                match capacity.clone().acquire_owned().await {
+                    Ok(permit) => Some(permit),
+                    Err(_) => break,
+                }
+            } else {
+                None
+            };
+
+            // Operator controls may have changed while global capacity was
+            // unavailable. Requeue reserved work if a lane was paused meanwhile.
+            if *lane.paused.lock().await
+                || memory_guard.is_critical()
+                || stop.load(AtomicOrdering::Acquire)
+            {
+                lane.waitlist.lock().await.push(ordered);
+                continue;
+            }
+            let parallelism = lane.limits.lock().await.parallelism;
+            if lane.active.load(AtomicOrdering::Relaxed) >= parallelism {
+                lane.waitlist.lock().await.push(ordered);
+                continue;
+            }
+
             lane.active.fetch_add(1, AtomicOrdering::Relaxed);
             global_active.fetch_add(1, AtomicOrdering::Relaxed);
 
             let lane2 = lane.clone();
             let global_active2 = global_active.clone();
             tokio::spawn(async move {
+                let _global_permit = global_permit;
                 let member = (
                     ordered.work.msg.topic.clone(),
                     ordered.work.msg.partition,
