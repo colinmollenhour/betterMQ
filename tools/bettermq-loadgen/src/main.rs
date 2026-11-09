@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -196,7 +195,6 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let body = Arc::new("x".repeat(args.body_bytes));
     let results = Arc::new(Results::new()?);
-    let slots = Arc::new(Semaphore::new(args.concurrency));
     let started = Instant::now();
     let mut tasks = JoinSet::new();
     let mut seq = 0u64;
@@ -227,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
         if args.linger_ms > 0 {
             tokio::time::sleep(Duration::from_millis(args.linger_ms)).await;
         }
-        let permit = slots.clone().acquire_owned().await?;
+        reap_for_slot(&mut tasks, args.concurrency).await?;
         let http = http.clone();
         let base = args.url.clone();
         let token = args.token.clone();
@@ -240,7 +238,6 @@ async fn main() -> anyhow::Result<()> {
         let idempotency = args.idempotency;
         let body_bytes = args.body_bytes as u64;
         tasks.spawn(async move {
-            let _permit = permit;
             let service_started = Instant::now();
             let outcome = send_request(
                 &http,
@@ -274,6 +271,19 @@ async fn main() -> anyhow::Result<()> {
     let failed = results.failed_messages.load(Ordering::Relaxed);
     if failed > 0 {
         bail!("{failed} messages failed");
+    }
+    Ok(())
+}
+
+async fn reap_for_slot(tasks: &mut JoinSet<()>, concurrency: usize) -> anyhow::Result<()> {
+    // Bound retained completed tasks as well as in-flight requests.
+    while tasks.len() >= concurrency {
+        if let Some(joined) = tasks.join_next().await {
+            joined.context("load task panicked")?;
+        }
+    }
+    while let Some(joined) = tasks.try_join_next() {
+        joined.context("load task panicked")?;
     }
     Ok(())
 }
@@ -579,6 +589,21 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn task_retention_is_bounded_and_panics_surface() {
+        let mut tasks = JoinSet::new();
+        for _ in 0..10_000 {
+            reap_for_slot(&mut tasks, 4).await.unwrap();
+            tasks.spawn(async {});
+            assert!(tasks.len() <= 4);
+        }
+        while let Some(joined) = tasks.join_next().await {
+            joined.unwrap();
+        }
+        tasks.spawn(async { panic!("injected load task failure") });
+        assert!(reap_for_slot(&mut tasks, 1).await.is_err());
+    }
 
     #[test]
     fn single_publish_uses_public_body_shape() {
