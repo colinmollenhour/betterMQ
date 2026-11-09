@@ -39,7 +39,15 @@ route and retries through another seed, allowing one redirect to the new leader
 identities; requests without an idempotency key receive a gateway-local key.
 The gateway learns generations
 and terms from stale-leader responses. `/readyz` requires configured auth and
-at least one healthy broker. `/v1/gateway/status` reports routing readiness.
+at least one ready broker with matching shard count, layout version, and tenant.
+Any responding seed with a mismatched layout fails gateway readiness, even if
+another seed matches. `/v1/gateway/status` includes routing mismatch and failed
+probe counts. Unreachable, unready, or unauthenticated seeds are not healthy.
+
+`GET /metrics/prometheus` exports forwarding attempts, failures, and total/count
+latency by shard and HTTP status (`0` means a transport failure). It uses the same
+`BETTERMQ_METRICS_TOKEN` protection as broker metrics. Forwarding failures emit
+warnings limited to one per shard/status every 30 seconds.
 
 Supported ingest routes:
 

@@ -265,7 +265,7 @@ fn metrics_snapshot_from(
     }
 }
 
-fn metrics_authorized(headers: &axum::http::HeaderMap) -> Result<(), StatusCode> {
+pub(crate) fn metrics_authorized(headers: &axum::http::HeaderMap) -> Result<(), StatusCode> {
     if let Some(expected) = std::env::var("BETTERMQ_METRICS_TOKEN")
         .ok()
         .map(|s| s.trim().to_string())

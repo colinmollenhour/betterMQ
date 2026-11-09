@@ -70,6 +70,7 @@ pub struct GatewayOnlyState {
     layout_version: u32,
     tenant: Arc<String>,
     local_token: Option<Arc<String>>,
+    metrics: Arc<parking_lot::Mutex<ForwardMetrics>>,
     #[cfg(feature = "cloud")]
     auth: Option<broker_control_plane::ApiKeyValidator>,
     #[cfg(feature = "cloud")]
@@ -77,6 +78,50 @@ pub struct GatewayOnlyState {
 }
 
 const ROUTE_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct ForwardMetric {
+    attempts: u64,
+    failures: u64,
+    seconds: f64,
+    last_warning: Option<Instant>,
+}
+
+type ForwardMetrics = HashMap<(u32, u16), ForwardMetric>;
+
+#[derive(Default)]
+struct BrokerProbes {
+    healthy: usize,
+    mismatched: usize,
+    failed: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct GatewayBrokerReadiness {
+    ready: bool,
+    shard_count: u32,
+    layout_version: u32,
+    tenant: String,
+}
+
+pub(crate) async fn internal_gateway_ready(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<GatewayBrokerReadiness>) {
+    let ready = crate::ops::ready_snapshot(&state).ready;
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(GatewayBrokerReadiness {
+            ready,
+            shard_count: state.broker.shard_count(),
+            layout_version: state.broker.layout().version,
+            tenant: state.broker.tenant(),
+        }),
+    )
+}
 
 fn gateway_layout(shards: Option<&str>, version: Option<&str>) -> Result<(u32, u32), String> {
     let version = version
@@ -170,6 +215,7 @@ impl GatewayOnlyState {
             layout_version,
             tenant: Arc::new(tenant),
             local_token,
+            metrics: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             #[cfg(feature = "cloud")]
             auth: None,
             #[cfg(feature = "cloud")]
@@ -288,26 +334,60 @@ impl GatewayOnlyState {
         });
     }
 
-    async fn healthy_brokers(&self) -> usize {
+    async fn healthy_brokers(&self) -> BrokerProbes {
         let probes = self.seeds.iter().map(|seed| {
             // Probe serving readiness using the same listener and credentials as forwarding.
             let url = format!("{}/internal/v1/readyz", seed.trim_end_matches('/'));
             async move {
-                crate::cluster_auth::apply_cluster_secret(
+                let response = crate::cluster_auth::apply_cluster_secret(
                     gateway_http_client()
                         .get(url)
                         .timeout(Duration::from_secs(2)),
                 )
                 .send()
-                .await
-                .is_ok_and(|response| response.status().is_success())
+                .await;
+                let Ok(response) = response else {
+                    return (false, false);
+                };
+                let success = response.status().is_success();
+                let Ok(probe) = response.json::<GatewayBrokerReadiness>().await else {
+                    return (false, false);
+                };
+                let matches = probe.shard_count == self.shard_count
+                    && probe.layout_version == self.layout_version
+                    && (self.uses_cloud_auth() || probe.tenant == *self.tenant);
+                (success && probe.ready && matches, !matches)
             }
         });
-        futures_util::future::join_all(probes)
-            .await
-            .into_iter()
-            .filter(|healthy| *healthy)
-            .count()
+        let mut summary = BrokerProbes::default();
+        for (healthy, mismatch) in futures_util::future::join_all(probes).await {
+            summary.healthy += usize::from(healthy);
+            summary.mismatched += usize::from(mismatch);
+            summary.failed += usize::from(!healthy && !mismatch);
+        }
+        summary
+    }
+
+    fn record_forward(&self, shard: u32, status: u16, elapsed: Duration, failed: bool) {
+        let mut metrics = self.metrics.lock();
+        let metric = metrics.entry((shard, status)).or_default();
+        metric.attempts += 1;
+        metric.seconds += elapsed.as_secs_f64();
+        if failed {
+            metric.failures += 1;
+            if metric
+                .last_warning
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
+            {
+                metric.last_warning = Some(Instant::now());
+                tracing::warn!(
+                    shard,
+                    status,
+                    failures = metric.failures,
+                    "gateway forwarding failed"
+                );
+            }
+        }
     }
 
     fn auth_configured(&self) -> bool {
@@ -593,6 +673,7 @@ async fn forward_gateway_only_shard(
     // Cached leader -> alternate seed -> redirected leader, at most.
     for attempt in 0..=2 {
         attempted.insert(target.clone());
+        let started = Instant::now();
         let url = format!(
             "{}/internal/v1/gateway/ingest",
             target.trim_end_matches('/')
@@ -605,6 +686,7 @@ async fn forward_gateway_only_shard(
         let response = match response {
             Ok(response) => response,
             Err(error) => {
+                state.record_forward(shard, 0, started.elapsed(), true);
                 state.forget_route(shard, &target).await;
                 if attempt < 2 {
                     if let Some(seed) = state.seeds.iter().find(|seed| !attempted.contains(*seed)) {
@@ -623,12 +705,19 @@ async fn forward_gateway_only_shard(
         let decoded = match response.json::<GatewayForwardResponse>().await {
             Ok(decoded) => decoded,
             Err(error) => {
+                state.record_forward(shard, status.as_u16(), started.elapsed(), true);
                 return failed_results(
                     &request.items,
                     format!("gateway leader response decode failed for shard {shard}: {error}"),
                 );
             }
         };
+        state.record_forward(
+            shard,
+            status.as_u16(),
+            started.elapsed(),
+            !status.is_success() || decoded.results.iter().any(|result| !result.accepted),
+        );
         if status == StatusCode::CONFLICT && decoded.stale_leader && attempt < 2 {
             if let Some(leader) = decoded.leader {
                 target = leader;
@@ -872,6 +961,8 @@ pub struct GatewayOnlyStatus {
     shard_count: u32,
     layout_version: u32,
     draining: bool,
+    routing_mismatches: usize,
+    upstream_probe_failures: usize,
 }
 
 pub async fn gateway_only_ready(
@@ -879,7 +970,8 @@ pub async fn gateway_only_ready(
 ) -> (StatusCode, Json<GatewayOnlyStatus>) {
     let healthy = state.healthy_brokers().await;
     let draining = crate::admission::is_shutting_down();
-    let ready = state.auth_configured() && healthy > 0 && !draining;
+    let ready =
+        state.auth_configured() && healthy.healthy > 0 && healthy.mismatched == 0 && !draining;
     (
         if ready {
             StatusCode::OK
@@ -889,11 +981,13 @@ pub async fn gateway_only_ready(
         Json(GatewayOnlyStatus {
             mode: "gateway-only",
             ready,
-            healthy_brokers: healthy,
+            healthy_brokers: healthy.healthy,
             configured_brokers: state.seeds.len(),
             shard_count: state.shard_count,
             layout_version: state.layout_version,
             draining,
+            routing_mismatches: healthy.mismatched,
+            upstream_probe_failures: healthy.failed,
         }),
     )
 }
@@ -904,13 +998,46 @@ pub async fn gateway_only_status(
     let healthy = state.healthy_brokers().await;
     Json(GatewayOnlyStatus {
         mode: "gateway-only",
-        ready: state.auth_configured() && healthy > 0 && !crate::admission::is_shutting_down(),
-        healthy_brokers: healthy,
+        ready: state.auth_configured()
+            && healthy.healthy > 0
+            && healthy.mismatched == 0
+            && !crate::admission::is_shutting_down(),
+        healthy_brokers: healthy.healthy,
         configured_brokers: state.seeds.len(),
         shard_count: state.shard_count,
         layout_version: state.layout_version,
         draining: crate::admission::is_shutting_down(),
+        routing_mismatches: healthy.mismatched,
+        upstream_probe_failures: healthy.failed,
     })
+}
+
+pub async fn gateway_only_metrics(
+    State(state): State<Arc<GatewayOnlyState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Response, StatusCode> {
+    crate::ops::metrics_authorized(&headers)?;
+    use std::fmt::Write;
+    let mut body = String::from(
+        "# TYPE bettermq_gateway_forward_attempts_total counter\n\
+         # TYPE bettermq_gateway_forward_failures_total counter\n\
+         # TYPE bettermq_gateway_forward_duration_seconds_sum counter\n\
+         # TYPE bettermq_gateway_forward_duration_seconds_count counter\n",
+    );
+    for ((shard, status), metric) in state.metrics.lock().iter() {
+        for (name, value) in [
+            ("attempts_total", metric.attempts.to_string()),
+            ("failures_total", metric.failures.to_string()),
+            ("duration_seconds_sum", metric.seconds.to_string()),
+            ("duration_seconds_count", metric.attempts.to_string()),
+        ] {
+            let _ = writeln!(
+                body,
+                "bettermq_gateway_forward_{name}{{shard=\"{shard}\",status=\"{status}\"}} {value}"
+            );
+        }
+    }
+    Ok(([("content-type", "text/plain; version=0.0.4")], body).into_response())
 }
 
 /// Edge gateway: split by physical shard and forward sub-batches to leaders.
@@ -1516,6 +1643,7 @@ mod tests {
             layout_version: broker_partition::LAYOUT_V1,
             tenant: Arc::new("default".into()),
             local_token: Some(Arc::new("token".into())),
+            metrics: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             #[cfg(feature = "cloud")]
             auth: None,
             #[cfg(feature = "cloud")]
@@ -1550,6 +1678,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gateway_readiness_rejects_layout_drift_and_exports_forward_metrics() {
+        let shards = Arc::new(AtomicUsize::new(256));
+        let remote = shards.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/internal/v1/readyz",
+            axum::routing::get(move || {
+                let remote = remote.clone();
+                async move {
+                    Json(GatewayBrokerReadiness {
+                        ready: true,
+                        shard_count: remote.load(Ordering::SeqCst) as u32,
+                        layout_version: broker_partition::LAYOUT_V1,
+                        tenant: "default".into(),
+                    })
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = Arc::new(GatewayOnlyState {
+            seeds: Arc::new(vec![base]),
+            route_overrides: Arc::new(RwLock::new(HashMap::new())),
+            shard_count: 4,
+            layout_version: broker_partition::LAYOUT_V1,
+            tenant: Arc::new("default".into()),
+            local_token: Some(Arc::new("token".into())),
+            metrics: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            #[cfg(feature = "cloud")]
+            auth: None,
+            #[cfg(feature = "cloud")]
+            control_plane: None,
+        });
+        let (status, Json(body)) = gateway_only_ready(State(state.clone())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.routing_mismatches, 1);
+        shards.store(4, Ordering::SeqCst);
+        assert_eq!(
+            gateway_only_ready(State(state.clone())).await.0,
+            StatusCode::OK
+        );
+        state.record_forward(2, 503, Duration::from_millis(25), true);
+        let mut headers = axum::http::HeaderMap::new();
+        if let Ok(token) = std::env::var("BETTERMQ_METRICS_TOKEN") {
+            headers.insert("x-bettermq-metrics-token", token.parse().unwrap());
+        }
+        let response = gateway_only_metrics(State(state), headers).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("bettermq_gateway_forward_failures_total{shard=\"2\",status=\"503\"} 1")
+        );
+        assert!(text.contains("duration_seconds_sum{shard=\"2\",status=\"503\"} 0.025"));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn gateway_only_json_enforces_wire_size_before_parse() {
         let state = Arc::new(GatewayOnlyState {
             seeds: Arc::new(vec!["http://127.0.0.1:9".into()]),
@@ -1558,6 +1747,7 @@ mod tests {
             layout_version: broker_partition::LAYOUT_V2,
             tenant: Arc::new("default".into()),
             local_token: Some(Arc::new("token".into())),
+            metrics: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             #[cfg(feature = "cloud")]
             auth: None,
             #[cfg(feature = "cloud")]

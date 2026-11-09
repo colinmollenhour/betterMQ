@@ -254,7 +254,10 @@ fn internal_cluster_route_table() -> Router<Arc<AppState>> {
             "/internal/v1/gateway/queue-topics",
             axum::routing::post(gateway::internal_gateway_queue_topics),
         )
-        .route("/internal/v1/readyz", axum::routing::get(ops::readyz))
+        .route(
+            "/internal/v1/readyz",
+            axum::routing::get(gateway::internal_gateway_ready),
+        )
         .route(
             "/internal/v1/gateway/routes",
             axum::routing::get(gateway::internal_gateway_routes),
@@ -423,6 +426,7 @@ pub fn gateway_only_router(state: GatewayOnlyState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(gateway::gateway_only_ready))
         .route("/v1/gateway/status", get(gateway::gateway_only_status))
+        .route("/metrics/prometheus", get(gateway::gateway_only_metrics))
         .merge(protected)
         .layer(DefaultBodyLimit::max(ingest::MAX_BATCH_BYTES))
         .with_state(shared)
