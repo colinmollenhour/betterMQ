@@ -1531,11 +1531,15 @@ async fn apply_inline_flow(
     let parallelism = flow.parallelism.unwrap_or(1).max(1);
     let rate = flow.rate.unwrap_or(0);
     let period_secs = flow.period_secs.unwrap_or(60).max(1);
-    let profile =
-        state
-            .broker
-            .ensure_flow_profile_by_key(key.clone(), parallelism, rate, period_secs)?;
-    crate::cluster::replicate_flow_catalog(state, profile.clone()).await;
+    let (profile, changed) = state.broker.ensure_flow_profile_by_key_with_change(
+        key.clone(),
+        parallelism,
+        rate,
+        period_secs,
+    )?;
+    if changed {
+        crate::cluster::replicate_flow_catalog(state, profile.clone()).await;
+    }
     req.flow_id = Some(profile.id);
     let mut spec = profile.to_spec();
     if spec.key.is_none() {

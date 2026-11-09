@@ -25,8 +25,8 @@ use broker_storage::StorageMode;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -184,6 +184,12 @@ pub struct ClusterHandle {
     pub runtime: ClusterRuntime,
     pub replication: ReplicationClient,
     http: reqwest::Client,
+    catalog_peers: Arc<parking_lot::Mutex<Option<CatalogPeerCache>>>,
+}
+
+struct CatalogPeerCache {
+    at: Instant,
+    peers: Vec<String>,
 }
 
 impl ClusterHandle {
@@ -198,6 +204,7 @@ impl ClusterHandle {
             runtime,
             replication,
             http,
+            catalog_peers: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 }
@@ -679,6 +686,24 @@ pub fn peer_fanout_urls(public_url: &str) -> Vec<String> {
 /// Peer broker base URLs for catalog fan-out. Uses saved `bettermq.json` so joins and
 /// registrations propagate before restart (in-memory cluster runtime can be stale).
 pub fn catalog_peer_urls(state: &AppState) -> Vec<String> {
+    if let Some(cluster) = &state.cluster {
+        let mut cache = cluster.catalog_peers.lock();
+        if let Some(entry) = cache.as_ref() {
+            if entry.at.elapsed() < Duration::from_secs(1) {
+                return entry.peers.clone();
+            }
+        }
+        let peers = catalog_peer_urls_uncached(state);
+        *cache = Some(CatalogPeerCache {
+            at: Instant::now(),
+            peers: peers.clone(),
+        });
+        return peers;
+    }
+    catalog_peer_urls_uncached(state)
+}
+
+fn catalog_peer_urls_uncached(state: &AppState) -> Vec<String> {
     let dir = state.broker.config().data_dir.clone();
     if let Ok(Some(cfg)) = load_managed_config(&dir) {
         if cfg.cluster_enabled() {
@@ -781,16 +806,14 @@ async fn propagate_catalog_to_peers<T: Serialize>(
     if peer_bases.is_empty() {
         return 0;
     }
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "catalog fan-out: http client build failed");
-            return 0;
-        }
-    };
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(8))
+            .build()
+            .expect("catalog HTTP client")
+    });
     let mut notified = 0usize;
     for peer in peer_bases {
         let mut delivered = false;
@@ -1237,18 +1260,22 @@ pub async fn replicate_flow_catalog(state: &AppState, profile: FlowProfile) {
     advance_catalog_controller(state).await;
     put_authoritative_catalog(state, "flow", &profile.id.to_string(), &profile, false).await;
     let peers = catalog_peer_urls(state);
-    let notified = propagate_catalog_to_peers(
-        &peers,
-        "/internal/v1/cluster/catalog/flow",
-        &CatalogFlowUpsert { profile },
-    )
-    .await;
-    if !peers.is_empty() && notified == 0 {
-        warn!(
-            peers = peers.len(),
-            "flow catalog create did not reach any peer"
-        );
-    }
+    // Consensus acceptance stays on the request path; peer materialization does
+    // not. Unavailable peers need catalog reconciliation.
+    tokio::spawn(async move {
+        let notified = propagate_catalog_to_peers(
+            &peers,
+            "/internal/v1/cluster/catalog/flow",
+            &CatalogFlowUpsert { profile },
+        )
+        .await;
+        if !peers.is_empty() && notified == 0 {
+            warn!(
+                peers = peers.len(),
+                "flow catalog create did not reach any peer"
+            );
+        }
+    });
 }
 
 pub async fn replicate_queue_catalog(state: &AppState, subscription: Subscription) {

@@ -720,6 +720,23 @@ impl Broker {
             .ensure_by_key(&self.tenant(), key, parallelism, rate, period_secs)?)
     }
 
+    pub fn ensure_flow_profile_by_key_with_change(
+        &self,
+        key: String,
+        parallelism: u32,
+        rate: u32,
+        period_secs: u64,
+    ) -> Result<(crate::flows::FlowProfile, bool), BrokerError> {
+        broker_proto::validate_flow_key(&key)?;
+        Ok(self.inner.flows.ensure_by_key_with_change(
+            &self.tenant(),
+            key,
+            parallelism,
+            rate,
+            period_secs,
+        )?)
+    }
+
     pub fn get_flow_profile_by_key(
         &self,
         key: &str,

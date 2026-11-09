@@ -299,17 +299,51 @@ impl FlowProfileRegistry {
         rate: u32,
         period_secs: u64,
     ) -> Result<FlowProfile, FlowProfileError> {
+        self.ensure_by_key_with_change(tenant_id, key, parallelism, rate, period_secs)
+            .map(|(profile, _)| profile)
+    }
+
+    /// Atomically report whether a catalog mutation actually occurred.
+    pub fn ensure_by_key_with_change(
+        &self,
+        tenant_id: &str,
+        key: String,
+        parallelism: u32,
+        rate: u32,
+        period_secs: u64,
+    ) -> Result<(FlowProfile, bool), FlowProfileError> {
         let parallelism = parallelism.max(1);
         let period_secs = period_secs.max(1);
-        if let Some(existing) = self.get_by_key(tenant_id, &key)? {
-            if existing.parallelism == parallelism
-                && existing.rate == rate
-                && existing.period_secs == period_secs
+        self.mutate(|file| {
+            if let Some(existing) = file
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.tenant_id == tenant_id && profile.key == key)
             {
-                return Ok(existing);
+                if existing.parallelism == parallelism
+                    && existing.rate == rate
+                    && existing.period_secs == period_secs
+                {
+                    return Ok((existing.clone(), false));
+                }
+                existing.parallelism = parallelism;
+                existing.rate = rate;
+                existing.period_secs = period_secs;
+                existing.updated_at_ms = Utc::now().timestamp_millis();
+                return Ok((existing.clone(), true));
             }
-        }
-        self.upsert_by_key(tenant_id, key, parallelism, rate, period_secs)
+            let profile = FlowProfile {
+                id: Uuid::new_v4(),
+                tenant_id: tenant_id.into(),
+                key,
+                parallelism,
+                rate,
+                period_secs,
+                updated_at_ms: Utc::now().timestamp_millis(),
+            };
+            file.profiles.push(profile.clone());
+            Ok((profile, true))
+        })
     }
 
     pub fn get_by_id(
@@ -348,6 +382,31 @@ impl FlowProfileRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_reports_only_real_changes_without_advancing_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = FlowProfileRegistry::open(dir.path()).unwrap();
+        let (created, changed) = registry
+            .ensure_by_key_with_change("tenant", "key".into(), 1, 10, 60)
+            .unwrap();
+        assert!(changed);
+        let revision = registry.load().unwrap().revision;
+        for _ in 0..10 {
+            let (reused, changed) = registry
+                .ensure_by_key_with_change("tenant", "key".into(), 1, 10, 60)
+                .unwrap();
+            assert!(!changed);
+            assert_eq!(created, reused);
+            assert_eq!(registry.load().unwrap().revision, revision);
+        }
+        let (updated, changed) = registry
+            .ensure_by_key_with_change("tenant", "key".into(), 2, 10, 60)
+            .unwrap();
+        assert!(changed);
+        assert_eq!(updated.id, created.id);
+        assert_eq!(registry.load().unwrap().revision, revision + 1);
+    }
 
     #[test]
     fn flow_revision_survives_restart_and_newer_version_fails_closed() {

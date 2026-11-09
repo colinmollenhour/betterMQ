@@ -41,6 +41,10 @@ Batch failures include a stable `code`, a `retryable` flag and, for back-pressur
 keys. Broker forwarding preserves leader rejection status and `Retry-After`;
 transport failures return 503 and may have an unknown outcome.
 
+Repeated inline-flow publishes with unchanged limits reuse the existing profile
+without a catalog consensus write or peer fan-out. Actual flow changes submit
+controller metadata before asynchronous peer propagation.
+
 - `POST /v1/gateway/enqueue`
 - `POST /v1/ingest/batch`
 - `POST /v1/ingest/ndjson`
