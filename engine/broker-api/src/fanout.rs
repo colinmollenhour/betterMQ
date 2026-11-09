@@ -314,20 +314,33 @@ impl FanoutStore {
         }
         let bytes = std::fs::read(&self.journal_path)?;
         let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+        let mut boundary = 0;
         for (index, line) in lines.iter().enumerate() {
             if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+                boundary += line.len() + usize::from(index + 1 < lines.len());
                 continue;
             }
             let record = match serde_json::from_slice::<FanoutJournalRecord>(line) {
                 Ok(record) => record,
                 Err(error) if index + 1 == lines.len() => {
-                    tracing::warn!(%error, "ignoring torn fanout journal tail");
+                    tracing::warn!(%error, "truncating torn fanout journal tail");
+                    let file = OpenOptions::new().write(true).open(&self.journal_path)?;
+                    file.set_len(boundary as u64)?;
+                    file.sync_data()?;
                     break;
                 }
                 Err(error) => return Err(FanoutStoreError::Serde(error)),
             };
             if record.version != FANOUT_STATE_VERSION {
                 return Err(FanoutStoreError::UnsupportedVersion(record.version));
+            }
+            boundary += line.len() + 1;
+            // A complete JSON record can survive without its newline. Preserve it,
+            // but restore the delimiter before a subsequent append.
+            if index + 1 == lines.len() {
+                let mut file = OpenOptions::new().append(true).open(&self.journal_path)?;
+                file.write_all(b"\n")?;
+                file.sync_data()?;
             }
             if record.sequence <= state.sequence {
                 continue;
@@ -654,6 +667,17 @@ mod tests {
             completed_at_ms: None,
         };
         assert!(store.accept(command.clone()).unwrap().1);
+        // Crash during the next journal write, then recover and mutate again.
+        let mut journal = OpenOptions::new()
+            .append(true)
+            .open(&store.journal_path)
+            .unwrap();
+        journal
+            .write_all(br#"{"version":1,"sequence":2,"event":{"#)
+            .unwrap();
+        journal.sync_data().unwrap();
+        let store = FanoutStore::open(dir.path()).unwrap();
+        assert!(store.get(fanout_id).unwrap().is_some());
         store
             .record_result(
                 fanout_id,
@@ -698,6 +722,17 @@ mod tests {
         assert!(matches!(
             store.get(Uuid::nil()),
             Err(FanoutStoreError::UnsupportedVersion(99))
+        ));
+    }
+
+    #[test]
+    fn malformed_interior_journal_record_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("fanout-state.journal"), b"{torn\n{}\n").unwrap();
+        let store = FanoutStore::open(dir.path()).unwrap();
+        assert!(matches!(
+            store.get(Uuid::nil()),
+            Err(FanoutStoreError::Serde(_))
         ));
     }
 
