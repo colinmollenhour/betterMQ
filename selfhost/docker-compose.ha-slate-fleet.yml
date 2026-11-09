@@ -1,6 +1,8 @@
 # HA Slate + fleet: 3 brokers (S3/MinIO) + N fleet workers.
 #
 #   export BETTERMQ_CLUSTER_SECRET=$(openssl rand -hex 32)
+#   export BETTERMQ_METRICS_TOKEN=$(openssl rand -hex 32)
+#   export MINIO_ROOT_USER=bettermq MINIO_ROOT_PASSWORD=$(openssl rand -hex 32)
 #   cd selfhost && docker compose -f docker-compose.ha-slate-fleet.yml up -d --build
 #   docker compose -f docker-compose.ha-slate-fleet.yml up -d --scale fleet=3
 #
@@ -28,7 +30,7 @@ x-broker: &broker
   restart: unless-stopped
   stop_grace_period: ${BETTERMQ_STOP_GRACE_PERIOD:-120s}
   healthcheck:
-    test: ["CMD", "curl", "-f", "http://localhost:8080/readyz"]
+    test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
     interval: 10s
     timeout: 3s
     retries: 5

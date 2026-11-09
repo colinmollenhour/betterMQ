@@ -27,6 +27,14 @@ replication/catch-up, peer health, catalog/auth sync and internal forwarding use
 For fleet/gateway-only processes, explicitly configure `BETTERMQ_BROKER_URLS`
 with the internal endpoints. Reachable public enrollment URLs are still required.
 
+HA examples require both `BETTERMQ_CLUSTER_SECRET` and `BETTERMQ_METRICS_TOKEN`;
+generate each separately with `openssl rand -hex 32`. Slate also requires
+`MINIO_ROOT_USER` and a strong `MINIO_ROOT_PASSWORD`. Fleet Compose healthchecks
+use `/healthz` so workers can start before first-time auth/cluster setup. A
+healthy container is **not** necessarily ready to serve: configure local auth
+and membership using the management panel, then require `/readyz` on every
+broker before sending traffic. Fleet workers retry while brokers are unready.
+
 Free self-hosted BetterMQ. **No config files required** — install the CLI or run Docker, then use the panel.
 
 Shared engine code lives in [`../engine/`](../engine/). This folder is the self-host product (Docker + docs only).

@@ -6,7 +6,7 @@
 #
 # Panel: http://localhost:8081/panel/  (broker1)
 # Standalone panel: docker compose -f docker-compose.panel.yml up -d
-# Requires BETTERMQ_CLUSTER_SECRET (set below or in .env).
+# Requires BETTERMQ_CLUSTER_SECRET and BETTERMQ_METRICS_TOKEN (set in .env).
 #
 # After first boot: configure cluster from Panel → Infrastructure on broker1,
 # then join broker2/broker3 (or pre-seed bettermq.json). Shared meta is at
