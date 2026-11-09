@@ -5,6 +5,8 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Input } from "@/components/ui/input";
 import Field from "@/components/form/Field.vue";
 import ActionMessage from "@/components/form/ActionMessage.vue";
+import SecretInput from "@/components/form/SecretInput.vue";
+import { prepareDestination } from "@/lib/destination";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useActionStatus } from "@/composables/useActionStatus";
 import { apiPost, publicUrl } from "@/lib/api";
@@ -23,8 +25,8 @@ const kpis = reactive({
 });
 
 const pub = reactive({
-  url: "https://webhook.site",
-  secret: "whsec_demo",
+  url: "",
+  secret: "",
   body: '{"from":"dashboard"}',
 });
 
@@ -57,6 +59,8 @@ async function fetchJson(path: string) {
 }
 
 async function quickPublish() {
+  const error = prepareDestination(pub);
+  if (error) { publishStatus.fail(error); return; }
   const payload: Record<string, unknown> = {
     url: pub.url,
     secret: pub.secret,
@@ -163,8 +167,8 @@ const clusterNodes = () => session.cluster?.nodes || [];
           <CardDescription>One direct webhook from the console</CardDescription>
         </CardHeader>
         <CardContent class="grid gap-2">
-          <Field label="URL"><Input v-model="pub.url" class="font-mono text-xs" /></Field>
-          <Field label="Secret"><Input v-model="pub.secret" class="font-mono" /></Field>
+          <Field label="URL"><Input v-model="pub.url" placeholder="https://example.com/webhook" class="font-mono text-xs" /></Field>
+          <Field label="Secret"><SecretInput v-model="pub.secret" /></Field>
           <Field label="Body"><Input v-model="pub.body" class="font-mono text-xs" /></Field>
         </CardContent>
         <CardFooter>

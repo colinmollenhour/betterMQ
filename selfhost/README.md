@@ -181,6 +181,10 @@ Broker-only screens and requests are blocked while a remote cell is selected;
 open that cell's embedded panel to manage queues, schedules or HTTP delivery.
 The console labels the local API target explicitly.
 
+Panel destination forms start empty and require an explicit HTTP(S) destination.
+If the secret is blank, submission generates a unique cryptographically random
+secret; use **Reveal** to copy it to your receiver before enabling HMAC signing.
+
 ### `bettermq config`
 
 ```bash

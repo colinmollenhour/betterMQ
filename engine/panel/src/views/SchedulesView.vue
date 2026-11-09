@@ -11,6 +11,8 @@ import Field from "@/components/form/Field.vue";
 import ActionMessage from "@/components/form/ActionMessage.vue";
 import AppSelect from "@/components/form/AppSelect.vue";
 import RetryFields from "@/components/form/RetryFields.vue";
+import SecretInput from "@/components/form/SecretInput.vue";
+import { prepareDestination } from "@/lib/destination";
 import { useActionStatus } from "@/composables/useActionStatus";
 import { apiDelete, apiGet, apiPost, publicUrl } from "@/lib/api";
 import { catalog, flowId, refreshFlows } from "@/lib/catalog";
@@ -41,8 +43,8 @@ type Cron = {
 const form = reactive({
   type: "cron",
   key: "cron-1",
-  url: "https://webhook.site",
-  secret: "whsec_demo",
+  url: "",
+  secret: "",
   priority: 5,
   expr: "*/1 * * * *",
   every: 10,
@@ -87,10 +89,8 @@ async function load() {
 
 async function create() {
   createStatus.reset();
-  if (!form.url.trim() || !form.secret.trim()) {
-    createStatus.fail("Schedule needs destination URL and secret");
-    return;
-  }
+  const error = prepareDestination(form);
+  if (error) { createStatus.fail(error); return; }
   const payload: Record<string, unknown> = {
     url: form.url.trim(),
     secret: form.secret.trim(),
@@ -158,9 +158,9 @@ function fmt(ms?: number) {
         </Field>
         <Field label="Routing key"><Input v-model="form.key" /></Field>
         <Field label="Destination URL" class="sm:col-span-2">
-          <Input v-model="form.url" class="font-mono text-xs" />
+          <Input v-model="form.url" placeholder="https://example.com/webhook" class="font-mono text-xs" />
         </Field>
-        <Field label="Secret"><Input v-model="form.secret" class="font-mono" /></Field>
+        <Field label="Secret"><SecretInput v-model="form.secret" /></Field>
         <Field label="Priority"><Input v-model="form.priority" type="number" /></Field>
         <Field
           v-if="form.type === 'cron'"
