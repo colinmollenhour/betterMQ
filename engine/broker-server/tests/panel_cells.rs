@@ -318,3 +318,71 @@ async fn split_panel_listen_serves_v1_on_panel_and_hides_panel_from_public() {
         "public listener must not serve /internal/v1"
     );
 }
+
+#[tokio::test]
+async fn partial_listener_splits_bind_once_and_isolate_roles() {
+    for split in ["admin", "panel", "internal", "shared", "collapsed"] {
+        let data = tempfile::tempdir().unwrap();
+        let public = free_addr();
+        let private = free_addr();
+        let public_arg = public.to_string();
+        let private_arg = private.to_string();
+        let mut args = vec![
+            "serve",
+            "--listen",
+            &public_arg,
+            "--data-dir",
+            data.path().to_str().unwrap(),
+        ];
+        match split {
+            "admin" => args.extend(["--admin-listen", &private_arg]),
+            "panel" => args.extend(["--panel-listen", &private_arg]),
+            "internal" => args.extend(["--internal-listen", &private_arg]),
+            "shared" => args.extend([
+                "--admin-listen",
+                &private_arg,
+                "--internal-listen",
+                &private_arg,
+            ]),
+            _ => {}
+        }
+        let _guard = ChildGuard(spawn_serve(&args, data.path()));
+        let client = reqwest::Client::new();
+        assert!(
+            wait_health(&client, &format!("http://{public}/healthz")).await,
+            "{split}"
+        );
+        let admin = if ["admin", "panel", "shared"].contains(&split) {
+            private
+        } else {
+            public
+        };
+        let internal = if ["internal", "shared"].contains(&split) {
+            private
+        } else {
+            public
+        };
+        for addr in [public, private] {
+            if addr == private && split == "collapsed" {
+                continue;
+            }
+            for (path, present) in [
+                ("/admin/v1/cells", addr == admin),
+                ("/panel/", addr == admin),
+                ("/docs", addr == admin),
+                ("/internal/v1/cluster", addr == internal),
+            ] {
+                let response = client
+                    .get(format!("http://{addr}{path}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status() != reqwest::StatusCode::NOT_FOUND,
+                    present,
+                    "{split}: {addr}{path}"
+                );
+            }
+        }
+    }
+}

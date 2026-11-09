@@ -110,6 +110,11 @@ bettermq serve [OPTIONS]
 | `--internal-listen <HOST:PORT>` | `BETTERMQ_INTERNAL_LISTEN` | Replication/controller listener |
 | `--panel-listen <HOST:PORT>` | `BETTERMQ_PANEL_LISTEN` | Alias: separate panel+admin listener |
 
+Listener roles sharing an address bind that socket only once. Setting only
+`--admin-listen` (or `--panel-listen`) moves admin routes, docs and the panel off
+the public socket; internal routes remain on public unless `--internal-listen`
+is also set. An explicit `--admin-listen` takes precedence over the panel alias.
+
 Examples:
 
 ```bash

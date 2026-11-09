@@ -389,17 +389,11 @@ pub fn resolve_listeners(
     admin: Option<SocketAddr>,
     internal: Option<SocketAddr>,
     panel_listen: Option<SocketAddr>,
-    panel_mode: PanelMode,
+    _panel_mode: PanelMode,
 ) -> ResolvedListeners {
     let admin = admin.or(panel_listen).unwrap_or(public);
     let internal = internal.unwrap_or(public);
-    let collapsed =
-        admin == public && internal == public && panel_mode != PanelMode::SeparateListener;
-    let admin = if panel_mode == PanelMode::SeparateListener {
-        panel_listen.or(Some(admin)).unwrap_or(public)
-    } else {
-        admin
-    };
+    let collapsed = admin == public && internal == public;
     ResolvedListeners {
         public,
         admin,
