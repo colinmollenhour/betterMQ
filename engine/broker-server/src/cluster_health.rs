@@ -6,6 +6,8 @@ use broker_api::{
 };
 use broker_dispatch::DispatchEngine;
 use broker_partition::Broker;
+use broker_raft_meta::NodeConfig;
+use broker_replication::{ReplicateCatchUpRange, ReplicateCatchUpRequest};
 use broker_storage::StorageMode;
 use chrono::Utc;
 use std::collections::{HashMap, HashSet};
@@ -104,18 +106,53 @@ fn reopen_shared_shard(
     Ok(())
 }
 
-async fn catch_up_shard(cluster: &Cluster, state: &AppState, shard: u32) -> Result<(), String> {
-    let now = Utc::now().timestamp_millis();
-    let peers: Vec<_> = cluster
-        .runtime
-        .config()
-        .peer_nodes()
-        .into_iter()
-        .filter(|peer| cluster.runtime.is_peer_alive(peer.id, now))
-        .collect();
-    if peers.is_empty() {
-        return Ok(());
+/// Replica answers (besides this node's own log) a new shard leader needs
+/// before it can trust its view of the committed prefix. A write is
+/// acknowledged once `min_isr` replicas hold it, so any `rf - min_isr + 1`
+/// replicas include at least one copy of every acknowledged record.
+fn required_catch_up_answers(rf: usize, min_isr: usize, self_is_replica: bool) -> usize {
+    let rf = rf.max(1);
+    (rf + 1)
+        .saturating_sub(min_isr.clamp(1, rf))
+        .saturating_sub(usize::from(self_is_replica))
+}
+
+type ProbeResult = Result<ReplicateCatchUpRange, broker_replication::ReplicateError>;
+
+/// Probe every replica concurrently so one unreachable peer costs a single
+/// request timeout rather than one per peer.
+async fn probe_replicas(
+    cluster: &Cluster,
+    peers: &[NodeConfig],
+    request: &ReplicateCatchUpRequest,
+) -> Vec<(NodeConfig, ProbeResult)> {
+    let mut probes = tokio::task::JoinSet::new();
+    for peer in peers {
+        let client = cluster.replication.clone();
+        let peer = peer.clone();
+        let request = request.clone();
+        probes.spawn(async move {
+            let result = client.catch_up_from(peer.internal_base(), &request).await;
+            (peer, result)
+        });
     }
+    let mut answers = Vec::with_capacity(peers.len());
+    while let Some(joined) = probes.join_next().await {
+        match joined {
+            Ok(answer) => answers.push(answer),
+            Err(error) => warn!(%error, "leadership catch-up probe task failed"),
+        }
+    }
+    answers
+}
+
+async fn catch_up_shard(cluster: &Cluster, state: &AppState, shard: u32) -> Result<(), String> {
+    // Probe the shard's replica set directly instead of trusting this node's
+    // health view: a briefly "dead" replica may hold acknowledged records.
+    let node_id = cluster.runtime.config().node_id;
+    let replicas = cluster.runtime.replica_ids_for_shard(shard);
+    let (mut peers, min_isr) = cluster.runtime.replication_targets(shard);
+    let required = required_catch_up_answers(replicas.len(), min_isr, replicas.contains(&node_id));
     for topic in discover_topics(state) {
         let mut local_leo = state
             .broker
@@ -127,28 +164,18 @@ async fn catch_up_shard(cluster: &Cluster, state: &AppState, shard: u32) -> Resu
             .map_err(|e| format!("{topic}/{shard}: read local durable HWM: {e}"))?;
         let probe_from = local_committed.saturating_sub(1);
 
-        let mut best: Option<(String, broker_replication::ReplicateCatchUpRange)> = None;
-        for peer in &peers {
-            let request = broker_replication::ReplicateCatchUpRequest {
-                tenant_id: state.broker.tenant(),
-                topic: topic.clone(),
-                partition: shard,
-                from_offset: probe_from,
-                max_records: 4096,
-            };
-            match cluster
-                .replication
-                .catch_up_from(peer.internal_base(), &request)
-                .await
-            {
-                Ok(response)
-                    if best.as_ref().is_none_or(|(_, current)| {
-                        response.committed_hwm > current.committed_hwm
-                    }) =>
-                {
-                    best = Some((peer.internal_base().to_owned(), response));
-                }
-                Ok(_) => {}
+        let request = ReplicateCatchUpRequest {
+            tenant_id: state.broker.tenant(),
+            topic: topic.clone(),
+            partition: shard,
+            from_offset: probe_from,
+            max_records: 4096,
+        };
+        let mut answered = Vec::new();
+        let mut failed = HashSet::new();
+        for (peer, result) in probe_replicas(cluster, &peers, &request).await {
+            match result {
+                Ok(range) => answered.push((peer.internal_base().to_owned(), range)),
                 Err(error) => {
                     warn!(
                         peer = %peer.addr,
@@ -157,13 +184,27 @@ async fn catch_up_shard(cluster: &Cluster, state: &AppState, shard: u32) -> Resu
                         error = %error,
                         "leadership catch-up probe failed"
                     );
+                    failed.insert(peer.id);
                 }
             }
         }
-        let Some((source, mut page)) = best else {
+        // A replica that failed once is not retried for the remaining topics
+        // of this attempt; the next monitor cycle starts over.
+        peers.retain(|peer| !failed.contains(&peer.id));
+        if answered.len() < required {
             return Err(format!(
-                "{topic}/{shard}: no replica answered catch-up probe"
+                "{topic}/{shard}: {} of {required} required replicas answered the catch-up probe \
+                 (RF {}, minISR {min_isr}); cannot prove the committed prefix",
+                answered.len(),
+                replicas.len().max(1),
             ));
+        }
+        let Some((source, mut page)) = answered
+            .into_iter()
+            .max_by_key(|(_, range)| range.committed_hwm)
+        else {
+            // This node's own log already covers every acknowledged record.
+            continue;
         };
         if local_leo > page.committed_hwm {
             return Err(format!(
@@ -200,7 +241,7 @@ async fn catch_up_shard(cluster: &Cluster, state: &AppState, shard: u32) -> Resu
             if local_leo >= page.committed_hwm {
                 break;
             }
-            let request = broker_replication::ReplicateCatchUpRequest {
+            let request = ReplicateCatchUpRequest {
                 tenant_id: state.broker.tenant(),
                 topic: topic.clone(),
                 partition: shard,
@@ -468,5 +509,119 @@ mod tests {
 
         let error = reopen_shared_shard(&broker, &topics, broker.shard_count()).unwrap_err();
         assert!(error.contains("reopen shared storage"), "{error}");
+    }
+
+    const UNREACHABLE: &str = "http://127.0.0.1:1";
+
+    /// A local-WAL node in a three-node (RF=3, minISR=2) cluster whose two
+    /// peers live at `peer_addrs`.
+    fn three_node_state(
+        dir: &tempfile::TempDir,
+        peer_addrs: [&str; 2],
+    ) -> (Arc<AppState>, Cluster, [Uuid; 2]) {
+        let local = Uuid::new_v4();
+        let peer_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        let mut nodes = vec![NodeConfig {
+            id: local,
+            addr: "http://local.invalid".into(),
+            internal_url: None,
+        }];
+        nodes.extend(
+            peer_ids
+                .iter()
+                .zip(peer_addrs)
+                .map(|(id, addr)| NodeConfig {
+                    id: *id,
+                    addr: addr.to_string(),
+                    internal_url: None,
+                }),
+        );
+        let cluster = Cluster::new(ClusterRuntime::from_config_only(ClusterConfig {
+            cluster_id: Uuid::new_v4(),
+            nodes,
+            node_id: local,
+            generation: 1,
+            hash_version: 1,
+        }));
+        let broker = Broker::open(broker_partition::BrokerConfig::new(dir.path().into())).unwrap();
+        let state = Arc::new(AppState {
+            schedule: broker_schedule::ScheduleQueue::open(dir.path()).unwrap(),
+            crons: broker_schedule::CronRegistry::open(dir.path()).unwrap(),
+            dispatch: DispatchEngine::new_broker_only(
+                broker.clone(),
+                broker_dispatch::DispatchConfig::default(),
+            ),
+            broker,
+            leases: broker_dispatch::LeaseTable::new(),
+            cluster: Some(cluster.clone()),
+            local_auth: None,
+            fair_queue: Arc::new(broker_dispatch::TenantFairQueue::new()),
+            catalog_tombstones: broker_api::CatalogTombstones::open(dir.path()).unwrap(),
+            dispatch_fleet: false,
+            broker_only: true,
+            #[cfg(feature = "cloud")]
+            auth: None,
+            #[cfg(feature = "cloud")]
+            control_plane: None,
+        });
+        (state, cluster, peer_ids)
+    }
+
+    fn catch_up_body(shard: u32, committed_hwm: u64, frames: Vec<(u64, Vec<u8>)>) -> Vec<u8> {
+        ReplicateCatchUpRange {
+            partition: shard,
+            leader_generation: 0,
+            committed_hwm,
+            frames: frames
+                .into_iter()
+                .map(|(offset, bytes)| broker_replication::CatchUpFrame { offset, bytes })
+                .collect(),
+        }
+        .encode_binary()
+        .unwrap()
+    }
+
+    async fn catch_up_peer(body: Vec<u8>) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/internal/v1/replicate/catch-up"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(body),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[test]
+    fn catch_up_read_quorum_intersects_every_ack_set() {
+        // RF=3/minISR=2: self plus one replica covers every acked record.
+        assert_eq!(required_catch_up_answers(3, 2, true), 1);
+        // minISR=1 acks on one copy, so every other replica must answer.
+        assert_eq!(required_catch_up_answers(3, 1, true), 2);
+        // A leader outside the replica set holds nothing itself.
+        assert_eq!(required_catch_up_answers(3, 2, false), 2);
+        assert_eq!(required_catch_up_answers(2, 2, true), 0);
+        assert_eq!(required_catch_up_answers(1, 1, true), 0);
+        assert_eq!(required_catch_up_answers(1, 1, false), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catch_up_stays_fenced_when_no_replica_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, cluster, _) = three_node_state(&dir, [UNREACHABLE, UNREACHABLE]);
+        let error = catch_up_shard(&cluster, &state, 0).await.unwrap_err();
+        assert!(error.contains("0 of 1 required replicas"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catch_up_proceeds_with_a_read_quorum_while_one_replica_is_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = 0;
+        let peer = catch_up_peer(catch_up_body(shard, 0, Vec::new())).await;
+        let (state, cluster, _) = three_node_state(&dir, [&peer.uri(), UNREACHABLE]);
+        catch_up_shard(&cluster, &state, shard).await.unwrap();
     }
 }
