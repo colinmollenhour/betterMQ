@@ -137,6 +137,9 @@ pub struct ClusterJoinRequest {
     #[serde(default)]
     pub internal_url: Option<String>,
     pub node_name: String,
+    /// Replace an existing cluster membership on this node.
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -781,7 +784,7 @@ pub async fn infra_join_bootstrap(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Query(q): Query<BootstrapQuery>,
-) -> Result<Json<BootstrapResponse>, ApiError> {
+) -> Result<(axum::http::HeaderMap, Json<BootstrapResponse>), ApiError> {
     let dir = data_dir(&state);
     let Some(file) = read_join_token(&dir)? else {
         return Err(ApiError::BadRequest(
@@ -810,11 +813,30 @@ pub async fn infra_join_bootstrap(
     let generation = ClusterRuntime::load_config(&dir)
         .map(|c| c.generation)
         .unwrap_or(1);
-    Ok(Json(BootstrapResponse {
-        cluster_id: file.cluster_id,
-        generation,
-        nodes,
-    }))
+    // Answer the joiner's challenge so it can verify this seed holds the cluster
+    // secret before sending that secret here. Only after a valid join token, so
+    // the endpoint is not an HMAC oracle.
+    let mut response_headers = axum::http::HeaderMap::new();
+    if let (Some(secret), Some(challenge)) = (
+        crate::cluster_auth::cluster_secret(),
+        headers
+            .get(crate::cluster_auth::CLUSTER_CHALLENGE_HEADER)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        if let Some(proof) = crate::cluster_auth::seed_proof(&secret, challenge)
+            .and_then(|p| axum::http::HeaderValue::from_str(&p).ok())
+        {
+            response_headers.insert(crate::cluster_auth::CLUSTER_PROOF_HEADER, proof);
+        }
+    }
+    Ok((
+        response_headers,
+        Json(BootstrapResponse {
+            cluster_id: file.cluster_id,
+            generation,
+            nodes,
+        }),
+    ))
 }
 
 pub async fn infra_cluster_register(
@@ -898,21 +920,48 @@ pub async fn infra_cluster_join(
         ));
     }
     let dir = data_dir(&state);
+    if !body.force && already_in_cluster(&load_or_default_config(&state)?) {
+        return Err(ApiError::Conflict(
+            "this node is already in a cluster; remove it from that cluster first or pass force=true"
+                .into(),
+        ));
+    }
     let seed = body.seed_url.trim().trim_end_matches('/');
     // Prefer header over query string so join tokens are not written to access logs.
     let bootstrap_url = format!("{seed}/v1/infra/join/bootstrap");
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let bootstrap: BootstrapResponse = client
+    let secret = crate::cluster_auth::cluster_secret();
+    let challenge = crate::cluster_auth::new_challenge();
+    let bootstrap_resp = client
         .get(&bootstrap_url)
         .header("x-bettermq-join-token", &body.join_token)
+        .header(crate::cluster_auth::CLUSTER_CHALLENGE_HEADER, &challenge)
         .send()
         .await
         .map_err(|e| ApiError::BadRequest(format!("cannot reach seed: {e}")))?
         .error_for_status()
-        .map_err(|e| ApiError::BadRequest(format!("seed rejected bootstrap: {e}")))?
+        .map_err(|e| ApiError::BadRequest(format!("seed rejected bootstrap: {e}")))?;
+    // The seed is caller-supplied. Before this node sends it the cluster secret
+    // (auth and catalog pulls) or adopts its membership, the seed must prove it
+    // already holds that secret.
+    if let Some(secret) = secret.as_deref() {
+        let proven = bootstrap_resp
+            .headers()
+            .get(crate::cluster_auth::CLUSTER_PROOF_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|proof| crate::cluster_auth::verify_seed_proof(secret, &challenge, proof));
+        if !proven {
+            return Err(ApiError::BadRequest(
+                "seed did not prove it holds this node's BETTERMQ_CLUSTER_SECRET; check the seed URL and that every node uses the same secret"
+                    .into(),
+            ));
+        }
+    }
+    let bootstrap: BootstrapResponse = bootstrap_resp
         .json()
         .await
         .map_err(|e| ApiError::BadRequest(format!("invalid bootstrap response: {e}")))?;
@@ -997,18 +1046,70 @@ pub async fn infra_cluster_join(
     }))
 }
 
-/// Same as join, but authenticated by the seed join token (public). Used by the
-/// panel attach proxy so a fresh broker does not need its own API token.
+fn already_in_cluster(cfg: &BetterMqConfig) -> bool {
+    cfg.cluster
+        .as_ref()
+        .is_some_and(|c| c.enabled && !c.nodes.is_empty())
+}
+
+/// Same as join, on the public router so the panel attach proxy can enroll a
+/// fresh broker that has no API token yet. The caller must prove itself:
+/// a configured node needs its own API token; an unconfigured node needs an
+/// [`ENROLL_PROOF_HEADER`](crate::cluster_auth::ENROLL_PROOF_HEADER) signed
+/// with the shared cluster secret.
 pub async fn infra_cluster_enroll(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<ClusterJoinRequest>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
 ) -> Result<Json<ClusterJoinResponse>, ApiError> {
     if state.dispatch_fleet {
         return Err(ApiError::BadRequest(
             "enroll is not supported on dispatch fleet or WAL-less processes".into(),
         ));
     }
-    infra_cluster_join(State(state), Json(body)).await
+    authorize_enroll(&state, &headers, &body)?;
+    let request: ClusterJoinRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::BadRequest(format!("invalid enroll body: {e}")))?;
+    infra_cluster_join(State(state), Json(request)).await
+}
+
+fn authorize_enroll(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<(), ApiError> {
+    if crate::auth::insecure_no_auth() {
+        return Ok(());
+    }
+    if let Some(store) = state.local_auth.as_ref().filter(|s| s.is_configured()) {
+        let token = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if token.is_some_and(|t| store.authorize_admin(t)) {
+            return Ok(());
+        }
+        return Err(ApiError::Unauthorized(
+            "enroll on a node with local auth configured requires its API token".into(),
+        ));
+    }
+    let Some(secret) = crate::cluster_auth::cluster_secret() else {
+        return Err(ApiError::Unauthorized(
+            "enroll requires BETTERMQ_CLUSTER_SECRET on this node".into(),
+        ));
+    };
+    let proven = headers
+        .get(crate::cluster_auth::ENROLL_PROOF_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|proof| {
+            crate::cluster_auth::verify_enroll(&secret, Utc::now().timestamp_millis(), proof, body)
+        });
+    if !proven {
+        return Err(ApiError::Unauthorized(
+            "enroll requires a proof signed with the cluster secret".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn infra_cluster_remove_node(

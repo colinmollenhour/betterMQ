@@ -2202,6 +2202,11 @@
           },
           "node_name": {
             "type": "string"
+          },
+          "force": {
+            "type": "boolean",
+            "default": false,
+            "description": "Replace this node's existing cluster membership. Without it, joining a node that is already in a cluster returns 409."
           }
         }
       },
@@ -4492,6 +4497,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "x-bettermq-cluster-challenge",
+            "in": "header",
+            "description": "Nonce from the joiner. When the seed has BETTERMQ_CLUSTER_SECRET set, it answers with x-bettermq-cluster-proof = hex HMAC-SHA256(secret, \"bettermq-seed-proof-v1\\n\" + nonce). Joiners with a cluster secret refuse seeds that do not prove it.",
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            }
           }
         ],
         "responses": {
@@ -4501,6 +4515,14 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/BootstrapResponse"
+                }
+              }
+            },
+            "headers": {
+              "x-bettermq-cluster-proof": {
+                "description": "Seed's answer to x-bettermq-cluster-challenge.",
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -4536,6 +4558,54 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/infra/cluster/enroll": {
+      "post": {
+        "tags": [
+          "Infra"
+        ],
+        "operationId": "infraClusterEnroll",
+        "summary": "Join a cluster on behalf of the panel attach flow",
+        "security": [],
+        "description": "Same as /v1/infra/cluster/join, on the public router. A node with local auth configured requires its own API token (Authorization: Bearer). An unconfigured node requires x-bettermq-enroll-proof = `<unix_ms>.<hex HMAC-SHA256(BETTERMQ_CLUSTER_SECRET, \"bettermq-enroll-v1\\n\" + unix_ms + \"\\n\" + raw body)>`, at most 5 minutes old. Rejected on dispatch-fleet processes.",
+        "parameters": [
+          {
+            "name": "x-bettermq-enroll-proof",
+            "in": "header",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClusterJoinRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterJoinResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API token or enroll proof"
+          },
+          "409": {
+            "description": "Node already in a cluster (pass force)"
           }
         }
       }

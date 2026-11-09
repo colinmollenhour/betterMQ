@@ -1329,6 +1329,239 @@ mod tests {
         }
     }
 
+    fn enroll_body(seed: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "seed_url": seed,
+            "join_token": "join_x",
+            "public_url": "http://127.0.0.1:1",
+            "node_name": "victim",
+        }))
+        .unwrap()
+    }
+
+    async fn enroll(
+        app: Router,
+        body: Vec<u8>,
+        proof: Option<String>,
+        bearer: Option<&str>,
+    ) -> StatusCode {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/infra/cluster/enroll")
+            .header("content-type", "application/json");
+        if let Some(proof) = proof {
+            req = req.header(cluster_auth::ENROLL_PROOF_HEADER, proof);
+        }
+        if let Some(token) = bearer {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        app.oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    fn now_ms() -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    }
+
+    /// Fake seed that answers bootstrap/register like an attacker would and
+    /// counts every request that carries the cluster-secret header.
+    async fn fake_seed(
+        proof_secret: Option<&'static str>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::routing::{get, post};
+        let leaks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let leak_counter = leaks.clone();
+        let count_leak = axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let leaks = leak_counter.clone();
+                async move {
+                    if req
+                        .headers()
+                        .contains_key(cluster_auth::CLUSTER_SECRET_HEADER)
+                    {
+                        leaks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    next.run(req).await
+                }
+            },
+        );
+        let app = Router::new()
+            .route(
+                "/v1/infra/join/bootstrap",
+                get(move |headers: axum::http::HeaderMap| async move {
+                    let mut out = axum::http::HeaderMap::new();
+                    if let (Some(secret), Some(challenge)) = (
+                        proof_secret,
+                        headers
+                            .get(cluster_auth::CLUSTER_CHALLENGE_HEADER)
+                            .and_then(|v| v.to_str().ok()),
+                    ) {
+                        out.insert(
+                            cluster_auth::CLUSTER_PROOF_HEADER,
+                            cluster_auth::seed_proof(secret, challenge).unwrap().parse().unwrap(),
+                        );
+                    }
+                    (
+                        out,
+                        Json(serde_json::json!({
+                            "cluster_id": uuid::Uuid::new_v4(),
+                            "generation": 1,
+                            "nodes": [],
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/infra/cluster/register",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "cluster_id": uuid::Uuid::new_v4(),
+                        "generation": 1,
+                        "nodes": [
+                            { "name": "evil", "public_url": "http://127.0.0.1:2", "id": uuid::Uuid::new_v4() },
+                            { "name": "victim", "public_url": "http://127.0.0.1:1", "id": uuid::Uuid::new_v4() },
+                        ],
+                    }))
+                }),
+            )
+            .fallback(|| async { StatusCode::NOT_FOUND })
+            .layer(count_leak);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), leaks)
+    }
+
+    fn joined_a_cluster(dir: &tempfile::TempDir) -> bool {
+        broker_config::load_managed_config(dir.path())
+            .unwrap()
+            .and_then(|cfg| cfg.cluster)
+            .is_some_and(|c| c.enabled)
+    }
+
+    #[tokio::test]
+    async fn enroll_requires_proof_or_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BETTERMQ_CLUSTER_SECRET", "enroll-secret");
+        let dir = tempdir().unwrap();
+        let store = broker_local_auth::LocalAuthStore::open(dir.path()).unwrap();
+        let mut state = test_state(&dir);
+        state.local_auth = Some(Arc::new(store));
+        let app = router(state);
+        let body = enroll_body("http://127.0.0.1:9");
+        let no_proof = enroll(app.clone(), body.clone(), None, None).await;
+        let wrong_secret = enroll(
+            app.clone(),
+            body.clone(),
+            Some(cluster_auth::sign_enroll("not-the-secret", now_ms(), &body)),
+            None,
+        )
+        .await;
+        let other_body = enroll(
+            app.clone(),
+            body.clone(),
+            Some(cluster_auth::sign_enroll("enroll-secret", now_ms(), b"{}")),
+            None,
+        )
+        .await;
+        std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
+        let no_secret = enroll(
+            app,
+            body.clone(),
+            Some(cluster_auth::sign_enroll("enroll-secret", now_ms(), &body)),
+            None,
+        )
+        .await;
+        assert_eq!(no_proof, StatusCode::UNAUTHORIZED);
+        assert_eq!(wrong_secret, StatusCode::UNAUTHORIZED);
+        assert_eq!(other_body, StatusCode::UNAUTHORIZED);
+        assert_eq!(no_secret, StatusCode::UNAUTHORIZED);
+        assert!(!joined_a_cluster(&dir));
+    }
+
+    #[tokio::test]
+    async fn enroll_on_configured_node_requires_its_api_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BETTERMQ_CLUSTER_SECRET", "enroll-secret");
+        let dir = tempdir().unwrap();
+        let store = broker_local_auth::LocalAuthStore::open(dir.path()).unwrap();
+        store.setup("password1234").unwrap();
+        let mut state = test_state(&dir);
+        state.local_auth = Some(Arc::new(store));
+        let app = router(state);
+        let body = enroll_body("http://127.0.0.1:9");
+        let status = enroll(
+            app,
+            body.clone(),
+            Some(cluster_auth::sign_enroll("enroll-secret", now_ms(), &body)),
+            None,
+        )
+        .await;
+        std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn join_rejects_seed_that_cannot_prove_the_cluster_secret() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for seed_secret in [None, Some("attacker-guess")] {
+            std::env::set_var("BETTERMQ_CLUSTER_SECRET", "enroll-secret");
+            let (seed, leaks) = fake_seed(seed_secret).await;
+            let dir = tempdir().unwrap();
+            let app = router(test_state(&dir));
+            let body = enroll_body(&seed);
+            let status = enroll(
+                app,
+                body.clone(),
+                Some(cluster_auth::sign_enroll("enroll-secret", now_ms(), &body)),
+                None,
+            )
+            .await;
+            std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "seed secret {seed_secret:?}"
+            );
+            assert_eq!(leaks.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(!joined_a_cluster(&dir), "membership must not be rewritten");
+        }
+    }
+
+    #[tokio::test]
+    async fn join_refuses_a_node_already_in_a_cluster() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BETTERMQ_CLUSTER_SECRET", "enroll-secret");
+        let (seed, _) = fake_seed(Some("enroll-secret")).await;
+        let dir = tempdir().unwrap();
+        let mut cfg = broker_config::BetterMqConfig::template_single_local();
+        cfg.data_dir = dir.path().to_path_buf();
+        cfg.cluster = Some(broker_config::ClusterConfigSection {
+            enabled: true,
+            id: Some(uuid::Uuid::new_v4().to_string()),
+            nodes: vec![broker_config::ClusterNode {
+                name: cfg.node.name.clone(),
+                public_url: cfg.node.public_url.clone(),
+                internal_url: None,
+            }],
+            shared_meta_dir: None,
+        });
+        broker_config::save_managed_config(dir.path(), &cfg).unwrap();
+        let app = router(test_state(&dir));
+        let body = enroll_body(&seed);
+        let status = enroll(
+            app,
+            body.clone(),
+            Some(cluster_auth::sign_enroll("enroll-secret", now_ms(), &body)),
+            None,
+        )
+        .await;
+        std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
     #[tokio::test]
     async fn publish_with_flow_and_no_flow_id_does_not_panic() {
         let dir = tempdir().unwrap();

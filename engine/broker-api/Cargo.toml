@@ -37,6 +37,9 @@ base64 = { workspace = true }
 percent-encoding = "2"
 parking_lot = { workspace = true }
 subtle = "2"
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 thiserror = { workspace = true }
 futures-util = "0.3"
 

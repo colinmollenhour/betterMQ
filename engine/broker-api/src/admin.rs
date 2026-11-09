@@ -1353,15 +1353,35 @@ async fn attach_node(
                     }),
                 )
             })?;
+        let Some(secret) = state.cluster_secret.as_deref() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(AdminErrorBody {
+                    error: "attaching a broker requires BETTERMQ_CLUSTER_SECRET".into(),
+                    code: "cluster_secret_required",
+                }),
+            ));
+        };
+        let enroll_body = serde_json::to_vec(&serde_json::json!({
+            "seed_url": seed,
+            "join_token": token,
+            "public_url": advertise,
+            "node_name": name,
+        }))
+        .unwrap_or_default();
+        // The target proves the caller holds the cluster secret from this HMAC;
+        // the secret itself never goes to the (operator-typed) reach URL.
+        let proof = crate::cluster_auth::sign_enroll(
+            secret,
+            chrono::Utc::now().timestamp_millis(),
+            &enroll_body,
+        );
         let enroll_url = format!("{reach}/v1/infra/cluster/enroll");
         let resp = client
             .post(&enroll_url)
-            .json(&serde_json::json!({
-                "seed_url": seed,
-                "join_token": token,
-                "public_url": advertise,
-                "node_name": name,
-            }))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(crate::cluster_auth::ENROLL_PROOF_HEADER, proof)
+            .body(enroll_body)
             .send()
             .await
             .map_err(|err| {
