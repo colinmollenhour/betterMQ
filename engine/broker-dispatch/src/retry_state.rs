@@ -41,10 +41,40 @@ pub(crate) struct RetryRecord {
 struct RetrySnapshot {
     #[serde(default)]
     sequence: u64,
-    #[serde(default)]
+    #[serde(default, with = "snapshot_entries")]
     records: HashMap<RetryKey, RetryRecord>,
     #[serde(skip)]
     journal_ops: usize,
+}
+
+// JSON object keys cannot represent RetryKey. Keep the in-memory index, but
+// persist entries as an array. Accept old empty-object snapshots on upgrade.
+pub(crate) mod snapshot_entries {
+    use super::RetryKey;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::HashMap;
+
+    pub fn serialize<S: Serializer, T: Serialize>(
+        entries: &HashMap<RetryKey, T>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        entries.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+        deserializer: D,
+    ) -> Result<HashMap<RetryKey, T>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Entries<T> {
+            Array(Vec<(RetryKey, T)>),
+            Legacy(HashMap<RetryKey, T>),
+        }
+        Ok(match Entries::deserialize(deserializer)? {
+            Entries::Array(entries) => entries.into_iter().collect(),
+            Entries::Legacy(entries) => entries,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,5 +275,41 @@ mod tests {
         reopened.clear(&key).unwrap();
         drop(reopened);
         assert!(RetryState::open(dir.path()).unwrap().get(&key).is_none());
+    }
+
+    #[test]
+    fn nonempty_compaction_survives_restart_and_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = RetryKey {
+            topic: "orders".into(),
+            partition: 0,
+            offset: 1,
+            message_id: Uuid::new_v4(),
+        };
+        let state = RetryState::open(dir.path()).unwrap();
+        for attempts in 0..=RETRY_COMPACT_OPS as u32 {
+            state
+                .schedule(RetryRecord {
+                    key: key.clone(),
+                    cursor_key: "lane".into(),
+                    attempts,
+                    due_at_ms: 42,
+                    last_error: "HTTP 503".into(),
+                })
+                .unwrap();
+        }
+        drop(state);
+        let state = RetryState::open(dir.path()).unwrap();
+        assert_eq!(state.get(&key).unwrap().attempts, RETRY_COMPACT_OPS as u32);
+        state.clear(&key).unwrap();
+        drop(state);
+        assert!(RetryState::open(dir.path()).unwrap().pending().is_empty());
+    }
+
+    #[test]
+    fn legacy_empty_snapshot_is_readable() {
+        let snapshot: RetrySnapshot =
+            serde_json::from_str(r#"{"sequence":1,"records":{}}"#).unwrap();
+        assert!(snapshot.records.is_empty());
     }
 }

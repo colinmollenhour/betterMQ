@@ -40,7 +40,7 @@ pub(crate) struct DlqTransition {
 struct Snapshot {
     #[serde(default)]
     sequence: u64,
-    #[serde(default)]
+    #[serde(default, with = "crate::retry_state::snapshot_entries")]
     transitions: HashMap<RetryKey, DlqTransition>,
     #[serde(skip)]
     journal_ops: usize,
@@ -118,6 +118,7 @@ impl LifecycleStore {
     }
 
     pub(crate) fn prepare(&self, mut transition: DlqTransition) -> Result<(), LifecycleError> {
+        let _guard = self.io_lock.lock();
         if self
             .state
             .lock()
@@ -147,6 +148,7 @@ impl LifecycleStore {
     }
 
     pub(crate) fn clear(&self, source: &RetryKey) -> Result<(), LifecycleError> {
+        let _guard = self.io_lock.lock();
         if !self.state.lock().transitions.contains_key(source) {
             return Ok(());
         }
@@ -158,7 +160,6 @@ impl LifecycleStore {
     }
 
     fn write(&self, event: Event) -> Result<(), LifecycleError> {
-        let _guard = self.io_lock.lock();
         let sequence = self.state.lock().sequence.saturating_add(1);
         let mut file = OpenOptions::new()
             .create(true)
@@ -255,5 +256,53 @@ mod tests {
             .unwrap()
             .pending()
             .is_empty());
+    }
+
+    #[test]
+    fn nonempty_compaction_survives_restart_and_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let transition = transition();
+        let source = transition.source.clone();
+        let store = LifecycleStore::open(dir.path()).unwrap();
+        for _ in 0..=COMPACT_OPS {
+            store.prepare(transition.clone()).unwrap();
+        }
+        drop(store);
+        let store = LifecycleStore::open(dir.path()).unwrap();
+        assert_eq!(store.pending()[0].source, source);
+        store.mark_dlq_committed(&source).unwrap();
+        drop(store);
+        let store = LifecycleStore::open(dir.path()).unwrap();
+        assert_eq!(store.pending()[0].phase, DlqPhase::DlqCommitted);
+        store.clear(&source).unwrap();
+        drop(store);
+        assert!(LifecycleStore::open(dir.path())
+            .unwrap()
+            .pending()
+            .is_empty());
+    }
+
+    #[test]
+    fn concurrent_prepares_cannot_compact_unapplied_journal_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LifecycleStore::open(dir.path()).unwrap();
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let store = store.clone();
+                scope.spawn(move || {
+                    for offset in 0..129 {
+                        let mut entry = transition();
+                        entry.source.offset = worker * 129 + offset;
+                        store.prepare(entry).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(store.pending().len(), 1032);
+        drop(store);
+        assert_eq!(
+            LifecycleStore::open(dir.path()).unwrap().pending().len(),
+            1032
+        );
     }
 }
