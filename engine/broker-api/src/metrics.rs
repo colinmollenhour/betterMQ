@@ -184,6 +184,20 @@ pub(crate) fn record_single_outcome<T>(
             ApiError::Overloaded { .. } => 6,
             ApiError::TooManyRequests { .. } => 7,
             ApiError::Broker(_) => 8,
+            ApiError::Upstream { status, .. } => {
+                let code = error.failure().code;
+                REJECTION_REASONS
+                    .iter()
+                    .position(|reason| *reason == code)
+                    .unwrap_or(match status.as_u16() {
+                        401 | 403 => 1,
+                        404 => 2,
+                        409 => 3,
+                        429 => 7,
+                        500..=599 => 4,
+                        _ => 0,
+                    })
+            }
         };
         record_rejected();
         REJECTIONS_BY_REASON[index].fetch_add(1, Ordering::Relaxed);

@@ -30,6 +30,10 @@ queue IDs resolve to their queue name. A gateway batch containing queue IDs make
 one authenticated metadata lookup (IDs/names only, no destination secrets) before
 splitting by shard. This extra round trip avoids routing V1 queue-ID requests by
 an empty or caller-supplied topic.
+Batch failures include a stable `code`, a `retryable` flag and, for back-pressure,
+`retry_after_ms`. Retry only retryable items, with their original idempotency
+keys. Broker forwarding preserves leader rejection status and `Retry-After`;
+transport failures return 503 and may have an unknown outcome.
 
 - `POST /v1/gateway/enqueue`
 - `POST /v1/ingest/batch`

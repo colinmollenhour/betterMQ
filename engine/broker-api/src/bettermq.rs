@@ -2215,6 +2215,7 @@ async fn build_cron_scheduled_request(
         crate::routes::resolve_destination_with_repair(state, req.queue_id, queue_name)
             .await
             .map_err(|e| match e {
+                e @ ApiError::Upstream { .. } => CronApiError::BadRequest(e.to_string()),
                 ApiError::Broker(be) => CronApiError::BadRequest(be.to_string()),
                 ApiError::BadRequest(m)
                 | ApiError::Unauthorized(m)

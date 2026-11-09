@@ -351,29 +351,171 @@ async fn forward_publish_to_leader(
     shard: u32,
     req: &PublishRequest,
 ) -> Result<PublishResponse, ApiError> {
-    let leader = cluster
-        .runtime
-        .leader_http_base_for_shard(shard)
-        .ok_or_else(|| ApiError::BadRequest("no leader for shard".into()))?;
-    let url = format!(
-        "{}/internal/v1/cluster/publish",
-        leader.trim_end_matches('/')
-    );
-    let resp = crate::cluster_auth::apply_cluster_secret(cluster.http.post(&url))
-        .json(req)
-        .send()
-        .await
-        .map_err(|e| ApiError::BadRequest(format!("forward to shard leader failed: {e}")))?;
-    if !resp.status().is_success() {
+    for attempt in 0..=1 {
+        let leader = cluster
+            .runtime
+            .leader_http_base_for_shard(shard)
+            .ok_or_else(|| ApiError::Unavailable(format!("no leader for shard {shard}")))?;
+        let url = format!(
+            "{}/internal/v1/cluster/publish",
+            leader.trim_end_matches('/')
+        );
+        let resp = crate::cluster_auth::apply_cluster_secret(cluster.http.post(&url))
+            .json(req)
+            .send()
+            .await
+            .map_err(|e| {
+                ApiError::Unavailable(format!(
+                "forward to shard leader failed: {e}; outcome unknown, retry with idempotency_key"
+            ))
+            })?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(ApiError::BadRequest(format!(
-            "shard leader returned {status}: {body}"
-        )));
+        if status.is_success() {
+            return resp.json().await.map_err(|e| {
+                ApiError::Unavailable(format!(
+                    "invalid leader response: {e}; outcome unknown, retry with idempotency_key"
+                ))
+            });
+        }
+        let retry_after = resp.headers().get("retry-after").cloned();
+        let body = resp.bytes().await.map_err(|e| {
+            ApiError::Unavailable(format!(
+                "cannot read leader response: {e}; retry with idempotency_key"
+            ))
+        })?;
+        let stale = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .is_some_and(|value| value["code"] == "not_shard_leader");
+        if attempt == 0 && stale {
+            continue;
+        }
+        return Err(ApiError::Upstream {
+            status,
+            retry_after,
+            body,
+        });
     }
-    resp.json()
-        .await
-        .map_err(|e| ApiError::BadRequest(format!("invalid leader response: {e}")))
+    Err(ApiError::Unavailable(format!(
+        "stale leader retry exhausted for shard {shard}"
+    )))
+}
+
+#[cfg(test)]
+mod forwarding_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn cluster(base: String) -> ClusterHandle {
+        let id = Uuid::new_v4();
+        let runtime = ClusterRuntime::from_config_only(broker_raft_meta::ClusterConfig {
+            cluster_id: Uuid::new_v4(),
+            node_id: id,
+            generation: 1,
+            hash_version: 1,
+            nodes: vec![broker_raft_meta::NodeConfig {
+                id,
+                addr: base,
+                internal_url: None,
+            }],
+        });
+        runtime.record_self_alive(Utc::now().timestamp_millis());
+        ClusterHandle::new(runtime)
+    }
+
+    #[tokio::test]
+    async fn forwarding_retries_stale_leader_and_preserves_backpressure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = attempts.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/internal/v1/cluster/publish",
+            axum::routing::post(move || {
+                let count = count.clone();
+                async move {
+                    let code = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        "not_shard_leader"
+                    } else {
+                        "saturated"
+                    };
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", "7")],
+                        Json(serde_json::json!({"error": "try later", "code": code})),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let req = serde_json::from_value(serde_json::json!({"payload":"x"})).unwrap();
+        let error = forward_publish_to_leader(&cluster(base), 0, &req)
+            .await
+            .unwrap_err();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let failure = error.failure();
+        assert_eq!(failure.code, "saturated");
+        assert!(failure.retryable);
+        assert_eq!(failure.retry_after_ms, Some(7_000));
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "7");
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"],
+            "saturated"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn forwarding_without_a_known_leader_is_retryable() {
+        let ids: Vec<_> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let runtime = ClusterRuntime::from_config_only(broker_raft_meta::ClusterConfig {
+            cluster_id: Uuid::new_v4(),
+            node_id: ids[0],
+            generation: 1,
+            hash_version: 1,
+            nodes: ids
+                .iter()
+                .map(|id| broker_raft_meta::NodeConfig {
+                    id: *id,
+                    addr: "http://127.0.0.1:1".into(),
+                    internal_url: None,
+                })
+                .collect(),
+        });
+        let req = serde_json::from_value(serde_json::json!({"payload":"x"})).unwrap();
+        let error = forward_publish_to_leader(&ClusterHandle::new(runtime), 0, &req)
+            .await
+            .unwrap_err();
+        let failure = error.failure();
+        assert_eq!(failure.code, "unavailable");
+        assert!(failure.retryable);
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_transport_failure_is_retryable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let req = serde_json::from_value(serde_json::json!({"payload":"x"})).unwrap();
+        let error = forward_publish_to_leader(&cluster(base), 0, &req)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }
 
 pub async fn publish_with_cluster(
@@ -1586,7 +1728,7 @@ pub async fn internal_cluster_publish(
         .ok_or_else(|| ApiError::BadRequest("cluster mode not enabled".into()))?;
     let shard = shard_for_request(&state, &req);
     if !cluster.runtime.is_leader_for_shard(shard) {
-        return Err(ApiError::BadRequest(format!(
+        return Err(ApiError::Unavailable(format!(
             "this node is not leader for shard {shard}"
         )));
     }

@@ -140,6 +140,12 @@ pub enum ApiError {
     Conflict(String),
     Unavailable(String),
     ReplicationFailed(String),
+    /// Preserve a leader's rejection, including back-pressure headers.
+    Upstream {
+        status: StatusCode,
+        retry_after: Option<axum::http::HeaderValue>,
+        body: axum::body::Bytes,
+    },
     Overloaded {
         retry_after_ms: u64,
         message: String,
@@ -163,11 +169,21 @@ impl std::fmt::Display for ApiError {
             Self::Overloaded { message, .. } | Self::TooManyRequests { message, .. } => {
                 formatter.write_str(message)
             }
+            Self::Upstream { status, body, .. } => {
+                match serde_json::from_slice::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|value| value["error"].as_str().map(str::to_string))
+                {
+                    Some(message) => formatter.write_str(&message),
+                    None => write!(formatter, "shard leader returned {status}"),
+                }
+            }
         }
     }
 }
 
 impl ApiError {
+    /// Stable machine-readable classification for multi-status ingest results.
     pub(crate) fn failure(&self) -> crate::ingest::IngestFailure {
         let (code, retryable, retry_after_ms) = match self {
             Self::BadRequest(_) => ("invalid_request", false, None),
@@ -179,6 +195,25 @@ impl ApiError {
             Self::Overloaded { retry_after_ms, .. } => ("saturated", true, Some(*retry_after_ms)),
             Self::TooManyRequests { retry_after_ms, .. } => {
                 ("tenant_saturated", true, Some(*retry_after_ms))
+            }
+            Self::Upstream {
+                status,
+                retry_after,
+                body,
+            } => {
+                let code = serde_json::from_slice::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|value| value["code"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| "upstream_error".into());
+                return crate::ingest::IngestFailure {
+                    code,
+                    retryable: status.is_server_error() || *status == StatusCode::TOO_MANY_REQUESTS,
+                    retry_after_ms: retry_after
+                        .as_ref()
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                        .map(|seconds| seconds.saturating_mul(1_000)),
+                };
             }
             Self::Broker(BrokerError::QueueNotFound(_) | BrokerError::FlowProfileNotFound(_)) => {
                 ("not_found", false, None)
@@ -216,7 +251,7 @@ impl From<broker_schedule::ScheduleError> for ApiError {
     }
 }
 
-fn retry_after_seconds(retry_after_ms: u64) -> u64 {
+pub(crate) fn retry_after_seconds(retry_after_ms: u64) -> u64 {
     retry_after_ms
         .saturating_add(999)
         .saturating_div(1_000)
@@ -226,6 +261,18 @@ fn retry_after_seconds(retry_after_ms: u64) -> u64 {
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         match self {
+            ApiError::Upstream {
+                status,
+                retry_after,
+                body,
+            } => {
+                let mut response =
+                    (status, [("content-type", "application/json")], body).into_response();
+                if let Some(value) = retry_after {
+                    response.headers_mut().insert("retry-after", value);
+                }
+                response
+            }
             ApiError::BadRequest(msg) => (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "error": msg })),
@@ -346,6 +393,28 @@ mod tests {
                 .retryable
         );
         assert!(ApiError::Unavailable("fsync".into()).failure().retryable);
+    }
+
+    #[test]
+    fn upstream_failure_keeps_leader_code_and_retry_after() {
+        let saturated = ApiError::Upstream {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retry_after: Some(axum::http::HeaderValue::from_static("7")),
+            body: axum::body::Bytes::from_static(br#"{"error":"busy","code":"saturated"}"#),
+        }
+        .failure();
+        assert_eq!(saturated.code, "saturated");
+        assert!(saturated.retryable);
+        assert_eq!(saturated.retry_after_ms, Some(7_000));
+        let rejected = ApiError::Upstream {
+            status: StatusCode::BAD_REQUEST,
+            retry_after: None,
+            body: axum::body::Bytes::from_static(b"not json"),
+        }
+        .failure();
+        assert_eq!(rejected.code, "upstream_error");
+        assert!(!rejected.retryable);
+        assert_eq!(rejected.retry_after_ms, None);
     }
 
     #[test]

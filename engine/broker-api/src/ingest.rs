@@ -140,6 +140,21 @@ mod tests {
     }
 
     #[test]
+    fn batch_commit_failure_remains_retryable_and_preparation_errors_do_not() {
+        let records = vec![(0, "jobs".into(), 1)];
+        let outcomes = failed_outcomes(&records, ApiError::ReplicationFailed("no quorum".into()));
+        let failure = outcomes[0].result.as_ref().unwrap_err().failure();
+        assert_eq!(failure.code, "replication_failed");
+        assert!(failure.retryable);
+        let outcomes = failed_outcomes(&records, ApiError::BadRequest("invalid payload".into()));
+        let error = outcomes[0].result.as_ref().unwrap_err();
+        assert_eq!(error.to_string(), "invalid payload");
+        let failure = error.failure();
+        assert_eq!(failure.code, "invalid_request");
+        assert!(!failure.retryable);
+    }
+
+    #[test]
     fn batch_preserves_delay_ms() {
         let batch = IngestBatch::from_requests(vec![sample(Some(1500)), sample(None)]).unwrap();
         assert_eq!(batch.records[0].req.delay_ms, Some(1500));
@@ -149,12 +164,25 @@ mod tests {
     #[test]
     fn infrastructure_batch_failures_are_retryable() {
         let records = [(7, "topic".into(), 1)];
-        let transient = failed_outcomes(&records, "batch commit failed: fsync", true);
+        let transient = failed_outcomes(
+            &records,
+            ApiError::Unavailable("batch append failed: fsync".into()),
+        );
         let error = transient[0].result.as_ref().unwrap_err();
         assert_eq!(transient[0].index, 7);
         assert_eq!(error.failure().code, "unavailable");
         assert!(error.failure().retryable);
-        let invalid = failed_outcomes(&records, "invalid request", false);
+        let saturated = failed_outcomes(
+            &records,
+            ApiError::TooManyRequests {
+                retry_after_ms: 1_500,
+                message: "tenant busy".into(),
+            },
+        );
+        let failure = saturated[0].result.as_ref().unwrap_err().failure();
+        assert_eq!(failure.code, "tenant_saturated");
+        assert_eq!(failure.retry_after_ms, Some(2_000));
+        let invalid = failed_outcomes(&records, ApiError::BadRequest("invalid request".into()));
         assert!(!invalid[0].result.as_ref().unwrap_err().failure().retryable);
     }
 
@@ -311,12 +339,32 @@ pub struct IngestOutcome {
     pub result: Result<PublishResponse, ApiError>,
 }
 
-fn failed_outcomes(
-    records: &[(usize, String, usize)],
-    error: impl Into<String>,
-    retryable: bool,
-) -> Vec<IngestOutcome> {
-    let error = error.into();
+fn failed_outcomes(records: &[(usize, String, usize)], error: ApiError) -> Vec<IngestOutcome> {
+    let failure = error.failure();
+    let (status, retry_after, body) = match error {
+        ApiError::Upstream {
+            status,
+            retry_after,
+            body,
+        } => (status, retry_after, body),
+        error => {
+            let status = match &error {
+                ApiError::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
+                _ if failure.retryable => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            let retry_after = failure.retry_after_ms.map(|retry_after_ms| {
+                axum::http::HeaderValue::from(crate::routes::retry_after_seconds(retry_after_ms))
+            });
+            let body = axum::body::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "error": error.to_string(), "code": failure.code,
+                }))
+                .expect("error JSON"),
+            );
+            (status, retry_after, body)
+        }
+    };
     records
         .iter()
         .map(|(index, topic, _)| {
@@ -324,10 +372,10 @@ fn failed_outcomes(
             IngestOutcome {
                 index: *index,
                 topic: topic.clone(),
-                result: Err(if retryable {
-                    ApiError::Unavailable(error.clone())
-                } else {
-                    ApiError::BadRequest(error.clone())
+                result: Err(ApiError::Upstream {
+                    status,
+                    retry_after: retry_after.clone(),
+                    body: body.clone(),
                 }),
             }
         })
@@ -380,12 +428,7 @@ async fn submit_local_leader_batch(
     let mut prepared = match state.broker.prepare_publish_batch(requests) {
         Ok(prepared) => prepared,
         Err(error) => {
-            let error = ApiError::from(error);
-            rejected.extend(failed_outcomes(
-                &admitted,
-                format!("batch preparation failed: {error}"),
-                error.failure().retryable,
-            ));
+            rejected.extend(failed_outcomes(&admitted, ApiError::from(error)));
             return rejected;
         }
     };
@@ -409,7 +452,7 @@ async fn submit_local_leader_batch(
         }
     }
     if let Some(error) = append_error {
-        rejected.extend(failed_outcomes(&admitted, error, true));
+        rejected.extend(failed_outcomes(&admitted, ApiError::Unavailable(error)));
         return rejected;
     }
 
@@ -469,8 +512,9 @@ async fn submit_local_leader_batch(
                 Err(error) => {
                     rejected.extend(failed_outcomes(
                         &admitted,
-                        format!("batch replication encoding failed: {error}"),
-                        true,
+                        ApiError::ReplicationFailed(format!(
+                            "batch replication encoding failed: {error}"
+                        )),
                     ));
                     return rejected;
                 }
@@ -508,7 +552,10 @@ async fn submit_local_leader_batch(
         }
     }
     if let Some(error) = commit_error {
-        rejected.extend(failed_outcomes(&admitted, error, true));
+        rejected.extend(failed_outcomes(
+            &admitted,
+            ApiError::ReplicationFailed(error),
+        ));
         return rejected;
     }
 
@@ -520,8 +567,7 @@ async fn submit_local_leader_batch(
         {
             rejected.extend(failed_outcomes(
                 &admitted,
-                format!("batch finalize failed: {error}"),
-                true,
+                ApiError::Unavailable(format!("batch finalize failed: {error}")),
             ));
             return rejected;
         }
@@ -535,8 +581,7 @@ async fn submit_local_leader_batch(
         Err(error) => {
             rejected.extend(failed_outcomes(
                 &admitted,
-                format!("batch response finalization failed: {error}"),
-                true,
+                ApiError::Unavailable(format!("batch response finalization failed: {error}")),
             ));
             return rejected;
         }
