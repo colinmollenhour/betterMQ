@@ -614,6 +614,131 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    fn assert_contract_fields(
+        spec: &serde_json::Value,
+        schema: &serde_json::Value,
+        value: &serde_json::Value,
+    ) {
+        if let Some(reference) = schema["$ref"].as_str() {
+            return assert_contract_fields(
+                spec,
+                spec.pointer(reference.strip_prefix('#').unwrap()).unwrap(),
+                value,
+            );
+        }
+        if let Some(object) = value.as_object() {
+            let properties = schema["properties"]
+                .as_object()
+                .expect("object schema properties");
+            if let Some(required) = schema["required"].as_array() {
+                for field in required {
+                    assert!(
+                        object.contains_key(field.as_str().unwrap()),
+                        "missing {field}"
+                    );
+                }
+            }
+            for (key, value) in object {
+                assert!(properties.contains_key(key), "undocumented field {key}");
+                if !value.is_null() {
+                    assert_contract_fields(spec, &properties[key], value);
+                }
+            }
+        } else if let Some(array) = value.as_array() {
+            for item in array {
+                assert_contract_fields(spec, &schema["items"], item);
+            }
+        } else {
+            match schema["type"].as_str() {
+                Some("integer") => assert!(value.is_i64() || value.is_u64()),
+                Some("boolean") => assert!(value.is_boolean()),
+                Some("string") => assert!(value.is_string()),
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_ingest_router_responses_match_openapi() {
+        let spec: serde_json::Value = serde_json::from_str(include_str!(
+            "../../broker-server/openapi/bettermq.openapi.json"
+        ))
+        .unwrap();
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let group = state.broker.create_group("contract".into()).unwrap();
+        for (name, url) in [
+            ("valid", "https://example.com/hook"),
+            ("invalid", "not-a-url"),
+        ] {
+            state
+                .broker
+                .add_group_member(
+                    group.id,
+                    name.into(),
+                    url.into(),
+                    "s".into(),
+                    1,
+                    0,
+                    60,
+                    None,
+                )
+                .unwrap();
+        }
+        // Mount the real handlers without auth to isolate the wire contract.
+        let app = Router::new()
+            .route(
+                "/v1/enqueue/batch",
+                axum::routing::post(batch::batch_enqueue),
+            )
+            .merge(bettermq::bettermq_routes())
+            .with_state(Arc::new(state));
+        let bodies = [
+            (
+                "/v1/enqueue/batch",
+                serde_json::json!({"messages": [
+                    {"payload":"ok", "url":"https://example.com/hook", "secret":"s", "delay_ms":60000},
+                    {"payload":"bad", "topic":"missing"}
+                ]}),
+            ),
+            (
+                "/v1/publish",
+                serde_json::json!({"group_id": group.id, "body":"body"}),
+            ),
+        ];
+        for (path, body) in bodies {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::MULTI_STATUS);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["partial"], true);
+            let schema = &spec["paths"][path]["post"]["responses"]["207"]["content"]
+                ["application/json"]["schema"];
+            assert_contract_fields(&spec, schema, &body);
+        }
+        for path in [
+            "/v1/enqueue/batch",
+            "/v1/ingest/batch",
+            "/v1/ingest/ndjson",
+            "/v1/gateway/enqueue",
+        ] {
+            assert!(spec["paths"][path]["post"]["responses"]["207"].is_object());
+        }
+    }
+
     #[tokio::test]
     async fn missing_local_auth_is_401_fail_closed() {
         let dir = tempdir().unwrap();

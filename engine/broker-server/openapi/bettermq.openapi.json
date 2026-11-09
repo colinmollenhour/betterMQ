@@ -350,6 +350,8 @@
           "duplicate"
         ],
         "properties": {
+          "fanout_id": {"type": "string", "format": "uuid", "description": "Durable fan-out identity. Unaccepted members are replayed by the broker; preserve the original idempotency key when retrying the same command."},
+          "partial": {"type": "boolean", "description": "True when group member attempts produced mixed outcomes."},
           "message_id": {
             "type": "string",
             "format": "uuid"
@@ -385,12 +387,17 @@
         "type": "object",
         "required": [
           "accepted",
+          "failed",
+          "partial",
           "message_ids"
         ],
         "properties": {
           "accepted": {
             "type": "integer"
           },
+          "failed": {"type": "integer", "minimum": 0},
+          "partial": {"type": "boolean", "description": "True when accepted and failed items coexist. Retry only failed items marked retryable, preserving their idempotency keys."},
+          "results": {"type": "array", "items": {"$ref": "#/components/schemas/IngestItemResult"}},
           "message_ids": {
             "type": "array",
             "items": {
@@ -398,6 +405,25 @@
               "format": "uuid"
             }
           }
+        }
+      },
+      "IngestItemResult": {
+        "type": "object",
+        "required": ["index", "accepted", "topic", "duplicate", "message_id", "partition", "offset", "commit_epoch"],
+        "properties": {
+          "index": {"type": "integer", "minimum": 0, "description": "Original zero-based input index."},
+          "accepted": {"type": "boolean"},
+          "message_id": {"type": "string", "format": "uuid", "nullable": true},
+          "topic": {"type": "string"},
+          "partition": {"type": "integer", "nullable": true},
+          "offset": {"type": "integer", "nullable": true},
+          "duplicate": {"type": "boolean"},
+          "commit_epoch": {"type": "integer", "nullable": true},
+          "scheduled": {"$ref": "#/components/schemas/ScheduledInfo"},
+          "error": {"type": "string"},
+          "code": {"type": "string", "description": "Stable failure code; present only on failures."},
+          "retryable": {"type": "boolean", "description": "Retry only failed items with retryable=true. Retain idempotency keys because infrastructure failures can have an ambiguous commit outcome."},
+          "retry_after_ms": {"type": "integer", "minimum": 0}
         }
       },
       "BatchPublishMessage": {
@@ -785,9 +811,12 @@
         "type": "object",
         "required": [
           "member_id",
+          "accepted",
           "duplicate"
         ],
         "properties": {
+          "accepted": {"type": "boolean", "description": "Whether this member was committed or scheduled."},
+          "error": {"type": "string", "description": "Member failure or accepted-for-replay detail."},
           "member_id": {
             "type": "string",
             "format": "uuid"
@@ -2356,6 +2385,7 @@
           }
         },
         "responses": {
+          "207": {"description": "Group member outcomes. Failed members remain in the durable outbox for replay; preserve the original idempotency key.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AcceptResponse"}}}},
           "200": {
             "description": "Duplicate idempotency key",
             "content": {
@@ -2514,6 +2544,7 @@
           }
         },
         "responses": {
+          "207": {"description": "Group member outcomes. Failed members remain in the durable outbox for replay; preserve the original idempotency key.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AcceptResponse"}}}},
           "200": {
             "description": "Duplicate idempotency key",
             "content": {
@@ -3626,6 +3657,7 @@
           }
         },
         "responses": {
+          "207": {"description": "Indexed outcomes; retry only failures marked retryable, retaining idempotency keys.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BatchEnqueueResponse"}}}},
           "202": {
             "description": "Accepted",
             "content": {
@@ -3657,6 +3689,7 @@
           }
         },
         "responses": {
+          "207": {"description": "Indexed outcomes; retry only failures marked retryable, retaining idempotency keys.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BatchEnqueueResponse"}}}},
           "202": {
             "description": "Accepted",
             "content": {
@@ -3711,6 +3744,7 @@
           }
         },
         "responses": {
+          "207": {"description": "Indexed outcomes; retry only failures marked retryable, retaining idempotency keys.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BatchEnqueueResponse"}}}},
           "202": {
             "description": "Accepted",
             "content": {
@@ -3767,6 +3801,7 @@
           }
         },
         "responses": {
+          "207": {"description": "Indexed outcomes; retry only failures marked retryable, retaining idempotency keys.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BatchEnqueueResponse"}}}},
           "202": {
             "description": "Accepted",
             "content": {
