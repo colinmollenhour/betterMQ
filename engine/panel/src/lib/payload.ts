@@ -42,8 +42,8 @@ export function defaultRetry(): RetryState {
 
 export function mergeRetry(payload: Record<string, unknown>, retry: RetryState): Record<string, unknown> {
   const max = Math.max(0, Number(retry.maxRetries) || 0);
-  if (max <= 0) return payload;
   payload.max_retries = max;
+  if (max === 0) return payload;
   const kind = (retry.kind || "exponential").toLowerCase();
   const backoff: Record<string, unknown> = { kind, initialMs: Number(retry.initialMs) || 500 };
   if (kind === "exponential") {
