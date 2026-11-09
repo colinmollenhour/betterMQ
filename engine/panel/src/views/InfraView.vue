@@ -206,16 +206,13 @@ const nodeRows = computed<NodeRow[]>(() => {
 const selectedRow = computed(() => nodeRows.value.find((row) => row.key === selectedNodeKey.value) || null);
 
 const currentCluster = computed(() => {
-  const cell = selectedCell();
-  if (cell && clusterByCell[cell.id]) return clusterByCell[cell.id];
-  return Object.values(clusterByCell)[0] || null;
+  const id = session.selectedCellId || selectedCell()?.id || "local";
+  return clusterByCell[id] || null;
 });
 
 const shardRows = computed(() => {
-  const cell = selectedCell();
-  if (cell && shardsByCell[cell.id]) return shardsByCell[cell.id];
-  const first = Object.keys(shardsByCell)[0];
-  return first ? shardsByCell[first] || [] : [];
+  const id = session.selectedCellId || selectedCell()?.id || "local";
+  return shardsByCell[id] || [];
 });
 
 const kpiNode = computed(() => String(infraStatus.value?.node_name || "—"));
@@ -236,6 +233,9 @@ async function load() {
 
 async function loadFed() {
   fedStatus.reset();
+  for (const key of Object.keys(nodesByCell)) delete nodesByCell[key];
+  for (const key of Object.keys(shardsByCell)) delete shardsByCell[key];
+  for (const key of Object.keys(clusterByCell)) delete clusterByCell[key];
   try {
     const [nodes, shards, cluster] = await Promise.all([
       queryCells<{ nodes?: AdminNode[] }>("nodes"),
@@ -575,7 +575,7 @@ function openAddNode() {
             <Card>
               <CardHeader class="pb-2">
                 <CardDescription>Cluster</CardDescription>
-                <CardTitle>{{ session.clusterLabel }}</CardTitle>
+                <CardTitle>{{ currentCluster ? `${currentCluster.nodeCount ?? '—'} nodes` : 'Unavailable' }}</CardTitle>
               </CardHeader>
               <CardContent class="text-xs text-muted-foreground">
                 {{ nodeRows.length }} node{{ nodeRows.length === 1 ? "" : "s" }}
@@ -773,7 +773,8 @@ function openAddNode() {
             </CardHeader>
             <CardContent class="space-y-3">
               <p class="text-sm text-muted-foreground">
-                Status: {{ session.clusterLabel }}
+                Selected cell: {{ selectedCell()?.label || session.selectedCellId || 'local' }}
+                <span v-if="!currentCluster"> · Cluster data unavailable</span>
                 <span v-if="currentCluster">
                   · {{ currentCluster.nodeCount || 0 }} nodes · RF {{ currentCluster.replicationFactor || "—" }}
                   · {{ readinessLabel(currentCluster.ready ?? null, federationObservedAt, now) }}

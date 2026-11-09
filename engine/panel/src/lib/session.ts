@@ -92,7 +92,7 @@ setBrokerAccessGuard(() => session.phase !== "app" || localBrokerSelected());
 onAuthRejected((error) => handleAuthFailure(error));
 
 export function localBrokerSelected(): boolean {
-  return !isStandalone() && isLocalCell(selectedCell()?.id || "local", session.cluster?.cluster_id);
+  return !isStandalone() && isLocalCell(session.selectedCellId || selectedCell()?.id || "local", session.cluster?.cluster_id);
 }
 
 let healthTimer: ReturnType<typeof setInterval> | null = null;
@@ -122,7 +122,9 @@ export function handleAuthFailure(error: unknown) {
 }
 
 export function selectedCell(): CellRecord | null {
-  return session.cells.find((c) => c.id === session.selectedCellId) || session.cells[0] || null;
+  return session.selectedCellId
+    ? session.cells.find((c) => c.id === session.selectedCellId) || null
+    : session.cells[0] || null;
 }
 
 export function setApiBase(base: string) {
