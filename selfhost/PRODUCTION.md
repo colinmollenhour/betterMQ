@@ -16,6 +16,8 @@ without quorum. This correctness check does not replace the hardware soak below.
 
 - `bettermq doctor --data-dir <data-dir>` passes on every broker.
 - Every container reports `/readyz`; `/healthz` alone is only liveness.
+- During shutdown drain, `/readyz` returns 503 with `draining: true` before
+  listener teardown; `/healthz` stays a liveness signal while HTTP is available.
 - A restore drill from a checksummed backup completes within the documented RTO.
 - Capacity tests use production body sizes, batch sizes, durability, TLS, and
   destination latency. Keep at least 30% disk, memory, and ingest headroom.
