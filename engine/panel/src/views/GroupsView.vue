@@ -10,6 +10,7 @@ import ActionMessage from "@/components/form/ActionMessage.vue";
 import AppSelect from "@/components/form/AppSelect.vue";
 import SecretInput from "@/components/form/SecretInput.vue";
 import { prepareDestination } from "@/lib/destination";
+import { confirmDeletion } from "@/lib/deletion";
 import { useActionStatus } from "@/composables/useActionStatus";
 import { apiDelete, apiGet, apiPost, publicUrl } from "@/lib/api";
 import { catalog, groupId, refreshGroups, type GroupRow } from "@/lib/catalog";
@@ -101,6 +102,7 @@ async function addMember() {
 }
 
 async function removeGroup(g: GroupRow) {
+  if (!await confirmDeletion(`group ${g.name || groupId(g)} (${groupId(g)}) and its members`)) return;
   listStatus.reset();
   try {
     await apiDelete(publicUrl(`/v1/groups/${encodeURIComponent(groupId(g))}`));
@@ -112,10 +114,13 @@ async function removeGroup(g: GroupRow) {
 }
 
 async function removeMember(id: string) {
+  const gid = selected.value;
+  const name = members.value.find((m) => (m.member_id || m.id) === id)?.name || id;
+  if (!await confirmDeletion(`member ${name} (${id}) from group ${gid}`)) return;
   memberListStatus.reset();
   try {
     await apiDelete(
-      publicUrl(`/v1/groups/${encodeURIComponent(selected.value)}/members/${encodeURIComponent(id)}`),
+      publicUrl(`/v1/groups/${encodeURIComponent(gid)}/members/${encodeURIComponent(id)}`),
     );
     memberListStatus.succeed("Member removed");
     await loadMembers(selected.value);

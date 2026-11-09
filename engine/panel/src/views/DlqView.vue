@@ -28,6 +28,7 @@ import AppSelect from "@/components/form/AppSelect.vue";
 import { useActionStatus } from "@/composables/useActionStatus";
 import { apiDelete, apiGet, publicUrl } from "@/lib/api";
 import { copyText } from "@/lib/payload";
+import { confirmDeletion } from "@/lib/deletion";
 
 type Source = {
   dlq_topic: string;
@@ -127,6 +128,7 @@ async function remove(m: Msg) {
     partition: String(m.partition),
     offset: String(m.offset),
   });
+  if (!await confirmDeletion(`dead letter ${m.message_id} from ${dlqTopic}`)) return;
   loadStatus.reset();
   try {
     await apiDelete(publicUrl(`/v1/dlq?${qs}`));

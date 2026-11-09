@@ -8,11 +8,13 @@ import { useRoute } from "vue-router";
 import { isStandalone } from "@/lib/config";
 import { catalog } from "@/lib/catalog";
 import { navigationError } from "@/router";
+import DeleteConfirmation from "@/components/form/DeleteConfirmation.vue";
 const route = useRoute();
 </script>
 
 <template>
   <SidebarProvider>
+    <DeleteConfirmation />
     <AppSidebar />
     <SidebarInset>
       <Alert v-if="session.splitAuth" variant="destructive" class="m-2">

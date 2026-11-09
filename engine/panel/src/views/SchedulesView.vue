@@ -13,6 +13,7 @@ import AppSelect from "@/components/form/AppSelect.vue";
 import RetryFields from "@/components/form/RetryFields.vue";
 import SecretInput from "@/components/form/SecretInput.vue";
 import { prepareDestination } from "@/lib/destination";
+import { confirmDeletion } from "@/lib/deletion";
 import { useActionStatus } from "@/composables/useActionStatus";
 import { apiDelete, apiGet, apiPost, publicUrl } from "@/lib/api";
 import { catalog, flowId, refreshFlows } from "@/lib/catalog";
@@ -117,6 +118,7 @@ async function create() {
 }
 
 async function act(kind: string, id: string) {
+  if ((kind === "delayed" || kind === "cron-delete") && !await confirmDeletion(`${kind === "delayed" ? "delayed job" : "cron schedule"} ${id}`)) return;
   listStatus.reset();
   try {
     if (kind === "delayed") await apiDelete(publicUrl(`/v1/delayed/${id}`));

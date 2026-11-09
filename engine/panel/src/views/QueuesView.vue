@@ -9,6 +9,7 @@ import ActionMessage from "@/components/form/ActionMessage.vue";
 import RetryFields from "@/components/form/RetryFields.vue";
 import SecretInput from "@/components/form/SecretInput.vue";
 import { prepareDestination } from "@/lib/destination";
+import { confirmDeletion } from "@/lib/deletion";
 import { useActionStatus } from "@/composables/useActionStatus";
 import { apiDelete, apiPost, publicUrl } from "@/lib/api";
 import { catalog, queueId, refreshQueues, type QueueRow } from "@/lib/catalog";
@@ -51,6 +52,7 @@ async function create() {
 }
 
 async function remove(q: QueueRow) {
+  if (!await confirmDeletion(`queue ${q.queue || q.name || queueId(q)} (${queueId(q)})`)) return;
   listStatus.reset();
   try {
     await apiDelete(publicUrl(`/v1/queues/${encodeURIComponent(queueId(q))}`));

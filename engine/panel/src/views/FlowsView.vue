@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { confirmDeletion } from "@/lib/deletion";
 import { onMounted, reactive } from "vue";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
@@ -50,6 +51,7 @@ async function create() {
 }
 
 async function remove(f: FlowRow) {
+  if (!await confirmDeletion(`flow ${f.key || flowId(f)} (${flowId(f)})`)) return;
   listStatus.reset();
   try {
     await apiDelete(publicUrl(`/v1/flows/${encodeURIComponent(flowId(f))}`));
