@@ -7,13 +7,14 @@ its RocksDB/checkpoint metadata and is not a supported disaster-recovery image.
 
 ```bash
 # Backup
-./backup.sh /var/lib/bettermq /tmp/bettermq-backup.tgz
-# writes /tmp/bettermq-backup.tgz.sha256 when sha256sum/shasum is available
+install -d -m 700 "$HOME/bettermq-backups"
+./backup.sh /var/lib/bettermq "$HOME/bettermq-backups/backup.tgz"
+# Archives and checksum sidecars are private (0600); existing files are refused.
 
 # Restore (parent directory that will contain the data folder)
-./restore.sh /tmp/bettermq-backup.tgz /var/lib
+./restore.sh "$HOME/bettermq-backups/backup.tgz" /var/lib
 # Existing directory? Stop the broker and explicitly replace the whole tree:
-./restore.sh /tmp/bettermq-backup.tgz /var/lib --force
+./restore.sh "$HOME/bettermq-backups/backup.tgz" /var/lib --force
 # Previous tree is retained under bettermq.pre-restore-*/data, never overlaid.
 # then: bettermq serve --data-dir /var/lib/bettermq
 ```

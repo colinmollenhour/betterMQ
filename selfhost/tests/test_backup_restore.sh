@@ -15,6 +15,13 @@ bash "$SCRIPTS/restore.sh" "$TMP/backup.tgz" "$TMP/dest" --force
 test ! -e "$TMP/dest/data/segments/new.wal"
 test ! -e "$TMP/dest/data/schedule.journal"
 test "$(cat "$TMP/dest/data/active.wal")" = old
+umask 022
+bash "$SCRIPTS/backup.sh" "$TMP/source/data" "$TMP/private.tgz"
+test "$(stat -c %a "$TMP/private.tgz")" = 600
+test "$(stat -c %a "$TMP/private.tgz.sha256")" = 600
+if bash "$SCRIPTS/backup.sh" "$TMP/source/data" "$TMP/private.tgz"; then
+  echo 'must reject existing backup' >&2; exit 1
+fi
 test -f "$TMP"/dest/data.pre-restore-*/data/schedule.journal
 echo broken > "$TMP/broken.tgz"
 if bash "$SCRIPTS/restore.sh" "$TMP/broken.tgz" "$TMP/dest" --force; then
