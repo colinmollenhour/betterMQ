@@ -218,7 +218,9 @@ fn resolve_serve_with_env(
     listeners.validate_exposure(components)?;
     let replication = base.replication.clone().unwrap_or_else(|| {
         if cluster_enabled {
-            ReplicationPolicyConfig::default()
+            let count = base.cluster.as_ref().map_or(0, |c| c.nodes.len());
+            let (factor, min_isr) = broker_raft_meta::replication_policy(count);
+            ReplicationPolicyConfig { factor, min_isr }
         } else {
             ReplicationPolicyConfig {
                 factor: 1,

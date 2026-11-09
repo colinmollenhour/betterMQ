@@ -642,6 +642,15 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             ClusterRuntime::open_with_raft(&settings.data_dir, config, broker.layout().shard_count)
                 .await
                 .context("open OpenRaft controller")?;
+        let policy = runtime
+            .controller()
+            .context("controller unavailable")?
+            .state();
+        validate_replication_policy(
+            &settings.replication,
+            policy.replication_factor,
+            policy.min_isr,
+        )?;
         Some(Cluster::new(runtime))
     } else {
         None
@@ -877,6 +886,36 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     info!("dispatch, scheduler, and panel tasks stopped");
 
     Ok(())
+}
+
+fn validate_replication_policy(
+    configured: &broker_config::ReplicationPolicyConfig,
+    factor: u32,
+    min_isr: u32,
+) -> anyhow::Result<()> {
+    if configured.factor != factor || configured.min_isr != min_isr {
+        anyhow::bail!(
+            "configured replication factor={} minISR={} differs from controller factor={factor} minISR={min_isr}; use the admin replication policy API and align bettermq.json before starting",
+            configured.factor, configured.min_isr
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod replication_policy_tests {
+    use super::*;
+
+    #[test]
+    fn never_silently_accepts_a_weaker_controller_policy() {
+        let policy = broker_config::ReplicationPolicyConfig {
+            factor: 3,
+            min_isr: 3,
+        };
+        assert!(validate_replication_policy(&policy, 3, 2).is_err());
+        assert!(validate_replication_policy(&policy, 3, 3).is_ok());
+        assert!(validate_replication_policy(&policy, 2, 2).is_err());
+    }
 }
 
 async fn serve_panel(args: PanelArgs) -> anyhow::Result<()> {

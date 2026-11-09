@@ -132,7 +132,13 @@ bettermq panel --listen 127.0.0.1:8090 --controller http://broker1:8080
 BETTERMQ_BROKER_URLS=http://broker1:8080,http://broker2:8080 bettermq serve --dispatch-fleet
 ```
 
-Multi-node cells use **fixed RF=3 / minISR=2**. Additional nodes host other shards rather than extra copies of every message. ACKs never cross regions; a global `bettermq panel` federates cells.
+Multi-node cells default to **RF=3 / minISR=2** (limited by the initial node count).
+Additional nodes host other shards rather than extra copies of every message.
+An explicit `replication.factor` / `replication.minIsr` must match the controller's
+effective policy: startup fails on mismatch rather than acknowledging fewer
+copies than configured. Change an existing policy through the admin replication
+policy API and align the saved config before restart. ACKs never cross regions;
+a global `bettermq panel` federates cells.
 
 ### `bettermq config`
 
