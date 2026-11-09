@@ -179,6 +179,17 @@ pub enum LogError {
     },
     #[error("slate: {0}")]
     Slate(String),
+    #[error("partition log fenced until reopened from disk: {0}")]
+    Fenced(String),
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestFaults {
+    /// Write this many bytes of the next WAL write, then fail it.
+    short_write: Option<usize>,
+    /// Fail the rollback that follows a failed WAL write.
+    fail_rollback: bool,
 }
 
 /// Durable log for one partition directory.
@@ -201,7 +212,13 @@ pub struct PartitionLog {
     committed_hwm: u64,
     flush_count: u64,
     fail_next_sync: bool,
+    /// Set once the WAL on disk may no longer match the in-memory state.
+    /// Every later write or durability barrier fails until a reopen rebuilds
+    /// the log from disk.
+    fenced: Option<String>,
     telemetry: crate::telemetry::StorageTelemetryHandle,
+    #[cfg(test)]
+    faults: TestFaults,
 }
 
 impl PartitionLog {
@@ -255,7 +272,10 @@ impl PartitionLog {
             committed_hwm: 0,
             flush_count: 0,
             fail_next_sync: false,
+            fenced: None,
             telemetry: crate::telemetry::register_shard(shard_id),
+            #[cfg(test)]
+            faults: TestFaults::default(),
         };
 
         log.rebuild_from_disk()?;
@@ -633,6 +653,71 @@ impl PartitionLog {
         Ok(())
     }
 
+    /// Why the log refuses writes until it is reopened, if it does.
+    pub fn fenced_reason(&self) -> Option<&str> {
+        self.fenced.as_deref()
+    }
+
+    fn ensure_writable(&self) -> Result<(), LogError> {
+        match &self.fenced {
+            Some(reason) => Err(LogError::Fenced(reason.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn fence(&mut self, reason: String) {
+        if self.fenced.is_some() {
+            return;
+        }
+        tracing::error!(
+            dir = %self.dir.display(),
+            %reason,
+            "partition log fenced; writes refused until it is reopened from disk"
+        );
+        self.telemetry.record_fence();
+        self.fenced = Some(reason);
+    }
+
+    /// Append `bytes` at the end of the WAL (`self.wal_size`). If the write
+    /// fails, any partially written bytes are cut off again so a torn record
+    /// never sits in front of later ones; if that cannot be done durably the
+    /// log is fenced.
+    fn write_wal(&mut self, bytes: &[u8]) -> Result<(), LogError> {
+        let Err(error) = self.write_wal_bytes(bytes) else {
+            return Ok(());
+        };
+        if let Err(rollback) = self.truncate_wal_to_size() {
+            self.fence(format!(
+                "WAL write failed ({error}) and the partial record could not be removed ({rollback})"
+            ));
+        }
+        Err(error.into())
+    }
+
+    fn write_wal_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        #[cfg(test)]
+        if let Some(limit) = self.faults.short_write.take() {
+            self.wal.write_all(&bytes[..limit.min(bytes.len())])?;
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "injected short write",
+            ));
+        }
+        self.wal.write_all(bytes)
+    }
+
+    fn truncate_wal_to_size(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.faults.fail_rollback) {
+            return Err(io::Error::other("injected rollback failure"));
+        }
+        self.wal.set_len(self.wal_size)?;
+        // Always durable, even in `os` mode: a torn record that reappears
+        // after a crash would hide every record written after it.
+        self.wal.sync_data()
+    }
+
     /// Append a pre-encoded broker-proto frame (follower replication).
     /// When `expected_offset` is set, require `meta.next_offset == expected` (or
     /// idempotent success if that offset is already present).
@@ -642,6 +727,7 @@ impl PartitionLog {
         frame: &[u8],
         expected_offset: Option<u64>,
     ) -> Result<StoredMessage, LogError> {
+        self.ensure_writable()?;
         let (header, payload) = {
             let mut cursor = std::io::Cursor::new(frame);
             decode_frame(&mut cursor)?
@@ -676,8 +762,7 @@ impl PartitionLog {
         let byte_offset = self.wal_size;
         let wal_path = self.dir.join(WAL_FILE);
 
-        use std::io::Write;
-        self.wal.write_all(frame)?;
+        self.write_wal(frame)?;
 
         self.index.insert(
             offset,
@@ -739,6 +824,7 @@ impl PartitionLog {
         payload: Vec<u8>,
         fence_generation: Option<u64>,
     ) -> Result<(StoredMessage, Vec<u8>), LogError> {
+        self.ensure_writable()?;
         self.apply_fence(fence_generation)?;
         if self.manifest.wal_format_version == WAL_FORMAT_V2 {
             return self
@@ -756,8 +842,7 @@ impl PartitionLog {
 
         let mut frame = Vec::new();
         encode_frame(&header, &payload, &mut frame)?;
-        use std::io::Write;
-        self.wal.write_all(&frame)?;
+        self.write_wal(&frame)?;
 
         self.index.insert(
             offset,
@@ -814,8 +899,11 @@ impl PartitionLog {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        self.ensure_writable()?;
         self.apply_fence(fence_generation)?;
         let mut out = Vec::with_capacity(items.len());
+        // Positions are installed only once the bytes are in the WAL.
+        let mut positions = Vec::with_capacity(items.len());
         let mut buf = Vec::new();
         let wal_path = self.dir.join(WAL_FILE);
         let first_offset = self.meta.next_offset;
@@ -830,13 +918,13 @@ impl PartitionLog {
             let frame_start = buf.len();
             encode_frame(&header, &payload, &mut buf)?;
             let frame = buf[frame_start..].to_vec();
-            self.index.insert(
+            positions.push((
                 offset,
                 LogPosition {
                     path: wal_path.clone(),
                     byte_offset,
                 },
-            );
+            ));
             byte_offset += frame.len() as u64;
             let stored = StoredMessage {
                 id: header.id,
@@ -868,7 +956,6 @@ impl PartitionLog {
             offset += 1;
             out.push((stored, frame));
         }
-        use std::io::Write;
         let epoch_bytes = if self.manifest.wal_format_version == WAL_FORMAT_V2 {
             let epoch = EpochHeader::v2(
                 self.manifest.shard_id,
@@ -879,14 +966,15 @@ impl PartitionLog {
             );
             let mut encoded = Vec::with_capacity(EPOCH_HEADER_BYTES + buf.len());
             encode_epoch(&epoch, &buf, &mut encoded)?;
-            self.wal.write_all(&encoded)?;
+            self.write_wal(&encoded)?;
             self.wal_size = self.wal_size.saturating_add(encoded.len() as u64);
             encoded.len() as u64
         } else {
-            self.wal.write_all(&buf)?;
+            self.write_wal(&buf)?;
             self.wal_size = byte_offset;
             buf.len() as u64
         };
+        self.index.extend(positions);
         self.meta.next_offset = offset;
         self.after_write()?;
         self.telemetry
@@ -1135,6 +1223,7 @@ impl PartitionLog {
     /// unlinked, so a crash leaves deletable leftovers (removed on the next
     /// open) and never renumbered records.
     pub fn gc_sealed_below(&mut self, watermark: u64) -> Result<usize, LogError> {
+        self.ensure_writable()?;
         let current = self.meta.gc_watermark;
         if watermark < current {
             return Err(LogError::Io(io::Error::new(
@@ -1189,6 +1278,7 @@ impl PartitionLog {
     /// `base`, for a follower whose leader has already collected the prefix
     /// it is missing. Fails if any local record is at or above `base`.
     pub fn reset_base(&mut self, base: u64) -> Result<(), LogError> {
+        self.ensure_writable()?;
         if self.meta.next_offset > base {
             return Err(LogError::OffsetMismatch {
                 have: self.meta.next_offset,
@@ -1975,6 +2065,140 @@ mod tests {
         assert!(log.is_dirty());
         log.sync().unwrap();
         assert_eq!(log.committed_hwm(), 1);
+    }
+
+    fn wal_len(dir: &Path) -> u64 {
+        std::fs::metadata(dir.join(WAL_FILE)).unwrap().len()
+    }
+
+    fn assert_payload_sequence(log: &PartitionLog, expected: &[&[u8]]) {
+        let msgs = log.read_range(0, 0, 100).unwrap();
+        let got: Vec<&[u8]> = msgs.iter().map(|m| m.payload.as_slice()).collect();
+        assert_eq!(got, expected);
+        for (index, msg) in msgs.iter().enumerate() {
+            assert_eq!(msg.offset, index as u64);
+        }
+    }
+
+    #[test]
+    fn short_wal_write_is_rolled_back_before_later_appends() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            let mut log = PartitionLog::open_for_shard(
+                dir.path(),
+                group_cfg(Duration::from_secs(60)),
+                0,
+                format,
+            )
+            .unwrap();
+            log.append(0, sample_record("t"), b"one".to_vec()).unwrap();
+            log.append(0, sample_record("t"), b"two".to_vec()).unwrap();
+            let good_len = wal_len(dir.path());
+
+            log.faults.short_write = Some(10);
+            let err = log
+                .append_batch(
+                    0,
+                    vec![
+                        (sample_record("t"), b"lost-a".to_vec()),
+                        (sample_record("t"), b"lost-b".to_vec()),
+                    ],
+                    None,
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("injected short write"), "{err}");
+            assert_eq!(wal_len(dir.path()), good_len, "partial bytes left behind");
+            assert_eq!(log.high_watermark(), 2);
+            assert!(log.read_range(0, 2, 10).unwrap().is_empty());
+
+            let (third, _) = log
+                .append(0, sample_record("t"), b"three".to_vec())
+                .unwrap();
+            assert_eq!(third.offset, 2);
+            assert_payload_sequence(&log, &[b"one", b"two", b"three"]);
+            log.sync().unwrap();
+            drop(log);
+
+            let log = PartitionLog::open_for_shard(
+                dir.path(),
+                group_cfg(Duration::from_secs(60)),
+                0,
+                format,
+            )
+            .unwrap();
+            assert_payload_sequence(&log, &[b"one", b"two", b"three"]);
+        }
+    }
+
+    #[test]
+    fn short_write_on_single_v1_append_and_raw_frame_is_rolled_back() {
+        let dir = tempdir().unwrap();
+        let mut log = PartitionLog::open_for_shard(
+            dir.path(),
+            group_cfg(Duration::from_secs(60)),
+            0,
+            WAL_FORMAT_V1,
+        )
+        .unwrap();
+        log.append(0, sample_record("t"), b"one".to_vec()).unwrap();
+        log.faults.short_write = Some(5);
+        assert!(log.append(0, sample_record("t"), b"lost".to_vec()).is_err());
+        let mut frame = Vec::new();
+        encode_frame(&sample_record("t"), b"lost-raw", &mut frame).unwrap();
+        log.faults.short_write = Some(5);
+        assert!(log.append_raw_frame(0, &frame, Some(1)).is_err());
+        log.append(0, sample_record("t"), b"two".to_vec()).unwrap();
+        assert_payload_sequence(&log, &[b"one", b"two"]);
+        log.sync().unwrap();
+        drop(log);
+        let log = PartitionLog::open_for_shard(
+            dir.path(),
+            group_cfg(Duration::from_secs(60)),
+            0,
+            WAL_FORMAT_V1,
+        )
+        .unwrap();
+        assert_payload_sequence(&log, &[b"one", b"two"]);
+    }
+
+    #[test]
+    fn failed_rollback_fences_the_log_until_reopen() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            let mut log = PartitionLog::open_for_shard(
+                dir.path(),
+                group_cfg(Duration::from_secs(60)),
+                0,
+                format,
+            )
+            .unwrap();
+            log.append(0, sample_record("t"), b"one".to_vec()).unwrap();
+            log.sync().unwrap();
+            log.faults.short_write = Some(10);
+            log.faults.fail_rollback = true;
+            assert!(log.append(0, sample_record("t"), b"torn".to_vec()).is_err());
+            assert!(log.fenced_reason().is_some());
+            assert!(matches!(
+                log.append(0, sample_record("t"), b"refused".to_vec()),
+                Err(LogError::Fenced(_))
+            ));
+            assert!(matches!(log.gc_sealed_below(1), Err(LogError::Fenced(_))));
+            assert_payload_sequence(&log, &[b"one"]);
+            drop(log);
+
+            // Recovery drops the torn tail and the log is writable again.
+            let mut log = PartitionLog::open_for_shard(
+                dir.path(),
+                group_cfg(Duration::from_secs(60)),
+                0,
+                format,
+            )
+            .unwrap();
+            assert!(log.fenced_reason().is_none());
+            assert_payload_sequence(&log, &[b"one"]);
+            log.append(0, sample_record("t"), b"two".to_vec()).unwrap();
+            assert_payload_sequence(&log, &[b"one", b"two"]);
+        }
     }
 
     fn gc_cfg() -> PartitionLogConfig {

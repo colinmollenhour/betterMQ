@@ -362,6 +362,10 @@ fn append_storage_metrics(out: &mut String, snapshot: &broker_storage::StorageTe
     out.push_str("# TYPE bettermq_wal_fsync_total counter\n");
     out.push_str("# HELP bettermq_wal_fsync_failures_total Failed WAL fsync operations\n");
     out.push_str("# TYPE bettermq_wal_fsync_failures_total counter\n");
+    out.push_str(
+        "# HELP bettermq_wal_fence_events_total Partition logs fenced (writes refused until reopen)\n",
+    );
+    out.push_str("# TYPE bettermq_wal_fence_events_total counter\n");
     out.push_str("# HELP bettermq_wal_fsync_records_total Records covered by successful fsyncs\n");
     out.push_str("# TYPE bettermq_wal_fsync_records_total counter\n");
     out.push_str("# HELP bettermq_wal_records_per_fsync Mean records per successful fsync\n");
@@ -401,6 +405,10 @@ fn append_storage_metrics(out: &mut String, snapshot: &broker_storage::StorageTe
         out.push_str(&format!(
             "bettermq_wal_fsync_failures_total{{{label}}} {}\n",
             shard.fsync_failures
+        ));
+        out.push_str(&format!(
+            "bettermq_wal_fence_events_total{{{label}}} {}\n",
+            shard.fence_events
         ));
         out.push_str(&format!(
             "bettermq_wal_fsync_records_total{{{label}}} {}\n",
@@ -1008,6 +1016,7 @@ mod tests {
                     fsync_latency_count: 3,
                     fsync_latency_sum_us: 21_000,
                     fsync_buckets: [1, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                    fence_events: 1,
                 }],
                 dropped_shards: 0,
             },
@@ -1118,6 +1127,7 @@ mod tests {
         assert!(!output.contains("{,le="));
         assert!(output.contains("bettermq_wal_epoch_total{shard=\"7\"} 3"));
         assert!(output.contains("bettermq_wal_records_per_fsync{shard=\"7\"} 6"));
+        assert!(output.contains("bettermq_wal_fence_events_total{shard=\"7\"} 1"));
         assert!(output
             .contains("bettermq_wal_fsync_duration_seconds_bucket{shard=\"7\",le=\"+Inf\"} 3"));
         assert!(output.contains("bettermq_shard_queue_bytes{shard=\"7\"} 512"));

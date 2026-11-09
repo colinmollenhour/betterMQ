@@ -24,6 +24,7 @@ struct ShardCounters {
     fsync_latency_count: AtomicU64,
     fsync_latency_sum_us: AtomicU64,
     fsync_buckets: [AtomicU64; 10],
+    fence_events: AtomicU64,
 }
 
 #[derive(Default)]
@@ -100,6 +101,11 @@ impl StorageTelemetryHandle {
             self.counters.fsync_failures.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    /// A partition log on this shard stopped accepting writes until reopen.
+    pub(crate) fn record_fence(&self) {
+        self.counters.fence_events.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +124,9 @@ pub struct StorageShardTelemetrySnapshot {
     pub fsync_latency_sum_us: u64,
     /// Non-cumulative counts matching [`FSYNC_BUCKET_US`].
     pub fsync_buckets: [u64; 10],
+    /// Times a partition log on this shard was fenced (writes refused until
+    /// reopen). Any non-zero value needs operator attention.
+    pub fence_events: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +158,7 @@ pub fn storage_telemetry_snapshot() -> StorageTelemetrySnapshot {
             fsync_buckets: std::array::from_fn(|index| {
                 counters.fsync_buckets[index].load(Ordering::Relaxed)
             }),
+            fence_events: counters.fence_events.load(Ordering::Relaxed),
         })
         .collect();
     StorageTelemetrySnapshot {
