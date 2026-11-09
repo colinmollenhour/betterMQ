@@ -159,6 +159,19 @@ copies than configured. Change an existing policy through the admin replication
 policy API and align the saved config before restart. ACKs never cross regions;
 a global `bettermq panel` federates cells.
 
+The standalone panel authenticates through `/admin/v1` using its configured
+`BETTERMQ_CLUSTER_SECRET` bearer credential, not a broker's `sk_local_` token.
+Its Infrastructure view queries the configured controller through the admin
+connection. Broker-only queue, publishing, scheduling, HTTP, node settings and
+storage screens are available only in the broker's embedded panel.
+
+Each remote cell also needs its own `sk_local_` admin token: enter it in
+Infrastructure → Cells → Create/Edit cell. This write-only field is never returned
+by reads; leaving it blank on edit keeps the saved credential. Federated reads
+use only that cell credential, never the panel login bearer or cluster secret.
+If a cell reports "cell credential not configured", edit its entry to supply the
+token. Rotating a cell's token requires updating its saved credential here.
+
 ### `bettermq config`
 
 ```bash

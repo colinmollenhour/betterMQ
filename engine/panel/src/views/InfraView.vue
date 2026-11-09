@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -38,6 +38,8 @@ import {
 import { useActionStatus } from "@/composables/useActionStatus";
 import { errText } from "@/lib/payload";
 import { canRemoveNode } from "@/lib/targets";
+import { isStandalone } from "@/lib/config";
+import { cellCredentialError } from "@/lib/cellCredentials";
 import { refreshCells, selectedCell, session, type CellMember, type CellRecord } from "@/lib/session";
 
 type SectionId = "overview" | "nodes" | "cells" | "cluster" | "this-node" | "storage";
@@ -62,7 +64,7 @@ const sections: { id: SectionId; label: string }[] = [
   { id: "cluster", label: "Cluster" },
   { id: "this-node", label: "This node" },
   { id: "storage", label: "Storage" },
-];
+].filter((item) => !isStandalone() || !["this-node", "storage"].includes(item.id)) as { id: SectionId; label: string }[];
 
 const section = ref<SectionId>("overview");
 const selectedNodeKey = ref("");
@@ -76,7 +78,9 @@ const infraStatus = ref<Record<string, unknown> | null>(null);
 const joinToken = ref("");
 
 const createOpen = ref(false);
-const cellForm = reactive({ id: "", region: "", controllerUrl: "", label: "" });
+const editingCell = ref(false);
+const cellForm = reactive({ id: "", region: "", controllerUrl: "", label: "", adminToken: "" });
+watch(createOpen, (open) => { if (!open) cellForm.adminToken = ""; });
 
 const attachOpen = ref(false);
 const attach = reactive({
@@ -239,7 +243,7 @@ async function loadFed() {
     for (const key of Object.keys(clusterByCell)) delete clusterByCell[key];
     for (const row of cluster.ok || []) clusterByCell[row.cell] = row.data;
     const failed = [...(nodes.failed || []), ...(shards.failed || []), ...(cluster.failed || [])];
-    if (failed.length) fedStatus.fail(`Federated query failed: ${failed[0].cell} — ${failed[0].error}`);
+    if (failed.length) fedStatus.fail(`Federated query failed: ${[...new Set(failed.map((failure) => `${failure.cell} — ${failure.error}`))].join("; ")}`);
     const cell = selectedCell();
     if (cell) {
       const ov = dataForCell(cluster, cell.id);
@@ -251,6 +255,7 @@ async function loadFed() {
 }
 
 async function loadInfra() {
+  if (isStandalone()) return;
   try {
     const st = await apiGet<Record<string, unknown>>(publicUrl("/v1/infra/status"));
     infraStatus.value = st;
@@ -287,12 +292,15 @@ async function loadInfra() {
 
 async function createCell() {
   cellStatus.reset();
+  const credentialError = cellCredentialError(cellForm.adminToken, editingCell.value);
+  if (credentialError) { cellStatus.fail(credentialError); return; }
   try {
     await apiPost(adminUrl("/cells"), {
       id: cellForm.id,
       region: cellForm.region,
       controllerUrl: cellForm.controllerUrl,
       label: cellForm.label || undefined,
+      adminToken: cellForm.adminToken.trim() || undefined,
     });
     cellStatus.succeed(`Registered cell ${cellForm.id}`);
     createOpen.value = false;
@@ -301,6 +309,17 @@ async function createCell() {
   } catch (e) {
     cellStatus.fail(e);
   }
+}
+
+function openCellForm(cell?: CellRecord) {
+  editingCell.value = Boolean(cell);
+  cellForm.id = cell?.id || "";
+  cellForm.region = cell?.region || "";
+  cellForm.controllerUrl = cell?.controllerUrl || "";
+  cellForm.label = cell?.label || "";
+  cellForm.adminToken = "";
+  cellStatus.reset();
+  createOpen.value = true;
 }
 
 async function probe() {
@@ -381,7 +400,7 @@ async function syncCluster() {
 }
 
 function removable(row: NodeRow) {
-  return canRemoveNode(row, session.isSeed, session.cluster?.cluster_id);
+  return !isStandalone() && canRemoveNode(row, session.isSeed, session.cluster?.cluster_id);
 }
 
 async function removeNode(row: NodeRow) {
@@ -514,14 +533,14 @@ function openAddNode() {
       <div class="min-w-0 flex-1 space-y-4">
         <template v-if="section === 'overview'">
           <div class="grid gap-3 sm:grid-cols-3">
-            <Card>
+            <Card v-if="!isStandalone()">
               <CardHeader class="pb-2">
                 <CardDescription>This node</CardDescription>
                 <CardTitle>{{ kpiNode }}</CardTitle>
               </CardHeader>
               <CardContent class="truncate font-mono text-xs text-muted-foreground">{{ kpiUrl }}</CardContent>
             </Card>
-            <Card>
+            <Card v-if="!isStandalone()">
               <CardHeader class="pb-2">
                 <CardDescription>Storage</CardDescription>
                 <CardTitle class="capitalize">{{ kpiStorage }}</CardTitle>
@@ -688,7 +707,7 @@ function openAddNode() {
               <h2 class="text-base font-medium">Cells</h2>
               <p class="text-sm text-muted-foreground">Register another region’s controller. This does not start VMs.</p>
             </div>
-            <Button size="sm" @click="createOpen = true">Create cell</Button>
+            <Button size="sm" @click="openCellForm()">Create cell</Button>
           </div>
           <Card>
             <CardContent class="pt-4">
@@ -699,6 +718,8 @@ function openAddNode() {
                     <TableHead>Label</TableHead>
                     <TableHead>Region</TableHead>
                     <TableHead>Controller</TableHead>
+                    <TableHead>Admin credential</TableHead>
+                    <TableHead />
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -709,6 +730,8 @@ function openAddNode() {
                     <TableCell class="max-w-[16rem] truncate font-mono text-xs">
                       {{ cell.controllerUrl || "—" }}
                     </TableCell>
+                    <TableCell>{{ cell.adminTokenConfigured ? 'Configured' : 'Not configured' }}</TableCell>
+                    <TableCell><Button size="sm" variant="outline" @click="openCellForm(cell)">Edit</Button></TableCell>
                   </TableRow>
                 </TableBody>
               </Table>
@@ -729,7 +752,7 @@ function openAddNode() {
                   · {{ currentCluster.nodeCount || 0 }} nodes · RF {{ currentCluster.replicationFactor || "—" }}
                 </span>
               </p>
-              <div class="flex flex-wrap items-center gap-2">
+              <div v-if="!isStandalone()" class="flex flex-wrap items-center gap-2">
                 <Button size="sm" @click="createCluster">Create cluster</Button>
                 <Button size="sm" variant="outline" @click="syncCluster">Re-sync</Button>
                 <ActionMessage :error="clusterStatus.error" :ok="clusterStatus.ok" />
@@ -795,23 +818,26 @@ function openAddNode() {
   <Dialog v-model:open="createOpen">
     <DialogContent>
       <DialogHeader>
-        <DialogTitle>Create cell</DialogTitle>
+        <DialogTitle>{{ editingCell ? 'Edit cell' : 'Create cell' }}</DialogTitle>
         <DialogDescription>
           Register another region’s controller. This does not start VMs or join Raft.
         </DialogDescription>
       </DialogHeader>
       <div class="grid gap-3">
-        <Field label="ID"><Input v-model="cellForm.id" placeholder="eu-west" /></Field>
+        <Field label="ID"><Input v-model="cellForm.id" :readonly="editingCell" placeholder="eu-west" /></Field>
         <Field label="Region"><Input v-model="cellForm.region" placeholder="eu-west" /></Field>
         <Field label="Controller URL">
           <Input v-model="cellForm.controllerUrl" class="font-mono text-xs" placeholder="http://10.0.0.9:8090" />
         </Field>
         <Field label="Label"><Input v-model="cellForm.label" placeholder="EU" /></Field>
+        <Field label="Cell admin token" :hint="editingCell ? 'Write-only. Leave blank to keep the saved token.' : 'Required: the target cell’s sk_local_ admin token. Never use the cluster secret.'">
+          <Input v-model="cellForm.adminToken" type="password" autocomplete="off" :placeholder="editingCell ? 'Leave blank to keep' : 'sk_local_…'" />
+        </Field>
       </div>
       <DialogFooter>
         <ActionMessage :error="cellStatus.error" :ok="cellStatus.ok" />
         <Button variant="outline" size="sm" @click="createOpen = false">Cancel</Button>
-        <Button size="sm" @click="createCell">Register</Button>
+        <Button size="sm" @click="createCell">{{ editingCell ? 'Save' : 'Register' }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

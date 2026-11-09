@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { RefreshCw } from "@lucide/vue";
+import { isStandalone } from "@/lib/config";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import ActionMessage from "@/components/form/ActionMessage.vue";
@@ -17,9 +18,7 @@ async function refreshAll() {
       pollHealth(),
       pollCluster(),
       refreshCells(),
-      refreshQueues(),
-      refreshGroups(),
-      refreshFlows(),
+      ...(!isStandalone() ? [refreshQueues(), refreshGroups(), refreshFlows()] : []),
     ]);
     refreshStatus.succeed("Refreshed");
   } catch (e) {

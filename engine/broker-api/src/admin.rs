@@ -63,9 +63,17 @@ impl AdminState {
 
     pub fn remote_with_path(
         controller: String,
-        registry: CellRegistry,
+        mut registry: CellRegistry,
         registry_path: Option<PathBuf>,
     ) -> Self {
+        if registry.cells.is_empty() {
+            registry.cells.push(CellRecord {
+                id: "controller".into(),
+                region: "remote".into(),
+                controller_url: controller.clone(),
+                label: Some("Controller".into()),
+            });
+        }
         if let Some(path) = registry_path.as_ref() {
             let _ = registry.save(path);
         }

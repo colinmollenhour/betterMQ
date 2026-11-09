@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory } from "vue-router";
+import { isStandalone } from "@/lib/config";
 
 export const router = createRouter({
   history: createWebHistory("/panel/"),
@@ -17,4 +18,8 @@ export const router = createRouter({
     { path: "/settings", name: "settings", component: () => import("@/views/SettingsView.vue") },
     { path: "/:pathMatch(.*)*", redirect: "/" },
   ],
+});
+
+router.beforeEach((to) => {
+  if (isStandalone() && !["/infra", "/docs"].includes(to.path)) return "/infra";
 });

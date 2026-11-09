@@ -1,5 +1,5 @@
 import { reactive } from "vue";
-import { isExternalAuth } from "@/lib/config";
+import { isExternalAuth, isStandalone } from "@/lib/config";
 import { adminUrl, apiGet, apiPost, publicUrl } from "@/lib/api";
 import { refreshFlows, refreshGroups, refreshQueues } from "@/lib/catalog";
 import {
@@ -21,6 +21,7 @@ export type CellRecord = {
   region: string;
   controllerUrl: string;
   label?: string | null;
+  adminTokenConfigured?: boolean;
 };
 
 export type CellMember = {
@@ -116,6 +117,11 @@ export async function initAuth() {
   session.splitAuth = false;
   session.gateMessage = "";
   try {
+    if (isStandalone()) {
+      await validateSessionToken();
+      startApp();
+      return;
+    }
     const a = await fetch(publicUrl("/v1/auth/config")).then((r) => r.json() as Promise<AuthConfig>);
     const b = await fetch(publicUrl("/v1/auth/config")).then((r) => r.json() as Promise<AuthConfig>);
     if (a.configured !== b.configured || a.mode !== b.mode) {
@@ -141,7 +147,7 @@ export async function initAuth() {
       return;
     }
     try {
-      await apiGet(publicUrl("/v1/queues"));
+      await validateSessionToken();
       startApp();
     } catch (e) {
       setToken("");
@@ -175,17 +181,23 @@ export function finishReveal() {
 
 export function submitGateToken(raw: string) {
   const t = raw.trim();
-  if (!t) throw new Error("Paste your sk_local_… token.");
-  if (!t.startsWith("sk_local_")) throw new Error("Expected a sk_local_… token from this broker's setup.");
+  if (!t) throw new Error(isStandalone() ? "Paste the standalone admin credential." : "Paste your sk_local_… token.");
+  if (!isStandalone() && !t.startsWith("sk_local_")) throw new Error("Expected a sk_local_… token from this broker's setup.");
   setToken(t);
+}
+
+export function validateSessionToken() {
+  return apiGet(isStandalone() ? adminUrl("/cells") : publicUrl("/v1/queues"));
 }
 
 export function startApp() {
   session.phase = "app";
   void refreshCells();
-  void refreshQueues();
-  void refreshGroups();
-  void refreshFlows();
+  if (!isStandalone()) {
+    void refreshQueues();
+    void refreshGroups();
+    void refreshFlows();
+  }
   void pollHealth();
   void pollCluster();
   if (healthTimer) clearInterval(healthTimer);
@@ -221,6 +233,10 @@ export async function pollHealth() {
 }
 
 export async function pollCluster() {
+  if (isStandalone()) {
+    session.clusterLabel = "federated";
+    return;
+  }
   try {
     const c = await apiGet<ClusterStatus>(publicUrl("/v1/cluster"));
     session.cluster = c;

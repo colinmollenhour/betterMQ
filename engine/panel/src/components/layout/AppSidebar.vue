@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useRoute, RouterLink } from "vue-router";
+import { computed } from "vue";
 import {
   BookOpen,
   Clock,
@@ -31,7 +32,7 @@ import {
   SidebarRail,
 } from "@/components/ui/sidebar";
 import CellSwitcher from "@/components/layout/CellSwitcher.vue";
-import { isExternalAuth } from "@/lib/config";
+import { isExternalAuth, isStandalone } from "@/lib/config";
 import { session, setTheme } from "@/lib/session";
 import type { ThemeMode } from "@/lib/storage";
 import iconBrand from "@/assets/logos/betterMQ-icon-brand.svg";
@@ -53,6 +54,7 @@ const nav = [
 ];
 
 const settingsItem = { to: "/settings", label: "Settings", icon: Settings };
+const visibleNav = computed(() => nav.filter((item) => !isStandalone() || ["/infra", "/docs"].includes(item.to)));
 
 const themes: { id: ThemeMode; label: string; icon: typeof Sun }[] = [
   { id: "system", label: "System", icon: Monitor },
@@ -79,7 +81,7 @@ const themes: { id: ThemeMode; label: string; icon: typeof Sun }[] = [
         <SidebarGroupLabel class="text-xs tracking-widest uppercase">Navigate</SidebarGroupLabel>
         <SidebarGroupContent>
           <SidebarMenu>
-            <SidebarMenuItem v-for="item in nav" :key="item.to">
+            <SidebarMenuItem v-for="item in visibleNav" :key="item.to">
               <SidebarMenuButton
                 as-child
                 :is-active="route.path === item.to"
@@ -91,7 +93,7 @@ const themes: { id: ThemeMode; label: string; icon: typeof Sun }[] = [
                 </RouterLink>
               </SidebarMenuButton>
             </SidebarMenuItem>
-            <SidebarMenuItem v-if="!isExternalAuth()">
+            <SidebarMenuItem v-if="!isExternalAuth() && !isStandalone()">
               <SidebarMenuButton
                 as-child
                 :is-active="route.path === settingsItem.to"
