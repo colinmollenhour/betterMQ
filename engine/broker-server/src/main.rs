@@ -585,6 +585,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     let postgres = matches!(&settings.auth, ResolvedAuth::Cloud { .. });
+    if !postgres {
+        let auth_path = std::env::var_os("BETTERMQ_LOCAL_AUTH_FILE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| settings.data_dir.join("local-auth.json"));
+        check_auth_directory(&auth_path)?;
+    }
     let mut first_boot_task = None;
 
     #[cfg(feature = "cloud")]
@@ -888,6 +894,33 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn check_auth_directory(auth_path: &std::path::Path) -> anyhow::Result<()> {
+    let parent = auth_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create local auth directory {}", parent.display()))?;
+    let probe = parent.join(format!(".auth-write-check-{}", Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&probe).with_context(|| {
+        format!(
+            "local auth directory {} must be writable and on persistent storage (auth file {})",
+            parent.display(),
+            auth_path.display()
+        )
+    })?;
+    drop(file);
+    std::fs::remove_file(&probe).context("remove auth-directory write probe")?;
+    Ok(())
+}
+
 fn validate_replication_policy(
     configured: &broker_config::ReplicationPolicyConfig,
     factor: u32,
@@ -900,22 +933,6 @@ fn validate_replication_policy(
         );
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod replication_policy_tests {
-    use super::*;
-
-    #[test]
-    fn never_silently_accepts_a_weaker_controller_policy() {
-        let policy = broker_config::ReplicationPolicyConfig {
-            factor: 3,
-            min_isr: 3,
-        };
-        assert!(validate_replication_policy(&policy, 3, 2).is_err());
-        assert!(validate_replication_policy(&policy, 3, 3).is_ok());
-        assert!(validate_replication_policy(&policy, 2, 2).is_err());
-    }
 }
 
 async fn serve_panel(args: PanelArgs) -> anyhow::Result<()> {
@@ -1411,4 +1428,30 @@ fn spawn_fleet_workers(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<(
             });
         }
     }))
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn checks_auth_parent_before_first_boot_setup() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("meta/local-auth.json");
+        check_auth_directory(&path).unwrap();
+        assert!(!path.exists());
+        std::fs::write(root.path().join("file"), b"not a directory").unwrap();
+        assert!(check_auth_directory(&root.path().join("file/local-auth.json")).is_err());
+    }
+
+    #[test]
+    fn never_silently_accepts_a_weaker_controller_policy() {
+        let policy = broker_config::ReplicationPolicyConfig {
+            factor: 3,
+            min_isr: 3,
+        };
+        assert!(validate_replication_policy(&policy, 3, 2).is_err());
+        assert!(validate_replication_policy(&policy, 3, 3).is_ok());
+        assert!(validate_replication_policy(&policy, 2, 2).is_err());
+    }
 }

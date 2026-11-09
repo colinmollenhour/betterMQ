@@ -126,6 +126,11 @@ Config saves use private (Unix `0600`) temporary files and atomic replacement,
 with file and directory sync. Newly created config directories are private
 (`0700`); existing directories retain their permissions.
 
+The cluster template stores local auth at `/cluster-shared/meta/local-auth.json`,
+inside the HA compose persistent metadata mount. Startup checks that the auth
+directory is writable before opening first-boot setup. Custom auth paths must
+also point at a persistent writable volume.
+
 ```bash
 bettermq serve
 bettermq serve -p 9000

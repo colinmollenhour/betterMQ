@@ -362,7 +362,7 @@ impl BetterMqConfig {
             data_dir: PathBuf::from("/data"),
             storage: StorageConfig::Local,
             auth: AuthConfig::Local {
-                auth_file: Some(PathBuf::from("/cluster-shared/local-auth.json")),
+                auth_file: Some(PathBuf::from("/cluster-shared/meta/local-auth.json")),
             },
             dispatch: DispatchConfigSection::default(),
             cluster: Some(ClusterConfigSection {
@@ -437,6 +437,21 @@ mod tests {
         BetterMqConfig::template_single_local()
             .validate()
             .expect("valid");
+    }
+
+    #[test]
+    fn cluster_auth_is_inside_the_persistent_meta_mount() {
+        let cfg = BetterMqConfig::template_cluster_local();
+        let AuthConfig::Local {
+            auth_file: Some(path),
+        } = cfg.auth
+        else {
+            panic!("local auth")
+        };
+        assert_eq!(
+            path.parent(),
+            cfg.cluster.unwrap().shared_meta_dir.as_deref()
+        );
     }
 
     #[test]
