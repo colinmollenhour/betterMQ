@@ -15,10 +15,21 @@ const PAYLOAD_RETRY_MS: u64 = 10_000;
 /// Heartbeat cadence: a third of the 30 s lease TTL the client requests.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Default jobs requested per claim (`BETTERMQ_FLEET_CLAIM_BATCH`).
+pub const DEFAULT_CLAIM_BATCH: usize = 16;
+
+/// Default wait after every broker answered a claim with no jobs.
+pub const DEFAULT_IDLE_POLL: Duration = Duration::from_millis(250);
+
 #[derive(Debug, Clone)]
 pub struct FleetOptions {
     /// Jobs in flight per fleet process (`BETTERMQ_FLEET_CONCURRENCY`).
     pub concurrency: usize,
+    /// Most jobs requested by one claim; each claim asks for
+    /// `min(free permits, claim_batch)`.
+    pub claim_batch: usize,
+    /// Back-off after a full round of brokers returned no jobs.
+    pub idle_poll: Duration,
     /// How often each held lease is renewed while its job is in flight.
     pub heartbeat_interval: Duration,
 }
@@ -27,6 +38,11 @@ impl FleetOptions {
     pub fn from_env() -> Self {
         Self {
             concurrency: crate::lease::fleet_concurrency(),
+            claim_batch: std::env::var("BETTERMQ_FLEET_CLAIM_BATCH")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_CLAIM_BATCH),
+            idle_poll: DEFAULT_IDLE_POLL,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
         }
     }
@@ -34,63 +50,70 @@ impl FleetOptions {
 
 /// Claim jobs from every broker in `client` and deliver them until aborted.
 ///
-/// Each claim asks for as many jobs as there are free delivery permits, and
-/// every claimed job runs in its own task that heartbeats its lease from the
-/// moment it is claimed, so no lease sits idle waiting behind another delivery.
+/// The loop keeps claiming while delivery permits are free and brokers return
+/// work; it only waits `idle_poll` once a whole round of brokers came back
+/// empty. Each claim asks for as many jobs as there are free permits (capped
+/// by `claim_batch`), and every claimed job runs in its own task that
+/// heartbeats its lease from the moment it is claimed.
 pub fn spawn_fleet(
     dispatch: DispatchEngine,
     client: LeaseClient,
     options: FleetOptions,
 ) -> JoinHandle<()> {
     let sem = Arc::new(Semaphore::new(options.concurrency.max(1)));
+    let claim_batch = options.claim_batch.clamp(1, MAX_CLAIM_JOBS);
     tokio::spawn(async move {
         let mut rr = 0usize;
-        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        let mut empty_streak = 0usize;
         loop {
-            interval.tick().await;
             let urls = client.broker_urls();
-            if urls.is_empty() {
+            if urls.is_empty() || dispatch.is_draining() {
+                tokio::time::sleep(options.idle_poll).await;
                 continue;
             }
-            rr = (rr + 1) % urls.len();
-            let broker = urls[rr].clone();
+            if empty_streak >= urls.len() {
+                empty_streak = 0;
+                tokio::time::sleep(options.idle_poll).await;
+            }
             let Ok(first) = sem.clone().acquire_owned().await else {
                 break;
             };
             let mut permits = vec![first];
-            while permits.len() < MAX_CLAIM_JOBS {
+            while permits.len() < claim_batch {
                 match sem.clone().try_acquire_owned() {
                     Ok(permit) => permits.push(permit),
                     Err(_) => break,
                 }
             }
-            let dispatch = dispatch.clone();
-            let client = client.clone();
-            let options = options.clone();
-            tokio::spawn(async move {
-                if dispatch.is_draining() {
-                    return;
-                }
-                claim_and_deliver(&dispatch, &client, &broker, permits, &options).await;
-            });
+            rr = (rr + 1) % urls.len();
+            let broker = urls[rr].clone();
+            let claimed = claim_and_deliver(&dispatch, &client, &broker, permits, &options).await;
+            if claimed == 0 {
+                empty_streak += 1;
+            } else {
+                empty_streak = 0;
+            }
         }
     })
 }
 
+/// Claim up to `permits.len()` jobs and start one delivery task per job.
+/// Returns how many jobs were claimed; unused permits are released.
 async fn claim_and_deliver(
     dispatch: &DispatchEngine,
     client: &LeaseClient,
     broker: &str,
     mut permits: Vec<OwnedSemaphorePermit>,
     options: &FleetOptions,
-) {
+) -> usize {
     let claimed = match client.claim(broker, permits.len()).await {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!(error = %e, %broker, "fleet claim");
-            return;
+            return 0;
         }
     };
+    let count = claimed.jobs.len();
     for job in claimed.jobs {
         let Some(permit) = permits.pop() else {
             // The broker returned more jobs than requested; let the extra
@@ -107,6 +130,7 @@ async fn claim_and_deliver(
             deliver_claimed_job(&dispatch, &client, &broker, job, heartbeat_interval).await;
         });
     }
+    count
 }
 
 /// Deliver one claimed job and report the outcome to the broker that leased it.

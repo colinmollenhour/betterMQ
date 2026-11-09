@@ -345,6 +345,7 @@ Background loops export these `/metrics` series: `bettermq_scheduler_failures_to
 | `BETTERMQ_LEGACY_SCHEDULE_IMPORT_SECS` | How long after start a node re-scans `BETTERMQ_SHARED_META_DIR` for schedule state from older releases (default `3600`, every 30 s) |
 | `BETTERMQ_BROKER_URLS` | Fleet/gateway: comma-separated broker base URLs |
 | `BETTERMQ_FLEET_CONCURRENCY` | Fleet in-flight jobs (default `1`) |
+| `BETTERMQ_FLEET_CLAIM_BATCH` | Most jobs one fleet claim requests, `1`–`64` (default `16`). Each claim asks for the free in-flight slots up to this cap; the fleet keeps claiming while brokers return work and polls every 250 ms when they are idle |
 | `BETTERMQ_FLEET_HOLDER` | Optional fleet worker id |
 | `BETTERMQ_LONG_WAIT_TIER` | Fleet long HTTP wait: `15m` \| `1h` \| `6h` \| `12h` |
 | `BETTERMQ_NODE_NAME` | Node display name (also set from config) |

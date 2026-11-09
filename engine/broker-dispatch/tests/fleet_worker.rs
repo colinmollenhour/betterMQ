@@ -7,10 +7,11 @@ use broker_dispatch::{
 use broker_partition::{Broker, BrokerConfig};
 use broker_storage::StoredMessage;
 use std::sync::Once;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 fn allow_wiremock_localhost() {
     static ONCE: Once = Once::new();
@@ -126,6 +127,7 @@ async fn every_claimed_lease_is_heartbeated_while_deliveries_run() {
         FleetOptions {
             concurrency: 2,
             heartbeat_interval: Duration::from_millis(100),
+            ..FleetOptions::from_env()
         },
     );
 
@@ -161,5 +163,92 @@ async fn every_claimed_lease_is_heartbeated_while_deliveries_run() {
             .len(),
         2
     );
+    fleet.abort();
+}
+
+/// Hands out queued jobs, honouring each claim's `max_jobs`.
+struct ClaimQueue(Arc<Mutex<Vec<ClaimedJob>>>);
+
+impl Respond for ClaimQueue {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let max = body["max_jobs"].as_u64().unwrap() as usize;
+        let mut queue = self.0.lock().unwrap();
+        let take = max.min(queue.len());
+        let jobs: Vec<ClaimedJob> = queue.drain(..take).collect();
+        ResponseTemplate::new(200).set_body_json(ClaimResponse { jobs })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fleet_keeps_claiming_while_brokers_return_work() {
+    allow_wiremock_localhost();
+    let destination = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/fast"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&destination)
+        .await;
+    let hook = format!("{}/fast", destination.uri());
+
+    let broker = MockServer::start().await;
+    const JOBS: usize = 120;
+    let queue = Arc::new(Mutex::new(
+        (0..JOBS as u64).map(|offset| job(offset, &hook)).collect(),
+    ));
+    Mock::given(method("POST"))
+        .and(path("/internal/v1/lease/claim"))
+        .respond_with(ClaimQueue(queue.clone()))
+        .mount(&broker)
+        .await;
+    for route in [
+        "/internal/v1/lease/heartbeat",
+        "/internal/v1/lease/complete",
+    ] {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&broker)
+            .await;
+    }
+
+    let (engine, _dir) = fleet_engine();
+    let client = LeaseClient::new(vec![broker.uri()], "fleet-test".into());
+    let started = std::time::Instant::now();
+    let fleet = spawn_fleet(
+        engine,
+        client,
+        FleetOptions {
+            concurrency: 4,
+            claim_batch: 4,
+            idle_poll: Duration::from_millis(250),
+            heartbeat_interval: Duration::from_secs(10),
+        },
+    );
+    loop {
+        let done = requests_to(&broker, "/internal/v1/lease/complete")
+            .await
+            .len();
+        if done == JOBS {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "only {done}/{JOBS} delivered; claims are tick-gated"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A 250 ms tick with 4 jobs per claim would need 7.5 s for 120 jobs.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+
+    // Once the backlog is gone the loop backs off instead of spinning.
+    let before = requests_to(&broker, "/internal/v1/lease/claim").await.len();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let idle_claims = requests_to(&broker, "/internal/v1/lease/claim").await.len() - before;
+    assert!(idle_claims <= 6, "{idle_claims} claims in one idle second");
     fleet.abort();
 }
