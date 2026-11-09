@@ -1049,6 +1049,17 @@ impl DispatchEngine {
             });
             let pin = match crate::egress::pin_destination_addr(url).await {
                 Ok(p) => p,
+                Err(crate::egress::EgressError::ResolveFailed) => {
+                    self.host_blocker.record_transport_failure(url);
+                    return self
+                        .retry_local_failure(
+                            msg,
+                            attempt,
+                            None,
+                            "destination DNS resolution failed".into(),
+                        )
+                        .await;
+                }
                 Err(e) => {
                     warn!(destination = %url, error = %e, "delivery blocked by egress pin — moving to DLQ");
                     self.finalize_dead_letter(
@@ -1154,33 +1165,44 @@ impl DispatchEngine {
                 }
             }
 
-            let attempt = attempt.saturating_add(1);
-            let max_retries = msg.max_retries;
-            if attempt > max_retries {
-                self.telemetry.record_retry_exhausted();
-                let attempts = max_retries.saturating_add(1);
-                let detail = last_failure.as_str();
-                self.finalize_dead_letter(
+            self.retry_local_failure(msg, attempt, requested_retry_after_ms, last_failure)
+                .await
+        }
+    }
+
+    async fn retry_local_failure(
+        &self,
+        msg: &StoredMessage,
+        attempt: u32,
+        requested_retry_after_ms: Option<u64>,
+        last_failure: String,
+    ) -> Result<(), DispatchError> {
+        let attempt = attempt.saturating_add(1);
+        let max_retries = msg.max_retries;
+        if attempt > max_retries {
+            self.telemetry.record_retry_exhausted();
+            let attempts = max_retries.saturating_add(1);
+            let detail = last_failure.as_str();
+            self.finalize_dead_letter(
                     msg,
                     format!(
                         "{detail} — exhausted {attempts} delivery attempt(s) (max_retries={max_retries})"
                     ),
                 )
                 .await?;
-                return Ok(());
-            }
-
-            let backoff_cfg = msg
-                .retry_backoff
-                .as_ref()
-                .unwrap_or(&self.config.retry_defaults.backoff);
-            let backoff = backoff_cfg.delay_ms(attempt);
-            let delay_ms = requested_retry_after_ms
-                .unwrap_or(backoff)
-                .min(backoff_cfg.max_ms);
-            self.schedule_retry(msg, attempt, delay_ms, last_failure)?;
-            Ok(())
+            return Ok(());
         }
+
+        let backoff_cfg = msg
+            .retry_backoff
+            .as_ref()
+            .unwrap_or(&self.config.retry_defaults.backoff);
+        let backoff = backoff_cfg.delay_ms(attempt);
+        let delay_ms = requested_retry_after_ms
+            .unwrap_or(backoff)
+            .min(backoff_cfg.max_ms);
+        self.schedule_retry(msg, attempt, delay_ms, last_failure)?;
+        Ok(())
     }
 
     pub async fn commit_cursor(
@@ -1405,9 +1427,19 @@ impl DispatchEngine {
             }
             self.telemetry.record_retry_due();
         }
-        let pin = crate::egress::pin_destination_addr(url)
-            .await
-            .map_err(|e| DispatchError::Egress(e.to_string()))?;
+        let pin = match crate::egress::pin_destination_addr(url).await {
+            Ok(pin) => pin,
+            Err(crate::egress::EgressError::ResolveFailed) => {
+                self.host_blocker.record_transport_failure(url);
+                return self.retry_fleet_failure(
+                    msg,
+                    prior,
+                    None,
+                    "destination DNS resolution failed".into(),
+                );
+            }
+            Err(error) => return Err(DispatchError::Egress(error.to_string())),
+        };
         let pinned_client;
         let http = if let Some((host, addr)) = pin {
             pinned_client = reqwest::Client::builder()
@@ -1454,6 +1486,16 @@ impl DispatchEngine {
                 format!("transport error: {error}")
             }
         };
+        self.retry_fleet_failure(msg, prior, retry_after_ms, failure)
+    }
+
+    fn retry_fleet_failure(
+        &self,
+        msg: &StoredMessage,
+        prior: Option<RetryRecord>,
+        retry_after_ms: Option<u64>,
+        failure: String,
+    ) -> Result<(), DispatchError> {
         let attempts = prior
             .map(|record| record.attempts)
             .unwrap_or(0)
@@ -1540,6 +1582,36 @@ mod tests {
                 response.offset.unwrap(),
             )
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dns_failure_is_durable_retry_not_dead_letter() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let msg = publish_test_message(&broker, "https://destination.invalid/hook");
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        tokio::time::timeout(Duration::from_secs(5), engine.deliver_message(&msg))
+            .await
+            .unwrap()
+            .unwrap();
+        let key = DispatchEngine::retry_key(&msg);
+        assert_eq!(engine.retry_state.get(&key).unwrap().attempts, 1);
+        assert!(engine.lifecycle.pending().is_empty());
+        assert!(!broker
+            .is_dispatch_complete(
+                &broker.tenant(),
+                &broker_partition::flow_lane_owner(&msg).to_string(),
+                msg.partition,
+                msg.offset
+            )
+            .unwrap());
+        engine.clear_retry(&msg).unwrap();
+        assert!(matches!(
+            engine.push_http_only(&msg, msg.offset + 1).await,
+            Err(DispatchError::RetryDeferred { .. })
+        ));
+        assert_eq!(engine.retry_state.get(&key).unwrap().attempts, 1);
+        engine.shutdown_background().await;
     }
 
     #[tokio::test]

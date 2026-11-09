@@ -57,10 +57,14 @@ pub async fn pin_destination_addr(raw: &str) -> Result<Option<(String, SocketAdd
         return Ok(Some((host, SocketAddr::new(ip, port))));
     }
     let lookup = format!("{host}:{port}");
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&lookup)
-        .await
-        .map_err(|_| EgressError::ResolveFailed)?
-        .collect();
+    let addrs: Vec<SocketAddr> = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::lookup_host(&lookup),
+    )
+    .await
+    .map_err(|_| EgressError::ResolveFailed)?
+    .map_err(|_| EgressError::ResolveFailed)?
+    .collect();
     if addrs.is_empty() {
         return Err(EgressError::ResolveFailed);
     }

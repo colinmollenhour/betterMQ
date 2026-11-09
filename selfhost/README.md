@@ -257,6 +257,8 @@ The public repo reads **92** `BETTERMQ_*` names used by self-host. **16** are CL
 
 Unpaused, unpinned flow lanes are reclaimed after 60 seconds idle (no queued or active deliveries). Paused lanes and operator pins remain until explicitly cleared.
 
+DNS lookup failures (including the two-second resolution timeout) use the normal durable retry budget in both local and fleet dispatch. Egress-policy rejections remain terminal.
+
 #### DLQ and group fan-out
 
 Fan-out vars are **group bookkeeping**, not DLQ TTL.
