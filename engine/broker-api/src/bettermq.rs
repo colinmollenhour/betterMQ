@@ -646,7 +646,7 @@ async fn publish_to_group(
             });
             continue;
         }
-        let member_req = member.request;
+        let member_req = command.request_for_attempt(&member);
         let state = state.clone();
         #[cfg(feature = "cloud")]
         let plan = plan.clone();
@@ -927,7 +927,12 @@ async fn replay_fanout_command(
             .map(|outcome| outcome.attempts)
             .unwrap_or(0)
             .saturating_add(1);
-        let outcome = match crate::cluster::publish_with_cluster(state, member.request, None).await
+        let outcome = match crate::ingest::submit_one(
+            state,
+            command.request_for_attempt(&member),
+            None,
+        )
+        .await
         {
             Ok(response) => {
                 crate::cluster::enqueue_dispatch_after_publish(state, &response);
@@ -1044,7 +1049,10 @@ mod fanout_tests {
             request: None,
         };
 
-        let (status, Json(response)) = publish_to_group(state, None, group.id, base).await.unwrap();
+        let (status, Json(response)) =
+            publish_to_group(state.clone(), None, group.id, base.clone())
+                .await
+                .unwrap();
         assert_eq!(status, StatusCode::MULTI_STATUS);
         assert_eq!(response.accepted, Some(1));
         assert_eq!(response.partial, Some(true));
@@ -1052,6 +1060,60 @@ mod fanout_tests {
         assert_eq!(deliveries.len(), 2);
         assert_eq!(deliveries.iter().filter(|d| d.accepted).count(), 1);
         assert_eq!(deliveries.iter().filter(|d| d.error.is_some()).count(), 1);
+
+        // Simulate recovery after durable acceptance but before member scheduling.
+        let store = crate::fanout::FanoutStore::open(dir.path()).unwrap();
+        let member = state
+            .broker
+            .active_group_members(group.id)
+            .unwrap()
+            .into_iter()
+            .find(|member| member.url.starts_with("https://"))
+            .unwrap();
+        let mut request = state
+            .broker
+            .group_member_publish_request(group.id, &member, &base);
+        request.delay_ms = Some(60_000);
+        request.idempotency_key = Some("recovered-delayed-member".into());
+        let accepted_at = chrono::Utc::now().timestamp_millis() - 10_000;
+        let command = crate::fanout::FanoutCommand {
+            id: Uuid::new_v4(),
+            acceptance_hash: "recovery".into(),
+            tenant_id: state.broker.tenant(),
+            group_id: group.id,
+            created_at_ms: accepted_at,
+            updated_at_ms: accepted_at,
+            members: vec![crate::fanout::FanoutMemberCommand {
+                member_id: member.id,
+                request,
+            }],
+            outcomes: Default::default(),
+            completed: false,
+            completed_at_ms: None,
+        };
+        store.accept(command.clone()).unwrap();
+        replay_fanout_command(&state, &store, command.clone())
+            .await
+            .unwrap();
+        let restored = store.get(command.id).unwrap().unwrap();
+        let response = restored.outcomes[&member.id].response.as_ref().unwrap();
+        assert!(
+            response.offset.is_none(),
+            "replay must not append a delayed member"
+        );
+        let scheduled = response.scheduled.as_ref().unwrap();
+        assert!((scheduled.deliver_at_ms - (accepted_at + 60_000)).abs() < 1000);
+
+        let mut invalid = command;
+        invalid.id = Uuid::new_v4();
+        invalid.members[0].request.url = Some("not-a-url".into());
+        store.accept(invalid.clone()).unwrap();
+        replay_fanout_command(&state, &store, invalid.clone())
+            .await
+            .unwrap();
+        assert!(store.get(invalid.id).unwrap().unwrap().outcomes[&member.id]
+            .response
+            .is_none());
     }
 }
 

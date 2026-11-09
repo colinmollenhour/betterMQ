@@ -69,6 +69,22 @@ pub struct FanoutCommand {
     pub completed_at_ms: Option<i64>,
 }
 
+impl FanoutCommand {
+    /// The accepted timestamp and original delay form a durable absolute deadline.
+    pub(crate) fn request_for_attempt(&self, member: &FanoutMemberCommand) -> PublishRequest {
+        let mut request = member.request.clone();
+        request.delay_ms = request.delay_ms.map(|delay| {
+            let deadline = self
+                .created_at_ms
+                .saturating_add(i64::try_from(delay).unwrap_or(i64::MAX));
+            deadline
+                .saturating_sub(chrono::Utc::now().timestamp_millis())
+                .max(0) as u64
+        });
+        request
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct FanoutSnapshot {
     #[serde(default)]
