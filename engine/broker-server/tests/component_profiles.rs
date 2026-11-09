@@ -61,4 +61,5 @@ fn broker_profile_opens_storage_without_local_dispatch() {
     assert!(settings.opens_local_storage);
     assert!(settings.has(Component::Broker));
     assert!(!settings.has(Component::Dispatch));
+    assert!(settings.has(Component::Panel));
 }

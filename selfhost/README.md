@@ -103,7 +103,7 @@ bettermq serve [OPTIONS]
 | `--broker-only` | `BETTERMQ_BROKER_ONLY` | Compatibility alias for `--profile broker` |
 | `--gateway-only` | `BETTERMQ_GATEWAY_ONLY` | Compatibility alias for `--profile gateway` (no WAL) |
 | `--dispatch-fleet` | `BETTERMQ_DISPATCH_FLEET` | Compatibility alias for `--profile dispatch` |
-| `--profile <NAME>` | `BETTERMQ_PROFILE` | `all` (default), `broker`, `dispatch`, `gateway`, `controller`, `panel` |
+| `--profile <NAME>` | `BETTERMQ_PROFILE` | `all` (default), `broker`, `dispatch`, `gateway`, `panel` |
 | `--components <A,B>` | `BETTERMQ_COMPONENTS` | Extra components to enable (comma-separated) |
 | `--no-panel` | `BETTERMQ_NO_PANEL` | Disable the embedded panel |
 | `--admin-listen <HOST:PORT>` | `BETTERMQ_ADMIN_LISTEN` | Private admin + panel listener |
@@ -119,6 +119,9 @@ For the public bind address, CLI/env `--listen` or `--port` wins over
 `config validate` and `doctor` check V2 component dependencies, panel modes and
 all listener addresses. Invalid listener strings fail instead of falling back
 to a potentially public socket. Separate-panel mode needs a panel/admin address.
+Controller-only operation is not implemented: `--profile controller` and a
+controller component without broker fail explicitly. Use `--profile broker`
+for controller + ingest without local delivery; it retains the setup panel.
 
 Examples:
 
@@ -382,7 +385,7 @@ Settings persist in the Docker volume at `/data/bettermq.json`.
 Roles (one binary):
 
 - `bettermq serve` — broker + local dispatch
-- `bettermq serve --broker-only` — ingest + lease API (no local push workers)
+- `bettermq serve --broker-only` — ingest + controller + lease API + admin/panel (no local push workers; use `--no-panel` to hide the UI)
 - `bettermq serve --dispatch-fleet` — claim/push via `BETTERMQ_BROKER_URLS`
 
 ### Panel on its own port

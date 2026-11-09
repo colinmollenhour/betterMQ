@@ -4,6 +4,7 @@ use std::process::Command;
 fn validate_and_doctor_reject_invalid_v2_sections() {
     for invalid in [
         serde_json::json!({"components": {"profile": "typo"}}),
+        serde_json::json!({"components": {"profile": "controller"}}),
         serde_json::json!({"components": {"include": ["typo"]}}),
         serde_json::json!({"components": {"include": ["panel"]}}),
         serde_json::json!({"listeners": {"public": "not-an-address"}}),

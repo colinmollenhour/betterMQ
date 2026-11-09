@@ -30,7 +30,7 @@ Windows: `powershell -ExecutionPolicy Bypass -c "irm https://betterMQ.com/instal
 - **Retries & DLQ** — backoff, dead-letter, idempotency keys
 - **Durable ACK** — `202` after the shard WAL commit (RF=3 in a multi-node cell)
 - **Panel** — `/panel/` plus `/admin/v1`; optional standalone `bettermq panel`
-- **One binary** — `serve` (all-in-one) or split roles: broker, gateway, dispatch, controller, panel
+- **One binary** — `serve` (all-in-one) or split roles: broker (including controller), gateway, dispatch, panel
 
 Delivery is **at-least-once**. Handlers should be idempotent.
 
@@ -89,7 +89,7 @@ Client  →  gateway?  →  brokers (WAL + RF=3 replicas)  →  dispatch  →  y
 | Command | What it is |
 |---------|------------|
 | `bettermq serve` | Default. One process: ingest, store, deliver, panel |
-| `bettermq serve --profile broker` | Warehouse only (no local delivery workers) |
+| `bettermq serve --profile broker` | Broker + controller + admin/panel (no local delivery workers) |
 | `bettermq serve --profile dispatch` | Delivery workers (`BETTERMQ_BROKER_URLS`) |
 | `bettermq serve --profile gateway` | Stateless ingest; forwards to shard leaders. **No WAL** |
 | `bettermq panel` | UI + `/admin/v1` only; `--controller` points at a cell |

@@ -66,7 +66,7 @@ impl ComponentProfile {
             "broker" => Ok(Self::Broker),
             "dispatch" => Ok(Self::Dispatch),
             "gateway" => Ok(Self::Gateway),
-            "controller" => Ok(Self::Controller),
+            "controller" => Err(ConfigError::Invalid("controller-only profile is not implemented; use profile broker (controller + ingest, without local delivery)".into())),
             "panel" => Ok(Self::Panel),
             other => Err(ConfigError::Invalid(format!(
                 "unknown profile '{other}' (use all, broker, dispatch, gateway, controller, panel)"
@@ -81,6 +81,7 @@ impl ComponentProfile {
                 Component::Broker,
                 Component::Controller,
                 Component::Admin,
+                Component::Panel,
             ]),
             Self::Dispatch => ComponentSet::from_slice(&[Component::Dispatch]),
             Self::Gateway => ComponentSet::from_slice(&[Component::Gateway, Component::Admin]),
@@ -244,11 +245,10 @@ impl ComponentSet {
                 "panel requires the admin component".into(),
             ));
         }
-        if self.contains(Component::Dispatch)
-            && !self.contains(Component::Broker)
-            && !self.contains(Component::Gateway)
-        {
-            // Fleet dispatch talks to remote brokers; local WAL is not required.
+        if self.contains(Component::Controller) && !self.contains(Component::Broker) {
+            return Err(ConfigError::Invalid(
+                "controller without broker is not implemented; use profile broker".into(),
+            ));
         }
         Ok(())
     }
@@ -318,11 +318,7 @@ pub fn resolve_component_set(
     }
 
     if broker_only {
-        return Ok(ComponentSet::from_slice(&[
-            Component::Broker,
-            Component::Controller,
-            Component::Admin,
-        ]));
+        return Ok(ComponentProfile::Broker.components());
     }
     if gateway_only {
         return Ok(ComponentSet::from_slice(&[
@@ -348,7 +344,10 @@ pub fn resolve_component_set(
         return Ok(set);
     }
 
-    Ok(ComponentSet::all())
+    let mut set = ComponentSet::all();
+    apply_include(&mut set, include_override)?;
+    set.validate_dependencies()?;
+    Ok(set)
 }
 
 fn apply_include(set: &mut ComponentSet, include: &[String]) -> Result<(), ConfigError> {
@@ -421,6 +420,7 @@ mod tests {
         let set = resolve_component_set(&cfg, None, &[], true, false, false, false).unwrap();
         assert!(set.contains(Component::Broker));
         assert!(!set.contains(Component::Dispatch));
+        assert!(set.contains(Component::Panel));
         assert!(set.requires_local_storage());
     }
 
@@ -442,5 +442,19 @@ mod tests {
         set.validate_dependencies().unwrap_err();
         set.insert(Component::Admin);
         set.validate_dependencies().unwrap();
+    }
+
+    #[test]
+    fn controller_only_is_rejected_before_runtime_startup() {
+        let cfg = BetterMqConfig::template_single_local();
+        assert!(
+            resolve_component_set(&cfg, Some("controller"), &[], false, false, false, false)
+                .is_err()
+        );
+        assert!(
+            ComponentSet::from_slice(&[Component::Controller, Component::Admin])
+                .validate_dependencies()
+                .is_err()
+        );
     }
 }

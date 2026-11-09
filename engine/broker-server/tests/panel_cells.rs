@@ -413,3 +413,29 @@ async fn configured_public_listener_is_the_actual_bind_address() {
     assert!(wait_health(&reqwest::Client::new(), &format!("http://{public}/healthz")).await);
     assert!(tokio::net::TcpStream::connect(unused).await.is_err());
 }
+
+#[tokio::test]
+async fn broker_only_still_hosts_the_setup_panel() {
+    let data = tempfile::tempdir().unwrap();
+    let addr = free_addr();
+    let _guard = ChildGuard(spawn_serve(
+        &[
+            "serve",
+            "--broker-only",
+            "--listen",
+            &addr.to_string(),
+            "--data-dir",
+            data.path().to_str().unwrap(),
+        ],
+        data.path(),
+    ));
+    let client = reqwest::Client::new();
+    assert!(wait_health(&client, &format!("http://{addr}/healthz")).await);
+    assert!(client
+        .get(format!("http://{addr}/panel/"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+}
