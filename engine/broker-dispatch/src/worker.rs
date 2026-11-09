@@ -686,7 +686,22 @@ impl DispatchEngine {
 
     fn replay_retry_state(&self) {
         let now_ms = chrono::Utc::now().timestamp_millis();
-        for record in self.retry_state.pending() {
+        for mut record in self.retry_state.pending() {
+            // Upgrade legacy retry records using the immutable delivery metadata.
+            if record.fifo_key.is_none() {
+                if let Ok(msg) = self.broker.read_message(
+                    &record.key.topic,
+                    record.key.partition,
+                    record.key.offset,
+                ) {
+                    record.fifo_key = Self::fifo_retry_key(&msg);
+                    if record.fifo_key.is_some() {
+                        if let Err(error) = self.retry_state.schedule(record.clone()) {
+                            warn!(%error, "could not upgrade FIFO retry index");
+                        }
+                    }
+                }
+            }
             let delay_ms = record.due_at_ms.saturating_sub(now_ms).max(0) as u64;
             self.defer_job(
                 DeliveryJob::live(
@@ -730,6 +745,27 @@ impl DispatchEngine {
         }
     }
 
+    fn fifo_retry_key(msg: &StoredMessage) -> Option<String> {
+        if !broker_partition::delivery_uses_flow_control(msg) {
+            return None;
+        }
+        let flow = broker_partition::ResolvedFlow::for_delivery(&msg.routing_key, msg);
+        (flow.parallelism == 1).then_some(flow.key)
+    }
+
+    fn blocking_delivery_retry(&self, msg: &StoredMessage) -> Option<RetryRecord> {
+        Self::fifo_retry_key(msg)
+            .and_then(|flow| {
+                self.retry_state.blocking_retry(
+                    &broker_partition::flow_lane_owner(msg).to_string(),
+                    &flow,
+                    msg.partition,
+                    msg.offset,
+                )
+            })
+            .or_else(|| self.retry_state.get(&Self::retry_key(msg)))
+    }
+
     fn clear_retry(&self, msg: &StoredMessage) -> Result<(), DispatchError> {
         self.retry_state
             .clear(&Self::retry_key(msg))
@@ -769,6 +805,7 @@ impl DispatchEngine {
             .schedule(RetryRecord {
                 key: Self::retry_key(msg),
                 cursor_key: broker_partition::flow_lane_owner(msg).to_string(),
+                fifo_key: Self::fifo_retry_key(msg),
                 attempts,
                 due_at_ms,
                 last_error: reason,
@@ -839,10 +876,7 @@ impl DispatchEngine {
             return Ok(());
         }
         let lane_key = broker_partition::flow_lane_owner(&msg).to_string();
-        if let Some(blocking) =
-            self.retry_state
-                .blocking_retry(&lane_key, msg.partition, msg.offset)
-        {
+        if let Some(blocking) = self.blocking_delivery_retry(&msg) {
             let is_retry = blocking.key == Self::retry_key(&msg);
             let wait_ms = blocking
                 .due_at_ms
@@ -933,11 +967,7 @@ impl DispatchEngine {
             .await
             .map_err(|_| DispatchError::Failed("dispatch semaphore closed".into()))?;
         let _active_http = self.active_http_guard();
-        let lane_key = broker_partition::flow_lane_owner(msg).to_string();
-        if let Some(blocking) =
-            self.retry_state
-                .blocking_retry(&lane_key, msg.partition, msg.offset)
-        {
+        if let Some(blocking) = self.blocking_delivery_retry(msg) {
             let is_retry = blocking.key == Self::retry_key(msg);
             let wait_ms = blocking
                 .due_at_ms
@@ -1611,6 +1641,45 @@ mod tests {
             Err(DispatchError::RetryDeferred { .. })
         ));
         assert_eq!(engine.retry_state.get(&key).unwrap().attempts, 1);
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn retries_fence_only_the_actual_strict_fifo_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let mut first = publish_test_message(&broker, "https://example.com/a");
+        let engine = DispatchEngine::new_broker_only(broker, DispatchConfig::default());
+        first.queue_id = Some(Uuid::new_v4());
+        first.flow_parallelism = Some(1);
+        first.flow_key = Some("a".into());
+        engine
+            .persist_retry(&first, 1, 60_000, "HTTP 503".into())
+            .unwrap();
+        let mut later = first.clone();
+        later.offset += 1;
+        later.id = Uuid::new_v4();
+        assert!(engine.blocking_delivery_retry(&later).is_some());
+        later.flow_key = Some("b".into());
+        assert!(engine.blocking_delivery_retry(&later).is_none());
+        later.flow_key = Some("a".into());
+        later.flow_parallelism = Some(2);
+        assert!(engine.blocking_delivery_retry(&later).is_none());
+        let mut direct = first.clone();
+        direct.queue_id = None;
+        direct.flow_key = None;
+        direct.flow_parallelism = None;
+        engine
+            .persist_retry(&direct, 1, 60_000, "HTTP 503".into())
+            .unwrap();
+        assert!(
+            engine.blocking_delivery_retry(&direct).is_some(),
+            "own deadline is retained"
+        );
+        direct.offset += 1;
+        direct.id = Uuid::new_v4();
+        direct.destination_url = Some("https://example.net/other".into());
+        assert!(engine.blocking_delivery_retry(&direct).is_none());
         engine.shutdown_background().await;
     }
 

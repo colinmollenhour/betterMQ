@@ -259,6 +259,8 @@ Unpaused, unpinned flow lanes are reclaimed after 60 seconds idle (no queued or 
 
 DNS lookup failures (including the two-second resolution timeout) use the normal durable retry budget in both local and fleet dispatch. Egress-policy rejections remain terminal.
 
+Retries hold back later work only within the same strict-FIFO flow key. Other keys and unconstrained destinations continue independently; each retry still observes its own durable backoff deadline.
+
 #### DLQ and group fan-out
 
 Fan-out vars are **group bookkeeping**, not DLQ TTL.

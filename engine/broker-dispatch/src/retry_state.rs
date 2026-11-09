@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -32,6 +32,8 @@ pub(crate) struct RetryKey {
 pub(crate) struct RetryRecord {
     pub key: RetryKey,
     pub cursor_key: String,
+    #[serde(default)]
+    pub fifo_key: Option<String>,
     pub attempts: u32,
     pub due_at_ms: i64,
     pub last_error: String,
@@ -45,6 +47,8 @@ struct RetrySnapshot {
     records: HashMap<RetryKey, RetryRecord>,
     #[serde(skip)]
     journal_ops: usize,
+    #[serde(skip)]
+    fifo_index: HashMap<(String, String, u32), BTreeMap<u64, RetryKey>>,
 }
 
 // JSON object keys cannot represent RetryKey. Keep the in-memory index, but
@@ -110,6 +114,7 @@ impl RetryState {
         } else {
             RetrySnapshot::default()
         };
+        rebuild_index(&mut state);
         if journal_path.exists() {
             let bytes = std::fs::read(&journal_path)?;
             let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
@@ -155,20 +160,17 @@ impl RetryState {
     pub(crate) fn blocking_retry(
         &self,
         cursor_key: &str,
+        flow_key: &str,
         partition: u32,
         offset: u64,
     ) -> Option<RetryRecord> {
-        self.state
-            .lock()
-            .records
-            .values()
-            .filter(|record| {
-                record.cursor_key == cursor_key
-                    && record.key.partition == partition
-                    && record.key.offset <= offset
-            })
-            .min_by_key(|record| record.key.offset)
-            .cloned()
+        let state = self.state.lock();
+        let (_, key) = state
+            .fifo_index
+            .get(&(cursor_key.into(), flow_key.into(), partition))?
+            .range(..=offset)
+            .next()?;
+        state.records.get(key).cloned()
     }
 
     pub(crate) fn schedule(&self, record: RetryRecord) -> Result<(), RetryStateError> {
@@ -176,7 +178,7 @@ impl RetryState {
         self.append(RetryEvent::Upsert {
             record: record.clone(),
         })?;
-        self.state.lock().records.insert(record.key.clone(), record);
+        apply_event(&mut self.state.lock(), RetryEvent::Upsert { record });
         self.maybe_compact()
     }
 
@@ -186,7 +188,10 @@ impl RetryState {
             return Ok(());
         }
         self.append(RetryEvent::Remove { key: key.clone() })?;
-        self.state.lock().records.remove(key);
+        apply_event(
+            &mut self.state.lock(),
+            RetryEvent::Remove { key: key.clone() },
+        );
         self.maybe_compact()
     }
 
@@ -233,13 +238,51 @@ impl RetryState {
 }
 
 fn apply_event(state: &mut RetrySnapshot, event: RetryEvent) {
+    let key = match &event {
+        RetryEvent::Upsert { record } => &record.key,
+        RetryEvent::Remove { key } => key,
+    };
+    if let Some(old) = state.records.get(key) {
+        if let Some(flow) = &old.fifo_key {
+            let lane = (old.cursor_key.clone(), flow.clone(), key.partition);
+            if let Some(offsets) = state.fifo_index.get_mut(&lane) {
+                offsets.remove(&key.offset);
+                if offsets.is_empty() {
+                    state.fifo_index.remove(&lane);
+                }
+            }
+        }
+    }
     match event {
         RetryEvent::Upsert { record } => {
+            index_record(&mut state.fifo_index, &record);
             state.records.insert(record.key.clone(), record);
         }
         RetryEvent::Remove { key } => {
             state.records.remove(&key);
         }
+    }
+}
+
+fn index_record(
+    index: &mut HashMap<(String, String, u32), BTreeMap<u64, RetryKey>>,
+    record: &RetryRecord,
+) {
+    if let Some(flow) = &record.fifo_key {
+        index
+            .entry((
+                record.cursor_key.clone(),
+                flow.clone(),
+                record.key.partition,
+            ))
+            .or_default()
+            .insert(record.key.offset, record.key.clone());
+    }
+}
+
+fn rebuild_index(state: &mut RetrySnapshot) {
+    for record in state.records.values() {
+        index_record(&mut state.fifo_index, record);
     }
 }
 
@@ -261,6 +304,7 @@ mod tests {
             .schedule(RetryRecord {
                 key: key.clone(),
                 cursor_key: "lane".into(),
+                fifo_key: Some("fifo".into()),
                 attempts: 2,
                 due_at_ms: 42,
                 last_error: "HTTP 503".into(),
@@ -272,7 +316,10 @@ mod tests {
         let restored = reopened.get(&key).unwrap();
         assert_eq!(restored.attempts, 2);
         assert_eq!(restored.due_at_ms, 42);
+        assert!(reopened.blocking_retry("lane", "fifo", 2, 10).is_some());
+        assert!(reopened.blocking_retry("lane", "other", 2, 10).is_none());
         reopened.clear(&key).unwrap();
+        assert!(reopened.blocking_retry("lane", "fifo", 2, 10).is_none());
         drop(reopened);
         assert!(RetryState::open(dir.path()).unwrap().get(&key).is_none());
     }
@@ -292,6 +339,7 @@ mod tests {
                 .schedule(RetryRecord {
                     key: key.clone(),
                     cursor_key: "lane".into(),
+                    fifo_key: None,
                     attempts,
                     due_at_ms: 42,
                     last_error: "HTTP 503".into(),
