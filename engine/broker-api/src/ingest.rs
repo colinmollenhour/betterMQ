@@ -346,6 +346,18 @@ mod tests {
     }
 
     #[test]
+    fn schedule_backlog_and_delay_errors_map_to_client_errors() {
+        assert!(matches!(
+            ApiError::from(broker_schedule::ScheduleError::BacklogFull { jobs: 1, bytes: 1 }),
+            ApiError::TooManyRequests { .. }
+        ));
+        assert!(matches!(
+            ApiError::from(broker_schedule::ScheduleError::InvalidDelay(u64::MAX)),
+            ApiError::BadRequest(_)
+        ));
+    }
+
+    #[test]
     fn immediate_records_are_not_gated() {
         assert!(delayed_batch_rejections(&[sample(None), sample(None)]).is_none());
     }

@@ -192,6 +192,20 @@ impl JsonlJournal {
         }
     }
 
+    /// Atomically replace the journal with `lines` (each newline-terminated),
+    /// e.g. to drop records a snapshot now covers while keeping later ones.
+    pub fn rewrite(&self, lines: &[Vec<u8>]) -> std::io::Result<()> {
+        let mut bytes = Vec::with_capacity(lines.iter().map(|line| line.len() + 1).sum());
+        for line in lines {
+            bytes.extend_from_slice(line);
+            bytes.push(b'\n');
+        }
+        crate::meta::atomic_write_file(&self.path, &bytes)?;
+        set_secret_file_mode(&self.path);
+        self.poisoned.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Empty the journal after its records were folded into a snapshot.
     pub fn reset(&self) -> std::io::Result<()> {
         let file: File = OpenOptions::new()
@@ -363,6 +377,21 @@ mod tests {
         assert!(
             journal.clone().is_poisoned(),
             "clones share the poison flag"
+        );
+    }
+
+    #[test]
+    fn rewrite_replaces_contents_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = JsonlJournal::new(dir.path().join("x.journal"));
+        journal.append(&Rec { n: 1 }).unwrap();
+        journal.append(&Rec { n: 2 }).unwrap();
+        let keep: Vec<_> = journal.read_lines().unwrap().into_iter().skip(1).collect();
+        journal.rewrite(&keep).unwrap();
+        journal.append(&Rec { n: 3 }).unwrap();
+        assert_eq!(
+            parse(&journal.read_lines().unwrap()),
+            vec![Rec { n: 2 }, Rec { n: 3 }]
         );
     }
 

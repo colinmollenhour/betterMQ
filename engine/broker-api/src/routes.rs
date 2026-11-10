@@ -267,9 +267,16 @@ impl From<BrokerError> for ApiError {
 
 impl From<broker_schedule::ScheduleError> for ApiError {
     fn from(e: broker_schedule::ScheduleError) -> Self {
-        Self::Broker(BrokerError::Storage(broker_storage::LogError::Io(
-            std::io::Error::other(e.to_string()),
-        )))
+        match e {
+            broker_schedule::ScheduleError::BacklogFull { .. } => Self::TooManyRequests {
+                retry_after_ms: 1_000,
+                message: e.to_string(),
+            },
+            broker_schedule::ScheduleError::InvalidDelay(_) => Self::BadRequest(e.to_string()),
+            other => Self::Broker(BrokerError::Storage(broker_storage::LogError::Io(
+                std::io::Error::other(other.to_string()),
+            ))),
+        }
     }
 }
 

@@ -1991,7 +1991,9 @@ impl From<ScheduleError> for DelayedApiError {
             ScheduleError::UnsupportedVersion(version) => DelayedApiError::Internal(format!(
                 "unsupported delayed schedule version: {version}"
             )),
-            ScheduleError::Locked(_) => DelayedApiError::Internal(e.to_string()),
+            ScheduleError::Locked(_)
+            | ScheduleError::BacklogFull { .. }
+            | ScheduleError::InvalidDelay(_) => DelayedApiError::Internal(e.to_string()),
         }
     }
 }

@@ -1236,6 +1236,10 @@ fn legacy_schedule_import_window() -> Duration {
 
 const LEGACY_SCHEDULE_IMPORT_EVERY: Duration = Duration::from_secs(30);
 
+/// Upper bound on delayed jobs fired per 200 ms tick, so a burst of due jobs
+/// cannot starve the cron pass or the lease renewal.
+const MAX_DELAYED_FIRES_PER_TICK: usize = 256;
+
 /// Import pre-upgrade schedule state from `BETTERMQ_SHARED_META_DIR`: crons on
 /// every node (only the scheduler holder fires them), delayed jobs only on the
 /// scheduler holder, which then owns and fires them.
@@ -1302,7 +1306,12 @@ fn spawn_schedule_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
             // so every node drains its own pre-upgrade jobs through the quorum
             // publish path (deduplicated by their `delay:<uuid>` key) rather
             // than waiting to win the scheduler lease.
-            fire_due_schedules(&state, state.schedule.pop_due(now), now).await;
+            fire_due_schedules(
+                &state,
+                state.schedule.pop_due(now, MAX_DELAYED_FIRES_PER_TICK),
+                now,
+            )
+            .await;
             if scheduler_leader {
                 fire_due_crons(&state, now).await;
             }
@@ -1830,7 +1839,7 @@ mod tests {
             .unwrap();
 
         let now = Utc::now().timestamp_millis();
-        fire_due_schedules(&state, state.schedule.pop_due(i64::MAX), now).await;
+        fire_due_schedules(&state, state.schedule.pop_due(i64::MAX, usize::MAX), now).await;
 
         assert_eq!(
             state
@@ -1844,8 +1853,8 @@ mod tests {
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, missing.id);
         // The failed job is back on the heap behind its backoff, not stuck in flight.
-        assert!(state.schedule.pop_due(now).is_empty());
-        assert_eq!(state.schedule.pop_due(i64::MAX).len(), 1);
+        assert!(state.schedule.pop_due(now, usize::MAX).is_empty());
+        assert_eq!(state.schedule.pop_due(i64::MAX, usize::MAX).len(), 1);
 
         drop(state);
         let reopened = ScheduleQueue::open(dir.path()).unwrap();
@@ -1965,7 +1974,7 @@ mod schedule_worker_tests {
             .unwrap();
 
         let now = scheduled.deliver_at_ms;
-        fire_due_schedules(&state, state.schedule.pop_due(now), now).await;
+        fire_due_schedules(&state, state.schedule.pop_due(now, usize::MAX), now).await;
 
         assert_eq!(state.schedule.count(), 0, "fired and completed");
         let published = state

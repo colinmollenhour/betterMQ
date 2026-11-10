@@ -2661,6 +2661,9 @@
           },
           "501": {
             "description": "Not available in a cluster: the request sets delay (including 0), which multi-node cells do not support in this release. Nothing was accepted."
+          },
+          "429": {
+            "description": "Delayed backlog is full (BETTERMQ_SCHEDULE_MAX_PENDING / BETTERMQ_SCHEDULE_MAX_PENDING_BYTES); nothing was accepted. Retry after the Retry-After header."
           }
         },
         "description": "Provide either url+secret (1:1) or group_id (fan-out). Shared options: delay, retries, idempotency, priority, outbound HTTP fields."
@@ -2840,6 +2843,9 @@
           },
           "501": {
             "description": "Not available in a cluster: the request sets delay (including 0), which multi-node cells do not support in this release. Nothing was accepted."
+          },
+          "429": {
+            "description": "Delayed backlog is full (BETTERMQ_SCHEDULE_MAX_PENDING / BETTERMQ_SCHEDULE_MAX_PENDING_BYTES); nothing was accepted. Retry after the Retry-After header."
           }
         }
       }
@@ -2946,6 +2952,9 @@
           },
           "501": {
             "description": "Not available in a cluster: the request sets delay (including 0), which multi-node cells do not support in this release. Nothing was accepted."
+          },
+          "429": {
+            "description": "Delayed backlog is full (BETTERMQ_SCHEDULE_MAX_PENDING / BETTERMQ_SCHEDULE_MAX_PENDING_BYTES); nothing was accepted. Retry after the Retry-After header."
           }
         }
       }
@@ -3062,6 +3071,9 @@
           },
           "501": {
             "description": "Not available in a cluster: the request sets delay (including 0), which multi-node cells do not support in this release. Nothing was accepted."
+          },
+          "429": {
+            "description": "Delayed backlog is full (BETTERMQ_SCHEDULE_MAX_PENDING / BETTERMQ_SCHEDULE_MAX_PENDING_BYTES); nothing was accepted. Retry after the Retry-After header."
           }
         }
       }

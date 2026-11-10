@@ -17,8 +17,8 @@ pub use retry::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -41,6 +41,10 @@ pub enum ScheduleError {
         "schedule journal {0} is in use by another process; every broker needs its own data dir"
     )]
     Locked(PathBuf),
+    #[error("delayed backlog is full ({jobs} jobs, {bytes} bytes pending); retry later")]
+    BacklogFull { jobs: usize, bytes: usize },
+    #[error("delay of {0} ms is out of range")]
+    InvalidDelay(u64),
 }
 
 fn deserialize_flexible_payload<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -110,19 +114,9 @@ pub struct ScheduledSummary {
     pub routing_key: String,
 }
 
-impl HeapItem {
-    fn summary(&self) -> ScheduledSummary {
-        ScheduledSummary {
-            id: self.id,
-            deliver_at_ms: self.deliver_at_ms,
-            topic: self.request.topic.clone(),
-            routing_key: self.request.routing_key.clone(),
-        }
-    }
-}
-
+/// A pending delayed job as persisted in snapshots and journal records.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct HeapItem {
+struct QueuedJob {
     deliver_at_ms: i64,
     id: Uuid,
     request: ScheduledPublishRequest,
@@ -132,32 +126,71 @@ struct HeapItem {
     not_before_ms: i64,
 }
 
-impl HeapItem {
+impl QueuedJob {
     fn due_at_ms(&self) -> i64 {
         self.deliver_at_ms.max(self.not_before_ms)
     }
-}
 
-impl PartialEq for HeapItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.due_at_ms() == other.due_at_ms() && self.id == other.id
+    /// Approximate memory held for the job, for the backlog byte cap.
+    fn size_bytes(&self) -> usize {
+        self.request.payload.len() + self.request.topic.len() + self.request.routing_key.len()
+    }
+
+    fn summary(&self) -> ScheduledSummary {
+        ScheduledSummary {
+            id: self.id,
+            deliver_at_ms: self.deliver_at_ms,
+            topic: self.request.topic.clone(),
+            routing_key: self.request.routing_key.clone(),
+        }
+    }
+
+    fn to_public(&self) -> ScheduledPublish {
+        ScheduledPublish {
+            id: self.id,
+            deliver_at_ms: self.deliver_at_ms,
+            request: self.request.clone(),
+        }
     }
 }
 
-impl Eq for HeapItem {}
+/// Backlog limits for delayed jobs, checked before a delayed enqueue is
+/// acknowledged. Jobs are held in memory until they fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduleLimits {
+    pub max_jobs: usize,
+    pub max_bytes: usize,
+}
 
-impl PartialOrd for HeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+impl ScheduleLimits {
+    pub const DEFAULT_MAX_JOBS: usize = 1_000_000;
+    pub const DEFAULT_MAX_BYTES: usize = 1 << 30;
+
+    /// `BETTERMQ_SCHEDULE_MAX_PENDING` / `BETTERMQ_SCHEDULE_MAX_PENDING_BYTES`.
+    pub fn from_env() -> Self {
+        let read = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
+        Self {
+            max_jobs: read("BETTERMQ_SCHEDULE_MAX_PENDING", Self::DEFAULT_MAX_JOBS),
+            max_bytes: read(
+                "BETTERMQ_SCHEDULE_MAX_PENDING_BYTES",
+                Self::DEFAULT_MAX_BYTES,
+            ),
+        }
     }
 }
 
-impl Ord for HeapItem {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .due_at_ms()
-            .cmp(&self.due_at_ms())
-            .then_with(|| other.id.cmp(&self.id))
+impl Default for ScheduleLimits {
+    fn default() -> Self {
+        Self {
+            max_jobs: Self::DEFAULT_MAX_JOBS,
+            max_bytes: Self::DEFAULT_MAX_BYTES,
+        }
     }
 }
 
@@ -166,26 +199,88 @@ pub struct ScheduleQueue {
     path: PathBuf,
     journal: JsonlJournal,
     state: Arc<Mutex<ScheduleState>>,
+    limits: ScheduleLimits,
     /// Exclusive ownership of the journal for the life of the queue.
     _lock: Arc<FileLock>,
 }
 
+/// Jobs live in `jobs`; `due` orders `(due_at_ms, id)` keys and may hold stale
+/// keys (cancelled or rescheduled jobs) that `pop_due` skips, so every
+/// operation is O(log n) instead of draining and rebuilding a heap.
 #[derive(Default)]
 struct ScheduleState {
-    heap: BinaryHeap<HeapItem>,
-    in_flight: HashMap<Uuid, HeapItem>,
+    jobs: HashMap<Uuid, QueuedJob>,
+    due: BinaryHeap<Reverse<(i64, Uuid)>>,
+    in_flight: HashSet<Uuid>,
+    /// Payload-free rows by `(deliver_at_ms, id)` for paged inspection.
     listing: BTreeMap<(i64, Uuid), ScheduledSummary>,
     /// Consecutive failed fires per job (in memory only).
     attempts: HashMap<Uuid, u32>,
+    bytes: usize,
     sequence: u64,
     journal_ops: usize,
+    compacting: bool,
+}
+
+impl ScheduleState {
+    fn from_jobs(jobs: HashMap<Uuid, QueuedJob>) -> Self {
+        let due = jobs
+            .values()
+            .map(|job| Reverse((job.due_at_ms(), job.id)))
+            .collect::<Vec<_>>()
+            .into();
+        let bytes = jobs.values().map(QueuedJob::size_bytes).sum();
+        let listing = jobs
+            .values()
+            .map(|job| ((job.deliver_at_ms, job.id), job.summary()))
+            .collect();
+        Self {
+            jobs,
+            due,
+            listing,
+            bytes,
+            ..Self::default()
+        }
+    }
+
+    fn insert(&mut self, job: QueuedJob) {
+        if let Some(previous) = self.jobs.remove(&job.id) {
+            self.bytes -= previous.size_bytes();
+            self.listing.remove(&(previous.deliver_at_ms, previous.id));
+        }
+        self.bytes += job.size_bytes();
+        self.due.push(Reverse((job.due_at_ms(), job.id)));
+        self.listing
+            .insert((job.deliver_at_ms, job.id), job.summary());
+        self.jobs.insert(job.id, job);
+    }
+
+    fn remove(&mut self, id: &Uuid) -> Option<QueuedJob> {
+        self.in_flight.remove(id);
+        self.attempts.remove(id);
+        let removed = self.jobs.remove(id)?;
+        self.bytes -= removed.size_bytes();
+        self.listing.remove(&(removed.deliver_at_ms, removed.id));
+        // Bound the stale keys left behind by cancels.
+        if self.due.len() > 2 * self.jobs.len() + 1024 {
+            let in_flight = &self.in_flight;
+            self.due = self
+                .jobs
+                .values()
+                .filter(|job| !in_flight.contains(&job.id))
+                .map(|job| Reverse((job.due_at_ms(), job.id)))
+                .collect::<Vec<_>>()
+                .into();
+        }
+        Some(removed)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)] // Persisted operations are infrequent and mirror heap records.
 enum JournalOp {
-    Add { item: HeapItem },
+    Add { item: QueuedJob },
     Remove { id: Uuid },
 }
 
@@ -200,14 +295,14 @@ struct JournalRecord {
 struct ScheduleSnapshot {
     version: u16,
     sequence: u64,
-    items: Vec<HeapItem>,
+    items: Vec<QueuedJob>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 enum ScheduleSnapshotCompat {
     Current(ScheduleSnapshot),
-    Legacy(Vec<HeapItem>),
+    Legacy(Vec<QueuedJob>),
 }
 
 const SCHEDULE_STATE_VERSION: u16 = 1;
@@ -228,7 +323,9 @@ fn parse_journal_line(line: &[u8], sequence: u64) -> Result<JournalRecord, Sched
     }
 }
 
-fn snapshot_items(snapshot: ScheduleSnapshotCompat) -> Result<(Vec<HeapItem>, u64), ScheduleError> {
+fn snapshot_items(
+    snapshot: ScheduleSnapshotCompat,
+) -> Result<(Vec<QueuedJob>, u64), ScheduleError> {
     match snapshot {
         ScheduleSnapshotCompat::Current(snapshot) => {
             if snapshot.version != SCHEDULE_STATE_VERSION {
@@ -250,6 +347,13 @@ impl ScheduleQueue {
     /// Open the node-local delayed queue in `data_dir`. Never shared between
     /// processes: the journal is locked exclusively for the queue's lifetime.
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, ScheduleError> {
+        Self::open_with_limits(data_dir, ScheduleLimits::from_env())
+    }
+
+    pub fn open_with_limits(
+        data_dir: impl AsRef<Path>,
+        limits: ScheduleLimits,
+    ) -> Result<Self, ScheduleError> {
         let path = data_dir.as_ref().join("schedule.json");
         let journal_path = path.with_extension("journal");
         let lock = lock_journal(&journal_path)?
@@ -268,7 +372,9 @@ impl ScheduleQueue {
                 "schedule queue recovered after metadata read failure"
             );
         }
-        let mut heap: BinaryHeap<HeapItem> = items.into_iter().collect();
+        // Replay into a map and build the due queue once at the end.
+        let mut jobs: HashMap<Uuid, QueuedJob> =
+            items.into_iter().map(|item| (item.id, item)).collect();
         let mut journal_ops = 0usize;
         for line in journal.read_lines()? {
             let record = parse_journal_line(&line, sequence)?;
@@ -282,32 +388,21 @@ impl ScheduleQueue {
             journal_ops += 1;
             match record.op {
                 JournalOp::Add { item } => {
-                    let mut items: Vec<_> = heap.drain().filter(|i| i.id != item.id).collect();
-                    items.push(item);
-                    heap.extend(items);
+                    jobs.insert(item.id, item);
                 }
                 JournalOp::Remove { id } => {
-                    let items: Vec<_> = heap.drain().filter(|i| i.id != id).collect();
-                    heap.extend(items);
+                    jobs.remove(&id);
                 }
             }
         }
-
-        let listing = heap
-            .iter()
-            .map(|item| ((item.deliver_at_ms, item.id), item.summary()))
-            .collect();
+        let mut state = ScheduleState::from_jobs(jobs);
+        state.sequence = sequence;
+        state.journal_ops = journal_ops;
         Ok(Self {
             path,
             journal,
-            state: Arc::new(Mutex::new(ScheduleState {
-                heap,
-                in_flight: HashMap::new(),
-                listing,
-                attempts: HashMap::new(),
-                sequence,
-                journal_ops,
-            })),
+            state: Arc::new(Mutex::new(state)),
+            limits,
             _lock: Arc::new(lock),
         })
     }
@@ -337,7 +432,7 @@ impl ScheduleQueue {
         }
         // Shared journals had several writers with colliding sequence numbers,
         // so apply records in file order instead of filtering by sequence.
-        let mut found: HashMap<Uuid, HeapItem> = HashMap::new();
+        let mut found: HashMap<Uuid, QueuedJob> = HashMap::new();
         for group in &groups {
             if let Some(snapshot) = &group.snapshot {
                 let parsed: ScheduleSnapshotCompat =
@@ -370,8 +465,8 @@ impl ScheduleQueue {
             let mut items: Vec<_> = found.into_values().collect();
             items.sort_by_key(|item| (item.deliver_at_ms, item.id));
             for mut item in items {
-                let local = state.in_flight.contains_key(&item.id)
-                    || state.heap.iter().any(|queued| queued.id == item.id);
+                // Imported jobs were already acknowledged: no backlog cap here.
+                let local = state.jobs.contains_key(&item.id);
                 if local || ledger.contains(&item.id) {
                     report.skipped += 1;
                     ledger.insert(item.id);
@@ -380,15 +475,12 @@ impl ScheduleQueue {
                 item.not_before_ms = 0;
                 self.append_op(&mut state, JournalOp::Add { item: item.clone() })?;
                 ledger.insert(item.id);
-                state
-                    .listing
-                    .insert((item.deliver_at_ms, item.id), item.summary());
-                state.heap.push(item);
+                state.insert(item);
                 state.journal_ops += 1;
                 report.imported += 1;
             }
-            self.maybe_compact(&mut state);
         }
+        self.compact_if_needed();
         ledger.save()?;
         legacy::finish(&groups)?;
         legacy::record_imported_delayed(report.imported);
@@ -407,22 +499,32 @@ impl ScheduleQueue {
         request: ScheduledPublishRequest,
         delay_ms: u64,
     ) -> Result<ScheduledPublish, ScheduleError> {
-        let deliver_at_ms = Utc::now().timestamp_millis() + delay_ms as i64;
+        let deliver_at_ms = i64::try_from(delay_ms)
+            .ok()
+            .and_then(|delay| Utc::now().timestamp_millis().checked_add(delay))
+            .ok_or(ScheduleError::InvalidDelay(delay_ms))?;
         let id = Uuid::new_v4();
-        let item = HeapItem {
+        let item = QueuedJob {
             deliver_at_ms,
             id,
             request: request.clone(),
             not_before_ms: 0,
         };
-        let mut state = self.state.lock();
-        self.append_op(&mut state, JournalOp::Add { item: item.clone() })?;
-        state
-            .listing
-            .insert((item.deliver_at_ms, item.id), item.summary());
-        state.heap.push(item);
-        state.journal_ops += 1;
-        self.maybe_compact(&mut state);
+        {
+            let mut state = self.state.lock();
+            if state.jobs.len() >= self.limits.max_jobs
+                || state.bytes.saturating_add(item.size_bytes()) > self.limits.max_bytes
+            {
+                return Err(ScheduleError::BacklogFull {
+                    jobs: state.jobs.len(),
+                    bytes: state.bytes,
+                });
+            }
+            self.append_op(&mut state, JournalOp::Add { item: item.clone() })?;
+            state.insert(item);
+            state.journal_ops += 1;
+        }
+        self.compact_if_needed();
         Ok(ScheduledPublish {
             id,
             deliver_at_ms,
@@ -432,21 +534,12 @@ impl ScheduleQueue {
 
     pub fn list(&self) -> Vec<ScheduledPublish> {
         let state = self.state.lock();
-        state
-            .heap
-            .iter()
-            .chain(state.in_flight.values())
-            .map(|item| ScheduledPublish {
-                id: item.id,
-                deliver_at_ms: item.deliver_at_ms,
-                request: item.request.clone(),
-            })
-            .collect()
+        state.jobs.values().map(QueuedJob::to_public).collect()
     }
 
     /// Jobs waiting to fire, including ones being fired now.
     pub fn count(&self) -> usize {
-        self.state.lock().listing.len()
+        self.state.lock().jobs.len()
     }
 
     /// At most 1000 metadata rows, exclusively after the supplied stable key.
@@ -464,63 +557,55 @@ impl ScheduleQueue {
     }
 
     pub fn cancel(&self, id: Uuid) -> Result<ScheduledPublish, ScheduleError> {
-        let mut state = self.state.lock();
-        let drained: Vec<HeapItem> = state.heap.drain().collect();
-        let (mut hit, rest): (Vec<HeapItem>, Vec<HeapItem>) =
-            drained.into_iter().partition(|i| i.id == id);
-        for item in rest {
-            state.heap.push(item);
-        }
-        let removed = hit
-            .pop()
-            .or_else(|| state.in_flight.remove(&id))
-            .ok_or(ScheduleError::NotFound(id))?;
-        if let Err(error) = self.append_op(&mut state, JournalOp::Remove { id }) {
-            state.heap.push(removed);
-            return Err(error);
-        }
-        state.listing.remove(&(removed.deliver_at_ms, removed.id));
-        state.attempts.remove(&id);
-        state.journal_ops += 1;
-        self.maybe_compact(&mut state);
-        Ok(ScheduledPublish {
-            id: removed.id,
-            deliver_at_ms: removed.deliver_at_ms,
-            request: removed.request,
-        })
+        let removed = {
+            let mut state = self.state.lock();
+            if !state.jobs.contains_key(&id) {
+                return Err(ScheduleError::NotFound(id));
+            }
+            self.append_op(&mut state, JournalOp::Remove { id })?;
+            state.journal_ops += 1;
+            state.remove(&id).expect("checked above")
+        };
+        self.compact_if_needed();
+        Ok(removed.to_public())
     }
 
-    /// Pop due jobs from the in-memory heap **without** persisting.
-    /// Persist only via [`Self::complete`] after a successful fire so a crash
-    /// before publish still reloads the job from disk (at-least-once).
-    pub fn pop_due(&self, now_ms: i64) -> Vec<ScheduledPublish> {
-        let mut state = self.state.lock();
+    /// Pop at most `limit` due jobs **without** persisting, so one tick does
+    /// bounded work. Persist only via [`Self::complete`] after a successful
+    /// fire so a crash before publish still reloads the job (at-least-once).
+    pub fn pop_due(&self, now_ms: i64, limit: usize) -> Vec<ScheduledPublish> {
+        let mut guard = self.state.lock();
+        let state = &mut *guard;
         let mut popped = Vec::new();
-        while let Some(top) = state.heap.peek() {
-            if top.due_at_ms() > now_ms {
+        while popped.len() < limit {
+            let Some(&Reverse((due_at_ms, id))) = state.due.peek() else {
+                break;
+            };
+            if due_at_ms > now_ms {
                 break;
             }
-            let item = state.heap.pop().expect("peeked");
-            state.in_flight.insert(item.id, item.clone());
-            popped.push(ScheduledPublish {
-                id: item.id,
-                deliver_at_ms: item.deliver_at_ms,
-                request: item.request,
-            });
+            state.due.pop();
+            let Some(job) = state.jobs.get(&id) else {
+                continue; // cancelled or completed
+            };
+            if state.in_flight.contains(&id) || job.due_at_ms() != due_at_ms {
+                continue; // stale key from before a reschedule
+            }
+            state.in_flight.insert(id);
+            popped.push(job.to_public());
         }
         popped
     }
 
     /// Remove a fired job from durable storage after successful publish.
     pub fn complete(&self, id: Uuid) -> Result<(), ScheduleError> {
-        let mut state = self.state.lock();
-        self.append_op(&mut state, JournalOp::Remove { id })?;
-        if let Some(item) = state.in_flight.remove(&id) {
-            state.listing.remove(&(item.deliver_at_ms, item.id));
+        {
+            let mut state = self.state.lock();
+            self.append_op(&mut state, JournalOp::Remove { id })?;
+            state.remove(&id);
+            state.journal_ops += 1;
         }
-        state.attempts.remove(&id);
-        state.journal_ops += 1;
-        self.maybe_compact(&mut state);
+        self.compact_if_needed();
         Ok(())
     }
 
@@ -529,25 +614,24 @@ impl ScheduleQueue {
         if ids.is_empty() {
             return Ok(());
         }
-        let mut state = self.state.lock();
-        self.append_ops(
-            &mut state,
-            ids.iter().map(|id| JournalOp::Remove { id: *id }).collect(),
-        )?;
-        for id in ids {
-            if let Some(item) = state.in_flight.remove(id) {
-                state.listing.remove(&(item.deliver_at_ms, item.id));
+        {
+            let mut state = self.state.lock();
+            self.append_ops(
+                &mut state,
+                ids.iter().map(|id| JournalOp::Remove { id: *id }).collect(),
+            )?;
+            for id in ids {
+                state.remove(id);
             }
-            state.attempts.remove(id);
+            state.journal_ops += ids.len();
         }
-        state.journal_ops += ids.len();
-        self.maybe_compact(&mut state);
+        self.compact_if_needed();
         Ok(())
     }
 
     /// Record a failed fire of a job returned by [`Self::pop_due`].
     ///
-    /// On [`FireRetry::Retry`] the job goes back onto the heap but is not due
+    /// On [`FireRetry::Retry`] the job goes back into the queue but is not due
     /// again until the backoff elapses; its durable Add stays in the journal.
     /// On [`FireRetry::GiveUp`] (a permanent failure that kept failing) the
     /// job is removed durably, like [`Self::complete`].
@@ -557,7 +641,8 @@ impl ScheduleQueue {
         failure: FireFailure,
         now_ms: i64,
     ) -> Result<FireRetry, ScheduleError> {
-        let mut state = self.state.lock();
+        let mut guard = self.state.lock();
+        let state = &mut *guard;
         let attempt = state
             .attempts
             .get(&job.id)
@@ -568,40 +653,37 @@ impl ScheduleQueue {
         let retry_at_ms = match decision {
             FireRetry::Retry { retry_at_ms, .. } => retry_at_ms,
             FireRetry::GiveUp { .. } => {
-                match self.append_op(&mut state, JournalOp::Remove { id: job.id }) {
+                match self.append_op(state, JournalOp::Remove { id: job.id }) {
                     Ok(()) => {
-                        state.in_flight.remove(&job.id);
-                        state.listing.remove(&(job.deliver_at_ms, job.id));
-                        state.attempts.remove(&job.id);
+                        state.remove(&job.id);
                         state.journal_ops += 1;
-                        self.maybe_compact(&mut state);
+                        drop(guard);
+                        self.compact_if_needed();
                         return Ok(decision);
                     }
                     Err(error) => {
                         // Keep the job and retry later rather than losing track of it.
-                        Self::push_retry(&mut state, job, attempt, now_ms + FIRE_RETRY_MAX_MS);
+                        Self::push_retry(state, job.id, attempt, now_ms + FIRE_RETRY_MAX_MS);
                         return Err(error);
                     }
                 }
             }
         };
-        Self::push_retry(&mut state, job, attempt, retry_at_ms);
+        Self::push_retry(state, job.id, attempt, retry_at_ms);
         Ok(decision)
     }
 
-    fn push_retry(state: &mut ScheduleState, job: ScheduledPublish, attempt: u32, at_ms: i64) {
-        if state.in_flight.remove(&job.id).is_none() {
-            // Cancelled while the fire was in progress.
-            state.attempts.remove(&job.id);
-            return;
+    fn push_retry(state: &mut ScheduleState, id: Uuid, attempt: u32, at_ms: i64) {
+        if !state.in_flight.remove(&id) {
+            return; // cancelled while the fire was in progress
         }
-        state.attempts.insert(job.id, attempt);
-        state.heap.push(HeapItem {
-            deliver_at_ms: job.deliver_at_ms,
-            id: job.id,
-            request: job.request,
-            not_before_ms: at_ms,
-        });
+        let Some(job) = state.jobs.get_mut(&id) else {
+            return;
+        };
+        job.not_before_ms = at_ms;
+        let due_at_ms = job.due_at_ms();
+        state.attempts.insert(id, attempt);
+        state.due.push(Reverse((due_at_ms, id)));
     }
 
     fn append_op(&self, state: &mut ScheduleState, op: JournalOp) -> Result<(), ScheduleError> {
@@ -632,37 +714,65 @@ impl ScheduleQueue {
         Ok(())
     }
 
-    fn maybe_compact(&self, state: &mut ScheduleState) {
-        if state.journal_ops < JOURNAL_COMPACT_OPS {
-            return;
-        }
-        let items: Vec<_> = state
-            .heap
-            .iter()
-            .chain(state.in_flight.values())
-            .cloned()
-            .collect();
-        let snapshot = ScheduleSnapshot {
-            version: SCHEDULE_STATE_VERSION,
-            sequence: state.sequence,
-            items,
-        };
-        let bytes = match serde_json::to_vec(&snapshot) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                tracing::warn!(%error, "schedule journal compaction encode failed");
+    /// Fold the journal into a snapshot every [`JOURNAL_COMPACT_OPS`] ops.
+    ///
+    /// Only cloning the jobs happens under the state lock; encoding and the
+    /// fsynced snapshot write run outside it, so ingest and firing continue.
+    /// The journal is then rotated under the lock, keeping only records newer
+    /// than the snapshot's sequence: appends made while the snapshot was being
+    /// written are never truncated away.
+    fn compact_if_needed(&self) {
+        let (items, sequence) = {
+            let mut state = self.state.lock();
+            if state.journal_ops < JOURNAL_COMPACT_OPS || state.compacting {
                 return;
             }
+            state.compacting = true;
+            (
+                state.jobs.values().cloned().collect::<Vec<_>>(),
+                state.sequence,
+            )
         };
-        if let Err(error) = persist_json_atomic(&self.path, &bytes) {
+        let written = self.write_snapshot(items, sequence);
+        let mut state = self.state.lock();
+        state.compacting = false;
+        if let Err(error) = written {
             tracing::warn!(%error, "schedule journal compaction snapshot failed");
             return;
         }
-        broker_storage::set_secret_file_mode(&self.path);
-        match self.journal.reset() {
-            Ok(()) => state.journal_ops = 0,
-            Err(error) => tracing::warn!(%error, "schedule journal compaction truncate failed"),
+        match self.rotate_journal(sequence) {
+            Ok(kept) => state.journal_ops = kept,
+            Err(error) => tracing::warn!(%error, "schedule journal rotation failed"),
         }
+    }
+
+    fn write_snapshot(&self, items: Vec<QueuedJob>, sequence: u64) -> Result<(), ScheduleError> {
+        let bytes = serde_json::to_vec(&ScheduleSnapshot {
+            version: SCHEDULE_STATE_VERSION,
+            sequence,
+            items,
+        })?;
+        persist_json_atomic(&self.path, &bytes)?;
+        broker_storage::set_secret_file_mode(&self.path);
+        Ok(())
+    }
+
+    /// Drop journal records the snapshot at `covered` already contains.
+    /// Caller holds the state lock, so no append races the rewrite. Bare
+    /// legacy ops carry no sequence; they predate this process and were
+    /// replayed into the snapshot, so they are dropped too.
+    fn rotate_journal(&self, covered: u64) -> Result<usize, ScheduleError> {
+        let keep: Vec<_> = self
+            .journal
+            .read_lines()?
+            .into_iter()
+            .filter(|line| {
+                serde_json::from_slice::<JournalRecord>(line)
+                    .is_ok_and(|record| record.sequence > covered)
+            })
+            .collect();
+        self.journal.rewrite(&keep)?;
+        Ok(keep.len())
     }
 }
 
@@ -715,7 +825,7 @@ mod schedule_tests {
             .is_none());
         queue.cancel(first[0].id).unwrap();
         assert_eq!(queue.count(), 4);
-        let mut due = queue.pop_due(i64::MAX);
+        let mut due = queue.pop_due(i64::MAX, usize::MAX);
         assert_eq!(queue.count(), 4, "in-flight jobs remain visible");
         queue
             .fail(due.pop().unwrap(), FireFailure::Transient, 0)
@@ -770,13 +880,13 @@ mod schedule_tests {
 
         let queue = ScheduleQueue::open(dir.path()).unwrap();
         assert_eq!(queue.list().len(), 1);
-        let pending = queue.pop_due(i64::MAX).pop().unwrap();
+        let pending = queue.pop_due(i64::MAX, usize::MAX).pop().unwrap();
         queue.fail(pending, FireFailure::Transient, 0).unwrap();
         drop(queue);
 
         let queue = ScheduleQueue::open(dir.path()).unwrap();
         assert_eq!(queue.list().len(), 1);
-        let pending = queue.pop_due(i64::MAX).pop().unwrap();
+        let pending = queue.pop_due(i64::MAX, usize::MAX).pop().unwrap();
         assert_eq!(pending.id, scheduled.id);
         queue.complete(pending.id).unwrap();
         drop(queue);
@@ -792,7 +902,7 @@ mod schedule_tests {
         let ids: Vec<_> = (0..5)
             .map(|_| queue.schedule(request(), 0).unwrap().id)
             .collect();
-        let due = queue.pop_due(i64::MAX);
+        let due = queue.pop_due(i64::MAX, usize::MAX);
         assert_eq!(due.len(), 5);
         let journal = dir.path().join("schedule.journal");
         let before = std::fs::read(&journal).unwrap().len();
@@ -819,7 +929,7 @@ mod schedule_tests {
         let scheduled = queue.schedule(request(), 0).unwrap();
         let now = scheduled.deliver_at_ms + 1;
 
-        let pending = queue.pop_due(now).pop().unwrap();
+        let pending = queue.pop_due(now, usize::MAX).pop().unwrap();
         assert_eq!(
             queue.fail(pending, FireFailure::Transient, now).unwrap(),
             FireRetry::Retry {
@@ -827,13 +937,15 @@ mod schedule_tests {
                 retry_at_ms: now + FIRE_RETRY_BASE_MS
             }
         );
-        assert!(queue.pop_due(now + FIRE_RETRY_BASE_MS - 1).is_empty());
+        assert!(queue
+            .pop_due(now + FIRE_RETRY_BASE_MS - 1, usize::MAX)
+            .is_empty());
         let listed = queue.list();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].deliver_at_ms, scheduled.deliver_at_ms);
 
         let retry_at = now + FIRE_RETRY_BASE_MS;
-        let pending = queue.pop_due(retry_at).pop().unwrap();
+        let pending = queue.pop_due(retry_at, usize::MAX).pop().unwrap();
         assert_eq!(pending.deliver_at_ms, scheduled.deliver_at_ms);
         assert_eq!(
             queue
@@ -845,7 +957,7 @@ mod schedule_tests {
             }
         );
 
-        let pending = queue.pop_due(i64::MAX).pop().unwrap();
+        let pending = queue.pop_due(i64::MAX, usize::MAX).pop().unwrap();
         queue.complete(pending.id).unwrap();
         assert!(queue.list().is_empty());
     }
@@ -857,7 +969,7 @@ mod schedule_tests {
         queue.schedule(request(), 0).unwrap();
         let mut outcome = None;
         for _ in 0..PERMANENT_FAILURE_ATTEMPTS {
-            let pending = queue.pop_due(i64::MAX).pop().unwrap();
+            let pending = queue.pop_due(i64::MAX, usize::MAX).pop().unwrap();
             outcome = Some(queue.fail(pending, FireFailure::Permanent, 0).unwrap());
         }
         assert_eq!(
@@ -867,7 +979,7 @@ mod schedule_tests {
             })
         );
         assert!(queue.list().is_empty());
-        assert!(queue.pop_due(i64::MAX).is_empty());
+        assert!(queue.pop_due(i64::MAX, usize::MAX).is_empty());
         drop(queue);
         assert!(ScheduleQueue::open(dir.path()).unwrap().list().is_empty());
     }
@@ -877,7 +989,7 @@ mod schedule_tests {
         let dir = tempdir().unwrap();
         let queue = ScheduleQueue::open(dir.path()).unwrap();
         queue.schedule(request(), 0).unwrap();
-        let pending = queue.pop_due(i64::MAX).pop().unwrap();
+        let pending = queue.pop_due(i64::MAX, usize::MAX).pop().unwrap();
         queue.cancel(pending.id).unwrap();
         queue.fail(pending, FireFailure::Transient, 0).unwrap();
         assert!(queue.list().is_empty());
@@ -1003,7 +1115,7 @@ mod schedule_tests {
 
         // A late append from an old node (re-adding b, plus a new d) after b
         // already fired here: only d is imported.
-        let job = queue.pop_due(i64::MAX);
+        let job = queue.pop_due(i64::MAX, usize::MAX);
         for fired in job {
             if fired.id == b.id {
                 queue.complete(fired.id).unwrap();
@@ -1026,7 +1138,7 @@ mod schedule_tests {
                 version: SCHEDULE_STATE_VERSION,
                 sequence: 1,
                 op: JournalOp::Add {
-                    item: HeapItem {
+                    item: QueuedJob {
                         deliver_at_ms: b.deliver_at_ms,
                         id: b.id,
                         request: request(),
@@ -1085,6 +1197,144 @@ mod schedule_tests {
             LegacyImport::default()
         );
         assert!(dir.path().join("schedule.journal").exists());
+    }
+
+    #[test]
+    fn replay_applies_adds_and_removes_by_id() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        let mut kept = Vec::new();
+        for index in 0..200 {
+            let job = queue.schedule(request(), 60_000 + index).unwrap();
+            if index % 3 == 0 {
+                queue.cancel(job.id).unwrap();
+            } else {
+                kept.push(job.id);
+            }
+        }
+        drop(queue);
+        let reopened = ScheduleQueue::open(dir.path()).unwrap();
+        assert_eq!(ids(&reopened), sorted(kept));
+        assert_eq!(reopened.count(), reopened.list().len());
+    }
+
+    #[test]
+    fn compaction_keeps_appends_made_while_the_snapshot_was_written() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        let first = queue.schedule(request(), 60_000).unwrap();
+        // Snapshot taken here (as compact_if_needed does under the lock) ...
+        let (items, sequence) = {
+            let state = queue.state.lock();
+            (
+                state.jobs.values().cloned().collect::<Vec<_>>(),
+                state.sequence,
+            )
+        };
+        // ... an append lands while it is being written outside the lock ...
+        let second = queue.schedule(request(), 60_000).unwrap();
+        queue.write_snapshot(items, sequence).unwrap();
+        // ... and rotation keeps it.
+        {
+            let _state = queue.state.lock();
+            assert_eq!(queue.rotate_journal(sequence).unwrap(), 1);
+        }
+        drop(queue);
+        let reopened = ScheduleQueue::open(dir.path()).unwrap();
+        assert_eq!(ids(&reopened), sorted(vec![first.id, second.id]));
+    }
+
+    #[test]
+    fn threshold_compaction_snapshots_and_rotates() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        let first = queue.schedule(request(), 60_000).unwrap();
+        queue.state.lock().journal_ops = JOURNAL_COMPACT_OPS - 1;
+        let second = queue.schedule(request(), 60_000).unwrap();
+        assert_eq!(queue.state.lock().journal_ops, 0);
+        assert!(dir.path().join("schedule.json").exists());
+        assert_eq!(
+            std::fs::metadata(dir.path().join("schedule.journal"))
+                .unwrap()
+                .len(),
+            0
+        );
+        let third = queue.schedule(request(), 60_000).unwrap();
+        drop(queue);
+        let reopened = ScheduleQueue::open(dir.path()).unwrap();
+        assert_eq!(ids(&reopened), sorted(vec![first.id, second.id, third.id]));
+    }
+
+    #[test]
+    fn backlog_cap_rejects_before_anything_is_written() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open_with_limits(
+            dir.path(),
+            ScheduleLimits {
+                max_jobs: 2,
+                max_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        queue.schedule(request(), 60_000).unwrap();
+        queue.schedule(request(), 60_000).unwrap();
+        let journal_len = std::fs::metadata(dir.path().join("schedule.journal"))
+            .unwrap()
+            .len();
+        assert!(matches!(
+            queue.schedule(request(), 60_000),
+            Err(ScheduleError::BacklogFull { jobs: 2, .. })
+        ));
+        assert_eq!(
+            std::fs::metadata(dir.path().join("schedule.journal"))
+                .unwrap()
+                .len(),
+            journal_len
+        );
+
+        let small = tempdir().unwrap();
+        let queue = ScheduleQueue::open_with_limits(
+            small.path(),
+            ScheduleLimits {
+                max_jobs: usize::MAX,
+                max_bytes: 4,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            queue.schedule(request(), 60_000),
+            Err(ScheduleError::BacklogFull { .. })
+        ));
+    }
+
+    #[test]
+    fn out_of_range_delay_is_rejected() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        assert!(matches!(
+            queue.schedule(request(), u64::MAX),
+            Err(ScheduleError::InvalidDelay(u64::MAX))
+        ));
+        assert!(matches!(
+            queue.schedule(request(), i64::MAX as u64),
+            Err(ScheduleError::InvalidDelay(_))
+        ));
+        assert_eq!(queue.count(), 0);
+    }
+
+    #[test]
+    fn pop_due_is_bounded_and_skips_cancelled_jobs() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        let jobs: Vec<_> = (0..5)
+            .map(|_| queue.schedule(request(), 0).unwrap())
+            .collect();
+        queue.cancel(jobs[0].id).unwrap();
+        let now = i64::MAX;
+        assert_eq!(queue.pop_due(now, 2).len(), 2);
+        assert_eq!(queue.pop_due(now, 2).len(), 2);
+        assert!(queue.pop_due(now, 2).is_empty());
+        assert_eq!(queue.count(), 4, "popped jobs stay pending until completed");
     }
 
     #[test]
