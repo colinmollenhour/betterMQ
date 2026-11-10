@@ -305,11 +305,7 @@ impl PartitionLog {
             );
         }
 
-        let mut segment_files: Vec<PathBuf> = std::fs::read_dir(self.dir.join(SEGMENTS_DIR))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.is_file())
-            .collect();
-        segment_files.sort();
+        let segment_files = self.sealed_segment_files()?;
 
         // A crash between the roll rename and the meta checkpoint, a failed
         // checkpoint, or a reset meta.json leaves a stale counter. Never hand
@@ -346,6 +342,48 @@ impl PartitionLog {
         self.meta.next_offset = next;
         self.meta.save(&self.dir)?;
         Ok(())
+    }
+
+    /// Sealed segments in roll order. Only canonical `segment-NNNNNN.log`
+    /// names are WAL: archive markers, temp files and other sidecars that
+    /// share the directory are ignored. A segment quarantined by an older
+    /// build, or a gap in the roll numbers, means records are missing from
+    /// the middle of the log, so open fails instead of renumbering.
+    fn sealed_segment_files(&self) -> Result<Vec<PathBuf>, LogError> {
+        let mut segments = Vec::new();
+        for entry in std::fs::read_dir(self.dir.join(SEGMENTS_DIR))? {
+            let path = entry?.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(index) = segment_index(&path) {
+                segments.push((index, path));
+            } else if is_quarantined_segment(&path) {
+                return Err(LogError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "quarantined sealed segment {} must be repaired or restored before \
+                         this log can open",
+                        path.display()
+                    ),
+                )));
+            }
+        }
+        segments.sort();
+        for pair in segments.windows(2) {
+            let ((previous, _), (next, path)) = (&pair[0], &pair[1]);
+            if *next != previous + 1 {
+                return Err(LogError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "sealed segment {} is missing before {}",
+                        segment_file_name(previous + 1),
+                        path.display()
+                    ),
+                )));
+            }
+        }
+        Ok(segments.into_iter().map(|(_, path)| path).collect())
     }
 
     /// The lowest sealed segment on disk is newer than `meta.base_segment`,
@@ -1480,6 +1518,20 @@ fn segment_index(path: &Path) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// `segment-NNNNNN.corrupt.<ts>`: a sealed segment renamed in place by the
+/// quarantine of older builds.
+fn is_quarantined_segment(path: &Path) -> bool {
+    let Some(rest) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("segment-"))
+    else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    digits >= 6 && rest[digits..].starts_with(".corrupt.")
+}
+
 fn segment_exists_error(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::AlreadyExists,
@@ -2199,6 +2251,106 @@ mod tests {
             log.append(0, sample_record("t"), b"two".to_vec()).unwrap();
             assert_payload_sequence(&log, &[b"one", b"two"]);
         }
+    }
+
+    #[test]
+    fn archive_markers_and_sidecars_in_segments_dir_are_not_wal() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            let mut expected = Vec::new();
+            {
+                let mut log =
+                    PartitionLog::open_for_shard(dir.path(), small_segment_cfg(), 0, format)
+                        .unwrap();
+                expected.extend(std::iter::repeat_n(
+                    1u8,
+                    append_until_roll(&mut log, 1) as usize,
+                ));
+                expected.extend(std::iter::repeat_n(
+                    2u8,
+                    append_until_roll(&mut log, 2) as usize,
+                ));
+            }
+            // What the archive service leaves beside sealed segments (see
+            // archive.rs pending_marker/complete_marker), plus a marker that
+            // an older build quarantined in place and a stray temp file.
+            let segments = dir.path().join(SEGMENTS_DIR);
+            let first = segments.join("segment-000000.log");
+            std::fs::write(
+                segments.join("segment-000000.log.archive.complete.json"),
+                br#"{"segment": "segment-000000.log", "sha256": "00"}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                segments.join("segment-000001.log.archive.pending"),
+                format!("{}\n", first.display()),
+            )
+            .unwrap();
+            std::fs::write(
+                segments.join("segment-000000.log.archive.corrupt.1700000000000"),
+                b"segments/segment-000000.log\n",
+            )
+            .unwrap();
+            std::fs::write(segments.join("segment-000002.log.tmp"), b"partial").unwrap();
+
+            for round in 0..2u8 {
+                let mut log =
+                    PartitionLog::open_for_shard(dir.path(), small_segment_cfg(), 0, format)
+                        .unwrap();
+                assert_payloads(&log, &expected);
+                let payload = 3 + round;
+                expected.extend(std::iter::repeat_n(
+                    payload,
+                    append_until_roll(&mut log, payload) as usize,
+                ));
+                assert_payloads(&log, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn quarantined_or_missing_sealed_segment_refuses_open() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            {
+                let mut log =
+                    PartitionLog::open_for_shard(dir.path(), small_segment_cfg(), 0, format)
+                        .unwrap();
+                for payload in 0..3 {
+                    append_until_roll(&mut log, payload);
+                }
+            }
+            let segments = dir.path().join(SEGMENTS_DIR);
+            std::fs::rename(
+                segments.join("segment-000001.log"),
+                segments.join("segment-000001.corrupt.1700000000000"),
+            )
+            .unwrap();
+            let err = PartitionLog::open_for_shard(dir.path(), small_segment_cfg(), 0, format)
+                .err()
+                .expect("quarantined segment must block open");
+            assert!(err.to_string().contains("quarantined"), "{err}");
+
+            std::fs::remove_file(segments.join("segment-000001.corrupt.1700000000000")).unwrap();
+            let err = PartitionLog::open_for_shard(dir.path(), small_segment_cfg(), 0, format)
+                .err()
+                .expect("segment gap must block open");
+            assert!(
+                err.to_string().contains("segment-000001.log is missing"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn segment_sidecar_names_are_classified() {
+        assert!(is_quarantined_segment(Path::new(
+            "segment-000001.corrupt.17"
+        )));
+        assert!(!is_quarantined_segment(Path::new(
+            "segment-000001.log.archive.corrupt.17"
+        )));
+        assert!(!is_quarantined_segment(Path::new("segment-000001.log")));
     }
 
     fn gc_cfg() -> PartitionLogConfig {
