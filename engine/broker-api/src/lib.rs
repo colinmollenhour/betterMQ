@@ -1674,7 +1674,7 @@ mod tests {
         let (_, listed) = admin_json(app, "GET", "/admin/v1/cells", None).await;
         assert_eq!(listed["cells"][0]["adminTokenConfigured"], true);
         assert!(!listed.to_string().contains("sk_local_eu"));
-        let on_disk = CellRegistry::load(&path);
+        let on_disk = CellRegistry::load(&path).unwrap();
         assert_eq!(on_disk.cells[0].admin_token.as_deref(), Some("sk_local_eu"));
         #[cfg(unix)]
         {

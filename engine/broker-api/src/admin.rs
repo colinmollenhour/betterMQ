@@ -41,15 +41,20 @@ impl AdminState {
         registry_path: Option<PathBuf>,
         controller_url: Option<String>,
     ) -> Self {
-        let mut registry = registry_path
-            .as_ref()
-            .map(|path| CellRegistry::load(path))
-            .unwrap_or_default();
+        let (mut registry, registry_path) = match registry_path {
+            Some(path) => {
+                let (registry, persist) = CellRegistry::load_for_startup(&path);
+                (registry, persist.then_some(path))
+            }
+            None => (CellRegistry::default(), None),
+        };
         if let Some(url) = controller_url.as_deref() {
             ensure_local_cell(&mut registry, &state, url);
         }
         if let Some(path) = registry_path.as_ref() {
-            let _ = registry.save(path);
+            if let Err(error) = registry.save(path) {
+                tracing::warn!(%error, path = %path.display(), "cell registry save failed");
+            }
         }
         Self {
             local: Some(state),
@@ -79,7 +84,9 @@ impl AdminState {
             ensure_controller_cell(&mut registry, url);
         }
         if let Some(path) = registry_path.as_ref() {
-            let _ = registry.save(path);
+            if let Err(error) = registry.save(path) {
+                tracing::warn!(%error, path = %path.display(), "cell registry save failed");
+            }
         }
         Self {
             local: None,
@@ -169,20 +176,92 @@ pub struct CellMember {
 }
 
 impl CellRegistry {
-    pub fn load(path: &std::path::Path) -> Self {
-        std::fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+    /// Strict load: a missing file is an empty registry; an unreadable or
+    /// unparsable file is an error.
+    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e),
+        }
     }
 
-    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    /// Startup load that never destroys a damaged registry. A corrupt or
+    /// unreadable file is moved aside to `<file>.corrupt-<unix ms>` and an
+    /// empty registry is used. If it cannot be moved aside, the registry runs
+    /// in memory only (`false`): nothing is written over the original.
+    pub fn load_for_startup(path: &std::path::Path) -> (Self, bool) {
+        let error = match Self::load(path) {
+            Ok(registry) => return (registry, true),
+            Err(error) => error,
+        };
+        let mut quarantine = path.as_os_str().to_os_string();
+        quarantine.push(format!(
+            ".corrupt-{}",
+            chrono::Utc::now().timestamp_millis()
+        ));
+        let quarantine = PathBuf::from(quarantine);
+        match std::fs::rename(path, &quarantine) {
+            Ok(()) => {
+                tracing::error!(
+                    %error,
+                    path = %path.display(),
+                    saved_as = %quarantine.display(),
+                    "cell registry unreadable; moved aside and starting with an empty registry"
+                );
+                (Self::default(), true)
+            }
+            Err(rename_error) => {
+                tracing::error!(
+                    %error,
+                    %rename_error,
+                    path = %path.display(),
+                    "cell registry unreadable and could not be moved aside; registry changes will not be saved"
+                );
+                (Self::default(), false)
+            }
         }
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)?;
-        // Holds per-cell admin tokens.
-        broker_storage::set_secret_file_mode(path);
+    }
+
+    /// Durable replace: unique 0600 temp file → fsync → rename → dir fsync, so
+    /// a crash or full disk never leaves a truncated registry (it holds
+    /// per-cell admin tokens, hence the mode).
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let bytes = serde_json::to_vec_pretty(self)?;
+        let tmp = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        let written = (|| {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&tmp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, path)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return written;
+        }
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 
@@ -1852,7 +1931,7 @@ mod tests {
             cell_id: "us-east".into(),
         });
         registry.save(&path).unwrap();
-        let loaded = CellRegistry::load(&path);
+        let loaded = CellRegistry::load(&path).unwrap();
         assert_eq!(loaded.cells.len(), 1);
         assert_eq!(loaded.cells[0].id, "us-east");
         assert_eq!(
@@ -1861,6 +1940,49 @@ mod tests {
         );
         assert_eq!(loaded.members.len(), 1);
         assert_eq!(loaded.members[0].profile, "dispatch");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn missing_registry_is_empty_and_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cell-registry.json");
+        let (registry, persist) = CellRegistry::load_for_startup(&path);
+        assert!(registry.cells.is_empty());
+        assert!(persist);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn corrupt_registry_is_preserved_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cell-registry.json");
+        std::fs::write(&path, b"{\"cells\": [{\"id\": \"eu\", \"regi").unwrap();
+        assert!(CellRegistry::load(&path).is_err());
+        let mut admin = AdminState::remote_with_path(
+            Some("http://broker1:8080".into()),
+            CellRegistry::load_for_startup(&path).0,
+            Some(path.clone()),
+        );
+        admin.cluster_secret = None;
+        let saved: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert_eq!(saved.len(), 1, "damaged file kept for recovery");
+        assert_eq!(
+            std::fs::read(&saved[0]).unwrap(),
+            b"{\"cells\": [{\"id\": \"eu\", \"regi"
+        );
+        let fresh = CellRegistry::load(&path).unwrap();
+        assert_eq!(fresh.cells.len(), 1, "only the default controller cell");
     }
 
     #[test]
