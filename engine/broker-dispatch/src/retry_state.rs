@@ -181,6 +181,27 @@ impl RetryState {
         self.maybe_compact()
     }
 
+    /// Clear any retry record for `(topic, partition, offset)`.
+    pub(crate) fn clear_offset(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<(), RetryStateError> {
+        let keys: Vec<RetryKey> = self
+            .state
+            .lock()
+            .records
+            .keys()
+            .filter(|key| key.topic == topic && key.partition == partition && key.offset == offset)
+            .cloned()
+            .collect();
+        for key in keys {
+            self.clear(&key)?;
+        }
+        Ok(())
+    }
+
     fn append(&self, event: RetryEvent) -> Result<(), RetryStateError> {
         let sequence = self.state.lock().sequence.saturating_add(1);
         self.journal.append(&RetryJournalRecord {

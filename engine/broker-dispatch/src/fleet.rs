@@ -213,7 +213,7 @@ pub async fn deliver_claimed_job(
 ) {
     let Some(msg) = job.message.clone() else {
         let _ = client
-            .fail(broker, &job, "missing message envelope", true, 0)
+            .fail(broker, &job, "missing message envelope", true, 0, false)
             .await;
         return;
     };
@@ -230,7 +230,9 @@ pub async fn deliver_claimed_job(
         }
     });
 
-    let result = dispatch.push_http_only(&msg, job.committed_hwm).await;
+    let result = dispatch
+        .push_http_only(&msg, job.committed_hwm, job.attempts)
+        .await;
     heartbeat.abort();
     match result {
         Ok(()) => {
@@ -246,6 +248,8 @@ pub async fn deliver_claimed_job(
                     | DispatchError::NonRetryable(_)
                     | DispatchError::RetryExhausted(_)
             );
+            // Only a real webhook attempt spends the broker-side retry budget.
+            let counts_attempt = matches!(&e, DispatchError::RetryDeferred { .. });
             let retry_after_ms = match &e {
                 DispatchError::RetryDeferred { retry_after_ms, .. } => *retry_after_ms,
                 DispatchError::HostBlocked => 30_000,
@@ -254,7 +258,14 @@ pub async fn deliver_claimed_job(
                 _ => 1_000,
             };
             let _ = client
-                .fail(broker, &job, &e.to_string(), dead, retry_after_ms)
+                .fail(
+                    broker,
+                    &job,
+                    &e.to_string(),
+                    dead,
+                    retry_after_ms,
+                    counts_attempt,
+                )
                 .await;
         }
     }

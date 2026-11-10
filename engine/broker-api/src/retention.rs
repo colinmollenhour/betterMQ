@@ -509,6 +509,7 @@ mod tests {
                 committed_hwm: 0,
                 cursor_key: String::new(),
                 message: None,
+                attempts: 0,
             },
         );
         let safe = compute_safe_watermark(&state, &log, &no_min_age()).unwrap();

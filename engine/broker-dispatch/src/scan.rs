@@ -12,6 +12,7 @@
 //! restart resumes from the last floor. A floor is only ever a lower bound of
 //! finished work: losing or lowering it costs a rescan, never a skipped message.
 
+use crate::flow_control::FlowKey;
 use broker_partition::{Broker, BrokerError};
 use broker_storage::StoredMessage;
 use parking_lot::Mutex;
@@ -43,6 +44,37 @@ pub(crate) struct PendingEntry {
     pub published_at_ms: i64,
     /// Strict-FIFO flow key: retries of earlier offsets with this key fence it.
     pub fifo_key: Option<String>,
+    pub queue_id: Option<Uuid>,
+    pub group_member_id: Option<Uuid>,
+    /// Flow lane and limits frozen on the message, when it is flow-controlled.
+    pub flow: Option<FlowAdmission>,
+}
+
+/// Flow-control lane of a pending message (same key the local FlowController uses).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FlowAdmission {
+    pub key: FlowKey,
+    pub parallelism: u32,
+    pub rate: u32,
+    pub period_secs: u64,
+}
+
+impl FlowAdmission {
+    pub(crate) fn for_message(msg: &StoredMessage) -> Option<Self> {
+        if !broker_partition::delivery_uses_flow_control(msg) {
+            return None;
+        }
+        let limits = broker_partition::ResolvedFlow::for_delivery(&msg.routing_key, msg);
+        Some(Self {
+            key: FlowKey {
+                endpoint_id: broker_partition::flow_lane_owner(msg),
+                flow_key: limits.key,
+            },
+            parallelism: limits.parallelism.max(1),
+            rate: limits.rate,
+            period_secs: limits.period_secs.max(1),
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -293,6 +325,9 @@ impl DispatchScan {
                             tenant_id,
                             published_at_ms: msg.published_at_ms,
                             fifo_key: crate::worker::DispatchEngine::fifo_retry_key(&msg),
+                            queue_id: msg.queue_id,
+                            group_member_id: msg.group_member_id,
+                            flow: FlowAdmission::for_message(&msg),
                         },
                     );
                 }

@@ -116,6 +116,7 @@ fn resolve_completion_job(
         message_id: identity.message_id,
         expires_at_ms: chrono::Utc::now().timestamp_millis(),
         generation: identity.generation,
+        attempts: 0,
         committed_hwm: state
             .broker
             .committed_hwm(identity.topic, identity.partition)?,
@@ -140,7 +141,8 @@ pub async fn lease_claim(
         req.partition,
         &|p| is_dispatch_leader(state_ref, p),
         &|p| generation(state_ref, p),
-    );
+    )
+    .await;
     Ok(Json(resp))
 }
 
@@ -232,15 +234,43 @@ pub async fn lease_fail(
             .await
         {
             job.expires_at_ms = chrono::Utc::now().timestamp_millis() + 5_000;
-            let _ = state.leases.try_insert(req.holder.clone(), job.clone());
+            let _ = state.leases.try_reinsert(req.holder.clone(), job.clone());
             return Err(ApiError::Broker(broker_partition::BrokerError::Storage(
                 broker_storage::LogError::Io(std::io::Error::other(e.to_string())),
             )));
         }
+    } else if req.counts_attempt {
+        // The broker owns the retry budget: count the attempt durably and
+        // either hold the offset (and its lane) back until the retry is due or
+        // dead-letter it once the budget is spent.
+        match state
+            .dispatch
+            .fail_leased_delivery(
+                &job.topic,
+                job.partition,
+                job.offset,
+                &req.reason,
+                req.retry_after_ms,
+            )
+            .await
+        {
+            Ok(outcome) => {
+                tracing::debug!(lease_id = %job.lease_id, ?outcome, "lease fail recorded");
+            }
+            Err(e) => {
+                job.expires_at_ms = chrono::Utc::now().timestamp_millis() + 5_000;
+                let _ = state.leases.try_reinsert(req.holder.clone(), job.clone());
+                return Err(ApiError::Broker(broker_partition::BrokerError::Storage(
+                    broker_storage::LogError::Io(std::io::Error::other(e.to_string())),
+                )));
+            }
+        }
     } else {
+        // Nothing was sent (blocked host, payload not loaded, …): keep the
+        // offset leased for the delay without spending an attempt.
         job.expires_at_ms = chrono::Utc::now().timestamp_millis()
             + i64::try_from(req.retry_after_ms.max(250)).unwrap_or(i64::MAX);
-        if !state.leases.try_insert(req.holder, job) {
+        if !state.leases.try_reinsert(req.holder, job) {
             return Err(map_lease(LeaseError::Conflict));
         }
     }

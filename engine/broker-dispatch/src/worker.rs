@@ -167,6 +167,13 @@ pub enum DispatchError {
     Failed(String),
 }
 
+/// Outcome of [`DispatchEngine::fail_leased_delivery`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeasedFailure {
+    RetryScheduled { attempts: u32, delay_ms: u64 },
+    DeadLettered,
+}
+
 type ShardLeaderFn = Arc<dyn Fn(u32) -> bool + Send + Sync>;
 type InFlightSet = Arc<parking_lot::Mutex<HashSet<(String, u32, u64)>>>;
 
@@ -271,6 +278,7 @@ pub struct DispatchEngine {
     background: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
     scan: crate::scan::DispatchScan,
     backfill_rotation: Arc<AtomicUsize>,
+    claim_rates: crate::lease::ClaimRates,
 }
 
 impl DispatchEngine {
@@ -342,6 +350,7 @@ impl DispatchEngine {
             background: Arc::new(parking_lot::Mutex::new(Vec::new())),
             scan,
             backfill_rotation: Arc::new(AtomicUsize::new(0)),
+            claim_rates: crate::lease::ClaimRates::default(),
         };
         if let Some(handle) = engine.memory_guard.spawn_monitor() {
             engine.background.lock().push(handle);
@@ -1145,6 +1154,7 @@ impl DispatchEngine {
                 message_id: job.message_id,
                 expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
                 generation: 0,
+                attempts: 0,
                 committed_hwm,
                 cursor_key: lane_key,
                 message: None,
@@ -1468,7 +1478,10 @@ impl DispatchEngine {
         offset: u64,
     ) -> Result<(), DispatchError> {
         self.commit_dispatch_offset(tenant_id, topic, cursor_key, partition, offset)
-            .await
+            .await?;
+        self.retry_state
+            .clear_offset(topic, partition, offset)
+            .map_err(|error| DispatchError::Failed(error.to_string()))
     }
 
     async fn commit_dispatch_offset(
@@ -1643,11 +1656,14 @@ impl DispatchEngine {
         Ok(())
     }
 
-    /// Fleet push: HTTP only (no local cursor). Caller completes/fails the lease on the broker.
+    /// Fleet push: HTTP only (no local cursor or retry state). Caller
+    /// completes/fails the lease on the broker, which owns the attempt count;
+    /// `prior_attempts` is the count the broker reported on the claim.
     pub async fn push_http_only(
         &self,
         msg: &StoredMessage,
         committed_hwm: u64,
+        prior_attempts: u32,
     ) -> Result<(), DispatchError> {
         let _permit = self
             .in_flight
@@ -1675,16 +1691,7 @@ impl DispatchEngine {
         }
         let outbound = build_outbound(msg);
         let long = msg.payload.len() >= self.config.long_payload_threshold_bytes;
-        let retry_key = Self::retry_key(msg);
-        let prior = self.retry_state.get(&retry_key);
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        if let Some(record) = &prior {
-            if record.due_at_ms > now_ms {
-                return Err(DispatchError::RetryDeferred {
-                    retry_after_ms: record.due_at_ms.saturating_sub(now_ms) as u64,
-                    reason: record.last_error.clone(),
-                });
-            }
+        if prior_attempts > 0 {
             self.telemetry.record_retry_due();
         }
         crate::egress::validate_destination_url(url).map_err(|error| {
@@ -1704,7 +1711,6 @@ impl DispatchEngine {
             Ok(response) if response.status().is_success() => {
                 self.host_blocker.record_success_async(url).await;
                 discard_body_capped(response).await;
-                self.clear_retry(msg)?;
                 return Ok(());
             }
             Ok(response) => {
@@ -1717,7 +1723,6 @@ impl DispatchEngine {
                     .map(|secs| secs.saturating_mul(1000));
                 discard_body_capped(response).await;
                 if self.config.non_retry_status_codes.contains(&code) {
-                    self.clear_retry(msg)?;
                     return Err(DispatchError::NonRetryable(format!("HTTP {code}")));
                 }
                 self.host_blocker.record_transport_failure_async(url).await;
@@ -1735,23 +1740,9 @@ impl DispatchEngine {
                 format!("transport error: {error}")
             }
         };
-        self.retry_fleet_failure(msg, prior, retry_after_ms, failure)
-    }
-
-    fn retry_fleet_failure(
-        &self,
-        msg: &StoredMessage,
-        prior: Option<RetryRecord>,
-        retry_after_ms: Option<u64>,
-        failure: String,
-    ) -> Result<(), DispatchError> {
-        let attempts = prior
-            .map(|record| record.attempts)
-            .unwrap_or(0)
-            .saturating_add(1);
+        let attempts = prior_attempts.saturating_add(1);
         if attempts > msg.max_retries {
             self.telemetry.record_retry_exhausted();
-            self.clear_retry(msg)?;
             return Err(DispatchError::RetryExhausted(format!(
                 "{failure}; exhausted {} delivery attempt(s)",
                 msg.max_retries.saturating_add(1)
@@ -1765,7 +1756,6 @@ impl DispatchEngine {
             .unwrap_or_else(|| backoff_cfg.delay_ms(attempts))
             .min(backoff_cfg.max_ms)
             .max(1);
-        self.persist_retry(msg, attempts, wait_ms, failure.clone())?;
         self.telemetry.record_retry_scheduled();
         Err(DispatchError::RetryDeferred {
             retry_after_ms: wait_ms,
@@ -1794,6 +1784,68 @@ impl DispatchEngine {
 
     pub(crate) fn record_flow_error(&self) {
         self.telemetry.record_flow_error();
+    }
+
+    /// Broker side of a failed fleet delivery: count the attempt in the
+    /// durable retry state and either schedule the next attempt (the claim
+    /// path keeps the offset, and later offsets of its lane, back until it is
+    /// due) or dead-letter the message once its retry budget is spent. The
+    /// budget is therefore shared by every fleet worker and survives fleet
+    /// restarts.
+    pub async fn fail_leased_delivery(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        reason: &str,
+        retry_after_ms: u64,
+    ) -> Result<LeasedFailure, DispatchError> {
+        let msg = self.broker.read_message(topic, partition, offset)?;
+        let attempts = self
+            .retry_state
+            .get(&Self::retry_key(&msg))
+            .map(|record| record.attempts)
+            .unwrap_or(0)
+            .saturating_add(1);
+        if attempts > msg.max_retries {
+            self.telemetry.record_retry_exhausted();
+            let max_retries = msg.max_retries;
+            self.finalize_dead_letter(
+                &msg,
+                format!(
+                    "{reason} — exhausted {attempts} delivery attempt(s) (max_retries={max_retries})"
+                ),
+            )
+            .await?;
+            return Ok(LeasedFailure::DeadLettered);
+        }
+        let delay_ms = retry_after_ms.max(1);
+        self.persist_retry(&msg, attempts, delay_ms, reason.to_string())?;
+        self.telemetry.record_retry_scheduled();
+        Ok(LeasedFailure::RetryScheduled { attempts, delay_ms })
+    }
+
+    /// Delivery attempts already spent on a message (broker-side retry state).
+    pub(crate) fn prior_attempts(
+        &self,
+        msg_topic: &str,
+        partition: u32,
+        offset: u64,
+        id: Uuid,
+    ) -> u32 {
+        self.retry_state
+            .get(&RetryKey {
+                topic: msg_topic.to_string(),
+                partition,
+                offset,
+                message_id: id,
+            })
+            .map(|record| record.attempts)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn claim_rates(&self) -> &crate::lease::ClaimRates {
+        &self.claim_rates
     }
 
     /// Move a leased offset to the DLQ and advance the gap-aware cursor.
@@ -2042,7 +2094,7 @@ mod tests {
             .unwrap());
         engine.clear_retry(&msg).unwrap();
         assert!(matches!(
-            engine.push_http_only(&msg, msg.offset + 1).await,
+            engine.push_http_only(&msg, msg.offset + 1, 0).await,
             Err(DispatchError::RetryDeferred { .. })
         ));
         assert_eq!(engine.retry_state.get(&key).unwrap().attempts, 1);
@@ -2152,7 +2204,7 @@ mod tests {
         );
         assert!(tokio::time::timeout(
             Duration::from_millis(50),
-            engine.push_http_only(&msg, msg.offset + 1)
+            engine.push_http_only(&msg, msg.offset + 1, 0)
         )
         .await
         .is_err());

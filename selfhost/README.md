@@ -573,6 +573,13 @@ Roles (one binary):
 - `bettermq serve --broker-only` — ingest + controller + lease API + admin/panel (no local push workers; use `--no-panel` to hide the UI)
 - `bettermq serve --dispatch-fleet` — claim/push via `BETTERMQ_BROKER_URLS`
 
+Fleet delivery keeps the same semantics as local dispatch, because the broker decides what a fleet worker may claim:
+
+- Paused queues, paused group members and paused flow keys are not handed out.
+- A strict-FIFO lane (a queue job with a routing key, or `parallelism: 1`) has at most one message in flight across all fleet workers, and later messages wait while an earlier one is waiting on a retry. Other lanes get at most `parallelism` concurrent leases and at most `rate` claims per `period`. Pinned limits from the panel apply.
+- The broker counts delivery attempts, so `max_retries` is shared by all fleet workers and survives fleet restarts. Fleet workers keep no retry state, so their `--data-dir` does not need a volume.
+- Limits are enforced per broker for the shards that broker leads, as with local dispatch on each node.
+
 ### Panel on its own port
 
 By default the panel is on the same listen address as the API (`http://localhost:8080/panel/`).

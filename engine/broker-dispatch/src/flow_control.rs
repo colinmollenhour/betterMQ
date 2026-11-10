@@ -53,6 +53,15 @@ pub struct GlobalParallelismInfo {
     pub parallelism_count: u32,
 }
 
+/// Operator overrides of one flow lane (see [`FlowController::pause`] / [`FlowController::pin`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FlowOverride {
+    pub paused: bool,
+    pub parallelism: Option<u32>,
+    pub rate: Option<u32>,
+    pub period_secs: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 struct PinnedLimits {
     parallelism: Option<u32>,
@@ -342,6 +351,39 @@ impl FlowController {
                 .saturating_add(lane.active.load(AtomicOrdering::Acquire) as usize);
         }
         pending
+    }
+
+    /// Operator pause and pinned limits per lane, for admission outside this
+    /// controller (broker-side fleet claims).
+    pub(crate) async fn admission_overrides(&self) -> HashMap<FlowKey, FlowOverride> {
+        let lanes: Vec<(FlowKey, Arc<FlowLane>)> = self
+            .lanes
+            .lock()
+            .await
+            .iter()
+            .map(|(key, lane)| (key.clone(), lane.clone()))
+            .collect();
+        let mut out = HashMap::with_capacity(lanes.len());
+        for (key, lane) in lanes {
+            let paused = *lane.paused.lock().await;
+            let pin = lane.pinned.lock().await.clone();
+            if paused
+                || pin.parallelism.is_some()
+                || pin.rate.is_some()
+                || pin.period_secs.is_some()
+            {
+                out.insert(
+                    key,
+                    FlowOverride {
+                        paused,
+                        parallelism: pin.parallelism,
+                        rate: pin.rate,
+                        period_secs: pin.period_secs,
+                    },
+                );
+            }
+        }
+        out
     }
 
     /// Create the in-memory lane if missing (so pause/pin work before first delivery).

@@ -46,6 +46,15 @@ async fn harness() -> Harness {
     let (tx, received) = mpsc::unbounded_channel::<Vec<u8>>();
     let destination = Router::new()
         .route(
+            "/fail",
+            post(
+                |State(tx): State<mpsc::UnboundedSender<Vec<u8>>>, body: axum::body::Bytes| async move {
+                    let _ = tx.send(body.to_vec());
+                    StatusCode::SERVICE_UNAVAILABLE
+                },
+            ),
+        )
+        .route(
             "/hook",
             post(
                 |State(tx): State<mpsc::UnboundedSender<Vec<u8>>>, body: axum::body::Bytes| async move {
@@ -245,4 +254,85 @@ async fn fleet_refuses_to_complete_a_lease_without_its_body() {
         !is_complete(&h.broker, &job),
         "the lease is failed for a retry, not completed"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_budget_is_shared_across_fleet_restarts() {
+    let mut h = harness().await;
+    let fail_url = h.hook_url.replace("/hook", "/fail");
+    let response = h
+        .broker
+        .publish(PublishRequest {
+            topic: String::new(),
+            queue_id: None,
+            group_id: None,
+            group_member_id: None,
+            routing_key: "retry".into(),
+            payload: "body".into(),
+            routing_id: None,
+            payload_encoding: None,
+            idempotency_key: None,
+            delay_ms: None,
+            priority: None,
+            flow_id: None,
+            url: Some(fail_url),
+            secret: Some("whsec_test".into()),
+            destination: None,
+            flow: None,
+            parallelism: None,
+            max_retries: Some(1),
+            retry_backoff: Some(broker_proto::RetryBackoff {
+                kind: broker_proto::RetryBackoffKind::Fixed,
+                initial_ms: 5,
+                max_ms: 5,
+                multiplier: 1.0,
+            }),
+            method: None,
+            headers: None,
+            sign: None,
+            request: None,
+        })
+        .unwrap();
+    h.broker.flush_wal().unwrap();
+
+    // Each attempt runs on a fresh fleet process with its own empty data dir,
+    // as after a container restart; only the broker remembers the attempts.
+    let mut last_job = None;
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let fleet_dir = tempfile::tempdir().unwrap();
+        let fleet_broker = Broker::open(BrokerConfig::new(fleet_dir.path().to_path_buf())).unwrap();
+        let fleet = DispatchEngine::new_broker_only(fleet_broker, DispatchConfig::default());
+        let claimed = h.client.claim(&h.broker_url, 4).await.unwrap();
+        assert_eq!(claimed.jobs.len(), 1);
+        let job = claimed.jobs.into_iter().next().unwrap();
+        deliver_claimed_job(
+            &fleet,
+            &h.client,
+            &h.broker_url,
+            job.clone(),
+            broker_dispatch::DEFAULT_HEARTBEAT_INTERVAL,
+        )
+        .await;
+        last_job = Some(job);
+    }
+    let mut attempts = 0;
+    while h.received.try_recv().is_ok() {
+        attempts += 1;
+    }
+    assert_eq!(attempts, 2, "max_retries=1 allows exactly two attempts");
+    let dlq = h
+        .broker
+        .list_topic_messages(&broker_partition::dlq_topic(&response.topic), 10)
+        .unwrap();
+    assert_eq!(dlq.len(), 1, "the exhausted message is dead-lettered");
+    assert!(is_complete(&h.broker, &last_job.unwrap()));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(h
+        .client
+        .claim(&h.broker_url, 4)
+        .await
+        .unwrap()
+        .jobs
+        .is_empty());
 }

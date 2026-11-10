@@ -30,6 +30,7 @@ fn job(offset: u64, url: &str) -> ClaimedJob {
         message_id,
         expires_at_ms: chrono::Utc::now().timestamp_millis() + 30_000,
         generation: 0,
+        attempts: 0,
         committed_hwm: offset + 100,
         cursor_key: "lane".into(),
         message: Some(StoredMessage {
