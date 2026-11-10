@@ -7,6 +7,7 @@
 use crate::archive_checkpoint::load_checkpoint;
 use crate::archive_restore::RestoreBatch;
 use crate::ArchiveCheckpoint;
+use crate::ArchiveSource;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -40,6 +41,10 @@ pub struct ArchiveManifest {
     pub archived_at_unix_ms: u128,
     #[serde(default)]
     pub checkpoint: Option<ArchiveCheckpoint>,
+    #[serde(default)]
+    pub source: Option<ArchiveSource>,
+    #[serde(default)]
+    pub restore_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -205,6 +210,8 @@ fn initialize_service() -> Result<Option<ArchiveService>, ArchiveError> {
     let Some(backend) = archive_backend()? else {
         return Ok(None);
     };
+    let source = ArchiveSource::from_env()?;
+    info!(archive_cluster = %source.cluster_id, archive_node = %source.node_id, "initialized archive source namespace");
     let capacity = env_usize("BETTERMQ_ARCHIVE_QUEUE_CAPACITY", 128);
     let retries = env_usize("BETTERMQ_ARCHIVE_MAX_RETRIES", 5);
     let counters = Arc::new(ArchiveCounters::default());
@@ -212,7 +219,7 @@ fn initialize_service() -> Result<Option<ArchiveService>, ArchiveError> {
     let (sender, receiver) = mpsc::sync_channel(capacity);
     std::thread::Builder::new()
         .name("bettermq-archive".into())
-        .spawn(move || archive_worker(receiver, backend, retries, worker_counters))?;
+        .spawn(move || archive_worker(receiver, backend, source, retries, worker_counters))?;
     let service = ArchiveService {
         sender,
         counters,
@@ -434,6 +441,7 @@ fn finish_job(counters: &ArchiveCounters, bytes: u64, failed: bool) {
 fn archive_worker(
     receiver: mpsc::Receiver<ArchiveJob>,
     backend: ArchiveBackend,
+    source: ArchiveSource,
     retries: usize,
     counters: Arc<ArchiveCounters>,
 ) {
@@ -445,20 +453,23 @@ fn archive_worker(
             .expect("archive object-store runtime")
     });
     while let Ok(job) = receiver.recv() {
-        retry_archive_job(
-            &job,
-            retries,
-            &counters,
-            Duration::from_millis(100),
-            || match &backend {
-                ArchiveBackend::Local(root) => archive_local_once(&job.path, root),
+        retry_archive_job(&job, retries, &counters, Duration::from_millis(100), || {
+            // Never count an unrecoverable legacy byte copy as successful
+            // protection. Keep the durable job pending for operator repair.
+            if load_checkpoint(&job.path)?.is_none() {
+                return Err(ArchiveError::Manifest(
+                    "source WAL has no recovery checkpoint or format manifest".into(),
+                ));
+            }
+            match &backend {
+                ArchiveBackend::Local(root) => archive_local_once(&job.path, root, &source),
                 #[cfg(feature = "s3")]
                 ArchiveBackend::Object { store, prefix } => runtime
                     .as_ref()
                     .expect("object backend runtime")
-                    .block_on(archive_object_once(store, prefix, &job.path)),
-            },
-        );
+                    .block_on(archive_object_once(store, prefix, &job.path, &source)),
+            }
+        });
     }
 }
 
@@ -507,35 +518,79 @@ fn retry_archive_job(
     }
 }
 
-fn archive_local_once(src: &Path, dest_root: &Path) -> Result<ArchiveManifest, ArchiveError> {
-    let key = archive_key(src);
+struct TemporaryFile(PathBuf);
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn archive_local_once(
+    src: &Path,
+    dest_root: &Path,
+    source: &ArchiveSource,
+) -> Result<ArchiveManifest, ArchiveError> {
+    std::fs::create_dir_all(dest_root)?;
+    let part = TemporaryFile(dest_root.join(format!(".archive-upload-{}", uuid::Uuid::new_v4())));
+    let output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part.0)?;
+    let (bytes, sha256) = copy_and_hash(File::open(src)?, output)?;
+    let key = source.object_key(&archive_key(src), &sha256)?;
     let dest = dest_root.join(&key);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let part = dest.with_extension("archive-part");
-    let (bytes, sha256) = copy_and_hash(File::open(src)?, File::create(&part)?)?;
-    std::fs::rename(&part, &dest)?;
-
-    let manifest = new_manifest(src, &key, bytes, sha256)?;
+    let manifest = new_manifest(src, &key, bytes, sha256, source)?;
+    // Atomic create-only publication. Identical retries may reuse an object;
+    // nothing ever replaces bytes already published under an immutable key.
+    match std::fs::hard_link(&part.0, &dest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            verify_local_manifest(dest_root, &manifest)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
     let manifest_path = local_manifest_path(&dest);
-    let manifest_part = manifest_path.with_extension("json.part");
-    let mut file = File::create(&manifest_part)?;
+    let manifest_part =
+        TemporaryFile(dest.with_extension(format!("manifest-{}", uuid::Uuid::new_v4())));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&manifest_part.0)?;
     serde_json::to_writer_pretty(&mut file, &manifest)
         .map_err(|error| ArchiveError::Manifest(error.to_string()))?;
     file.write_all(b"\n")?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(manifest_part, manifest_path)?;
-    if let Some(parent) = dest.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
+    let published = match std::fs::hard_link(&manifest_part.0, &manifest_path) {
+        Ok(()) => manifest,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = read_local_manifest(&manifest_path)?;
+            require_same_manifest(&existing, &manifest)?;
+            existing
         }
+        Err(error) => return Err(error.into()),
+    };
+    let mut directory = dest.parent().expect("archive parent");
+    loop {
+        File::open(directory)?.sync_all()?;
+        if directory == dest_root {
+            break;
+        }
+        directory = directory
+            .parent()
+            .ok_or_else(|| ArchiveError::Manifest("archive namespace escaped root".into()))?;
     }
-    Ok(manifest)
+    Ok(published)
 }
 
-fn copy_and_hash(mut input: File, mut output: File) -> Result<(u64, String), ArchiveError> {
+fn stream_and_hash(
+    mut input: impl Read,
+    mut output: impl Write,
+) -> Result<(u64, String), ArchiveError> {
     let mut hasher = Sha256::new();
     let mut bytes = 0u64;
     let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
@@ -548,8 +603,41 @@ fn copy_and_hash(mut input: File, mut output: File) -> Result<(u64, String), Arc
         output.write_all(&buffer[..read])?;
         bytes += read as u64;
     }
-    output.sync_all()?;
     Ok((bytes, hex::encode(hasher.finalize())))
+}
+
+fn copy_and_hash(mut input: File, mut output: File) -> Result<(u64, String), ArchiveError> {
+    let result = stream_and_hash(&mut input, &mut output)?;
+    output.sync_all()?;
+    Ok(result)
+}
+
+fn require_same_manifest(
+    existing: &ArchiveManifest,
+    candidate: &ArchiveManifest,
+) -> Result<(), ArchiveError> {
+    let range = |manifest: &ArchiveManifest| {
+        manifest.checkpoint.as_ref().map(|checkpoint| {
+            (
+                checkpoint.wal_manifest.clone(),
+                checkpoint.first_offset,
+                checkpoint.next_offset,
+            )
+        })
+    };
+    if existing.version != candidate.version
+        || existing.segment != candidate.segment
+        || existing.sha256 != candidate.sha256
+        || existing.bytes != candidate.bytes
+        || existing.source != candidate.source
+        || existing.restore_path != candidate.restore_path
+        || range(existing) != range(candidate)
+    {
+        return Err(ArchiveError::Manifest(
+            "immutable archive identity already has a different manifest".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn new_manifest(
@@ -557,15 +645,18 @@ fn new_manifest(
     key: &Path,
     bytes: u64,
     sha256: String,
+    source: &ArchiveSource,
 ) -> Result<ArchiveManifest, ArchiveError> {
     let checkpoint = load_checkpoint(src)?;
     Ok(ArchiveManifest {
-        version: if checkpoint.is_some() { 2 } else { 1 },
+        version: 3,
         segment: key.to_string_lossy().replace('\\', "/"),
         bytes,
         sha256,
         archived_at_unix_ms: unix_ms() as u128,
         checkpoint,
+        source: Some(source.clone()),
+        restore_path: Some(archive_key(src).to_string_lossy().replace('\\', "/")),
     })
 }
 
@@ -582,41 +673,90 @@ async fn archive_object_once(
     store: &Arc<dyn ObjectStore>,
     prefix: &str,
     src: &Path,
+    source: &ArchiveSource,
 ) -> Result<ArchiveManifest, ArchiveError> {
-    let key = archive_key(src);
+    // Multipart uploads cannot apply create-only preconditions in object_store.
+    // Hash the sealed file first, then upload only to its content identity. A
+    // concurrent retry can only publish identical bytes under that key.
+    let (expected_bytes, expected_sha) = stream_and_hash(File::open(src)?, std::io::sink())?;
+    let key = source.object_key(&archive_key(src), &expected_sha)?;
+    let mut manifest = new_manifest(src, &key, expected_bytes, expected_sha, source)?;
     let object_key = prefixed_key(prefix, &key);
     let path = ObjectPath::from(object_key.as_str());
-    let mut upload = store.put_multipart(&path).await.map_err(object_error)?;
-    let mut file = File::open(src)?;
-    let mut hasher = Sha256::new();
-    let mut bytes = 0u64;
-    loop {
-        let mut buffer = vec![0u8; MULTIPART_BYTES];
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    match store.head(&path).await {
+        Ok(_) => verify_object_manifest(store, prefix, &manifest).await?,
+        Err(object_store::Error::NotFound { .. }) => {
+            let mut file = File::open(src)?;
+            let mut upload = store.put_multipart(&path).await.map_err(object_error)?;
+            let mut hasher = Sha256::new();
+            let mut bytes = 0u64;
+            loop {
+                let mut buffer = vec![0u8; MULTIPART_BYTES];
+                let read = match file.read(&mut buffer) {
+                    Ok(read) => read,
+                    Err(error) => {
+                        let _ = upload.abort().await;
+                        return Err(error.into());
+                    }
+                };
+                if read == 0 {
+                    break;
+                }
+                buffer.truncate(read);
+                hasher.update(&buffer);
+                bytes += read as u64;
+                if let Err(error) = upload.put_part(Bytes::from(buffer).into()).await {
+                    let _ = upload.abort().await;
+                    return Err(object_error(error));
+                }
+            }
+            if bytes != manifest.bytes || hex::encode(hasher.finalize()) != manifest.sha256 {
+                let _ = upload.abort().await;
+                return Err(ArchiveError::Manifest(
+                    "sealed segment changed during archive upload".into(),
+                ));
+            }
+            if let Err(error) = upload.complete().await {
+                let _ = upload.abort().await;
+                return Err(object_error(error));
+            }
         }
-        buffer.truncate(read);
-        hasher.update(&buffer);
-        bytes += read as u64;
-        if let Err(error) = upload.put_part(Bytes::from(buffer).into()).await {
-            let _ = upload.abort().await;
-            return Err(object_error(error));
-        }
+        Err(error) => return Err(object_error(error)),
     }
-    upload.complete().await.map_err(object_error)?;
-    let manifest = new_manifest(src, &key, bytes, hex::encode(hasher.finalize()))?;
+    // PITR uses archival time, not the potentially much earlier upload start.
+    // Existing create-only manifests retain their original timestamp below.
+    manifest.archived_at_unix_ms = unix_ms() as u128;
     let manifest_key = format!("{object_key}.manifest.json");
-    store
-        .put(
-            &ObjectPath::from(manifest_key),
+    let manifest_path = ObjectPath::from(manifest_key);
+    match store
+        .put_opts(
+            &manifest_path,
             serde_json::to_vec_pretty(&manifest)
                 .map_err(|error| ArchiveError::Manifest(error.to_string()))?
                 .into(),
+            object_store::PutOptions {
+                mode: object_store::PutMode::Create,
+                ..Default::default()
+            },
         )
         .await
-        .map_err(object_error)?;
-    Ok(manifest)
+    {
+        Ok(_) => Ok(manifest),
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            let bytes = store
+                .get(&manifest_path)
+                .await
+                .map_err(object_error)?
+                .bytes()
+                .await
+                .map_err(object_error)?;
+            let existing = serde_json::from_slice(&bytes)
+                .map_err(|error| ArchiveError::Manifest(error.to_string()))?;
+            require_same_manifest(&existing, &manifest)?;
+            Ok(existing)
+        }
+        Err(error) => Err(object_error(error)),
+    }
 }
 
 #[cfg(feature = "s3")]
@@ -748,10 +888,43 @@ pub fn restore_local_archive_until(
     destination: &Path,
     until_unix_ms: Option<u128>,
 ) -> ArchiveToolReport {
+    restore_local_archive_selected(root, destination, None, until_unix_ms)
+}
+
+pub fn restore_local_archive_source_until(
+    root: &Path,
+    destination: &Path,
+    source: &ArchiveSource,
+    until_unix_ms: Option<u128>,
+) -> ArchiveToolReport {
+    restore_local_archive_selected(root, destination, Some(source), until_unix_ms)
+}
+
+fn restore_local_archive_selected(
+    root: &Path,
+    destination: &Path,
+    source: Option<&ArchiveSource>,
+    until_unix_ms: Option<u128>,
+) -> ArchiveToolReport {
     let mut report = ArchiveToolReport::default();
+    if let Some(source) = source {
+        if let Err(error) = ArchiveSource::new(source.cluster_id.clone(), source.node_id.clone()) {
+            report.errors.push(error.to_string());
+            return report;
+        }
+    }
     let mut paths = Vec::new();
-    if let Err(error) = collect_manifest_paths(root, &mut paths) {
+    let selected_root = source
+        .map(|source| root.join(source.namespace()))
+        .unwrap_or_else(|| root.into());
+    if let Err(error) = collect_manifest_paths(&selected_root, &mut paths) {
         report.errors.push(error.to_string());
+        return report;
+    }
+    if paths.is_empty() && source.is_some() {
+        report
+            .errors
+            .push("no archived segments found for selected source".into());
         return report;
     }
     let mut manifests = Vec::new();
@@ -771,7 +944,7 @@ pub fn restore_local_archive_until(
         return report;
     }
     let result = (|| {
-        let batch = RestoreBatch::new(destination, manifests.clone())?;
+        let batch = RestoreBatch::new(destination, manifests.clone(), source)?;
         let mut restored_bytes = 0;
         for manifest in &manifests {
             verify_local_manifest(root, manifest)?;
@@ -895,14 +1068,51 @@ pub async fn restore_object_archive_until(
     destination: &Path,
     until_unix_ms: Option<u128>,
 ) -> ArchiveToolReport {
+    restore_object_archive_selected(store, prefix, destination, None, until_unix_ms).await
+}
+
+#[cfg(feature = "s3")]
+pub async fn restore_object_archive_source_until(
+    store: Arc<dyn ObjectStore>,
+    prefix: &str,
+    destination: &Path,
+    source: &ArchiveSource,
+    until_unix_ms: Option<u128>,
+) -> ArchiveToolReport {
+    restore_object_archive_selected(store, prefix, destination, Some(source), until_unix_ms).await
+}
+
+#[cfg(feature = "s3")]
+async fn restore_object_archive_selected(
+    store: Arc<dyn ObjectStore>,
+    prefix: &str,
+    destination: &Path,
+    source: Option<&ArchiveSource>,
+    until_unix_ms: Option<u128>,
+) -> ArchiveToolReport {
     let mut report = ArchiveToolReport::default();
-    let manifests = match object_manifests(&store, prefix).await {
+    if let Some(source) = source {
+        if let Err(error) = ArchiveSource::new(source.cluster_id.clone(), source.node_id.clone()) {
+            report.errors.push(error.to_string());
+            return report;
+        }
+    }
+    let selected_prefix = source
+        .map(|source| prefixed_key(prefix, &source.namespace()))
+        .unwrap_or_else(|| prefix.into());
+    let manifests = match object_manifests(&store, &selected_prefix).await {
         Ok(manifests) => manifests,
         Err(error) => {
             report.errors.push(error.to_string());
             return report;
         }
     };
+    if manifests.is_empty() && source.is_some() {
+        report
+            .errors
+            .push("no archived segments found for selected source".into());
+        return report;
+    }
     let mut selected = Vec::new();
     for (_, manifest) in manifests {
         report.manifests += 1;
@@ -916,7 +1126,7 @@ pub async fn restore_object_archive_until(
         return report;
     }
     let result = async {
-        let batch = RestoreBatch::new(destination, selected.clone())?;
+        let batch = RestoreBatch::new(destination, selected.clone(), source)?;
         let mut restored_bytes = 0;
         for manifest in &selected {
             verify_object_manifest(&store, prefix, manifest).await?;
@@ -962,6 +1172,99 @@ pub async fn restore_object_archive_until(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn test_source() -> ArchiveSource {
+        ArchiveSource::parse("test/first").unwrap()
+    }
+
+    fn archive_local_once(src: &Path, root: &Path) -> Result<ArchiveManifest, ArchiveError> {
+        super::archive_local_once(src, root, &test_source())
+    }
+
+    fn restore_local_archive(root: &Path, destination: &Path) -> ArchiveToolReport {
+        super::restore_local_archive_source_until(root, destination, &test_source(), None)
+    }
+
+    fn restore_local_archive_until(
+        root: &Path,
+        destination: &Path,
+        until: Option<u128>,
+    ) -> ArchiveToolReport {
+        super::restore_local_archive_source_until(root, destination, &test_source(), until)
+    }
+
+    #[cfg(feature = "s3")]
+    async fn archive_object_once(
+        store: &Arc<dyn ObjectStore>,
+        prefix: &str,
+        src: &Path,
+    ) -> Result<ArchiveManifest, ArchiveError> {
+        super::archive_object_once(store, prefix, src, &test_source()).await
+    }
+
+    #[cfg(feature = "s3")]
+    async fn restore_object_archive(
+        store: Arc<dyn ObjectStore>,
+        prefix: &str,
+        destination: &Path,
+    ) -> ArchiveToolReport {
+        super::restore_object_archive_source_until(store, prefix, destination, &test_source(), None)
+            .await
+    }
+
+    #[test]
+    fn sources_and_content_identities_never_overwrite_local_archives() {
+        let source = tempdir().unwrap();
+        let archive = tempdir().unwrap();
+        let segment = source.path().join("segment-000000.log");
+        std::fs::write(&segment, b"first node").unwrap();
+        let first = archive_local_once(&segment, archive.path()).unwrap();
+        let repeated = archive_local_once(&segment, archive.path()).unwrap();
+        assert_eq!(first.archived_at_unix_ms, repeated.archived_at_unix_ms);
+        std::fs::write(&segment, b"second node").unwrap();
+        let second_source = ArchiveSource::parse("test/second").unwrap();
+        let second = super::archive_local_once(&segment, archive.path(), &second_source).unwrap();
+        assert_eq!(first.restore_path, second.restore_path);
+        assert_ne!(first.segment, second.segment);
+        assert_eq!(
+            std::fs::read(archive.path().join(&first.segment)).unwrap(),
+            b"first node"
+        );
+        let changed = archive_local_once(&segment, archive.path()).unwrap();
+        assert_ne!(first.segment, changed.segment);
+        assert_eq!(scrub_local_archive(archive.path()).verified, 3);
+    }
+
+    #[test]
+    fn restore_selects_one_source_and_refuses_implicit_or_wrong_source() {
+        let archive = tempdir().unwrap();
+        for node in ["first", "second"] {
+            let source = tempdir().unwrap();
+            let identity = ArchiveSource::new("test".into(), node.into()).unwrap();
+            for segment in real_segments(source.path(), crate::WAL_FORMAT_V2, false) {
+                super::archive_local_once(&segment, archive.path(), &identity).unwrap();
+            }
+        }
+        let restored = tempdir().unwrap();
+        assert!(
+            !super::restore_local_archive(archive.path(), restored.path())
+                .errors
+                .is_empty()
+        );
+        let restored = restore_local_archive(archive.path(), restored.path());
+        assert!(restored.errors.is_empty(), "{restored:?}");
+        assert_eq!(restored.restored, 4);
+        let empty = tempdir().unwrap();
+        let missing = ArchiveSource::parse("test/missing").unwrap();
+        assert!(!super::restore_local_archive_source_until(
+            archive.path(),
+            empty.path(),
+            &missing,
+            None
+        )
+        .errors
+        .is_empty());
+    }
 
     fn record() -> crate::LogRecord {
         serde_json::from_value(serde_json::json!({
@@ -1088,7 +1391,13 @@ mod tests {
         for segment in &segments {
             archive_local_once(segment, archive.path()).unwrap();
         }
-        let missing = local_manifest_path(&archive.path().join(archive_key(&segments[1])));
+        let missing = local_manifest_path(
+            &archive.path().join(
+                archive_local_once(&segments[1], archive.path())
+                    .unwrap()
+                    .segment,
+            ),
+        );
         std::fs::remove_file(missing).unwrap();
         let report = restore_local_archive(archive.path(), restored.path());
         assert_eq!(report.restored, 0);
@@ -1174,6 +1483,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env("BETTERMQ_TEST_ARCHIVE_INIT", mode)
+                .env("BETTERMQ_DATA_DIR", dir.path().join("data"))
                 .env(variable, value)
                 .output()
                 .unwrap();
@@ -1266,7 +1576,7 @@ mod tests {
         let seg = source.path().join("segment-000000.log");
         std::fs::write(&seg, b"hello").unwrap();
         let manifest = archive_local_once(&seg, archive.path()).unwrap();
-        let key = archive_key(&seg);
+        let key = PathBuf::from(&manifest.segment);
         let archived = archive.path().join(&key);
         assert_eq!(manifest.bytes, 5);
         assert_eq!(
@@ -1319,6 +1629,42 @@ mod tests {
         assert!(discover_recovery_segments(data.path()).is_empty());
         assert!(!pending_marker(&segment).exists());
         assert!(complete_marker(&segment).exists());
+    }
+
+    #[cfg(feature = "s3")]
+    #[tokio::test]
+    async fn object_archives_isolate_nodes_and_preserve_immutable_retries() {
+        let source = tempdir().unwrap();
+        let segment = source.path().join("segment-000000.log");
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        std::fs::write(&segment, b"first node").unwrap();
+        let first = archive_object_once(&store, "shared", &segment)
+            .await
+            .unwrap();
+        let repeated = archive_object_once(&store, "shared", &segment)
+            .await
+            .unwrap();
+        assert_eq!(first.archived_at_unix_ms, repeated.archived_at_unix_ms);
+        std::fs::write(&segment, b"second node").unwrap();
+        let second_source = ArchiveSource::parse("test/second").unwrap();
+        let second = super::archive_object_once(&store, "shared", &segment, &second_source)
+            .await
+            .unwrap();
+        assert_eq!(first.restore_path, second.restore_path);
+        assert_ne!(first.segment, second.segment);
+        let bytes = store
+            .get(&ObjectPath::from(format!("shared/{}", first.segment)))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"first node");
+        let changed = archive_object_once(&store, "shared", &segment)
+            .await
+            .unwrap();
+        assert_ne!(first.segment, changed.segment);
+        assert_eq!(scrub_object_archive(store, "shared").await.verified, 3);
     }
 
     #[cfg(feature = "s3")]

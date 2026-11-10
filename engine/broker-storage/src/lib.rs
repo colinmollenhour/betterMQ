@@ -3,6 +3,7 @@
 mod archive;
 mod archive_checkpoint;
 mod archive_restore;
+mod archive_source;
 mod backend;
 mod flock;
 mod indexes;
@@ -26,12 +27,16 @@ pub use slate_log::slate_db_path;
 
 pub use archive::{
     archive_admission_blocked, archive_lag_status, restore_local_archive,
-    restore_local_archive_until, scrub_local_archive, start_archive_service, ArchiveLagStatus,
-    ArchiveManifest, ArchiveToolReport,
+    restore_local_archive_source_until, restore_local_archive_until, scrub_local_archive,
+    start_archive_service, ArchiveError, ArchiveLagStatus, ArchiveManifest, ArchiveToolReport,
 };
 #[cfg(feature = "s3")]
-pub use archive::{restore_object_archive, restore_object_archive_until, scrub_object_archive};
+pub use archive::{
+    restore_object_archive, restore_object_archive_source_until, restore_object_archive_until,
+    scrub_object_archive,
+};
 pub use archive_checkpoint::ArchiveCheckpoint;
+pub use archive_source::ArchiveSource;
 pub use backend::{PartitionBackend, StorageMode};
 pub use flock::FileLock;
 pub use indexes::{DedupEntry, IndexError, MetadataStore, MetadataWriteBatch};

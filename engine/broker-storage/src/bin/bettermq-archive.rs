@@ -1,11 +1,51 @@
-use broker_storage::{restore_local_archive_until, scrub_local_archive, ArchiveToolReport};
+use broker_storage::{ArchiveSource, ArchiveToolReport};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-fn usage() -> ! {
-    eprintln!(
-        "usage:\n  bettermq-archive scrub <archive-dir>\n  bettermq-archive restore <archive-dir> <destination> [--until-unix-ms N]\n  bettermq-archive scrub-s3 [prefix]\n  bettermq-archive restore-s3 <destination> [prefix] [--until-unix-ms N]\n\n--until-unix-ms restores only segments archived at or before that timestamp (PITR). S3 stays off the ACK path."
-    );
-    std::process::exit(2);
+/// Verify or restore sealed-segment WAL archives. Active WAL tails need a separate backup.
+#[derive(Debug, Parser)]
+#[command(name = "bettermq-archive", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Verify checksums, including legacy archives that cannot be restored.
+    Scrub { archive_dir: PathBuf },
+    /// Restore one source's consistent WAL chain into a new or empty directory.
+    Restore {
+        archive_dir: PathBuf,
+        destination: PathBuf,
+        /// Stable archive cluster/node identity, for example production/broker-1.
+        #[arg(long, value_parser = parse_source)]
+        source: ArchiveSource,
+        /// Include only segments archived at or before this Unix millisecond.
+        #[arg(long)]
+        until_unix_ms: Option<u128>,
+    },
+    /// Verify S3/MinIO/R2 archives using archive credentials from the environment.
+    #[cfg(feature = "s3")]
+    ScrubS3 {
+        #[arg(default_value = "bettermq-archive")]
+        prefix: String,
+    },
+    /// Restore one S3/MinIO/R2 source into a new or empty directory.
+    #[cfg(feature = "s3")]
+    RestoreS3 {
+        destination: PathBuf,
+        #[arg(default_value = "bettermq-archive")]
+        prefix: String,
+        #[arg(long, value_parser = parse_source)]
+        source: ArchiveSource,
+        #[arg(long)]
+        until_unix_ms: Option<u128>,
+    },
+}
+
+fn parse_source(value: &str) -> Result<ArchiveSource, String> {
+    ArchiveSource::parse(value).map_err(|error| error.to_string())
 }
 
 fn print_report(report: ArchiveToolReport) {
@@ -18,88 +58,57 @@ fn print_report(report: ArchiveToolReport) {
     }
 }
 
-fn take_until(raw: Vec<String>) -> Result<(Vec<String>, Option<u128>), String> {
-    let mut until = None;
-    let mut positional = Vec::new();
-    let mut iter = raw.into_iter();
-    while let Some(arg) = iter.next() {
-        let value = if arg == "--until-unix-ms" {
-            Some(iter.next().ok_or("--until-unix-ms requires a value")?)
-        } else if let Some(value) = arg.strip_prefix("--until-unix-ms=") {
-            Some(value.to_owned())
-        } else if arg.starts_with('-') {
-            return Err(format!("unknown option: {arg}"));
-        } else {
-            positional.push(arg);
-            None
-        };
-        if let Some(value) = value {
-            if until.is_some() {
-                return Err("--until-unix-ms may only be specified once".into());
-            }
-            until = Some(value.parse().map_err(|_| {
-                format!("invalid --until-unix-ms: {value:?}; expected Unix milliseconds")
-            })?);
+fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    match cli.command {
+        Command::Scrub { archive_dir } => {
+            print_report(broker_storage::scrub_local_archive(&archive_dir))
         }
-    }
-    Ok((positional, until))
-}
-
-fn restore_args(raw: Vec<String>, min: usize) -> (Vec<String>, Option<u128>) {
-    let parsed = take_until(raw).unwrap_or_else(|error| {
-        eprintln!("error: {error}");
-        std::process::exit(2);
-    });
-    if !(min..=2).contains(&parsed.0.len()) {
-        usage();
-    }
-    parsed
-}
-
-fn main() {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("scrub") => {
-            let root = PathBuf::from(args.next().unwrap_or_else(|| usage()));
-            print_report(scrub_local_archive(&root));
-        }
-        Some("restore") => {
-            let raw: Vec<String> = args.collect();
-            let (positional, until) = restore_args(raw, 2);
-            let root = PathBuf::from(positional.first().cloned().unwrap_or_else(|| usage()));
-            let destination = PathBuf::from(positional.get(1).cloned().unwrap_or_else(|| usage()));
-            print_report(restore_local_archive_until(&root, &destination, until));
+        Command::Restore {
+            archive_dir,
+            destination,
+            source,
+            until_unix_ms,
+        } => {
+            print_report(broker_storage::restore_local_archive_source_until(
+                &archive_dir,
+                &destination,
+                &source,
+                until_unix_ms,
+            ));
         }
         #[cfg(feature = "s3")]
-        Some("scrub-s3") => {
-            let prefix = args.next().unwrap_or_else(|| "bettermq-archive".into());
-            let store = broker_storage::open_archive_object_store_from_env()
-                .unwrap_or_else(|error| panic!("open archive object store: {error}"));
-            let runtime = tokio::runtime::Runtime::new().expect("archive tooling runtime");
+        Command::ScrubS3 { prefix } => {
+            let store = broker_storage::open_archive_object_store_from_env()?;
+            let runtime = tokio::runtime::Runtime::new()?;
             print_report(runtime.block_on(broker_storage::scrub_object_archive(store, &prefix)));
         }
         #[cfg(feature = "s3")]
-        Some("restore-s3") => {
-            let raw: Vec<String> = args.collect();
-            let (positional, until) = restore_args(raw, 1);
-            let destination = PathBuf::from(positional.first().cloned().unwrap_or_else(|| usage()));
-            let prefix = positional
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "bettermq-archive".into());
-            let store = broker_storage::open_archive_object_store_from_env()
-                .unwrap_or_else(|error| panic!("open archive object store: {error}"));
-            let runtime = tokio::runtime::Runtime::new().expect("archive tooling runtime");
+        Command::RestoreS3 {
+            destination,
+            prefix,
+            source,
+            until_unix_ms,
+        } => {
+            let store = broker_storage::open_archive_object_store_from_env()?;
+            let runtime = tokio::runtime::Runtime::new()?;
             print_report(
-                runtime.block_on(broker_storage::restore_object_archive_until(
+                runtime.block_on(broker_storage::restore_object_archive_source_until(
                     store,
                     &prefix,
                     &destination,
-                    until,
+                    &source,
+                    until_unix_ms,
                 )),
             );
         }
-        _ => usage(),
+    }
+    Ok(())
+}
+
+fn main() {
+    if let Err(error) = run(Cli::parse()) {
+        eprintln!("bettermq-archive: {error}");
+        std::process::exit(1);
     }
 }
 
@@ -108,22 +117,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn invalid_pitr_never_becomes_unrestricted_restore() {
-        for args in [
-            vec!["--until-unix-ms"],
-            vec!["--until-unix-ms", "typo"],
-            vec!["--until-unix-ms="],
-            vec!["--until-unix-ms=-1"],
-            vec!["--until-unix-ms=340282366920938463463374607431768211456"],
-            vec!["--until-unix-ms=1", "--until-unix-ms=2"],
-            vec!["--unknown"],
-        ] {
-            assert!(take_until(args.into_iter().map(String::from).collect()).is_err());
+    fn restore_requires_explicit_source_and_valid_timestamp() {
+        assert!(Cli::try_parse_from(["bettermq-archive", "restore", "archive", "dest"]).is_err());
+        assert!(Cli::try_parse_from([
+            "bettermq-archive",
+            "restore",
+            "archive",
+            "dest",
+            "--source",
+            "cluster/node",
+            "--until-unix-ms",
+            "bad"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "bettermq-archive",
+            "restore",
+            "archive",
+            "dest",
+            "--source",
+            "cluster/../node"
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from([
+            "bettermq-archive",
+            "restore",
+            "archive",
+            "dest",
+            "--source",
+            "cluster/node",
+            "--until-unix-ms=123",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Restore {
+                until_unix_ms: Some(123),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn help_and_version_are_successful() {
+        for option in ["--help", "--version"] {
+            let error = Cli::try_parse_from(["bettermq-archive", option]).unwrap_err();
+            assert_eq!(error.exit_code(), 0);
         }
-        let (paths, until) =
-            take_until(vec!["archive".into(), "--until-unix-ms=123".into()]).unwrap();
-        assert_eq!(paths, vec!["archive"]);
-        assert_eq!(until, Some(123));
-        assert_eq!(take_until(vec![]).unwrap().1, None);
     }
 }

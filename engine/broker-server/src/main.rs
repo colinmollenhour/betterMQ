@@ -550,7 +550,6 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&settings.data_dir)
         .with_context(|| format!("create data dir {}", settings.data_dir.display()))?;
-    broker_storage::start_archive_service().context("initialize sealed-segment archive")?;
 
     if settings.cluster_enabled {
         let cluster_cfg = if let Some(c) = &file_cfg {
@@ -565,6 +564,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         ensure_cluster_config(&cluster_cfg, &settings.data_dir)
             .context("write cluster-config.json")?;
     }
+    // The archive namespace defaults to the durable cluster/node identities.
+    broker_storage::start_archive_service().context("initialize sealed-segment archive")?;
 
     let postgres = matches!(&settings.auth, ResolvedAuth::Cloud { .. });
     if !postgres {

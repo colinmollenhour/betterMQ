@@ -32,9 +32,10 @@ queued bytes or oldest outstanding age reach the configured limits below.
 Local archive:
 
 ```bash
-BETTERMQ_ARCHIVE_DIR=/srv/bettermq-archive bettermq serve
+BETTERMQ_ARCHIVE_CLUSTER_ID=production BETTERMQ_ARCHIVE_NODE_ID=broker-1 \
+  BETTERMQ_ARCHIVE_DIR=/srv/bettermq-archive bettermq serve
 bettermq-archive scrub /srv/bettermq-archive
-bettermq-archive restore /srv/bettermq-archive /srv/restored
+bettermq-archive restore /srv/bettermq-archive /srv/restored --source production/broker-1
 ```
 
 S3, MinIO, or R2 archive:
@@ -45,9 +46,11 @@ export R2_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com
 export R2_ACCESS_KEY=...
 export R2_SECRET_KEY=...
 export BETTERMQ_ARCHIVE_PREFIX=production
+export BETTERMQ_ARCHIVE_CLUSTER_ID=production
+export BETTERMQ_ARCHIVE_NODE_ID=broker-1
 
 bettermq-archive scrub-s3 production
-bettermq-archive restore-s3 /srv/restored production
+bettermq-archive restore-s3 /srv/restored production --source production/broker-1
 ```
 
 For AWS/MinIO, use `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, and
@@ -66,14 +69,50 @@ Point-in-time restore (optional extra storage; S3 is never on the ACK path):
 
 ```bash
 # Restore only segments archived at or before this Unix millisecond.
-bettermq-archive restore /srv/bettermq-archive /srv/restored --until-unix-ms 1710000000000
-bettermq-archive restore-s3 /srv/restored production --until-unix-ms 1710000000000
+bettermq-archive restore /srv/bettermq-archive /srv/restored --source production/broker-1 --until-unix-ms 1710000000000
+bettermq-archive restore-s3 /srv/restored production --source production/broker-1 --until-unix-ms 1710000000000
 ```
 
 Restore writes only paths validated as safe relative archive keys and verifies
 both byte length and SHA-256 before replacing a destination file. Segments
 newer than `--until-unix-ms` are skipped and counted in the report's `skipped`
 field.
+
+## Source identities and immutable objects
+
+Each archive is isolated by stable cluster and source-node identity:
+
+```text
+[prefix/]clusters/<cluster>/nodes/<node>/objects/<sha256>/<original-WAL-path>
+```
+
+Each segment has a neighboring `.manifest.json`. Objects are content-addressed
+and manifests are create-only; a retry reuses the original manifest and archive
+timestamp instead of replacing it. Different nodes may seal the same offsets
+with different epoch boundaries without overwriting one another. Object uploads
+hash the sealed file before streaming it, which costs one additional local read
+but keeps multipart buffering bounded.
+
+Set **both** `BETTERMQ_ARCHIVE_CLUSTER_ID` and `BETTERMQ_ARCHIVE_NODE_ID` to
+override identities. Without overrides, clustered brokers use the durable IDs in
+`cluster-config.json`; standalone brokers generate and persist identities in
+`archive-source.json` under their data directory. Missing cluster identity is a
+startup error, not permission to share an unnamespaced archive. Keep identities
+stable across restarts and unique per source log history. A node reinitialized
+with unrelated log data must use a new archive source identity.
+
+Restore requires `--source CLUSTER/NODE` and reads only that namespace. It never
+combines leaders' and followers' independent segment chains. Overlapping or
+missing ranges fail closed. Archives from before source namespacing are
+read-only/scrub-only; restoring their mixed node histories by guessing is unsafe.
+Source IDs can be found in the source files above, startup logs, and archive
+manifests. `--help` describes the commands; malformed timestamps are errors.
+
+The live worker also refuses to complete a job whose source lacks WAL format or
+recovery metadata. Such jobs remain pending and fail closed rather than claiming
+a byte-only backup is recoverable. Pre-manifest source directories must first be
+opened with the matching WAL format while archiving is disabled; do not invent
+offsets or format metadata by hand.
 
 ## Recovery coverage
 

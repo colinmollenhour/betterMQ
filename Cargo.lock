@@ -660,6 +660,7 @@ dependencies = [
  "bincode-next",
  "broker-proto",
  "bytes",
+ "clap",
  "criterion",
  "fjall",
  "fs2",

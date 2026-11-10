@@ -2,7 +2,7 @@
 
 use crate::archive::{ArchiveError, ArchiveManifest};
 use crate::archive_checkpoint::{segment_number, validate_segment};
-use crate::{LogMeta, PartitionLog, PartitionLogConfig, WalManifest};
+use crate::{ArchiveSource, LogMeta, OffsetRanges, PartitionLog, PartitionLogConfig, WalManifest};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -16,10 +16,20 @@ fn invalid(message: impl Into<String>) -> ArchiveError {
     ArchiveError::Manifest(message.into())
 }
 
+fn restore_key(manifest: &ArchiveManifest) -> Result<PathBuf, ArchiveError> {
+    crate::archive::safe_archive_key(
+        manifest
+            .restore_path
+            .as_deref()
+            .ok_or_else(|| invalid("archive has no original WAL path"))?,
+    )
+}
+
 impl RestoreBatch {
     pub(crate) fn new(
         destination: &Path,
         manifests: Vec<ArchiveManifest>,
+        source: Option<&ArchiveSource>,
     ) -> Result<Self, ArchiveError> {
         if destination.exists() && destination.read_dir()?.next().is_some() {
             return Err(invalid(
@@ -28,7 +38,25 @@ impl RestoreBatch {
         }
         let mut groups: BTreeMap<PathBuf, Vec<ArchiveManifest>> = BTreeMap::new();
         for manifest in manifests {
-            let key = crate::archive::safe_archive_key(&manifest.segment)?;
+            if manifest.version != 3 || manifest.checkpoint.is_none() || manifest.source.is_none() {
+                return Err(invalid("archive has no namespaced WAL recovery checkpoint; legacy archives are scrub-only"));
+            }
+            let source = source.ok_or_else(|| {
+                invalid("restore requires an explicit archive source; use --source CLUSTER/NODE")
+            })?;
+            if manifest.source.as_ref() != Some(source) {
+                return Err(invalid(
+                    "archive manifest does not belong to the selected source",
+                ));
+            }
+            let key = restore_key(&manifest)?;
+            if crate::archive::safe_archive_key(&manifest.segment)?
+                != source.object_key(&key, &manifest.sha256)?
+            {
+                return Err(invalid(
+                    "archive object key does not match its source and checksum identity",
+                ));
+            }
             let parent = key
                 .parent()
                 .filter(|parent| parent.file_name().is_some_and(|name| name == "segments"))
@@ -37,9 +65,6 @@ impl RestoreBatch {
                     invalid("archived segment is not inside a shard's segments directory")
                 })?;
             segment_number(&key)?;
-            if manifest.version != 2 || manifest.checkpoint.is_none() {
-                return Err(invalid("archive has no versioned WAL recovery checkpoint; legacy archives are scrub-only"));
-            }
             groups.entry(parent.into()).or_default().push(manifest);
         }
         for manifests in groups.values_mut() {
@@ -88,9 +113,7 @@ impl RestoreBatch {
     }
 
     pub(crate) fn target(&self, manifest: &ArchiveManifest) -> Result<PathBuf, ArchiveError> {
-        let path = self
-            .root
-            .join(crate::archive::safe_archive_key(&manifest.segment)?);
+        let path = self.root.join(restore_key(manifest)?);
         std::fs::create_dir_all(path.parent().expect("segment parent"))?;
         Ok(path)
     }
@@ -109,14 +132,14 @@ impl RestoreBatch {
                 .expect("checked checkpoint");
             let mut meta: LogMeta = last.meta.clone();
             meta.base_offset = first.first_offset;
-            meta.base_segment = segment_number(Path::new(&manifests[0].segment))?;
+            meta.base_segment = segment_number(&restore_key(&manifests[0])?)?;
             meta.next_offset = last.next_offset;
             meta.gc_watermark = first.first_offset;
-            meta.purged_offsets.clear();
+            meta.purged_offsets = OffsetRanges::default();
             for manifest in manifests {
                 let checkpoint = manifest.checkpoint.as_ref().expect("checked checkpoint");
                 let end = validate_segment(
-                    &self.root.join(&manifest.segment),
+                    &self.root.join(restore_key(manifest)?),
                     &checkpoint.wal_manifest,
                     checkpoint.first_offset,
                 )?;
@@ -125,17 +148,14 @@ impl RestoreBatch {
                         "archived segment does not match its checkpoint offset range",
                     ));
                 }
-                let roll = segment_number(Path::new(&manifest.segment))?
+                let roll = segment_number(&restore_key(manifest)?)?
                     .checked_add(1)
                     .ok_or_else(|| invalid("segment sequence overflow"))?;
                 meta.segment_roll_count = meta.segment_roll_count.max(roll);
-                meta.purged_offsets.extend(
-                    checkpoint
-                        .meta
-                        .purged_offsets
-                        .range(first.first_offset..last.next_offset)
-                        .copied(),
-                );
+                for (start, end) in checkpoint.meta.purged_offsets.ranges() {
+                    meta.purged_offsets
+                        .insert_range(start.max(first.first_offset), end.min(last.next_offset));
+                }
             }
             let dir = self.root.join(shard);
             crate::atomic_write_file(
