@@ -59,11 +59,67 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
+impl LogFormat {
+    /// `BETTERMQ_LOG_FORMAT`: `text` (default) or `json`.
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "text" => Some(Self::Text),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+}
+
 fn init_tracing() {
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    let raw = std::env::var("BETTERMQ_LOG_FORMAT").unwrap_or_default();
+    let format = LogFormat::parse(&raw);
+    let registry = tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()));
+    match format {
+        Some(LogFormat::Json) => registry
+            .with(tracing_subscriber::fmt::layer().json().flatten_event(true))
+            .init(),
+        Some(LogFormat::Text) | None => registry.with(tracing_subscriber::fmt::layer()).init(),
+    }
+    if format.is_none() {
+        tracing::warn!(value = %raw, "invalid BETTERMQ_LOG_FORMAT (use text|json); using text");
+    }
+}
+
+/// Request IDs plus a per-request span carrying them, so every log line a
+/// handler emits can be correlated across gateway, broker and peer calls.
+trait HttpObservability {
+    fn with_http_observability(self) -> Self;
+}
+
+impl HttpObservability for axum::Router {
+    fn with_http_observability(self) -> Self {
+        self.layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
+                let request_id = request
+                    .headers()
+                    .get(broker_api::request_id::REQUEST_ID_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                // Path only: query strings may carry credentials.
+                tracing::info_span!(
+                    "request",
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                    request_id = %request_id,
+                )
+            },
+        ))
+        .layer(axum::middleware::from_fn(
+            broker_api::request_id::assign_request_id,
+        ))
+    }
 }
 
 fn config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
@@ -704,7 +760,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         r.merge(docs::router())
             .layer(axum::middleware::from_fn(security::api_security_headers))
             .layer(cors.clone())
-            .layer(TraceLayer::new_for_http())
+            .with_http_observability()
     };
 
     // Assemble roles by socket, not by a second runtime collapse heuristic.
@@ -734,7 +790,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         let app = app
             .layer(axum::middleware::from_fn(security::api_security_headers))
             .layer(cors.clone())
-            .layer(TraceLayer::new_for_http());
+            .with_http_observability();
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .with_context(|| format!("bind {addr}"))?;
@@ -912,7 +968,7 @@ async fn serve_panel_from_settings(settings: &ResolvedServeSettings) -> anyhow::
         .route("/healthz", get(|| async { "ok" }))
         .layer(axum::middleware::from_fn(security::api_security_headers))
         .layer(build_cors_layer())
-        .layer(TraceLayer::new_for_http());
+        .with_http_observability();
     let addr = settings.listeners.admin;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -957,7 +1013,7 @@ async fn serve_gateway_only(settings: &ResolvedServeSettings) -> anyhow::Result<
         .merge(docs::router())
         .layer(axum::middleware::from_fn(security::api_security_headers))
         .layer(build_cors_layer())
-        .layer(TraceLayer::new_for_http());
+        .with_http_observability();
     let listener = tokio::net::TcpListener::bind(settings.listen)
         .await
         .with_context(|| format!("bind {}", settings.listen))?;
@@ -1139,6 +1195,7 @@ fn spawn_schedule_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
                 None => true,
                 Some(c) => {
                     if let Err(error) = c.runtime.acquire_scheduler_leader(5_000).await {
+                        broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Lease);
                         tracing::warn!(%error, "OpenRaft scheduler lease acquisition failed");
                     }
                     c.runtime.is_scheduler_leader()
@@ -1166,10 +1223,14 @@ fn spawn_schedule_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
                 let ok = fire_scheduled_publish(&state, req).await;
                 if ok {
                     if let Err(e) = state.crons.commit_fire(job.id) {
+                        broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
                         tracing::warn!(error = %e, cron_id = %job.id, "cron commit_fire failed");
                     }
-                } else if let Err(e) = state.crons.revert_fire(&job) {
-                    tracing::warn!(error = %e, cron_id = %job.id, "cron revert_fire failed");
+                } else {
+                    broker_api::record_scheduler_failure(broker_api::SchedulerFailure::CronFire);
+                    if let Err(e) = state.crons.revert_fire(&job) {
+                        tracing::warn!(error = %e, cron_id = %job.id, "cron revert_fire failed");
+                    }
                 }
             }
         }
@@ -1204,12 +1265,16 @@ async fn fire_due_schedules(state: &Arc<AppState>, due: Vec<broker_schedule::Sch
             match joined {
                 Ok((job, true)) => completed.push(job.id),
                 Ok((job, false)) => {
+                    broker_api::record_scheduler_failure(broker_api::SchedulerFailure::DelayedFire);
                     if let Err(e) = state.schedule.requeue(job) {
                         tracing::warn!(error = %e, "schedule requeue after failed fire failed");
                     }
                 }
                 // The job stays in flight; its durable Add makes a restart fire it again.
-                Err(e) => tracing::warn!(error = %e, "scheduled fire task failed"),
+                Err(e) => {
+                    broker_api::record_scheduler_failure(broker_api::SchedulerFailure::DelayedFire);
+                    tracing::warn!(error = %e, "scheduled fire task failed");
+                }
             }
         }
         if completed.is_empty() {
@@ -1218,8 +1283,14 @@ async fn fire_due_schedules(state: &Arc<AppState>, due: Vec<broker_schedule::Sch
         let schedule = state.schedule.clone();
         match tokio::task::spawn_blocking(move || schedule.complete_many(&completed)).await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "schedule complete persist failed"),
-            Err(e) => tracing::warn!(error = %e, "schedule complete task failed"),
+            Ok(Err(e)) => {
+                broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
+                tracing::warn!(error = %e, "schedule complete persist failed");
+            }
+            Err(e) => {
+                broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
+                tracing::warn!(error = %e, "schedule complete task failed");
+            }
         }
     }
 }
@@ -1306,6 +1377,45 @@ async fn fire_scheduled_publish(
     }
 }
 
+/// Lets one warning through per interval and reports how many were
+/// suppressed since the last one.
+struct WarnRateLimit {
+    interval_ms: i64,
+    last_ms: std::sync::atomic::AtomicI64,
+    suppressed: std::sync::atomic::AtomicU64,
+}
+
+impl WarnRateLimit {
+    const fn new(interval: Duration) -> Self {
+        Self {
+            interval_ms: interval.as_millis() as i64,
+            last_ms: std::sync::atomic::AtomicI64::new(i64::MIN),
+            suppressed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn permit(&self) -> Option<u64> {
+        self.permit_at(Utc::now().timestamp_millis())
+    }
+
+    fn permit_at(&self, now_ms: i64) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        let last = self.last_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) >= self.interval_ms
+            && self
+                .last_ms
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            return Some(self.suppressed.swap(0, Ordering::Relaxed));
+        }
+        self.suppressed.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+}
+
+static FLEET_CLAIM_WARNINGS: WarnRateLimit = WarnRateLimit::new(Duration::from_secs(30));
+
 fn spawn_fleet_workers(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
     let Some(client) = broker_dispatch::LeaseClient::from_env() else {
         tracing::error!(
@@ -1346,7 +1456,17 @@ fn spawn_fleet_workers(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<(
                 let claimed = match client.claim(&broker, 4).await {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::debug!(error = %e, %broker, "fleet claim");
+                        broker_api::record_fleet_claim_failure();
+                        if let Some(suppressed) = FLEET_CLAIM_WARNINGS.permit() {
+                            tracing::warn!(
+                                error = %e,
+                                %broker,
+                                suppressed,
+                                "fleet claim failed (check BETTERMQ_BROKER_URLS and BETTERMQ_CLUSTER_SECRET)"
+                            );
+                        } else {
+                            tracing::debug!(error = %e, %broker, "fleet claim failed");
+                        }
                         return;
                     }
                 };
@@ -1575,5 +1695,41 @@ mod tests {
         drop(state);
         let reopened = ScheduleQueue::open(dir.path()).unwrap();
         assert_eq!(reopened.list().len(), 1, "completions are durable");
+    }
+
+    #[test]
+    fn log_format_parses_text_and_json_only() {
+        assert_eq!(LogFormat::parse(""), Some(LogFormat::Text));
+        assert_eq!(LogFormat::parse(" Text "), Some(LogFormat::Text));
+        assert_eq!(LogFormat::parse("JSON"), Some(LogFormat::Json));
+        assert_eq!(LogFormat::parse("yaml"), None);
+    }
+
+    #[test]
+    fn warn_rate_limit_reports_suppressed_count() {
+        let limit = WarnRateLimit::new(Duration::from_secs(30));
+        assert_eq!(limit.permit_at(1_000), Some(0));
+        assert_eq!(limit.permit_at(2_000), None);
+        assert_eq!(limit.permit_at(30_999), None);
+        assert_eq!(limit.permit_at(31_000), Some(2));
+    }
+
+    #[tokio::test]
+    async fn http_observability_assigns_and_echoes_request_ids() {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route("/ok", get(|| async { "ok" }))
+            .with_http_observability();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/ok")
+                    .header("x-request-id", "from-gateway")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["x-request-id"], "from-gateway");
     }
 }

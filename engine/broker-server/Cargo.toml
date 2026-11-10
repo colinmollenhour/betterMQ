@@ -47,5 +47,6 @@ tower = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
 wiremock = "0.6"
+tower = { workspace = true }
 broker-dispatch = { workspace = true }
 serde_json = { workspace = true }

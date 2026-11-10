@@ -39,6 +39,124 @@ static ACK_BUCKETS: [AtomicU64; 10] = [
 ];
 const BUCKET_MS: [u64; 10] = [1, 2, 5, 10, 20, 50, 100, 250, 500, 1000];
 
+/// Scheduler failure stages (`bettermq_scheduler_failures_total{stage}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerFailure {
+    /// A delayed publish failed to fire and was requeued.
+    DelayedFire,
+    /// A cron tick failed to publish and was reverted.
+    CronFire,
+    /// Persisting fired jobs or cron progress failed.
+    Persist,
+    /// Acquiring or renewing the cluster scheduler lease failed.
+    Lease,
+}
+
+impl SchedulerFailure {
+    const ALL: [Self; 4] = [
+        Self::DelayedFire,
+        Self::CronFire,
+        Self::Persist,
+        Self::Lease,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::DelayedFire => "delayed_fire",
+            Self::CronFire => "cron_fire",
+            Self::Persist => "persist",
+            Self::Lease => "lease",
+        }
+    }
+}
+
+/// Why a newly gained shard stayed fenced
+/// (`bettermq_shard_recovery_failures_total{reason}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardRecoveryFailure {
+    /// Storage, transport or replica-quorum failure; retried every cycle.
+    Retryable,
+    /// The local or replica tail cannot be verified; needs reconciliation.
+    UnverifiedTail,
+}
+
+impl ShardRecoveryFailure {
+    const ALL: [Self; 2] = [Self::Retryable, Self::UnverifiedTail];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Retryable => "retryable",
+            Self::UnverifiedTail => "unverified_tail",
+        }
+    }
+}
+
+static SCHEDULER_FAILURES: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static SHARD_RECOVERY_FAILURES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static FLEET_CLAIM_FAILURES: AtomicU64 = AtomicU64::new(0);
+static FENCED_SHARDS: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_scheduler_failure(stage: SchedulerFailure) {
+    SCHEDULER_FAILURES[stage as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_shard_recovery_failure(reason: ShardRecoveryFailure) {
+    SHARD_RECOVERY_FAILURES[reason as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_fleet_claim_failure() {
+    FLEET_CLAIM_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Shards this node leads per placement but keeps fenced (not serving).
+pub fn set_fenced_shards(count: u64) {
+    FENCED_SHARDS.store(count, Ordering::Relaxed);
+}
+
+fn append_background_metrics(out: &mut String) {
+    out.push_str("# HELP bettermq_scheduler_failures_total Scheduler loop failures by stage\n");
+    out.push_str("# TYPE bettermq_scheduler_failures_total counter\n");
+    for stage in SchedulerFailure::ALL {
+        out.push_str(&format!(
+            "bettermq_scheduler_failures_total{{stage=\"{}\"}} {}\n",
+            stage.label(),
+            SCHEDULER_FAILURES[stage as usize].load(Ordering::Relaxed)
+        ));
+    }
+    out.push_str(
+        "# HELP bettermq_fleet_claim_failures_total Dispatch fleet lease claims that failed\n",
+    );
+    out.push_str("# TYPE bettermq_fleet_claim_failures_total counter\n");
+    out.push_str(&format!(
+        "bettermq_fleet_claim_failures_total {}\n",
+        FLEET_CLAIM_FAILURES.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP bettermq_shard_recovery_failures_total Leadership catch-ups that left a shard fenced\n",
+    );
+    out.push_str("# TYPE bettermq_shard_recovery_failures_total counter\n");
+    for reason in ShardRecoveryFailure::ALL {
+        out.push_str(&format!(
+            "bettermq_shard_recovery_failures_total{{reason=\"{}\"}} {}\n",
+            reason.label(),
+            SHARD_RECOVERY_FAILURES[reason as usize].load(Ordering::Relaxed)
+        ));
+    }
+    out.push_str(
+        "# HELP bettermq_shards_fenced Shards this node leads but keeps fenced pending catch-up\n",
+    );
+    out.push_str("# TYPE bettermq_shards_fenced gauge\n");
+    out.push_str(&format!(
+        "bettermq_shards_fenced {}\n",
+        FENCED_SHARDS.load(Ordering::Relaxed)
+    ));
+}
+
 pub fn record_accepted() {
     ACCEPTED.fetch_add(1, Ordering::Relaxed);
 }
@@ -180,6 +298,7 @@ pub fn prometheus_text() -> String {
         "bettermq_ingest_ack_latency_ms_count {}\n",
         snapshot.ack_observations
     ));
+    append_background_metrics(&mut out);
     out
 }
 
@@ -849,6 +968,26 @@ mod tests {
         assert_eq!(bucket_index(Duration::from_millis(1_000)), Some(9));
         assert_eq!(bucket_index(Duration::from_millis(1_001)), None);
         assert_eq!(bucket_index(Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn background_loop_failures_are_exported() {
+        record_scheduler_failure(SchedulerFailure::CronFire);
+        record_shard_recovery_failure(ShardRecoveryFailure::UnverifiedTail);
+        record_fleet_claim_failure();
+        set_fenced_shards(3);
+        let output = prometheus_text();
+        let value = |series: &str| -> u64 {
+            output
+                .lines()
+                .find_map(|line| line.strip_prefix(series)?.trim().parse().ok())
+                .unwrap_or_else(|| panic!("missing {series}"))
+        };
+        assert!(value("bettermq_scheduler_failures_total{stage=\"cron_fire\"}") >= 1);
+        assert!(value("bettermq_scheduler_failures_total{stage=\"lease\"}") < u64::MAX);
+        assert!(value("bettermq_shard_recovery_failures_total{reason=\"unverified_tail\"}") >= 1);
+        assert!(value("bettermq_fleet_claim_failures_total") >= 1);
+        assert_eq!(value("bettermq_shards_fenced"), 3);
     }
 
     #[test]

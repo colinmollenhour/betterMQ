@@ -551,6 +551,7 @@ pub fn spawn_cluster_health_monitor(
 
             let mut gained_shards = Vec::new();
             let mut lost_shards = Vec::new();
+            let mut led_shards = Vec::new();
             for shard in 0..state.broker.layout().shard_count {
                 if runtime.is_controller_leader() {
                     let current = runtime.elect_leader_for_shard(shard);
@@ -566,6 +567,9 @@ pub fn spawn_cluster_health_monitor(
                     None => continue,
                 };
                 let was = prev_leaders.insert(shard, leader);
+                if leader == node_id {
+                    led_shards.push(shard);
+                }
                 if leader == node_id && was != Some(node_id) {
                     runtime.set_shard_ready(shard, false);
                     gained_shards.push(shard);
@@ -596,6 +600,13 @@ pub fn spawn_cluster_health_monitor(
                         Err(error) => {
                             runtime.set_shard_ready(shard, false);
                             prev_leaders.remove(&shard);
+                            broker_api::record_shard_recovery_failure(
+                                if error.needs_tail_reconciliation() {
+                                    broker_api::ShardRecoveryFailure::UnverifiedTail
+                                } else {
+                                    broker_api::ShardRecoveryFailure::Retryable
+                                },
+                            );
                             if error.needs_tail_reconciliation() {
                                 tracing::error!(
                                     shard,
@@ -615,6 +626,12 @@ pub fn spawn_cluster_health_monitor(
                     dispatch.backfill_pending();
                 }
             }
+            broker_api::set_fenced_shards(
+                led_shards
+                    .iter()
+                    .filter(|shard| !runtime.shard_ready(**shard))
+                    .count() as u64,
+            );
         }
     })
 }

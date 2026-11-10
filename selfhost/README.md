@@ -309,7 +309,7 @@ Standalone management gateway (no broker storage). Same `--config` / `--listen` 
 
 ### Related environment variables
 
-The public repo reads **92** `BETTERMQ_*` names used by self-host. **16** are CLI flags for `serve`/`panel` (tables above). **5** are installer-only (`BETTERMQ_FORCE`, `BETTERMQ_NO_START`, `BETTERMQ_INSTALL_DIR`, `BETTERMQ_BIN_DIR`, `BETTERMQ_VERSION`). The rest are process env (some also written from `bettermq.json` at startup).
+The public repo reads **93** `BETTERMQ_*` names used by self-host. **16** are CLI flags for `serve`/`panel` (tables above). **5** are installer-only (`BETTERMQ_FORCE`, `BETTERMQ_NO_START`, `BETTERMQ_INSTALL_DIR`, `BETTERMQ_BIN_DIR`, `BETTERMQ_VERSION`). The rest are process env (some also written from `bettermq.json` at startup).
 
 #### Auth, setup, metrics
 
@@ -322,9 +322,14 @@ The public repo reads **92** `BETTERMQ_*` names used by self-host. **16** are CL
 | `BETTERMQ_LOCAL_AUTH_FILE` | Path to local auth file (also set from config) |
 | `BETTERMQ_ALLOW_QUERY_SECRET` | Deprecated: accept GET publish `?secret=` (`1`) |
 | `BETTERMQ_METRICS_TOKEN` | Bearer / header gate for `/metrics` (required in HA compose files) |
+| `BETTERMQ_LOG_FORMAT` | Log output: `text` (default) or `json` (one JSON object per line, with the request span's `request_id`) |
 | `BETTERMQ_JOIN_TOKEN_QUERY` | Allow join token in query string (`1`/`true`/`yes`) |
 | `BETTERMQ_TRUST_PROXY` | Use `X-Forwarded-For` for the auth rate-limit client IP, only when the connection comes from a trusted proxy; the client is the right-most hop that is not a trusted proxy. Without it, the socket peer address is used |
 | `BETTERMQ_TRUSTED_PROXIES` | Comma-separated proxy CIDRs/IPs for `BETTERMQ_TRUST_PROXY` (default: loopback and private ranges) |
+
+Every HTTP response carries an `x-request-id` header. A well-formed inbound value (up to 128 letters, digits, `-`, `_`, `.`, `:`) is kept; otherwise the server generates one. Log lines emitted while serving a request include it, and broker-to-broker calls made for that request (gateway and shard-leader forwarding, catalog propagation) forward it.
+
+Background loops export these `/metrics` series: `bettermq_scheduler_failures_total{stage="delayed_fire|cron_fire|persist|lease"}`, `bettermq_fleet_claim_failures_total`, `bettermq_shard_recovery_failures_total{reason="retryable|unverified_tail"}` and the gauge `bettermq_shards_fenced` (shards this node leads but keeps fenced while it cannot verify their committed prefix). Alert on a non-zero `bettermq_shards_fenced` that persists. Fleet claim failures are logged at `warn` at most once per 30 seconds, with a count of suppressed repeats.
 
 #### Cluster, fleet, identity
 

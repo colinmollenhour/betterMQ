@@ -21,7 +21,9 @@ pub fn cluster_secret() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Authenticate an inter-node call; also forwards the current request ID.
 pub fn apply_cluster_secret(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let builder = crate::request_id::forward(builder);
     if let Some(secret) = cluster_secret() {
         builder.header(CLUSTER_SECRET_HEADER, secret)
     } else {
