@@ -55,6 +55,10 @@ impl CatalogJournal {
         }
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn replay<C>(
         &self,
         snapshot_sequence: u64,

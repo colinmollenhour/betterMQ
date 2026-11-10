@@ -1551,4 +1551,25 @@ mod tests {
             eprintln!("shared metadata: batch={size}, records={}, records/s={:.0}, batch_p99_us={}, elapsed_ms={}, filesystem={}", size * 500, (size * 500) as f64 / elapsed.as_secs_f64(), latencies[494], elapsed.as_millis(), dir.path().display());
         }
     }
+
+    #[test]
+    fn cached_reads_observe_writes_from_another_process_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = SharedMetadataStore::open(dir.path()).unwrap();
+        let b = SharedMetadataStore::open(dir.path()).unwrap();
+        a.set_dispatch_offset("tenant", "lane", 0, 5).unwrap();
+        assert_eq!(b.dispatch_offset("tenant", "lane", 0).unwrap(), 5);
+        assert_eq!(b.dispatch_offset("tenant", "lane", 0).unwrap(), 5);
+        // `a` serves from its cache; a write through `b` must invalidate it.
+        b.set_dispatch_offset("tenant", "lane", 0, 9).unwrap();
+        assert_eq!(a.dispatch_offset("tenant", "lane", 0).unwrap(), 9);
+        a.put_dedup(
+            "tenant",
+            "key",
+            &DedupEntry::new(uuid::Uuid::nil(), 1, 0, String::new()),
+        )
+        .unwrap();
+        assert_eq!(b.get_dedup("tenant", "key").unwrap().unwrap().offset, 1);
+        assert_eq!(b.dispatch_offset("tenant", "lane", 0).unwrap(), 9);
+    }
 }

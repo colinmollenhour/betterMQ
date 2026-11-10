@@ -1612,13 +1612,13 @@ impl Broker {
         let (topic, queue_id, destination_url, destination_secret) = if is_dlq_topic(&req.topic) {
             (req.topic.clone(), None, None, None)
         } else if let Some(dest) = req.destination.take() {
-            let topic = dest
-                .queue_id
-                .and_then(|id| self.get_queue_by_id(id).ok().flatten().map(|q| q.topic))
-                .unwrap_or_else(|| DIRECT_TOPIC.to_string());
             if let Some(id) = dest.queue_id {
                 queue_sub = self.get_queue_by_id(id)?;
             }
+            let topic = queue_sub
+                .as_ref()
+                .map(|queue| queue.topic.clone())
+                .unwrap_or_else(|| DIRECT_TOPIC.to_string());
             (topic, dest.queue_id, Some(dest.url), Some(dest.secret))
         } else if let (Some(url), Some(secret)) = (req.url.take(), req.secret.take()) {
             (DIRECT_TOPIC.to_string(), None, Some(url), Some(secret))

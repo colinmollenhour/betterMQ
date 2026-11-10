@@ -1,9 +1,11 @@
 //! Flow-control profiles (rate, parallelism, grouping key) — separate from queues.
 
+use crate::catalog_cache::CatalogCache;
 use crate::catalog_journal::CatalogJournal;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -49,7 +51,7 @@ impl FlowProfile {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct FlowFile {
     #[serde(default)]
     version: u16,
@@ -94,6 +96,7 @@ fn apply_command(file: &mut FlowFile, command: FlowCommand) {
 pub struct FlowProfileRegistry {
     path: PathBuf,
     journal: CatalogJournal,
+    cache: Arc<CatalogCache<FlowFile>>,
 }
 
 fn meta_file_path(data_dir: &Path, name: &str) -> PathBuf {
@@ -103,12 +106,16 @@ fn meta_file_path(data_dir: &Path, name: &str) -> PathBuf {
 impl FlowProfileRegistry {
     pub fn import_snapshot(&self, profiles: Vec<FlowProfile>) -> Result<(), FlowProfileError> {
         let _lock = broker_storage::FileLock::exclusive(&self.path)?;
-        let mut file = self.load()?;
+        // `load()` would take the shared lock and self-deadlock under `exclusive`.
+        let (cached, _) = self.cache.read_locked(|| self.load_from_disk())?;
+        let mut file = FlowFile::clone(&cached);
         file.profiles = profiles;
         file.revision += 1;
         self.journal
             .compact(&self.path, &file)
-            .map_err(|e| FlowProfileError::Journal(e.to_string()))
+            .map_err(|e| FlowProfileError::Journal(e.to_string()))?;
+        self.cache.store(file, 0);
+        Ok(())
     }
     /// Read-only migration input. Never creates or writes legacy shared files.
     pub fn legacy_shared(data_dir: &Path) -> Result<Vec<FlowProfile>, FlowProfileError> {
@@ -118,14 +125,20 @@ impl FlowProfileRegistry {
         Self::read_snapshot_at(path)
     }
     pub fn read_snapshot_at(path: PathBuf) -> Result<Vec<FlowProfile>, FlowProfileError> {
-        Self {
-            journal: CatalogJournal::new(&path, FLOW_CATALOG_VERSION),
+        let journal = CatalogJournal::new(&path, FLOW_CATALOG_VERSION);
+        let cache = Arc::new(CatalogCache::new(&path, journal.path()));
+        let registry = Self {
             path,
-        }
-        .catalog_all()
+            journal,
+            cache,
+        };
+        // One-shot read: skip the cache so no lock file is created beside a
+        // legacy catalog.
+        let (file, _) = registry.load_from_disk()?;
+        Ok(file.profiles)
     }
     pub fn catalog_all(&self) -> Result<Vec<FlowProfile>, FlowProfileError> {
-        Ok(self.load()?.profiles)
+        Ok(self.load()?.profiles.clone())
     }
 
     pub fn apply_authoritative(
@@ -153,14 +166,20 @@ impl FlowProfileRegistry {
             std::fs::write(&path, serde_json::to_vec_pretty(&file)?)?;
         }
         let journal = CatalogJournal::new(&path, FLOW_CATALOG_VERSION);
-        Ok(Self { path, journal })
+        let cache = Arc::new(CatalogCache::new(&path, journal.path()));
+        Ok(Self {
+            path,
+            journal,
+            cache,
+        })
     }
 
-    fn load(&self) -> Result<FlowFile, FlowProfileError> {
-        self.load_state().map(|state| state.0)
+    /// Cached catalog view; re-read from disk only when the files changed.
+    fn load(&self) -> Result<Arc<FlowFile>, FlowProfileError> {
+        self.cache.read(|| self.load_from_disk())
     }
 
-    fn load_state(&self) -> Result<(FlowFile, usize), FlowProfileError> {
+    fn load_from_disk(&self) -> Result<(FlowFile, usize), FlowProfileError> {
         let bytes = std::fs::read(&self.path)?;
         let mut file: FlowFile = serde_json::from_slice(&bytes)?;
         if file.version != 0 && file.version != FLOW_CATALOG_VERSION {
@@ -180,7 +199,8 @@ impl FlowProfileRegistry {
         f: impl FnOnce(&mut FlowFile) -> Result<T, FlowProfileError>,
     ) -> Result<T, FlowProfileError> {
         let _lock = broker_storage::FileLock::exclusive(&self.path)?;
-        let (mut file, journal_ops) = self.load_state()?;
+        let (cached, journal_ops) = self.cache.read_locked(|| self.load_from_disk())?;
+        let mut file = FlowFile::clone(&cached);
         let before = file.profiles.clone();
         let out = f(&mut file)?;
         let before_by_id: std::collections::HashMap<_, _> =
@@ -212,11 +232,14 @@ impl FlowProfileRegistry {
             .append(revision, &FlowCommand::Patch { upserts, deletes })
             .map_err(|error| FlowProfileError::Journal(error.to_string()))?;
         file.revision = revision;
-        if journal_ops.saturating_add(1) >= FLOW_COMPACT_OPS {
+        let mut journal_ops = journal_ops.saturating_add(1);
+        if journal_ops >= FLOW_COMPACT_OPS {
             self.journal
                 .compact(&self.path, &file)
                 .map_err(|error| FlowProfileError::Journal(error.to_string()))?;
+            journal_ops = 0;
         }
+        self.cache.store(file, journal_ops);
         Ok(out)
     }
 
@@ -284,8 +307,9 @@ impl FlowProfileRegistry {
         let file = self.load()?;
         Ok(file
             .profiles
-            .into_iter()
-            .find(|p| p.tenant_id == tenant_id && p.key == key))
+            .iter()
+            .find(|p| p.tenant_id == tenant_id && p.key == key)
+            .cloned())
     }
 
     /// Create or update a flow profile by grouping key.
@@ -388,16 +412,18 @@ impl FlowProfileRegistry {
         let file = self.load()?;
         Ok(file
             .profiles
-            .into_iter()
-            .find(|p| p.tenant_id == tenant_id && p.id == id))
+            .iter()
+            .find(|p| p.tenant_id == tenant_id && p.id == id)
+            .cloned())
     }
 
     pub fn list(&self, tenant_id: &str) -> Result<Vec<FlowProfile>, FlowProfileError> {
         let file = self.load()?;
         Ok(file
             .profiles
-            .into_iter()
+            .iter()
             .filter(|p| p.tenant_id == tenant_id)
+            .cloned()
             .collect())
     }
 

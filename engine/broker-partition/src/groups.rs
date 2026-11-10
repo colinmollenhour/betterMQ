@@ -1,9 +1,11 @@
 //! Fan-out groups: one publish → many webhook destinations with per-member flow limits.
 
+use crate::catalog_cache::CatalogCache;
 use crate::catalog_journal::CatalogJournal;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -69,7 +71,7 @@ fn default_period_secs() -> u64 {
     60
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct GroupFile {
     #[serde(default)]
     version: u16,
@@ -137,6 +139,7 @@ fn apply_command(file: &mut GroupFile, command: GroupCommand) {
 pub struct GroupRegistry {
     path: PathBuf,
     journal: CatalogJournal,
+    cache: Arc<CatalogCache<GroupFile>>,
 }
 
 fn meta_file_path(data_dir: &Path, name: &str) -> PathBuf {
@@ -150,13 +153,17 @@ impl GroupRegistry {
         members: Vec<GroupMember>,
     ) -> Result<(), GroupError> {
         let _lock = broker_storage::FileLock::exclusive(&self.path)?;
-        let mut file = self.load()?;
+        // `load()` would take the shared lock and self-deadlock under `exclusive`.
+        let (cached, _) = self.cache.read_locked(|| self.load_from_disk())?;
+        let mut file = GroupFile::clone(&cached);
         file.groups = groups;
         file.members = members;
         file.revision += 1;
         self.journal
             .compact(&self.path, &file)
-            .map_err(|e| GroupError::Journal(e.to_string()))
+            .map_err(|e| GroupError::Journal(e.to_string()))?;
+        self.cache.store(file, 0);
+        Ok(())
     }
     pub fn legacy_shared(
         data_dir: &Path,
@@ -170,15 +177,21 @@ impl GroupRegistry {
     pub fn read_snapshot_at(
         path: PathBuf,
     ) -> Result<(Vec<DispatchGroup>, Vec<GroupMember>), GroupError> {
-        Self {
-            journal: CatalogJournal::new(&path, GROUP_CATALOG_VERSION),
+        let journal = CatalogJournal::new(&path, GROUP_CATALOG_VERSION);
+        let cache = Arc::new(CatalogCache::new(&path, journal.path()));
+        let registry = Self {
             path,
-        }
-        .catalog_all()
+            journal,
+            cache,
+        };
+        // One-shot read: skip the cache so no lock file is created beside a
+        // legacy catalog.
+        let (file, _) = registry.load_from_disk()?;
+        Ok((file.groups, file.members))
     }
     pub fn catalog_all(&self) -> Result<(Vec<DispatchGroup>, Vec<GroupMember>), GroupError> {
         let file = self.load()?;
-        Ok((file.groups, file.members))
+        Ok((file.groups.clone(), file.members.clone()))
     }
 
     pub fn apply_group_authoritative(
@@ -222,14 +235,20 @@ impl GroupRegistry {
             std::fs::write(&path, serde_json::to_vec_pretty(&file)?)?;
         }
         let journal = CatalogJournal::new(&path, GROUP_CATALOG_VERSION);
-        Ok(Self { path, journal })
+        let cache = Arc::new(CatalogCache::new(&path, journal.path()));
+        Ok(Self {
+            path,
+            journal,
+            cache,
+        })
     }
 
-    fn load(&self) -> Result<GroupFile, GroupError> {
-        self.load_state().map(|state| state.0)
+    /// Cached catalog view; re-read from disk only when the files changed.
+    fn load(&self) -> Result<Arc<GroupFile>, GroupError> {
+        self.cache.read(|| self.load_from_disk())
     }
 
-    fn load_state(&self) -> Result<(GroupFile, usize), GroupError> {
+    fn load_from_disk(&self) -> Result<(GroupFile, usize), GroupError> {
         let bytes = std::fs::read(&self.path)?;
         match serde_json::from_slice::<GroupFile>(&bytes) {
             Ok(mut file) => {
@@ -265,7 +284,8 @@ impl GroupRegistry {
         f: impl FnOnce(&mut GroupFile) -> Result<T, GroupError>,
     ) -> Result<T, GroupError> {
         let _lock = broker_storage::FileLock::exclusive(&self.path)?;
-        let (mut file, journal_ops) = self.load_state()?;
+        let (cached, journal_ops) = self.cache.read_locked(|| self.load_from_disk())?;
+        let mut file = GroupFile::clone(&cached);
         let before_groups = file.groups.clone();
         let before_members = file.members.clone();
         let out = f(&mut file)?;
@@ -332,11 +352,14 @@ impl GroupRegistry {
             )
             .map_err(|error| GroupError::Journal(error.to_string()))?;
         file.revision = revision;
-        if journal_ops.saturating_add(1) >= GROUP_COMPACT_OPS {
+        let mut journal_ops = journal_ops.saturating_add(1);
+        if journal_ops >= GROUP_COMPACT_OPS {
             self.journal
                 .compact(&self.path, &file)
                 .map_err(|error| GroupError::Journal(error.to_string()))?;
+            journal_ops = 0;
         }
+        self.cache.store(file, journal_ops);
         Ok(out)
     }
 
@@ -390,8 +413,9 @@ impl GroupRegistry {
         let file = self.load()?;
         Ok(file
             .groups
-            .into_iter()
-            .find(|g| g.tenant_id == tenant_id && g.id == id))
+            .iter()
+            .find(|g| g.tenant_id == tenant_id && g.id == id)
+            .cloned())
     }
 
     pub fn get_group_by_name(
@@ -402,16 +426,18 @@ impl GroupRegistry {
         let file = self.load()?;
         Ok(file
             .groups
-            .into_iter()
-            .find(|g| g.tenant_id == tenant_id && g.name == name))
+            .iter()
+            .find(|g| g.tenant_id == tenant_id && g.name == name)
+            .cloned())
     }
 
     pub fn list_groups(&self, tenant_id: &str) -> Result<Vec<DispatchGroup>, GroupError> {
         let file = self.load()?;
         Ok(file
             .groups
-            .into_iter()
+            .iter()
             .filter(|g| g.tenant_id == tenant_id)
+            .cloned()
             .collect())
     }
 
@@ -493,8 +519,9 @@ impl GroupRegistry {
         let file = self.load()?;
         Ok(file
             .members
-            .into_iter()
-            .find(|m| m.tenant_id == tenant_id && m.id == id))
+            .iter()
+            .find(|m| m.tenant_id == tenant_id && m.id == id)
+            .cloned())
     }
 
     pub fn list_members(
@@ -505,8 +532,9 @@ impl GroupRegistry {
         let file = self.load()?;
         Ok(file
             .members
-            .into_iter()
+            .iter()
             .filter(|m| m.tenant_id == tenant_id && m.group_id == group_id)
+            .cloned()
             .collect())
     }
 
@@ -514,8 +542,9 @@ impl GroupRegistry {
         let file = self.load()?;
         Ok(file
             .members
-            .into_iter()
+            .iter()
             .filter(|m| m.tenant_id == tenant_id)
+            .cloned()
             .collect())
     }
 
@@ -548,8 +577,9 @@ impl GroupRegistry {
         }
         Ok(file
             .members
-            .into_iter()
+            .iter()
             .filter(|m| m.tenant_id == tenant_id && m.group_id == group_id && !m.paused)
+            .cloned()
             .collect())
     }
 }

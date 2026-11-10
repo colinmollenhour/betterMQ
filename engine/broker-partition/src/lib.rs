@@ -2,6 +2,7 @@
 
 mod blob;
 mod broker;
+mod catalog_cache;
 mod catalog_journal;
 mod flow;
 mod flows;

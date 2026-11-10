@@ -45,7 +45,7 @@ pub use archive::{
 pub use archive_checkpoint::ArchiveCheckpoint;
 pub use archive_source::ArchiveSource;
 pub use backend::{PartitionBackend, StorageMode, SLATE_SINGLE_BROKER};
-pub use flock::FileLock;
+pub use flock::{FileFingerprint, FileLock};
 pub use indexes::{DedupEntry, IndexError, MetadataStore, MetadataWriteBatch};
 pub use log::{storage_faults, FsyncMode, LogError, PartitionLog, PartitionLogConfig};
 pub use manifest::{WalManifest, WAL_FORMAT_V1, WAL_FORMAT_V2};
