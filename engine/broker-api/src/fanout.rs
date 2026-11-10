@@ -28,6 +28,12 @@ pub enum FanoutStoreError {
     NotFound(Uuid),
     #[error("fanout authority: {0}")]
     Authority(String),
+    #[error(
+        "fanout command is too large for the cluster controller: {bytes} bytes (limit {limit})"
+    )]
+    TooLarge { bytes: usize, limit: usize },
+    #[error("fanout outbox is full; retry later")]
+    OutboxFull,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +124,58 @@ impl FanoutCommand {
                 .max(0) as u64
         });
         request
+    }
+}
+
+/// Member outcomes replicated by each controller update; the accepted command
+/// itself is never resent. (The accepted command already stores a group's
+/// shared body once, in `FanoutCommand::shared_payload`.)
+#[derive(Serialize, Deserialize)]
+struct FanoutProgress {
+    #[serde(default)]
+    outcomes: HashMap<Uuid, FanoutMemberOutcome>,
+    #[serde(default)]
+    completed: bool,
+    #[serde(default)]
+    completed_at_ms: Option<i64>,
+    #[serde(default)]
+    updated_at_ms: i64,
+}
+
+fn encode_accepted(command: &FanoutCommand) -> Result<String, serde_json::Error> {
+    serde_json::to_string(command)
+}
+
+fn encode_progress(command: &FanoutCommand) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&FanoutProgress {
+        outcomes: command.outcomes.clone(),
+        completed: command.completed,
+        completed_at_ms: command.completed_at_ms,
+        updated_at_ms: command.updated_at_ms,
+    })
+}
+
+/// Rebuild the full fan-out command from its controller outbox entry.
+pub fn authoritative_command(
+    entry: &broker_raft_meta::FanoutOutboxEntry,
+) -> Result<FanoutCommand, serde_json::Error> {
+    let mut command: FanoutCommand = serde_json::from_str(&entry.payload_json)?;
+    if !entry.progress_json.is_empty() {
+        let progress: FanoutProgress = serde_json::from_str(&entry.progress_json)?;
+        command.outcomes = progress.outcomes;
+        command.completed = progress.completed;
+        command.completed_at_ms = progress.completed_at_ms;
+        command.updated_at_ms = progress.updated_at_ms;
+    }
+    Ok(command)
+}
+
+fn controller_error(error: broker_raft_meta::ControllerError) -> FanoutStoreError {
+    let message = error.to_string();
+    if message.contains("fanout outbox is full") {
+        FanoutStoreError::OutboxFull
+    } else {
+        FanoutStoreError::Authority(message)
     }
 }
 
@@ -529,11 +587,17 @@ pub async fn accept_authoritative(
                 "fanout id belongs to another tenant".into(),
             ));
         }
-        let authoritative: FanoutCommand = serde_json::from_str(&existing.payload_json)?;
+        let authoritative = authoritative_command(existing)?;
         store.replace_async(authoritative.clone()).await?;
         return Ok(authoritative);
     }
-    let payload_json = serde_json::to_string(&command)?;
+    let payload_json = encode_accepted(&command)?;
+    if payload_json.len() > broker_raft_meta::FANOUT_MAX_ENTRY_BYTES {
+        return Err(FanoutStoreError::TooLarge {
+            bytes: payload_json.len(),
+            limit: broker_raft_meta::FANOUT_MAX_ENTRY_BYTES,
+        });
+    }
     let committed = controller
         .submit(ControllerCommand::AcceptFanout {
             id: command.id,
@@ -544,12 +608,12 @@ pub async fn accept_authoritative(
             controller_term: 0,
         })
         .await
-        .map_err(|error| FanoutStoreError::Authority(error.to_string()))?;
+        .map_err(controller_error)?;
     let entry = committed
         .fanout_outbox
         .get(&command.id)
         .ok_or(FanoutStoreError::NotFound(command.id))?;
-    let authoritative: FanoutCommand = serde_json::from_str(&entry.payload_json)?;
+    let authoritative = authoritative_command(entry)?;
     store.replace_async(authoritative.clone()).await?;
     Ok(authoritative)
 }
@@ -571,7 +635,7 @@ pub async fn claim_authority(
         .get(&fanout_id)
         .ok_or(FanoutStoreError::NotFound(fanout_id))?;
     if entry.completed {
-        let command: FanoutCommand = serde_json::from_str(&entry.payload_json)?;
+        let command = authoritative_command(entry)?;
         store.replace_async(command.clone()).await?;
         return Ok(Some(command));
     }
@@ -599,7 +663,7 @@ pub async fn claim_authority(
     if entry.owner_id != Some(owner_id) {
         return Ok(None);
     }
-    let command: FanoutCommand = serde_json::from_str(&entry.payload_json)?;
+    let command = authoritative_command(entry)?;
     store.replace_async(command.clone()).await?;
     Ok(Some(command))
 }
@@ -632,7 +696,7 @@ pub async fn update_authoritative(
             id: command.id,
             owner_id,
             expected_version: entry.version,
-            payload_json: serde_json::to_string(&command)?,
+            progress_json: encode_progress(&command)?,
             completed: command.completed,
             now_ms: 0,
             controller_term: 0,
@@ -643,7 +707,7 @@ pub async fn update_authoritative(
         .fanout_outbox
         .get(&command.id)
         .ok_or(FanoutStoreError::NotFound(command.id))?;
-    let authoritative: FanoutCommand = serde_json::from_str(&entry.payload_json)?;
+    let authoritative = authoritative_command(entry)?;
     store.replace_async(authoritative.clone()).await?;
     Ok(authoritative)
 }
@@ -661,11 +725,11 @@ pub async fn pending_authoritative(
         return store.blocking(move |store| store.pending(limit)).await;
     };
     let mut pending: Vec<FanoutCommand> = Vec::new();
-    for entry in controller.state().fanout_outbox.into_values() {
+    for entry in controller.state().fanout_outbox.values() {
         if entry.completed {
             continue;
         }
-        pending.push(serde_json::from_str(&entry.payload_json)?);
+        pending.push(authoritative_command(entry)?);
     }
     pending.sort_by_key(|command| (command.updated_at_ms, command.created_at_ms, command.id));
     pending.truncate(limit);
@@ -690,10 +754,10 @@ pub async fn garbage_collect_authoritative(
         return Ok(local_removed);
     };
     let cutoff = now_ms.saturating_sub(retention_ms.max(0));
-    let mut completed: Vec<_> = controller
-        .state()
+    let snapshot = controller.state();
+    let mut completed: Vec<_> = snapshot
         .fanout_outbox
-        .into_values()
+        .values()
         .filter(|entry| entry.completed)
         .collect();
     completed.sort_by_key(|entry| Reverse((entry.updated_at_ms, entry.id)));
@@ -848,6 +912,78 @@ mod tests {
         assert_eq!(restored.outcomes[&member_id].attempts, 1);
         let (_, inserted) = reopened.accept(command).unwrap();
         assert!(!inserted);
+    }
+
+    #[test]
+    fn controller_entry_stores_shared_body_once_and_outcomes_separately() {
+        // Group publishes keep one shared body; members carry empty payloads.
+        let members: Vec<_> = (0..8)
+            .map(|_| FanoutMemberCommand {
+                member_id: Uuid::new_v4(),
+                request: PublishRequest {
+                    payload: String::new(),
+                    ..request()
+                },
+            })
+            .collect();
+        let mut command = FanoutCommand {
+            id: Uuid::new_v4(),
+            acceptance_hash: "hash".into(),
+            tenant_id: "tenant".into(),
+            group_id: Uuid::new_v4(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            shared_payload: Some(std::sync::Arc::new("p".repeat(64 * 1024))),
+            members,
+            outcomes: HashMap::new(),
+            completed: false,
+            completed_at_ms: None,
+        };
+        let payload_json = encode_accepted(&command).unwrap();
+        assert!(payload_json.len() < 2 * 64 * 1024, "body stored once");
+        command.outcomes.insert(
+            command.members[0].member_id,
+            FanoutMemberOutcome {
+                response: None,
+                error: Some("boom".into()),
+                attempts: 2,
+                next_attempt_at_ms: Some(9),
+                terminal: false,
+            },
+        );
+        command.updated_at_ms = 5;
+        let progress_json = encode_progress(&command).unwrap();
+        assert!(progress_json.len() < 1024, "updates never resend the body");
+        let entry = broker_raft_meta::FanoutOutboxEntry {
+            id: command.id,
+            tenant_id: command.tenant_id.clone(),
+            acceptance_hash: command.acceptance_hash.clone(),
+            version: 3,
+            authority_term: 1,
+            owner_id: None,
+            lease_expires_at_ms: 0,
+            payload_json: payload_json.into(),
+            progress_json,
+            completed: false,
+            created_at_ms: 1,
+            updated_at_ms: 5,
+        };
+        let restored = authoritative_command(&entry).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&command).unwrap()
+        );
+
+        // Entries written before outcomes were split carry the whole command.
+        let legacy = broker_raft_meta::FanoutOutboxEntry {
+            payload_json: serde_json::to_string(&command).unwrap().into(),
+            progress_json: String::new(),
+            ..entry
+        };
+        assert_eq!(
+            serde_json::to_value(authoritative_command(&legacy).unwrap()).unwrap(),
+            serde_json::to_value(&command).unwrap()
+        );
     }
 
     #[test]

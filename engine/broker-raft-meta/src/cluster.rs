@@ -939,6 +939,7 @@ impl ClusterRuntime {
             return controller
                 .state()
                 .scheduler
+                .clone()
                 .filter(|lease| lease.expires_at_ms > now)
                 .map(|lease| lease.holder);
         }
@@ -980,7 +981,7 @@ impl ClusterRuntime {
     pub async fn acquire_scheduler_leader(&self, ttl_ms: i64) -> Result<bool, ClusterError> {
         if let Some(controller) = &self.controller {
             let now_ms = Utc::now().timestamp_millis();
-            match controller.state().scheduler {
+            match controller.state().scheduler.as_ref() {
                 Some(lease)
                     if lease.holder != self.config.node_id && lease.expires_at_ms > now_ms =>
                 {
@@ -1003,6 +1004,7 @@ impl ClusterRuntime {
                 .await?;
             return Ok(state
                 .scheduler
+                .as_ref()
                 .is_some_and(|lease| lease.holder == self.config.node_id));
         }
         Ok(self.try_acquire_scheduler_leader(ttl_ms))
@@ -1128,10 +1130,10 @@ mod tests {
         assert!(rt.is_scheduler_leader());
 
         // Less than half of a longer TTL remains, so this call renews.
-        let before = controller.state().scheduler.unwrap().expires_at_ms;
+        let before = controller.state().scheduler.as_ref().unwrap().expires_at_ms;
         assert!(rt.acquire_scheduler_leader(60_000).await.unwrap());
         assert!(last_log() > acquired_at);
-        assert!(controller.state().scheduler.unwrap().expires_at_ms > before);
+        assert!(controller.state().scheduler.as_ref().unwrap().expires_at_ms > before);
     }
 
     #[test]

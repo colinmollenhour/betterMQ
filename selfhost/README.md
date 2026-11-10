@@ -410,6 +410,13 @@ Fan-out vars are **group bookkeeping**, not DLQ TTL.
 | `BETTERMQ_FANOUT_RETENTION_MS` | Completed fan-out retention (default 24h) |
 | `BETTERMQ_FANOUT_MAX_COMPLETED` | Completed fan-out entries kept (default `10000`) |
 
+In cluster mode every accepted group publish is recorded by the cluster
+controller until it completes. A group publish whose recorded command (one
+copy of the body plus each member's destination) exceeds 4 MiB is rejected
+with `400`, and new group publishes get `503` with `Retry-After` while
+unfinished fan-outs hold more than 256 MiB. Single-node brokers have neither
+limit.
+
 #### Storage, WAL, archive, replication
 
 | Env | Used for |

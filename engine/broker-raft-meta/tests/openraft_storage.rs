@@ -13,7 +13,7 @@ struct RocksBuilder;
 impl StoreBuilder<TypeConfig, LogStore, StateMachine, TempDir> for RocksBuilder {
     async fn build(&self) -> Result<(TempDir, LogStore, StateMachine), StorageError<u64>> {
         let dir = TempDir::new().expect("temporary OpenRaft RocksDB directory");
-        let store = RocksStore::new(dir.path()).await;
+        let store = RocksStore::new(dir.path()).await?;
         let (log_store, state_machine) = Adaptor::new(store);
         Ok((dir, log_store, state_machine))
     }
@@ -36,7 +36,7 @@ impl StoreBuilder<TypeConfig, DurableLogStore, DurableStateMachine, TempDir>
         &self,
     ) -> Result<(TempDir, DurableLogStore, DurableStateMachine), StorageError<u64>> {
         let dir = TempDir::new().expect("temporary durable OpenRaft RocksDB directory");
-        let store = RocksStore::new(dir.path()).await;
+        let store = RocksStore::new(dir.path()).await?;
         let (log_store, state_machine) = Adaptor::new(DurableRocksStore::new(store));
         Ok((dir, log_store, state_machine))
     }

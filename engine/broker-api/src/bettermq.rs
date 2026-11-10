@@ -640,7 +640,7 @@ async fn publish_to_group(
         .as_ref()
         .and_then(|cluster| cluster.runtime.controller())
         .and_then(|controller| controller.state().fanout_outbox.get(&fanout_id).cloned())
-        .map(|entry| serde_json::from_str(&entry.payload_json))
+        .map(|entry| crate::fanout::authoritative_command(&entry))
         .transpose()
         .map_err(|error| fanout_store_error(crate::fanout::FanoutStoreError::Serde(error)))?;
     let mut expansion_permit = None;
@@ -1110,6 +1110,18 @@ async fn replay_fanout_command(
 }
 
 fn fanout_store_error(error: crate::fanout::FanoutStoreError) -> ApiError {
+    match error {
+        crate::fanout::FanoutStoreError::TooLarge { .. } => {
+            return ApiError::BadRequest(error.to_string())
+        }
+        crate::fanout::FanoutStoreError::OutboxFull => {
+            return ApiError::Overloaded {
+                retry_after_ms: 1_000,
+                message: error.to_string(),
+            }
+        }
+        _ => {}
+    }
     ApiError::Broker(BrokerError::Storage(broker_storage::LogError::Io(
         std::io::Error::other(error.to_string()),
     )))

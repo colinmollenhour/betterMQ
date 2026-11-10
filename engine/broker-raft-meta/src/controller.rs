@@ -9,18 +9,17 @@ use crate::cluster::{ClusterConfig, SchedulerLease};
 use crate::durable_store::DurableRocksStore;
 use crate::network::HttpNetworkFactory;
 use crate::placement::{
-    initial_controller_voters, min_isr_for, pick_leader, place_replicas, replication_policy,
-    upsert_catalog, CatalogRecord, DataNodeRecord, RebalanceOp,
+    catalog_key, initial_controller_voters, min_isr_for, pick_leader, place_replicas,
+    replication_policy, upsert_catalog, CatalogRecord, DataNodeRecord, RebalanceOp,
 };
 pub use crate::rocks_store::TypeConfig;
 use crate::rocks_store::{RocksRequest, RocksStore};
 use openraft::storage::Adaptor;
 use openraft::{BasicNode, Config, Raft, ServerState, SnapshotPolicy};
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -38,6 +37,31 @@ pub type ControllerSnapshotResponse = openraft::raft::InstallSnapshotResponse<No
 
 pub(crate) const STATE_KEY: &str = "bettermq/controller-state/v1";
 const QUORUM_ACK_MAX_AGE_MS: u64 = 2_000;
+
+/// Largest accepted fan-out command (`payload_json`) or outcome record
+/// (`progress_json`). Keeps every controller log entry well inside one Raft
+/// append request.
+pub const FANOUT_MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
+/// Admission limit for the accepted bodies of fan-outs that are not complete.
+pub const FANOUT_OUTBOX_MAX_PENDING_BYTES: usize = 256 * 1024 * 1024;
+
+/// One independently persisted part of the controller state. Each command
+/// reports the parts it changed so the state machine rewrites only those.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum StateKey {
+    /// Scalars, node tables, scheduler lease and replication policy.
+    Meta,
+    Shard(u32),
+    Fanout(Uuid),
+    Catalog(String),
+    GcWatermark(u32),
+    Rebalance(u32),
+    CatalogOperation(Uuid),
+    LogGcWatermark {
+        namespace: String,
+        partition: u32,
+    },
+}
 
 #[derive(Debug, Error)]
 pub enum ControllerError {
@@ -116,7 +140,14 @@ pub struct FanoutOutboxEntry {
     pub authority_term: u64,
     pub owner_id: Option<Uuid>,
     pub lease_expires_at_ms: i64,
-    pub payload_json: String,
+    /// Accepted fan-out command; immutable after acceptance and shared, not
+    /// copied, between state snapshots.
+    pub payload_json: Arc<str>,
+    /// Latest per-member outcomes, replaced by each `UpdateFanout`. Empty
+    /// until the first update; entries written before this field existed
+    /// carry their outcomes inside `payload_json`.
+    #[serde(default)]
+    pub progress_json: String,
     pub completed: bool,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -323,7 +354,8 @@ pub enum ControllerCommand {
         id: Uuid,
         owner_id: Uuid,
         expected_version: u64,
-        payload_json: String,
+        /// Outcome record only; the accepted command is never resent.
+        progress_json: String,
         completed: bool,
         now_ms: i64,
         controller_term: u64,
@@ -381,9 +413,22 @@ pub struct DrainReport {
     pub leadership_transfers: Vec<u32>,
 }
 
+/// Request header a forwarding node sets when it will read the result from its
+/// own replica: the leader then answers with the applied log index only.
+pub const CONTROLLER_RESPONSE_HEADER: &str = "x-bettermq-controller-response";
+pub const CONTROLLER_RESPONSE_APPLIED_INDEX: &str = "applied-index";
+
+/// How long a forwarding node waits for its replica to apply its own command.
+const FORWARDED_APPLY_WAIT: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControllerCommandResponse {
-    pub state: ControllerState,
+    /// Full state, only for callers that do not hold a controller replica.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<Arc<ControllerState>>,
+    /// Log index at which the command was applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_index: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -392,8 +437,7 @@ pub struct OpenRaftController {
     store: Arc<RocksStore>,
     node_id: NodeId,
     config: ClusterConfig,
-    state: Arc<RwLock<ControllerState>>,
-    state_committed: Arc<AtomicBool>,
+    bootstrap: Arc<ControllerState>,
     last_leader_contact_ms: Arc<AtomicI64>,
     command_lock: Arc<Mutex<()>>,
     http: reqwest::Client,
@@ -406,7 +450,9 @@ impl OpenRaftController {
         bootstrap_state: ControllerState,
     ) -> Result<Self, ControllerError> {
         let node_id = raft_id(config.node_id);
-        let store = RocksStore::new(data_dir.join("controller-rocksdb")).await;
+        let store = RocksStore::new(data_dir.join("controller-rocksdb"))
+            .await
+            .map_err(|error| ControllerError::Storage(error.to_string()))?;
         let durable_store = DurableRocksStore::new(Arc::clone(&store));
         let (log_store, state_machine) = Adaptor::new(durable_store);
         let network = HttpNetworkFactory::new()
@@ -443,8 +489,7 @@ impl OpenRaftController {
             store,
             node_id,
             config,
-            state: Arc::new(RwLock::new(bootstrap_state)),
-            state_committed: Arc::new(AtomicBool::new(false)),
+            bootstrap: Arc::new(bootstrap_state),
             last_leader_contact_ms: Arc::new(AtomicI64::new(0)),
             command_lock: Arc::new(Mutex::new(())),
             http,
@@ -463,7 +508,7 @@ impl OpenRaftController {
         {
             return Ok(());
         }
-        let state = self.state.read().clone();
+        let state = self.state();
         let voter_ids: BTreeSet<_> = if state.controller_voters.is_empty() {
             self.config.nodes.iter().map(|node| node.id).collect()
         } else {
@@ -487,68 +532,62 @@ impl OpenRaftController {
             .map_err(|error| ControllerError::Raft(error.to_string()))
     }
 
+    /// Bootstraps the migrated state and reconciles membership on the leader.
+    /// Committed state itself is published by the state machine on apply, so
+    /// nothing here re-reads or decodes it.
     fn spawn_state_sync(&self) {
         let controller = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            let mut interval = tokio::time::interval(Duration::from_millis(250));
             loop {
                 interval.tick().await;
-                if let Ok(Some(state)) = controller.read_store_state().await {
-                    *controller.state.write() = state;
-                    controller.state_committed.store(true, Ordering::Release);
-                } else if controller.is_leader_with_quorum() {
+                if !controller.is_leader_with_quorum() {
+                    continue;
+                }
+                if controller.store.controller_state().is_none() {
                     if let Err(error) = controller.bootstrap_local().await {
                         tracing::warn!(%error, "failed to commit migrated controller state");
                     }
                 }
-                if controller.is_leader_with_quorum() {
-                    if let Err(error) = controller.reconcile_membership().await {
-                        tracing::warn!(%error, "failed to reconcile OpenRaft membership");
-                    }
+                if let Err(error) = controller.reconcile_membership().await {
+                    tracing::warn!(%error, "failed to reconcile OpenRaft membership");
                 }
             }
         });
     }
 
-    async fn read_store_state(&self) -> Result<Option<ControllerState>, ControllerError> {
-        let state_machine = self.store.state_machine.read().await;
-        let encoded = state_machine
-            .get(STATE_KEY)
-            .map_err(|error| ControllerError::Storage(error.to_string()))?;
-        encoded
-            .map(|json| {
-                serde_json::from_str(&json)
-                    .map_err(|error| ControllerError::Storage(error.to_string()))
-            })
-            .transpose()
-    }
-
     /// Commit the migrated V1 state as the initial controller state. The state
     /// machine ignores this once any controller state exists.
     async fn bootstrap_local(&self) -> Result<(), ControllerError> {
-        let bootstrap = self.state.read().clone();
         self.raft
             .client_write(RocksRequest::ControllerBootstrap {
-                state: Box::new(bootstrap),
+                state: Box::new(self.bootstrap.as_ref().clone()),
             })
             .await
             .map_err(|error| ControllerError::Raft(error.to_string()))?;
         Ok(())
     }
 
-    async fn committed_state(&self) -> Result<ControllerState, ControllerError> {
-        let state = self.read_store_state().await?.ok_or_else(|| {
-            ControllerError::Storage("controller state is not bootstrapped".into())
-        })?;
-        *self.state.write() = state.clone();
-        self.state_committed.store(true, Ordering::Release);
-        Ok(state)
+    fn committed_state(&self) -> Result<Arc<ControllerState>, ControllerError> {
+        self.store
+            .controller_state()
+            .ok_or_else(|| ControllerError::Storage("controller state is not bootstrapped".into()))
+    }
+
+    fn is_raft_member(&self) -> bool {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .nodes()
+            .any(|(id, _)| *id == self.node_id)
     }
 
     pub async fn submit(
         &self,
         command: ControllerCommand,
-    ) -> Result<ControllerState, ControllerError> {
+    ) -> Result<Arc<ControllerState>, ControllerError> {
         if self.is_leader_with_quorum() {
             return self.submit_local(command).await;
         }
@@ -559,8 +598,7 @@ impl OpenRaftController {
             .current_leader
             .ok_or(ControllerError::NoLeader)?;
         let addr = self
-            .state
-            .read()
+            .state()
             .nodes
             .get(&leader)
             .map(|node| {
@@ -576,7 +614,16 @@ impl OpenRaftController {
             "{}/internal/v1/controller/command",
             addr.trim_end_matches('/')
         );
+        // A replica reads the result locally once it has applied the entry, so
+        // the leader does not ship the whole controller state back.
+        let read_locally = self.is_raft_member();
         let mut request = self.http.post(url).json(&command);
+        if read_locally {
+            request = request.header(
+                CONTROLLER_RESPONSE_HEADER,
+                CONTROLLER_RESPONSE_APPLIED_INDEX,
+            );
+        }
         if let Ok(secret) = std::env::var("BETTERMQ_CLUSTER_SECRET") {
             if !secret.trim().is_empty() {
                 request = request.header("x-bettermq-cluster-secret", secret);
@@ -602,14 +649,56 @@ impl OpenRaftController {
             .json()
             .await
             .map_err(|error| ControllerError::Transport(error.to_string()))?;
-        *self.state.write() = response.state.clone();
-        Ok(response.state)
+        if let Some(state) = response.state {
+            return Ok(state);
+        }
+        let index = response.applied_index.ok_or_else(|| {
+            ControllerError::Transport("controller leader returned neither state nor index".into())
+        })?;
+        self.raft
+            .wait(Some(FORWARDED_APPLY_WAIT))
+            .applied_index_at_least(Some(index), "forwarded controller command")
+            .await
+            .map_err(|error| {
+                ControllerError::Transport(format!(
+                    "command committed at index {index} but not yet applied locally: {error}"
+                ))
+            })?;
+        self.committed_state()
+    }
+
+    /// Serve a command forwarded by another node.
+    pub async fn serve_forwarded(
+        &self,
+        command: ControllerCommand,
+        applied_index_only: bool,
+    ) -> Result<ControllerCommandResponse, ControllerError> {
+        if self.is_leader_with_quorum() {
+            let (state, index) = self.submit_local_indexed(command).await?;
+            return Ok(ControllerCommandResponse {
+                state: (!applied_index_only).then_some(state),
+                applied_index: Some(index),
+            });
+        }
+        Ok(ControllerCommandResponse {
+            state: Some(self.submit(command).await?),
+            applied_index: None,
+        })
     }
 
     pub async fn submit_local(
         &self,
+        command: ControllerCommand,
+    ) -> Result<Arc<ControllerState>, ControllerError> {
+        self.submit_local_indexed(command)
+            .await
+            .map(|(state, _)| state)
+    }
+
+    async fn submit_local_indexed(
+        &self,
         mut command: ControllerCommand,
-    ) -> Result<ControllerState, ControllerError> {
+    ) -> Result<(Arc<ControllerState>, u64), ControllerError> {
         let _guard = self.command_lock.lock().await;
         let now = chrono::Utc::now().timestamp_millis();
         let term = self.term();
@@ -650,17 +739,20 @@ impl OpenRaftController {
             .ensure_linearizable()
             .await
             .map_err(|error| ControllerError::Raft(error.to_string()))?;
-        let mut probe = match self.read_store_state().await? {
+        let current = match self.store.controller_state() {
             Some(state) => state,
             None => {
                 self.bootstrap_local().await?;
-                self.committed_state().await?
+                self.committed_state()?
             }
         };
         // Rejected commands are not written to the log. The command lock keeps
         // other local commands from landing between this check and the write;
         // the state machine still re-validates against the committed state.
+        let mut probe = current.as_ref().clone();
+        drop(current);
         apply_replicated(&mut probe, command.clone(), term)?;
+        drop(probe);
         let response = self
             .raft
             .client_write(RocksRequest::Controller { command })
@@ -669,11 +761,11 @@ impl OpenRaftController {
         if let Some(rejected) = response.data.rejected {
             return Err(rejected.into());
         }
-        self.committed_state().await
+        Ok((self.committed_state()?, response.log_id.index))
     }
 
     async fn reconcile_membership(&self) -> Result<(), ControllerError> {
-        let state = self.state.read().clone();
+        let state = self.state();
         let desired: BTreeSet<_> = if state.controller_voters.is_empty() {
             self.config
                 .nodes
@@ -734,16 +826,21 @@ impl OpenRaftController {
         &self.raft
     }
 
-    pub fn state(&self) -> ControllerState {
-        self.state.read().clone()
+    /// Latest committed controller state (the migrated bootstrap state until
+    /// the first commit). Cheap: shares the snapshot the state machine
+    /// published instead of copying it.
+    pub fn state(&self) -> Arc<ControllerState> {
+        self.store
+            .controller_state()
+            .unwrap_or_else(|| Arc::clone(&self.bootstrap))
     }
 
     pub fn catalog_revision(&self) -> u64 {
-        self.state.read().catalog_epoch
+        self.state().catalog_epoch
     }
 
     pub fn catalog_writes_frozen(&self) -> bool {
-        self.state.read().catalog_frozen
+        self.state().catalog_frozen
     }
 
     pub fn term(&self) -> u64 {
@@ -753,7 +850,7 @@ impl OpenRaftController {
     pub fn leader_uuid(&self) -> Option<Uuid> {
         let metrics = self.raft.metrics();
         let leader = metrics.borrow().current_leader?;
-        self.state.read().nodes.get(&leader).map(|node| node.id)
+        self.state().nodes.get(&leader).map(|node| node.id)
     }
 
     /// Move shard replicas off `node_id` before dropping membership.
@@ -835,7 +932,7 @@ impl OpenRaftController {
     pub fn is_ready(&self) -> bool {
         let metrics = self.raft.metrics();
         let metrics = metrics.borrow();
-        self.state_committed.load(Ordering::Acquire)
+        self.store.controller_state().is_some()
             && metrics.running_state.is_ok()
             && metrics.current_leader.is_some()
             && (if matches!(metrics.state, ServerState::Leader) {
@@ -869,11 +966,12 @@ impl OpenRaftController {
 /// Apply a command from a log entry proposed in `log_term`. Term fences use
 /// the entry's own Raft term rather than whatever the proposer wrote, so every
 /// replica reaches the same result. On error the state is left unchanged.
+/// Returns the parts of the state the command changed.
 pub(crate) fn apply_replicated(
     state: &mut ControllerState,
     mut command: ControllerCommand,
     log_term: u64,
-) -> Result<(), ControllerError> {
+) -> Result<Vec<StateKey>, ControllerError> {
     match &mut command {
         ControllerCommand::AcceptFanout {
             controller_term, ..
@@ -892,405 +990,502 @@ pub(crate) fn apply_replicated(
     apply_command(state, command)
 }
 
+fn pending_fanout_bytes(state: &ControllerState) -> usize {
+    state
+        .fanout_outbox
+        .values()
+        .filter(|entry| !entry.completed)
+        .map(|entry| {
+            entry
+                .payload_json
+                .len()
+                .saturating_add(entry.progress_json.len())
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
 /// Validates fully before mutating, so an `Err` leaves `state` untouched.
 fn apply_command(
     state: &mut ControllerState,
     command: ControllerCommand,
-) -> Result<(), ControllerError> {
-    match command {
-        ControllerCommand::MutateCatalog {
-            operation_id,
-            request_fingerprint,
-            mutations,
-        } => {
-            if let Some(previous) = state.catalog_operations.get(&operation_id) {
-                if previous.request_fingerprint != request_fingerprint {
-                    return Err(ControllerError::CatalogConflict(
-                        "operation id reused for a different request".into(),
+) -> Result<Vec<StateKey>, ControllerError> {
+    let touched =
+        match command {
+            ControllerCommand::MutateCatalog {
+                operation_id,
+                request_fingerprint,
+                mutations,
+            } => {
+                if let Some(previous) = state.catalog_operations.get(&operation_id) {
+                    if previous.request_fingerprint != request_fingerprint {
+                        return Err(ControllerError::CatalogConflict(
+                            "operation id reused for a different request".into(),
+                        ));
+                    }
+                }
+                let before = state.catalog_records.clone();
+                crate::catalog::mutate(state, operation_id, mutations, false)?;
+                state
+                    .catalog_operations
+                    .get_mut(&operation_id)
+                    .expect("committed operation")
+                    .request_fingerprint = request_fingerprint;
+                catalog_touched(&before, state, operation_id)
+            }
+            ControllerCommand::BeginCatalogActivation => {
+                if !state.catalog_authoritative {
+                    state.catalog_frozen = true;
+                }
+                vec![StateKey::Meta]
+            }
+            ControllerCommand::SeedCatalog {
+                operation_id,
+                records,
+            } => {
+                let before = state.catalog_records.clone();
+                crate::catalog::mutate(state, operation_id, records, true)?;
+                catalog_touched(&before, state, operation_id)
+            }
+            ControllerCommand::AcquireShardLeadership { shard, leader_id } => {
+                if !state.nodes.values().any(|node| node.id == leader_id) {
+                    return Err(ControllerError::UnknownNode(leader_id));
+                }
+                let placement = state.shards.get_mut(&shard).ok_or_else(|| {
+                    ControllerError::InvalidCommand(format!("unknown shard {shard}"))
+                })?;
+                placement.leader_term = placement
+                    .leader_term
+                    .checked_add(1)
+                    .filter(|term| *term != u64::MAX)
+                    .ok_or_else(|| {
+                        ControllerError::InvalidCommand("shard term exhausted".into())
+                    })?;
+                placement.leader_id = leader_id;
+                vec![StateKey::Shard(shard)]
+            }
+            ControllerCommand::ObserveShardTerm {
+                shard,
+                leader_id,
+                term,
+            } => {
+                let placement = state.shards.get_mut(&shard).ok_or_else(|| {
+                    ControllerError::InvalidCommand(format!("unknown shard {shard}"))
+                })?;
+                if placement.leader_id != leader_id || placement.leader_term != term {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "term {term} for {leader_id} is not the committed placement {}@{}",
+                        placement.leader_id, placement.leader_term
+                    )));
+                }
+                Vec::new()
+            }
+            ControllerCommand::AcquireScheduler {
+                holder,
+                now_ms,
+                ttl_ms,
+            } => {
+                if !state.nodes.values().any(|node| node.id == holder) {
+                    return Err(ControllerError::UnknownNode(holder));
+                }
+                let can_acquire = state
+                    .scheduler
+                    .as_ref()
+                    .is_none_or(|lease| lease.expires_at_ms <= now_ms || lease.holder == holder);
+                if !can_acquire {
+                    return Err(ControllerError::InvalidCommand(
+                        "scheduler lease is held by another node".into(),
                     ));
                 }
+                state.scheduler = Some(SchedulerLease {
+                    holder,
+                    expires_at_ms: now_ms.saturating_add(ttl_ms.max(1)),
+                });
+                vec![StateKey::Meta]
             }
-            crate::catalog::mutate(state, operation_id, mutations, false)?;
-            state
-                .catalog_operations
-                .get_mut(&operation_id)
-                .expect("committed operation")
-                .request_fingerprint = request_fingerprint;
-        }
-        ControllerCommand::BeginCatalogActivation => {
-            if !state.catalog_authoritative {
-                state.catalog_frozen = true;
+            ControllerCommand::AdvanceCatalogEpoch => {
+                state.catalog_epoch = state.catalog_epoch.checked_add(1).ok_or_else(|| {
+                    ControllerError::InvalidCommand("catalog epoch exhausted".into())
+                })?;
+                vec![StateKey::Meta]
             }
-        }
-        ControllerCommand::SeedCatalog {
-            operation_id,
-            records,
-        } => crate::catalog::mutate(state, operation_id, records, true)?,
-        ControllerCommand::AcquireShardLeadership { shard, leader_id } => {
-            if !state.nodes.values().any(|node| node.id == leader_id) {
-                return Err(ControllerError::UnknownNode(leader_id));
-            }
-            let placement = state
-                .shards
-                .get_mut(&shard)
-                .ok_or_else(|| ControllerError::InvalidCommand(format!("unknown shard {shard}")))?;
-            placement.leader_term = placement
-                .leader_term
-                .checked_add(1)
-                .filter(|term| *term != u64::MAX)
-                .ok_or_else(|| ControllerError::InvalidCommand("shard term exhausted".into()))?;
-            placement.leader_id = leader_id;
-        }
-        ControllerCommand::ObserveShardTerm {
-            shard,
-            leader_id,
-            term,
-        } => {
-            let placement = state
-                .shards
-                .get_mut(&shard)
-                .ok_or_else(|| ControllerError::InvalidCommand(format!("unknown shard {shard}")))?;
-            if placement.leader_id != leader_id || placement.leader_term != term {
-                return Err(ControllerError::InvalidCommand(format!(
-                    "term {term} for {leader_id} is not the committed placement {}@{}",
-                    placement.leader_id, placement.leader_term
-                )));
-            }
-        }
-        ControllerCommand::AcquireScheduler {
-            holder,
-            now_ms,
-            ttl_ms,
-        } => {
-            if !state.nodes.values().any(|node| node.id == holder) {
-                return Err(ControllerError::UnknownNode(holder));
-            }
-            let can_acquire = state
-                .scheduler
-                .as_ref()
-                .is_none_or(|lease| lease.expires_at_ms <= now_ms || lease.holder == holder);
-            if !can_acquire {
-                return Err(ControllerError::InvalidCommand(
-                    "scheduler lease is held by another node".into(),
-                ));
-            }
-            state.scheduler = Some(SchedulerLease {
-                holder,
-                expires_at_ms: now_ms.saturating_add(ttl_ms.max(1)),
-            });
-        }
-        ControllerCommand::AdvanceCatalogEpoch => {
-            state.catalog_epoch = state
-                .catalog_epoch
-                .checked_add(1)
-                .ok_or_else(|| ControllerError::InvalidCommand("catalog epoch exhausted".into()))?;
-        }
-        ControllerCommand::AcceptFanout {
-            id,
-            tenant_id,
-            acceptance_hash,
-            payload_json,
-            created_at_ms,
-            controller_term,
-        } => {
-            if let Some(existing) = state.fanout_outbox.get(&id) {
-                if existing.tenant_id == tenant_id
-                    && ((!acceptance_hash.is_empty()
-                        && existing.acceptance_hash == acceptance_hash)
-                        || (acceptance_hash.is_empty() && existing.payload_json == payload_json))
-                {
-                    return Ok(());
-                }
-                return Err(ControllerError::InvalidCommand(format!(
-                    "fanout {id} already exists with different content"
-                )));
-            }
-            state.fanout_outbox.insert(
+            ControllerCommand::AcceptFanout {
                 id,
-                FanoutOutboxEntry {
+                tenant_id,
+                acceptance_hash,
+                payload_json,
+                created_at_ms,
+                controller_term,
+            } => {
+                if let Some(existing) = state.fanout_outbox.get(&id) {
+                    if existing.tenant_id == tenant_id
+                        && ((!acceptance_hash.is_empty()
+                            && existing.acceptance_hash == acceptance_hash)
+                            || (acceptance_hash.is_empty()
+                                && *existing.payload_json == *payload_json))
+                    {
+                        return Ok(Vec::new());
+                    }
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "fanout {id} already exists with different content"
+                    )));
+                }
+                if payload_json.len() > FANOUT_MAX_ENTRY_BYTES {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "fanout {id} is too large: {} bytes (limit {FANOUT_MAX_ENTRY_BYTES})",
+                        payload_json.len()
+                    )));
+                }
+                if pending_fanout_bytes(state).saturating_add(payload_json.len())
+                    > FANOUT_OUTBOX_MAX_PENDING_BYTES
+                {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "fanout outbox is full ({FANOUT_OUTBOX_MAX_PENDING_BYTES} pending bytes)"
+                    )));
+                }
+                state.fanout_outbox.insert(
                     id,
-                    tenant_id,
-                    acceptance_hash,
-                    version: 1,
-                    authority_term: controller_term,
-                    owner_id: None,
-                    lease_expires_at_ms: 0,
-                    payload_json,
-                    completed: false,
-                    created_at_ms,
-                    updated_at_ms: created_at_ms,
-                },
-            );
-        }
-        ControllerCommand::ClaimFanout {
-            id,
-            owner_id,
-            expected_version,
-            now_ms,
-            ttl_ms,
-            controller_term,
-        } => {
-            let entry = state
-                .fanout_outbox
-                .get_mut(&id)
-                .ok_or_else(|| ControllerError::InvalidCommand(format!("unknown fanout {id}")))?;
-            if entry.completed {
-                return Ok(());
-            }
-            if entry.owner_id == Some(owner_id)
-                && entry.authority_term == controller_term
-                && entry.lease_expires_at_ms > now_ms
-            {
-                return Ok(());
-            }
-            if expected_version != entry.version {
-                return Err(ControllerError::InvalidCommand(format!(
-                    "fanout {id} version fence failed: expected {expected_version}, have {}",
-                    entry.version
-                )));
-            }
-            if entry.authority_term > controller_term {
-                return Err(ControllerError::InvalidCommand(format!(
-                    "fanout {id} term fence failed: stale {controller_term}, have {}",
-                    entry.authority_term
-                )));
-            }
-            if entry.owner_id.is_some()
-                && entry.lease_expires_at_ms > now_ms
-                && entry.authority_term == controller_term
-            {
-                return Err(ControllerError::InvalidCommand(format!(
-                    "fanout {id} is leased by another worker"
-                )));
-            }
-            entry.version = entry.version.checked_add(1).ok_or_else(|| {
-                ControllerError::InvalidCommand(format!("fanout {id} version exhausted"))
-            })?;
-            entry.authority_term = controller_term;
-            entry.owner_id = Some(owner_id);
-            entry.lease_expires_at_ms = now_ms.saturating_add(ttl_ms.max(1));
-            entry.updated_at_ms = now_ms;
-        }
-        ControllerCommand::UpdateFanout {
-            id,
-            owner_id,
-            expected_version,
-            payload_json,
-            completed,
-            now_ms,
-            controller_term,
-        } => {
-            let entry = state
-                .fanout_outbox
-                .get_mut(&id)
-                .ok_or_else(|| ControllerError::InvalidCommand(format!("unknown fanout {id}")))?;
-            if entry.payload_json == payload_json && entry.completed == completed {
-                return Ok(());
-            }
-            if expected_version != entry.version
-                || entry.authority_term != controller_term
-                || entry.owner_id != Some(owner_id)
-            {
-                return Err(ControllerError::InvalidCommand(format!(
-                    "fanout {id} ownership fence failed"
-                )));
-            }
-            if entry.lease_expires_at_ms <= now_ms {
-                return Err(ControllerError::InvalidCommand(format!(
-                    "fanout {id} lease expired"
-                )));
-            }
-            entry.version = entry.version.checked_add(1).ok_or_else(|| {
-                ControllerError::InvalidCommand(format!("fanout {id} version exhausted"))
-            })?;
-            entry.payload_json = payload_json;
-            entry.completed = completed;
-            entry.updated_at_ms = now_ms;
-            if completed {
-                entry.owner_id = None;
-                entry.lease_expires_at_ms = 0;
-            }
-        }
-        ControllerCommand::GarbageCollectFanout {
-            ids,
-            completed_before_ms: _,
-            controller_term,
-        } => {
-            state.fanout_outbox.retain(|id, entry| {
-                !ids.contains(id) || !entry.completed || entry.authority_term > controller_term
-            });
-        }
-        ControllerCommand::RegisterDataNode { mut node } => {
-            node.controller_voter = state.controller_voters.contains(&node.id);
-            state.data_nodes.insert(node.id, node.clone());
-            if !state.nodes.values().any(|existing| existing.id == node.id) {
-                let raft_id = raft_id(node.id);
-                state.nodes.insert(
-                    raft_id,
-                    ControllerNode {
-                        id: node.id,
-                        raft_id,
-                        addr: node.addr.clone(),
+                    FanoutOutboxEntry {
+                        id,
+                        tenant_id,
+                        acceptance_hash,
+                        version: 1,
+                        authority_term: controller_term,
+                        owner_id: None,
+                        lease_expires_at_ms: 0,
+                        payload_json: payload_json.into(),
+                        progress_json: String::new(),
+                        completed: false,
+                        created_at_ms,
+                        updated_at_ms: created_at_ms,
                     },
                 );
+                vec![StateKey::Fanout(id)]
             }
-            state.membership_generation = state.membership_generation.saturating_add(1);
-        }
-        ControllerCommand::PutCatalogRecord {
-            kind,
-            key,
-            payload_json,
-            tombstone,
-        } => {
-            if state.catalog_authoritative || state.catalog_frozen {
-                return Err(ControllerError::CatalogConflict(
-                    "legacy catalog writes disabled; use MutateCatalog".into(),
-                ));
+            ControllerCommand::ClaimFanout {
+                id,
+                owner_id,
+                expected_version,
+                now_ms,
+                ttl_ms,
+                controller_term,
+            } => {
+                let entry = state.fanout_outbox.get_mut(&id).ok_or_else(|| {
+                    ControllerError::InvalidCommand(format!("unknown fanout {id}"))
+                })?;
+                if entry.completed {
+                    return Ok(Vec::new());
+                }
+                if entry.owner_id == Some(owner_id)
+                    && entry.authority_term == controller_term
+                    && entry.lease_expires_at_ms > now_ms
+                {
+                    return Ok(Vec::new());
+                }
+                if expected_version != entry.version {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "fanout {id} version fence failed: expected {expected_version}, have {}",
+                        entry.version
+                    )));
+                }
+                if entry.authority_term > controller_term {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "fanout {id} term fence failed: stale {controller_term}, have {}",
+                        entry.authority_term
+                    )));
+                }
+                if entry.owner_id.is_some()
+                    && entry.lease_expires_at_ms > now_ms
+                    && entry.authority_term == controller_term
+                {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "fanout {id} is leased by another worker"
+                    )));
+                }
+                entry.version = entry.version.checked_add(1).ok_or_else(|| {
+                    ControllerError::InvalidCommand(format!("fanout {id} version exhausted"))
+                })?;
+                entry.authority_term = controller_term;
+                entry.owner_id = Some(owner_id);
+                entry.lease_expires_at_ms = now_ms.saturating_add(ttl_ms.max(1));
+                entry.updated_at_ms = now_ms;
+                vec![StateKey::Fanout(id)]
             }
-            upsert_catalog(
-                &mut state.catalog_records,
+            ControllerCommand::UpdateFanout {
+                id,
+                owner_id,
+                expected_version,
+                progress_json,
+                completed,
+                now_ms,
+                controller_term,
+            } => {
+                let entry = state.fanout_outbox.get_mut(&id).ok_or_else(|| {
+                    ControllerError::InvalidCommand(format!("unknown fanout {id}"))
+                })?;
+                if entry.progress_json == progress_json && entry.completed == completed {
+                    return Ok(Vec::new());
+                }
+                if expected_version != entry.version
+                    || entry.authority_term != controller_term
+                    || entry.owner_id != Some(owner_id)
+                {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "fanout {id} ownership fence failed"
+                    )));
+                }
+                if entry.lease_expires_at_ms <= now_ms {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "fanout {id} lease expired"
+                    )));
+                }
+                if progress_json.len() > FANOUT_MAX_ENTRY_BYTES {
+                    return Err(ControllerError::InvalidCommand(format!(
+                    "fanout {id} progress is too large: {} bytes (limit {FANOUT_MAX_ENTRY_BYTES})",
+                    progress_json.len()
+                )));
+                }
+                entry.version = entry.version.checked_add(1).ok_or_else(|| {
+                    ControllerError::InvalidCommand(format!("fanout {id} version exhausted"))
+                })?;
+                entry.progress_json = progress_json;
+                entry.completed = completed;
+                entry.updated_at_ms = now_ms;
+                if completed {
+                    entry.owner_id = None;
+                    entry.lease_expires_at_ms = 0;
+                }
+                vec![StateKey::Fanout(id)]
+            }
+            ControllerCommand::GarbageCollectFanout {
+                ids,
+                completed_before_ms,
+                controller_term,
+            } => {
+                let ids: BTreeSet<_> = ids.into_iter().collect();
+                let removed: Vec<_> = state
+                    .fanout_outbox
+                    .values()
+                    .filter(|entry| {
+                        entry.completed
+                            && entry.authority_term <= controller_term
+                            && (ids.contains(&entry.id)
+                                || entry.updated_at_ms <= completed_before_ms)
+                    })
+                    .map(|entry| entry.id)
+                    .collect();
+                for id in &removed {
+                    state.fanout_outbox.remove(id);
+                }
+                removed.into_iter().map(StateKey::Fanout).collect()
+            }
+            ControllerCommand::RegisterDataNode { mut node } => {
+                node.controller_voter = state.controller_voters.contains(&node.id);
+                state.data_nodes.insert(node.id, node.clone());
+                if !state.nodes.values().any(|existing| existing.id == node.id) {
+                    let raft_id = raft_id(node.id);
+                    state.nodes.insert(
+                        raft_id,
+                        ControllerNode {
+                            id: node.id,
+                            raft_id,
+                            addr: node.addr.clone(),
+                        },
+                    );
+                }
+                state.membership_generation = state.membership_generation.saturating_add(1);
+                vec![StateKey::Meta]
+            }
+            ControllerCommand::PutCatalogRecord {
                 kind,
                 key,
                 payload_json,
                 tombstone,
-            );
-            state.catalog_epoch = state.catalog_epoch.saturating_add(1);
-        }
-        ControllerCommand::BeginRebalance { shard, add, remove } => {
-            let placement = state
-                .shards
-                .get_mut(&shard)
-                .ok_or_else(|| ControllerError::InvalidCommand(format!("unknown shard {shard}")))?;
-            if let Some(add) = add {
-                if !placement.replicas.contains(&add) && !placement.learners.contains(&add) {
-                    placement.learners.push(add);
+            } => {
+                if state.catalog_authoritative || state.catalog_frozen {
+                    return Err(ControllerError::CatalogConflict(
+                        "legacy catalog writes disabled; use MutateCatalog".into(),
+                    ));
                 }
+                state.catalog_epoch = state.catalog_epoch.saturating_add(1);
+                let map_key = catalog_key(&kind, &key);
+                upsert_catalog(
+                    &mut state.catalog_records,
+                    kind,
+                    key,
+                    payload_json,
+                    tombstone,
+                );
+                vec![StateKey::Meta, StateKey::Catalog(map_key)]
             }
-            let generation = state
-                .rebalance
-                .get(&shard)
-                .map(|op| op.generation.saturating_add(1))
-                .unwrap_or(1);
-            state.rebalance.insert(
-                shard,
-                RebalanceOp {
+            ControllerCommand::BeginRebalance { shard, add, remove } => {
+                let placement = state.shards.get_mut(&shard).ok_or_else(|| {
+                    ControllerError::InvalidCommand(format!("unknown shard {shard}"))
+                })?;
+                if let Some(add) = add {
+                    if !placement.replicas.contains(&add) && !placement.learners.contains(&add) {
+                        placement.learners.push(add);
+                    }
+                }
+                let generation = state
+                    .rebalance
+                    .get(&shard)
+                    .map(|op| op.generation.saturating_add(1))
+                    .unwrap_or(1);
+                state.rebalance.insert(
                     shard,
-                    adding: add.into_iter().collect(),
-                    removing: remove.into_iter().collect(),
-                    generation,
-                },
-            );
-        }
-        ControllerCommand::PromoteLearner { shard, node_id } => {
-            let placement = state
-                .shards
-                .get_mut(&shard)
-                .ok_or_else(|| ControllerError::InvalidCommand(format!("unknown shard {shard}")))?;
-            placement.learners.retain(|id| *id != node_id);
-            if !placement.replicas.contains(&node_id) {
-                placement.replicas.push(node_id);
+                    RebalanceOp {
+                        shard,
+                        adding: add.into_iter().collect(),
+                        removing: remove.into_iter().collect(),
+                        generation,
+                    },
+                );
+                vec![StateKey::Shard(shard), StateKey::Rebalance(shard)]
             }
-            if !placement.isr.contains(&node_id) {
-                placement.isr.push(node_id);
+            ControllerCommand::PromoteLearner { shard, node_id } => {
+                let placement = state.shards.get_mut(&shard).ok_or_else(|| {
+                    ControllerError::InvalidCommand(format!("unknown shard {shard}"))
+                })?;
+                placement.learners.retain(|id| *id != node_id);
+                if !placement.replicas.contains(&node_id) {
+                    placement.replicas.push(node_id);
+                }
+                if !placement.isr.contains(&node_id) {
+                    placement.isr.push(node_id);
+                }
+                vec![StateKey::Shard(shard)]
             }
-        }
-        ControllerCommand::CompleteRebalance { shard } => {
-            if let Some(op) = state.rebalance.remove(&shard) {
-                if let Some(placement) = state.shards.get_mut(&shard) {
-                    for id in op.removing {
-                        placement.replicas.retain(|r| *r != id);
-                        placement.isr.retain(|r| *r != id);
-                        placement.learners.retain(|r| *r != id);
-                        if placement.leader_id == id {
-                            if let Some(next) = pick_leader(&placement.replicas, shard) {
-                                placement.leader_id = next;
-                                placement.leader_term = placement.leader_term.saturating_add(1);
+            ControllerCommand::CompleteRebalance { shard } => {
+                if let Some(op) = state.rebalance.remove(&shard) {
+                    if let Some(placement) = state.shards.get_mut(&shard) {
+                        for id in op.removing {
+                            placement.replicas.retain(|r| *r != id);
+                            placement.isr.retain(|r| *r != id);
+                            placement.learners.retain(|r| *r != id);
+                            if placement.leader_id == id {
+                                if let Some(next) = pick_leader(&placement.replicas, shard) {
+                                    placement.leader_id = next;
+                                    placement.leader_term = placement.leader_term.saturating_add(1);
+                                }
                             }
                         }
                     }
-                }
-            }
-        }
-        ControllerCommand::SetGcWatermarks { leader_id, entries } => {
-            let mut rejected = Vec::new();
-            let mut applied = 0usize;
-            for entry in entries {
-                let fenced = state.shards.get(&entry.partition).is_some_and(|placement| {
-                    placement.leader_id == leader_id && placement.leader_term == entry.leader_term
-                });
-                let current = state.log_gc_watermark(&entry.namespace, entry.partition);
-                if !fenced {
-                    rejected.push(format!(
-                        "{}/{}: {leader_id} is not the shard leader at term {}",
-                        entry.namespace, entry.partition, entry.leader_term
-                    ));
-                } else if entry.watermark < current {
-                    rejected.push(format!(
-                        "{}/{}: watermark cannot move backwards ({} < {current})",
-                        entry.namespace, entry.partition, entry.watermark
-                    ));
+                    vec![StateKey::Shard(shard), StateKey::Rebalance(shard)]
                 } else {
-                    state
-                        .log_gc_watermarks
-                        .entry(entry.namespace)
-                        .or_default()
-                        .insert(entry.partition, entry.watermark);
-                    applied += 1;
+                    Vec::new()
                 }
             }
-            if applied == 0 && !rejected.is_empty() {
-                return Err(ControllerError::InvalidCommand(format!(
-                    "gc watermarks rejected: {}",
-                    rejected.join("; ")
-                )));
+            ControllerCommand::SetGcWatermarks { leader_id, entries } => {
+                let mut rejected = Vec::new();
+                let mut touched = Vec::new();
+                for entry in entries {
+                    let fenced = state.shards.get(&entry.partition).is_some_and(|placement| {
+                        placement.leader_id == leader_id
+                            && placement.leader_term == entry.leader_term
+                    });
+                    let current = state.log_gc_watermark(&entry.namespace, entry.partition);
+                    if !fenced {
+                        rejected.push(format!(
+                            "{}/{}: {leader_id} is not the shard leader at term {}",
+                            entry.namespace, entry.partition, entry.leader_term
+                        ));
+                    } else if entry.watermark < current {
+                        rejected.push(format!(
+                            "{}/{}: watermark cannot move backwards ({} < {current})",
+                            entry.namespace, entry.partition, entry.watermark
+                        ));
+                    } else {
+                        state
+                            .log_gc_watermarks
+                            .entry(entry.namespace.clone())
+                            .or_default()
+                            .insert(entry.partition, entry.watermark);
+                        touched.push(StateKey::LogGcWatermark {
+                            namespace: entry.namespace,
+                            partition: entry.partition,
+                        });
+                    }
+                }
+                if touched.is_empty() && !rejected.is_empty() {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "gc watermarks rejected: {}",
+                        rejected.join("; ")
+                    )));
+                }
+                if !rejected.is_empty() {
+                    tracing::warn!(?rejected, "some gc watermarks were rejected");
+                }
+                touched
             }
-            if !rejected.is_empty() {
-                tracing::warn!(?rejected, "some gc watermarks were rejected");
+            ControllerCommand::SetReplicationPolicy { factor, min_isr } => {
+                let factor = factor.max(1);
+                state.replication_factor = factor;
+                state.min_isr = min_isr_for(factor, min_isr);
+                vec![StateKey::Meta]
             }
-        }
-        ControllerCommand::SetReplicationPolicy { factor, min_isr } => {
-            let factor = factor.max(1);
-            state.replication_factor = factor;
-            state.min_isr = min_isr_for(factor, min_isr);
-        }
-        ControllerCommand::AddControllerVoter { node_id } => {
-            if !state.data_nodes.contains_key(&node_id)
-                && !state.nodes.values().any(|node| node.id == node_id)
-            {
-                return Err(ControllerError::InvalidCommand(format!(
-                    "unknown node {node_id}"
-                )));
+            ControllerCommand::AddControllerVoter { node_id } => {
+                if !state.data_nodes.contains_key(&node_id)
+                    && !state.nodes.values().any(|node| node.id == node_id)
+                {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "unknown node {node_id}"
+                    )));
+                }
+                if !state.controller_voters.contains(&node_id) {
+                    if state.controller_voters.len() >= 5 {
+                        return Err(ControllerError::InvalidCommand(
+                            "controller voter set is already at 5".into(),
+                        ));
+                    }
+                    state.controller_voters.push(node_id);
+                }
+                if let Some(node) = state.data_nodes.get_mut(&node_id) {
+                    node.controller_voter = true;
+                }
+                vec![StateKey::Meta]
             }
-            if !state.controller_voters.contains(&node_id) {
-                if state.controller_voters.len() >= 5 {
+            ControllerCommand::RemoveControllerVoter { node_id } => {
+                if !state.controller_voters.contains(&node_id) {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "{node_id} is not a controller voter"
+                    )));
+                }
+                if state.controller_voters.len() <= 1 {
                     return Err(ControllerError::InvalidCommand(
-                        "controller voter set is already at 5".into(),
+                        "cannot remove the last controller voter".into(),
                     ));
                 }
-                state.controller_voters.push(node_id);
+                state.controller_voters.retain(|id| *id != node_id);
+                if let Some(node) = state.data_nodes.get_mut(&node_id) {
+                    node.controller_voter = false;
+                }
+                vec![StateKey::Meta]
             }
-            if let Some(node) = state.data_nodes.get_mut(&node_id) {
-                node.controller_voter = true;
-            }
-        }
-        ControllerCommand::RemoveControllerVoter { node_id } => {
-            if !state.controller_voters.contains(&node_id) {
-                return Err(ControllerError::InvalidCommand(format!(
-                    "{node_id} is not a controller voter"
-                )));
-            }
-            if state.controller_voters.len() <= 1 {
-                return Err(ControllerError::InvalidCommand(
-                    "cannot remove the last controller voter".into(),
-                ));
-            }
-            state.controller_voters.retain(|id| *id != node_id);
-            if let Some(node) = state.data_nodes.get_mut(&node_id) {
-                node.controller_voter = false;
-            }
+        };
+    Ok(touched)
+}
+
+/// Entities a catalog mutation changed: the meta record (epoch, activation
+/// flags), its operation receipt and every catalog record that differs.
+fn catalog_touched(
+    before: &BTreeMap<String, CatalogRecord>,
+    state: &ControllerState,
+    operation_id: Uuid,
+) -> Vec<StateKey> {
+    let mut touched = vec![StateKey::Meta, StateKey::CatalogOperation(operation_id)];
+    for (key, record) in &state.catalog_records {
+        if before.get(key) != Some(record) {
+            touched.push(StateKey::Catalog(key.clone()));
         }
     }
-    Ok(())
+    touched.extend(
+        before
+            .keys()
+            .filter(|key| !state.catalog_records.contains_key(*key))
+            .cloned()
+            .map(StateKey::Catalog),
+    );
+    touched
 }
 
 pub fn raft_id(id: Uuid) -> NodeId {
@@ -1304,7 +1499,9 @@ mod tests {
     mod replicated {
         use super::*;
         use crate::rocks_store::RocksResponse;
-        use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, RaftStorage};
+        use openraft::{
+            CommittedLeaderId, Entry, EntryPayload, LogId, RaftSnapshotBuilder, RaftStorage,
+        };
 
         fn config(count: usize) -> (ClusterConfig, Vec<Uuid>) {
             let ids: Vec<_> = (0..count).map(|_| Uuid::new_v4()).collect();
@@ -1345,20 +1542,13 @@ mod tests {
         }
 
         async fn stored(store: &Arc<RocksStore>) -> ControllerState {
-            let json = store
-                .state_machine
-                .read()
-                .await
-                .get(STATE_KEY)
-                .unwrap()
-                .unwrap();
-            serde_json::from_str(&json).unwrap()
+            store.controller_state().unwrap().as_ref().clone()
         }
 
         #[tokio::test]
         async fn commands_from_successive_terms_build_on_committed_state() {
             let dir = tempfile::tempdir().unwrap();
-            let mut store = RocksStore::new(dir.path()).await;
+            let mut store = RocksStore::new(dir.path()).await.unwrap();
             let (config, ids) = config(3);
             let bootstrap = ControllerState::from_v1(&config, 2, &HashMap::new(), None).unwrap();
             apply(
@@ -1433,10 +1623,230 @@ mod tests {
             assert_eq!(stored(&store).await.shards[&0].leader_term, 2);
         }
 
+        fn accept(index: u64, id: Uuid, payload_json: String) -> Entry<TypeConfig> {
+            command(
+                1,
+                index,
+                ControllerCommand::AcceptFanout {
+                    id,
+                    tenant_id: "tenant".into(),
+                    acceptance_hash: id.to_string(),
+                    payload_json,
+                    created_at_ms: index as i64,
+                    controller_term: 0,
+                },
+            )
+        }
+
+        #[tokio::test]
+        async fn command_writes_only_the_entities_it_changes() {
+            let dir = tempfile::tempdir().unwrap();
+            let (config, ids) = config(3);
+            let bootstrap = ControllerState::from_v1(&config, 8, &HashMap::new(), None).unwrap();
+            let fanouts: Vec<_> = (0..20).map(|_| Uuid::new_v4()).collect();
+            {
+                let mut store = RocksStore::new(dir.path()).await.unwrap();
+                let mut entries = vec![entry(
+                    1,
+                    1,
+                    RocksRequest::ControllerBootstrap {
+                        state: Box::new(bootstrap),
+                    },
+                )];
+                for (index, id) in fanouts.iter().enumerate() {
+                    entries.push(accept(index as u64 + 2, *id, "x".repeat(64 * 1024)));
+                }
+                apply(&mut store, &entries).await;
+                assert!(
+                    store
+                        .last_commit_bytes
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        > 20 * 64 * 1024
+                );
+
+                // A scheduler renewal must not rewrite 1.3 MB of fan-out bodies.
+                apply(
+                    &mut store,
+                    &[command(
+                        1,
+                        30,
+                        ControllerCommand::AcquireScheduler {
+                            holder: ids[0],
+                            now_ms: 100,
+                            ttl_ms: 1_000,
+                        },
+                    )],
+                )
+                .await;
+                let bytes = store
+                    .last_commit_bytes
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                assert!(bytes < 4 * 1024, "scheduler renewal wrote {bytes} bytes");
+
+                // Readers share the published snapshot rather than copying it.
+                let first = store.controller_state().unwrap();
+                let second = store.controller_state().unwrap();
+                assert!(Arc::ptr_eq(&first, &second));
+                assert!(Arc::ptr_eq(
+                    &first.fanout_outbox[&fanouts[0]].payload_json,
+                    &second.fanout_outbox[&fanouts[0]].payload_json
+                ));
+            }
+            let reopened = RocksStore::new(dir.path()).await.unwrap();
+            let state = reopened.controller_state().unwrap();
+            assert_eq!(state.fanout_outbox.len(), 20);
+            assert_eq!(state.scheduler.as_ref().unwrap().holder, ids[0]);
+            assert_eq!(state.shards.len(), 8);
+        }
+
+        #[tokio::test]
+        async fn oversized_fanout_is_rejected_and_gc_honours_cutoff() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = RocksStore::new(dir.path()).await.unwrap();
+            let (config, ids) = config(1);
+            let bootstrap = ControllerState::from_v1(&config, 1, &HashMap::new(), None).unwrap();
+            let (big, old, recent) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+            let responses = apply(
+                &mut store,
+                &[
+                    entry(
+                        1,
+                        1,
+                        RocksRequest::ControllerBootstrap {
+                            state: Box::new(bootstrap),
+                        },
+                    ),
+                    accept(2, big, "x".repeat(FANOUT_MAX_ENTRY_BYTES + 1)),
+                    accept(3, old, "{}".into()),
+                    accept(4, recent, "{}".into()),
+                ],
+            )
+            .await;
+            assert!(matches!(
+                &responses[1].rejected,
+                Some(ControllerRejection::InvalidCommand(message)) if message.contains("too large")
+            ));
+            let mut index = 5;
+            for (id, now_ms) in [(old, 10), (recent, 1_000)] {
+                apply(
+                    &mut store,
+                    &[
+                        command(
+                            1,
+                            index,
+                            ControllerCommand::ClaimFanout {
+                                id,
+                                owner_id: ids[0],
+                                expected_version: 1,
+                                now_ms,
+                                ttl_ms: 100,
+                                controller_term: 0,
+                            },
+                        ),
+                        command(
+                            1,
+                            index + 1,
+                            ControllerCommand::UpdateFanout {
+                                id,
+                                owner_id: ids[0],
+                                expected_version: 2,
+                                progress_json: "{\"done\":true}".into(),
+                                completed: true,
+                                now_ms,
+                                controller_term: 0,
+                            },
+                        ),
+                    ],
+                )
+                .await;
+                index += 2;
+            }
+            let state = store.controller_state().unwrap();
+            assert!(!state.fanout_outbox.contains_key(&big));
+            assert_eq!(state.fanout_outbox[&old].progress_json, "{\"done\":true}");
+            assert_eq!(&*state.fanout_outbox[&old].payload_json, "{}");
+            apply(
+                &mut store,
+                &[command(
+                    1,
+                    index,
+                    ControllerCommand::GarbageCollectFanout {
+                        ids: Vec::new(),
+                        completed_before_ms: 500,
+                        controller_term: 0,
+                    },
+                )],
+            )
+            .await;
+            let state = store.controller_state().unwrap();
+            assert!(!state.fanout_outbox.contains_key(&old));
+            assert!(state.fanout_outbox.contains_key(&recent));
+            drop(store);
+            let reopened = RocksStore::new(dir.path()).await.unwrap();
+            assert!(!reopened
+                .controller_state()
+                .unwrap()
+                .fanout_outbox
+                .contains_key(&old));
+        }
+
+        #[tokio::test]
+        async fn legacy_single_value_state_is_migrated_and_snapshots_round_trip() {
+            let dir = tempfile::tempdir().unwrap();
+            let (config, ids) = config(3);
+            let mut legacy = ControllerState::from_v1(&config, 4, &HashMap::new(), None).unwrap();
+            legacy.catalog_epoch = 9;
+            {
+                let mut store = RocksStore::new(dir.path()).await.unwrap();
+                // Raw legacy layout, as written by older controllers.
+                let sm = store.state_machine.read().await;
+                sm.db
+                    .put_cf(
+                        sm.cf_sm_data(),
+                        STATE_KEY,
+                        serde_json::to_vec(&legacy).unwrap(),
+                    )
+                    .unwrap();
+                drop(sm);
+                drop(store);
+                store = RocksStore::new(dir.path()).await.unwrap();
+                assert_eq!(*store.controller_state().unwrap(), legacy);
+                assert_eq!(
+                    store.state_machine.read().await.get(STATE_KEY).unwrap(),
+                    None
+                );
+                apply(
+                    &mut store,
+                    &[command(
+                        2,
+                        1,
+                        ControllerCommand::AcquireShardLeadership {
+                            shard: 3,
+                            leader_id: ids[1],
+                        },
+                    )],
+                )
+                .await;
+                let snapshot = store.build_snapshot().await.unwrap();
+                let restored_dir = tempfile::tempdir().unwrap();
+                let mut restored = RocksStore::new(restored_dir.path()).await.unwrap();
+                restored
+                    .install_snapshot(&snapshot.meta, snapshot.snapshot)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    *restored.controller_state().unwrap(),
+                    *store.controller_state().unwrap()
+                );
+                let current = restored.get_current_snapshot().await.unwrap().unwrap();
+                assert_eq!(current.meta, snapshot.meta);
+            }
+        }
+
         #[tokio::test]
         async fn rejected_command_is_a_replicated_no_op() {
             let dir = tempfile::tempdir().unwrap();
-            let mut store = RocksStore::new(dir.path()).await;
+            let mut store = RocksStore::new(dir.path()).await.unwrap();
             let (config, _) = config(1);
             let bootstrap = ControllerState::from_v1(&config, 1, &HashMap::new(), None).unwrap();
             let stranger = Uuid::new_v4();
@@ -1473,7 +1883,7 @@ mod tests {
         #[tokio::test]
         async fn fanout_authority_term_comes_from_the_log_entry() {
             let dir = tempfile::tempdir().unwrap();
-            let mut store = RocksStore::new(dir.path()).await;
+            let mut store = RocksStore::new(dir.path()).await.unwrap();
             let (config, _) = config(1);
             let bootstrap = ControllerState::from_v1(&config, 1, &HashMap::new(), None).unwrap();
             let id = Uuid::new_v4();
@@ -1591,7 +2001,7 @@ mod tests {
                 id: fanout_id,
                 owner_id: ids[0],
                 expected_version: 2,
-                payload_json: r#"{"completed":true}"#.into(),
+                progress_json: r#"{"completed":true}"#.into(),
                 completed: true,
                 now_ms: 11,
                 controller_term: 4,

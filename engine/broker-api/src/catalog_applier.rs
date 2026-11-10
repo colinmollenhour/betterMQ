@@ -194,7 +194,7 @@ async fn replay_receipt(
 /// Taking a fresh version only at commit would overwrite concurrent changes with
 /// a payload prepared from an older cache.
 pub(crate) struct Mutation {
-    baseline: Option<ControllerState>,
+    baseline: Option<Arc<ControllerState>>,
     operation_id: Uuid,
 }
 pub(crate) fn begin(state: &AppState) -> Result<Mutation, ApiError> {
@@ -438,7 +438,7 @@ pub(crate) fn materialize(state: &AppState) -> Result<u64, ApiError> {
     Ok(materialize_snapshot(state)?.map_or(0, |s| s.catalog_epoch))
 }
 
-fn materialize_snapshot(state: &AppState) -> Result<Option<ControllerState>, ApiError> {
+fn materialize_snapshot(state: &AppState) -> Result<Option<Arc<ControllerState>>, ApiError> {
     let Some(cluster) = &state.cluster else {
         return Ok(None);
     };

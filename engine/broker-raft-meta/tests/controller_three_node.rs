@@ -51,8 +51,24 @@ async fn snapshot(
         .map_err(|error| (StatusCode::CONFLICT, error.to_string()))
 }
 
+async fn command(
+    State(controller): State<OpenRaftController>,
+    headers: axum::http::HeaderMap,
+    Json(command): Json<ControllerCommand>,
+) -> Result<Json<broker_raft_meta::ControllerCommandResponse>, ApiError> {
+    let applied_index_only = headers
+        .get(broker_raft_meta::CONTROLLER_RESPONSE_HEADER)
+        .is_some_and(|value| value == broker_raft_meta::CONTROLLER_RESPONSE_APPLIED_INDEX);
+    controller
+        .serve_forwarded(command, applied_index_only)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))
+}
+
 fn app(controller: OpenRaftController) -> Router {
     Router::new()
+        .route("/internal/v1/controller/command", post(command))
         .route("/internal/v1/controller/raft/vote", post(vote))
         .route("/internal/v1/controller/raft/append", post(append))
         .route("/internal/v1/controller/raft/snapshot", post(snapshot))
@@ -164,6 +180,19 @@ async fn catalog_cluster(node_count: usize) {
     .await
     .expect("controller state replicated to all three nodes");
 
+    // A follower forwards to the leader and reads the result from its own
+    // replica once it has applied the entry.
+    let follower = controllers
+        .iter()
+        .find(|controller| !controller.is_leader_with_quorum())
+        .unwrap();
+    let forwarded = follower
+        .submit(ControllerCommand::AdvanceCatalogEpoch)
+        .await
+        .unwrap();
+    assert_eq!(forwarded.catalog_epoch, 2);
+    assert_eq!(follower.state().catalog_epoch, 2);
+
     // Lose the current leader between mutations. The next leader's barrier must
     // precede its state read, including when its cached state is still behind.
     let previous_id = leader.raft().metrics().borrow().id;
@@ -197,7 +226,7 @@ async fn catalog_cluster(node_count: usize) {
         })
         .await
         .unwrap();
-    assert_eq!(updated_state.catalog_epoch, 2);
+    assert_eq!(updated_state.catalog_epoch, 3);
     assert_eq!(updated_state.catalog_records[&mutation.key()].version, 2);
     let stale = tokio::time::timeout(
         Duration::from_secs(3),

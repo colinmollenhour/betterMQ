@@ -1864,6 +1864,7 @@ pub async fn internal_controller_snapshot(
 
 pub async fn internal_controller_command(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(command): Json<broker_raft_meta::ControllerCommand>,
 ) -> Result<Json<broker_raft_meta::ControllerCommandResponse>, ApiError> {
     let controller = state
@@ -1871,11 +1872,14 @@ pub async fn internal_controller_command(
         .as_ref()
         .and_then(|cluster| cluster.runtime.controller())
         .ok_or_else(|| ApiError::Unavailable("OpenRaft controller is not enabled".into()))?;
-    let state = controller
-        .submit_local(command)
+    let applied_index_only = headers
+        .get(broker_raft_meta::CONTROLLER_RESPONSE_HEADER)
+        .is_some_and(|value| value == broker_raft_meta::CONTROLLER_RESPONSE_APPLIED_INDEX);
+    controller
+        .serve_forwarded(command, applied_index_only)
         .await
-        .map_err(crate::catalog_applier::controller_error)?;
-    Ok(Json(broker_raft_meta::ControllerCommandResponse { state }))
+        .map(Json)
+        .map_err(crate::catalog_applier::controller_error)
 }
 
 /// Merge peer health observations from another cluster member (CP7b gossip).
