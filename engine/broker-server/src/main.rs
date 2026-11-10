@@ -650,7 +650,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             policy.replication_factor,
             policy.min_isr,
         )?;
-        Some(Cluster::new(runtime))
+        Some(Cluster::new(runtime).with_physical_shards(broker.layout().is_physical()))
     } else {
         None
     };

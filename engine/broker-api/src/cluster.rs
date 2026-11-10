@@ -200,6 +200,12 @@ impl ClusterHandle {
             .is_none_or(|controller| self.catalog_apply.ready(controller.catalog_revision()))
     }
 
+    /// Track replication progress per physical shard (V2 layouts).
+    pub fn with_physical_shards(mut self, physical: bool) -> Self {
+        self.replication = self.replication.with_physical_shards(physical);
+        self
+    }
+
     pub fn new(runtime: ClusterRuntime) -> Self {
         let replication =
             ReplicationClient::new(runtime.config().clone()).with_runtime(runtime.clone());

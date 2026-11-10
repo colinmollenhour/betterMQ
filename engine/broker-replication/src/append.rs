@@ -14,6 +14,10 @@ use uuid::Uuid;
 
 type SharedReplicaProgress = Arc<Mutex<HashMap<(String, u32, Uuid), ReplicaProgress>>>;
 
+/// Progress for a stream that has seen no replication traffic for this long
+/// is dropped (deleted topics, departed peers).
+const PROGRESS_RETENTION_MS: u64 = 60 * 60 * 1000;
+
 const EPOCH_MAGIC: [u8; 4] = *b"BMQE";
 const EPOCH_VERSION: u16 = 1;
 const FIXED_HEADER_LEN: usize = 64;
@@ -494,6 +498,8 @@ pub struct ReplicateOutcome {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ReplicaProgress {
     pub peer_id: Uuid,
+    /// Replication stream: the logical topic of a V1 partition log, or empty
+    /// for a V2 physical shard (whose log carries many topics).
     pub topic: String,
     pub partition: u32,
     pub durable_hwm: u64,
@@ -502,6 +508,8 @@ pub struct ReplicaProgress {
     pub in_sync: bool,
     pub last_success_ms: Option<u64>,
     pub consecutive_failures: u64,
+    /// Last time this stream was updated (success or failure).
+    pub last_update_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -697,6 +705,7 @@ pub struct ReplicationClient {
     progress: SharedReplicaProgress,
     telemetry: Arc<crate::telemetry::ReplicationTelemetry>,
     runtime: Option<broker_raft_meta::ClusterRuntime>,
+    physical_shards: bool,
 }
 
 impl ReplicationClient {
@@ -716,6 +725,23 @@ impl ReplicationClient {
             progress: Arc::new(Mutex::new(HashMap::new())),
             telemetry: Arc::new(crate::telemetry::ReplicationTelemetry::default()),
             runtime: None,
+            physical_shards: false,
+        }
+    }
+
+    /// V2 layouts keep one log per physical shard, so progress is tracked per
+    /// shard and peer rather than per logical topic.
+    pub fn with_physical_shards(mut self, physical: bool) -> Self {
+        self.physical_shards = physical;
+        self
+    }
+
+    /// Progress stream for an epoch of `topic`.
+    pub fn progress_stream(&self, topic: &str) -> String {
+        if self.physical_shards {
+            String::new()
+        } else {
+            topic.to_string()
         }
     }
 
@@ -846,7 +872,7 @@ impl ReplicationClient {
             let tx = tx.clone();
             let epoch_permit = Arc::clone(&epoch_permit);
             let progress = Arc::clone(&self.progress);
-            let topic = req.topic.clone();
+            let topic = self.progress_stream(&req.topic);
             let partition = req.partition;
             let leader_epoch = req.leader_epoch;
             let peer_id = peer.id;
@@ -992,19 +1018,37 @@ impl ReplicationClient {
     }
 
     pub fn replica_progress(&self) -> Vec<ReplicaProgress> {
-        let mut progress: Vec<_> = self
+        let mut all = self
             .progress
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cutoff = now_ms().saturating_sub(PROGRESS_RETENTION_MS);
+        all.retain(|_, entry| entry.last_update_ms >= cutoff);
+        let mut progress: Vec<_> = all.values().cloned().collect();
+        drop(all);
         progress.sort_by_key(|p| (p.partition, p.topic.clone(), p.peer_id));
         progress
     }
 
+    /// ISR and lag telemetry. Only peers that are current replication targets
+    /// of a shard count toward its ISR.
     pub fn telemetry_snapshot(&self) -> crate::telemetry::ReplicationTelemetrySnapshot {
-        let progress = self.replica_progress();
+        let mut progress = self.replica_progress();
+        if self.runtime.is_some() {
+            let mut targets: HashMap<u32, Vec<Uuid>> = HashMap::new();
+            progress.retain(|entry| {
+                targets
+                    .entry(entry.partition)
+                    .or_insert_with(|| {
+                        self.targets_for_shard(entry.partition)
+                            .0
+                            .into_iter()
+                            .map(|peer| peer.id)
+                            .collect()
+                    })
+                    .contains(&entry.peer_id)
+            });
+        }
         self.telemetry.snapshot(&progress)
     }
 
@@ -1102,8 +1146,12 @@ fn update_progress(
         in_sync: false,
         last_success_ms: None,
         consecutive_failures: 0,
+        last_update_ms: 0,
     });
-    entry.leader_hwm = leader_hwm;
+    entry.last_update_ms = now_ms();
+    // Concurrent epochs can complete out of order; an older epoch's ack must
+    // not hide a failure of a newer one, so the leader frontier only grows.
+    entry.leader_hwm = entry.leader_hwm.max(leader_hwm);
     if success {
         entry.durable_hwm = entry.durable_hwm.max(durable_hwm);
         entry.last_success_ms = Some(now_ms());
@@ -1111,8 +1159,8 @@ fn update_progress(
     } else {
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
     }
-    entry.lag = leader_hwm.saturating_sub(entry.durable_hwm);
-    entry.in_sync = success && entry.durable_hwm >= leader_hwm;
+    entry.lag = entry.leader_hwm.saturating_sub(entry.durable_hwm);
+    entry.in_sync = success && entry.durable_hwm >= entry.leader_hwm;
 }
 
 #[cfg(test)]
@@ -1360,6 +1408,38 @@ mod tests {
             ReplicateCatchUpRange::decode_binary(&encoded),
             Err(ReplicateError::InvalidEpoch(message)) if message.contains("count")
         ));
+    }
+
+    #[test]
+    fn v2_progress_is_per_physical_shard_and_out_of_order_acks_do_not_hide_lag() {
+        let peer = Uuid::new_v4();
+        let client = ReplicationClient::new(ClusterConfig {
+            cluster_id: Uuid::new_v4(),
+            nodes: Vec::new(),
+            node_id: Uuid::new_v4(),
+            generation: 1,
+            hash_version: 1,
+        })
+        .with_physical_shards(true);
+        // Two logical topics routed to physical shard 4 share one stream.
+        for topic in ["orders", "billing"] {
+            let stream = client.progress_stream(topic);
+            update_progress(&client.progress, &stream, 4, peer, 10, 10, true);
+        }
+        assert_eq!(client.replica_progress().len(), 1);
+        assert_eq!(client.telemetry_snapshot().shards[0].isr_members, 2);
+
+        // Epoch ending at 20 fails, then the older epoch ending at 15 acks.
+        let stream = client.progress_stream("orders");
+        update_progress(&client.progress, &stream, 4, peer, 20, 0, false);
+        update_progress(&client.progress, &stream, 4, peer, 15, 15, true);
+        let progress = client.replica_progress();
+        assert!(!progress[0].in_sync);
+        assert_eq!(progress[0].lag, 5);
+        assert_eq!(client.telemetry_snapshot().shards[0].isr_members, 1);
+
+        let v1 = ReplicationClient::new(client.cluster.clone());
+        assert_eq!(v1.progress_stream("orders"), "orders");
     }
 
     #[tokio::test]

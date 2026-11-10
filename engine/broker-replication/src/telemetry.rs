@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use uuid::Uuid;
 
 pub const MAX_REPLICATION_TELEMETRY_SHARDS: usize = 4096;
 pub const QUORUM_BUCKET_MS: [u64; 10] = [1, 2, 5, 10, 20, 50, 100, 250, 500, 1_000];
@@ -97,12 +98,18 @@ impl ReplicationTelemetry {
             .take(MAX_REPLICATION_TELEMETRY_SHARDS)
             .map(|shard| {
                 let counters = registry.shards.get(&shard);
-                let mut isr_members = 1u64;
+                // A peer may have several progress streams on one shard (V1
+                // topics sharing a partition number). It is in sync only when
+                // every one of its streams is, and it counts once.
+                let mut peers: BTreeMap<Uuid, bool> = BTreeMap::new();
                 let mut max_replica_lag = 0u64;
                 for replica in progress.iter().filter(|item| item.partition == shard) {
-                    isr_members = isr_members.saturating_add(u64::from(replica.in_sync));
+                    let in_sync = peers.entry(replica.peer_id).or_insert(true);
+                    *in_sync &= replica.in_sync;
                     max_replica_lag = max_replica_lag.max(replica.lag);
                 }
+                let in_sync_peers = peers.values().filter(|in_sync| **in_sync).count() as u64;
+                let isr_members = 1u64.saturating_add(in_sync_peers);
                 ReplicationShardTelemetrySnapshot {
                     shard,
                     quorum_requests: load(counters, |value| &value.quorum_requests),
@@ -179,5 +186,43 @@ mod tests {
         assert_eq!(shard.follower_durable_acks_total, 1);
         assert_eq!(shard.quorum_latency_count, 2);
         assert_eq!(shard.quorum_buckets.iter().sum::<u64>(), 2);
+    }
+
+    fn progress(peer: Uuid, topic: &str, in_sync: bool, lag: u64) -> ReplicaProgress {
+        ReplicaProgress {
+            peer_id: peer,
+            topic: topic.into(),
+            partition: 3,
+            durable_hwm: 10 - lag,
+            leader_hwm: 10,
+            lag,
+            in_sync,
+            last_success_ms: Some(1),
+            consecutive_failures: u64::from(!in_sync),
+            last_update_ms: 1,
+        }
+    }
+
+    #[test]
+    fn isr_counts_each_peer_once_and_requires_every_stream_in_sync() {
+        let telemetry = ReplicationTelemetry::default();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        // RF=3: two followers, each with progress on two topics of shard 3.
+        let snapshot = telemetry.snapshot(&[
+            progress(a, "orders", true, 0),
+            progress(a, "billing", true, 0),
+            progress(b, "orders", true, 0),
+            progress(b, "billing", false, 4),
+        ]);
+        let shard = &snapshot.shards[0];
+        assert_eq!(shard.isr_members, 2, "leader + a; b lags on billing");
+        assert_eq!(shard.max_replica_lag, 4);
+        let healthy = telemetry.snapshot(&[
+            progress(a, "orders", true, 0),
+            progress(a, "billing", true, 0),
+            progress(b, "orders", true, 0),
+            progress(b, "billing", true, 0),
+        ]);
+        assert_eq!(healthy.shards[0].isr_members, 3, "never more than RF");
     }
 }
