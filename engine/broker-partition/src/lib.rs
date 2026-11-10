@@ -11,6 +11,7 @@ pub mod http_delivery;
 mod layout;
 pub mod payload;
 mod priority;
+mod retention;
 mod shard;
 mod subscriptions;
 mod telemetry;
@@ -29,9 +30,10 @@ pub use priority::{
 
 pub use broker::{
     AppendedRecordRef, AppendedShardBatch, Broker, BrokerConfig, BrokerError,
-    CreateSubscriptionRequest, CreateSubscriptionResponse, DestinationSnapshot, PendingDedup,
-    PreparedPublishBatch, PreparedShardBatch, PreparedShardKey, PublishRequest, PublishResponse,
-    ScheduledInfo, TopicMessagePage, DEDUP_IN_FLIGHT_WAIT, DEFAULT_PARTITIONS, DEFAULT_TENANT,
+    CreateSubscriptionRequest, CreateSubscriptionResponse, DestinationSnapshot, LogId,
+    PendingDedup, PreparedPublishBatch, PreparedShardBatch, PreparedShardKey, PublishRequest,
+    PublishResponse, ScheduledInfo, TopicMessagePage, DEDUP_IN_FLIGHT_WAIT, DEFAULT_PARTITIONS,
+    DEFAULT_TENANT,
 };
 pub use flows::{FlowProfile, FlowProfileError, FlowProfileRegistry};
 pub use groups::{DispatchGroup, GroupError, GroupMember, GroupRegistry};
@@ -44,7 +46,12 @@ pub use topic::{
 
 pub use broker_storage::{DedupEntry, StoredMessage};
 pub use layout::{ShardLayout, DEFAULT_V2_SHARDS, LAYOUT_V1, LAYOUT_V2};
-pub use shard::{CommitTicket, ShardHandle};
+pub use retention::{
+    pins_by_log, record_log_retention, record_retention_error, retention_telemetry_snapshot,
+    BlobSweepReport, CollectReport, LogRetentionTelemetry, RetentionConfig, RetentionLimit,
+    RetentionStore, RetentionTelemetrySnapshot, SafeWatermark,
+};
+pub use shard::{CommitTicket, LogRetentionStatus, ShardHandle};
 pub use telemetry::{
     partition_telemetry_snapshot, PartitionTelemetrySnapshot, ShardQueueTelemetrySnapshot,
     MAX_QUEUE_TELEMETRY_SHARDS,

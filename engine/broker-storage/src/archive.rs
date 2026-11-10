@@ -140,7 +140,13 @@ fn unix_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+/// Any archive setting present, even an invalid one: an empty
+/// `BETTERMQ_ARCHIVE_DIR` blocks admission and pins retention (fail closed).
 pub(crate) fn archive_configured() -> bool {
+    #[cfg(test)]
+    if FORCE_ARCHIVE_CONFIGURED.with(std::cell::Cell::get) {
+        return true;
+    }
     [
         "BETTERMQ_ARCHIVE_BUCKET",
         "S3_ARCHIVE_BUCKET",
@@ -308,6 +314,36 @@ pub fn enqueue_sealed_segment(path: &Path) {
         return;
     }
     queue_archive_job(service, path);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lets tests treat archiving as configured without racing on process env.
+    pub(crate) static FORCE_ARCHIVE_CONFIGURED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// True when archiving is configured and `segment` has not durably finished
+/// archiving (a pending marker, or no completion record). Retention must keep
+/// such a segment's local bytes or a bounded archive retry loses them.
+pub fn segment_retention_blocked(segment: &Path) -> bool {
+    archive_configured() && (pending_marker(segment).exists() || !complete_marker(segment).exists())
+}
+
+/// Remove the archive markers of a segment that retention has unlinked, so
+/// completion records do not accumulate. (Archive checkpoints are removed by
+/// the archiver itself once a segment's archive is published.)
+pub(crate) fn remove_segment_markers(segment: &Path) {
+    let markers = [pending_marker(segment), complete_marker(segment)];
+    for marker in markers {
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(marker = %marker.display(), %error, "failed to remove archive marker")
+            }
+        }
+    }
 }
 
 fn pending_marker(path: &Path) -> PathBuf {

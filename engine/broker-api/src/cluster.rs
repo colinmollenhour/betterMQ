@@ -1756,11 +1756,16 @@ pub async fn internal_replicate_catch_up(
         .into_iter()
         .map(|(offset, bytes)| CatchUpFrame { offset, bytes })
         .collect();
+    let base_offset = state
+        .broker
+        .log_retention_status(&state.broker.log_id(&body.topic, body.partition), 0)?
+        .base_offset;
     let encoded = ReplicateCatchUpRange {
         partition: body.partition,
         leader_generation,
         frames,
         committed_hwm,
+        base_offset,
     }
     .encode_binary()
     .map_err(|error| ApiError::BadRequest(error.to_string()))?;

@@ -35,7 +35,8 @@ pub use slate_log::{slate_db_path, slate_topics};
 pub use archive::{
     archive_admission_blocked, archive_lag_status, restore_local_archive,
     restore_local_archive_source_until, restore_local_archive_until, scrub_local_archive,
-    start_archive_service, ArchiveError, ArchiveLagStatus, ArchiveManifest, ArchiveToolReport,
+    segment_retention_blocked, start_archive_service, ArchiveError, ArchiveLagStatus,
+    ArchiveManifest, ArchiveToolReport,
 };
 #[cfg(feature = "s3")]
 pub use archive::{

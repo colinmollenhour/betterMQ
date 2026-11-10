@@ -221,6 +221,20 @@ pub struct ScheduledInfo {
     pub deliver_at_ms: i64,
 }
 
+/// Identity of one physical log on this node: `(topic, partition)` in layout
+/// V1, `("__physical", shard)` in V2.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LogId {
+    pub namespace: String,
+    pub partition: u32,
+}
+
+impl std::fmt::Display for LogId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}/{}", self.namespace, self.partition)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReservationKey {
     tenant_id: String,
@@ -523,6 +537,7 @@ struct BrokerInner {
     flows: FlowProfileRegistry,
     groups: GroupRegistry,
     blob_store: BlobStore,
+    retention: crate::retention::RetentionStore,
     layout: ShardLayout,
     shards: RwLock<HashMap<String, HashMap<u32, Arc<ShardHandle>>>>,
     // Serialize opens of the same backend without blocking unrelated shards.
@@ -755,6 +770,7 @@ impl Broker {
         let flows = FlowProfileRegistry::open(&config.data_dir)?;
         let groups = GroupRegistry::open(&config.data_dir)?;
         let blob_store = crate::blob::open_blob_store(&config.data_dir, config.storage)?;
+        let retention = crate::retention::RetentionStore::open(&config.data_dir)?;
 
         let broker = Self {
             inner: Arc::new(BrokerInner {
@@ -764,6 +780,7 @@ impl Broker {
                 flows,
                 groups,
                 blob_store,
+                retention,
                 layout,
                 shards: RwLock::new(HashMap::new()),
                 shard_open_locks: Mutex::new(HashMap::new()),
@@ -1170,6 +1187,113 @@ impl Broker {
         handle
             .gc_sealed_below(watermark)
             .map_err(BrokerError::Storage)
+    }
+
+    /// The physical log holding `topic` on `partition`.
+    pub fn log_id(&self, topic: &str, partition: u32) -> LogId {
+        LogId {
+            namespace: self.inner.layout.storage_namespace(topic).to_string(),
+            partition,
+        }
+    }
+
+    /// Local logs that exist on disk (opened lazily otherwise). V2 lists the
+    /// physical shards, V1 every `topic/pN` directory of this tenant.
+    pub fn retained_logs(&self) -> Vec<LogId> {
+        if self.inner.config.storage != StorageMode::Local {
+            return Vec::new();
+        }
+        let layout = &self.inner.layout;
+        let data_dir = &self.inner.config.data_dir;
+        if layout.is_physical() {
+            return (0..layout.shard_count)
+                .filter(|shard| layout.physical_shard_dir(data_dir, *shard).exists())
+                .map(|partition| LogId {
+                    namespace: layout.storage_namespace("").to_string(),
+                    partition,
+                })
+                .collect();
+        }
+        let mut logs = Vec::new();
+        let tenant_dir = data_dir.join("partitions").join(self.tenant());
+        let Ok(topics) = std::fs::read_dir(tenant_dir) else {
+            return logs;
+        };
+        for topic in topics.flatten() {
+            let namespace = topic.file_name().to_string_lossy().into_owned();
+            let Ok(partitions) = std::fs::read_dir(topic.path()) else {
+                continue;
+            };
+            for partition in partitions.flatten() {
+                let name = partition.file_name();
+                let Some(partition) = name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix('p'))
+                    .and_then(|index| index.parse::<u32>().ok())
+                    .filter(|index| *index < layout.shard_count)
+                else {
+                    continue;
+                };
+                logs.push(LogId {
+                    namespace: namespace.clone(),
+                    partition,
+                });
+            }
+        }
+        logs.sort();
+        logs
+    }
+
+    pub fn log_committed_hwm(&self, log: &LogId) -> Result<u64, BrokerError> {
+        Ok(self
+            .shard_handle(&log.namespace, log.partition)?
+            .committed_hwm())
+    }
+
+    /// Records of one physical log from `from` (inclusive), every topic.
+    pub fn read_log(
+        &self,
+        log: &LogId,
+        from: u64,
+        max: usize,
+    ) -> Result<Vec<StoredMessage>, BrokerError> {
+        Ok(self
+            .shard_handle(&log.namespace, log.partition)?
+            .read_range(log.partition, from, max)?)
+    }
+
+    pub fn log_retention_status(
+        &self,
+        log: &LogId,
+        watermark: u64,
+    ) -> Result<crate::shard::LogRetentionStatus, BrokerError> {
+        Ok(self
+            .shard_handle(&log.namespace, log.partition)?
+            .retention_status(watermark)?)
+    }
+
+    /// Delete the whole sealed segments of `log` below `boundary`. Use
+    /// [`crate::RetentionStore::collect`], which tombstones their payload
+    /// blobs first and never passes an unsafe boundary.
+    pub(crate) fn gc_log(&self, log: &LogId, boundary: u64) -> Result<usize, BrokerError> {
+        Ok(self
+            .shard_handle(&log.namespace, log.partition)?
+            .gc_sealed_below(boundary)?)
+    }
+
+    /// Continue an empty or fully-collected local log at `base`.
+    pub fn reset_log_base(&self, log: &LogId, base: u64) -> Result<(), BrokerError> {
+        Ok(self
+            .shard_handle(&log.namespace, log.partition)?
+            .reset_base(base)?)
+    }
+
+    pub fn blob_store(&self) -> &BlobStore {
+        &self.inner.blob_store
+    }
+
+    pub fn retention(&self) -> &crate::retention::RetentionStore {
+        &self.inner.retention
     }
 
     /// Group-commit timer: flush shards whose interval has elapsed.
@@ -1602,7 +1726,9 @@ impl Broker {
     ) -> Result<PreparedRecord, BrokerError> {
         let tenant_id = self.tenant();
         let message_id = Uuid::new_v4();
-        // Large payloads may write a blob before append; crash orphans are GC'd later.
+        // Large payloads write their blob before the append. Retention deletes
+        // blobs of collected or purged records; a blob orphaned by a failed
+        // append or a crash before it is not reclaimed.
         let (log_payload, payload_ref_json) =
             prepare_for_log(&self.inner.blob_store, &tenant_id, message_id, payload)?;
 
@@ -2130,8 +2256,7 @@ impl Broker {
         if is_dlq_topic(topic) {
             return Ok(false);
         }
-        let removed = self.shard_handle(topic, partition)?.purge_offset(offset)?;
-        Ok(removed)
+        self.purge_offset_and_blob(topic, partition, offset)
     }
 
     /// Remove a dead-letter record (operator cleanup from the panel / API).
@@ -2144,7 +2269,29 @@ impl Broker {
         if !is_dlq_topic(topic) {
             return Ok(false);
         }
-        let removed = self.shard_handle(topic, partition)?.purge_offset(offset)?;
+        self.purge_offset_and_blob(topic, partition, offset)
+    }
+
+    /// Tombstone one record and queue its payload blob (if any) for deletion:
+    /// retention never sees purged records again.
+    fn purge_offset_and_blob(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<bool, BrokerError> {
+        let handle = self.shard_handle(topic, partition)?;
+        let reference = handle
+            .read_range(partition, offset, 1)?
+            .into_iter()
+            .find(|message| message.offset == offset)
+            .and_then(|message| crate::retention::payload_reference(&message));
+        let removed = handle.purge_offset(offset)?;
+        if removed {
+            if let Some(reference) = reference {
+                self.inner.retention.tombstone_blobs(vec![reference])?;
+            }
+        }
         Ok(removed)
     }
 
@@ -2184,8 +2331,9 @@ impl Broker {
         Ok(deleted)
     }
 
-    /// Delivery no longer physically purges; GC is sealed-segment retention.
-    /// Kept so callers compile; always returns false.
+    /// Delivery no longer physically purges; delivered records are reclaimed
+    /// by automatic sealed-segment retention (`RetentionStore`). Kept so
+    /// callers compile; always returns false.
     pub fn try_purge_message(
         &self,
         _topic: &str,

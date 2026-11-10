@@ -21,6 +21,11 @@ without quorum. This correctness check does not replace the hardware soak below.
 - A restore drill from a checksummed backup completes within the documented RTO.
 - Capacity tests use production body sizes, batch sizes, durability, TLS, and
   destination latency. Keep at least 30% disk, memory, and ingest headroom.
+- Size WAL disks for `BETTERMQ_RETENTION_MIN_AGE_SECS` (default 24h) of ingest
+  plus your longest expected delivery backlog. Retention only deletes delivered,
+  replicated and archived segments. Alert on a flat `bettermq_gc_watermark`
+  while `bettermq_wal_retained_bytes_total` grows, and on
+  `bettermq_retention_errors_total`.
 - Slate remains outside the low-latency ACK profile. Core V2 ACKs from the
   local/RF=3 WAL; sealed segment archive is asynchronous.
 

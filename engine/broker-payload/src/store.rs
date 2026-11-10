@@ -90,6 +90,16 @@ impl BlobStore {
         }
     }
 
+    /// Delete a blob that retention has proven unreferenced. Returns whether
+    /// it existed; deleting an absent blob succeeds.
+    pub fn delete_blob(&self, reference: &PayloadRef) -> Result<bool, PayloadError> {
+        match self {
+            Self::Fs(fs) => fs.delete_blob(reference),
+            #[cfg(feature = "s3")]
+            Self::S3(s3) => s3.delete_blob(reference),
+        }
+    }
+
     pub fn get_blob_to_writer<W: std::io::Write + Unpin>(
         &self,
         reference: &PayloadRef,

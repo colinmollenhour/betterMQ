@@ -576,6 +576,7 @@ impl PartitionLog {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
+            crate::archive::remove_segment_markers(&path);
         }
         if removed > 0 {
             File::open(&segments)?.sync_all()?;
@@ -1502,6 +1503,40 @@ impl PartitionLog {
         self.meta.base_offset
     }
 
+    /// Number of leading sealed segments that end at or below `watermark`
+    /// (exclusive) and may be unlinked. Stops at the first segment that is
+    /// still waiting to be archived, so a bounded archive retry never loses
+    /// its local bytes.
+    fn condemned_segments(&self, watermark: u64) -> usize {
+        self.sealed_indexes
+            .iter()
+            .take_while(|segment| {
+                segment.last_offset <= watermark
+                    && !crate::archive::segment_retention_blocked(&segment.path)
+            })
+            .count()
+    }
+
+    /// Exclusive offset that [`Self::gc_sealed_below`] would collect up to
+    /// for `watermark`: the end of the last whole sealed segment it would
+    /// delete, or the current base when nothing is collectable.
+    pub fn gc_boundary(&self, watermark: u64) -> u64 {
+        match self.condemned_segments(watermark) {
+            0 => self.meta.base_offset,
+            count => self.sealed_indexes[count - 1].last_offset,
+        }
+    }
+
+    /// Bytes of WAL data on disk (sealed segments plus the active WAL).
+    pub fn retained_bytes(&self) -> u64 {
+        self.sealed_indexes
+            .iter()
+            .filter_map(|segment| std::fs::metadata(&segment.path).ok())
+            .map(|metadata| metadata.len())
+            .sum::<u64>()
+            .saturating_add(self.wal_size)
+    }
+
     /// Delete the leading sealed segments that end at or below `watermark`
     /// (exclusive offset). The active WAL is never deleted. Watermark only
     /// moves forward.
@@ -1518,13 +1553,19 @@ impl PartitionLog {
                 format!("gc watermark {watermark} is below durable {current}"),
             )));
         }
-        let condemned = self
-            .sealed_indexes
-            .iter()
-            .take_while(|segment| segment.last_offset <= watermark)
-            .count();
+        let condemned = self.condemned_segments(watermark);
         let previous = self.meta.clone();
-        self.meta.gc_watermark = watermark;
+        let stopped_early = self
+            .sealed_indexes
+            .get(condemned)
+            .is_some_and(|segment| segment.last_offset <= watermark);
+        // Stopped early at a segment that is still being archived: only claim
+        // the range actually collected, so a later GC can still reach it.
+        self.meta.gc_watermark = if stopped_early {
+            self.gc_boundary(watermark).max(current)
+        } else {
+            watermark
+        };
         if condemned > 0 {
             let last = &self.sealed_indexes[condemned - 1];
             let last_roll = segment_index(&last.path).ok_or_else(|| {
@@ -1555,6 +1596,7 @@ impl PartitionLog {
                 // next GC or open.
                 Err(err) => return Err(err.into()),
             }
+            crate::archive::remove_segment_markers(&segment.path);
         }
         // Also sweeps leftovers from an earlier interrupted GC.
         self.remove_segments_below_base()?;
@@ -3318,5 +3360,63 @@ mod tests {
         drop(log);
         let log = open_gc_log(dir.path(), WAL_FORMAT_V2);
         assert_retained(&log, 42, 42);
+    }
+
+    #[test]
+    fn gc_keeps_segments_until_archived_then_drops_their_sidecars() {
+        crate::archive::FORCE_ARCHIVE_CONFIGURED.with(|forced| forced.set(true));
+        let dir = tempdir().unwrap();
+        let mut log = open_gc_log(dir.path(), WAL_FORMAT_V2);
+        fill_gc_log(&mut log, 3, 1);
+        let segments: Vec<(PathBuf, u64)> = log
+            .sealed_indexes
+            .iter()
+            .map(|segment| (segment.path.clone(), segment.last_offset))
+            .collect();
+        let sidecars = |path: &Path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            (
+                path.with_file_name(format!("{name}.archive.pending")),
+                path.with_file_name(format!("{name}.archive.complete.json")),
+            )
+        };
+        let (_, complete0) = sidecars(&segments[0].0);
+        std::fs::write(&complete0, b"{}").unwrap();
+        let (pending1, complete1) = sidecars(&segments[1].0);
+        std::fs::write(&pending1, b"pending").unwrap();
+
+        let everything = log.high_watermark();
+        assert_eq!(log.gc_boundary(everything), segments[0].1);
+        assert_eq!(log.gc_sealed_below(everything).unwrap(), 1);
+        assert_eq!(log.base_offset(), segments[0].1);
+        assert!(!segments[0].0.exists());
+        assert!(!complete0.exists());
+        assert!(segments[1].0.exists() && pending1.exists());
+
+        // Archive of segment 1 completes; segment 2 has no completion record.
+        std::fs::remove_file(&pending1).unwrap();
+        std::fs::write(&complete1, b"{}").unwrap();
+        assert_eq!(log.gc_boundary(everything), segments[1].1);
+        assert_eq!(log.gc_sealed_below(everything).unwrap(), 1);
+        assert!(!segments[1].0.exists());
+        assert!(!complete1.exists());
+        assert!(segments[2].0.exists());
+        drop(log);
+        crate::archive::FORCE_ARCHIVE_CONFIGURED.with(|forced| forced.set(false));
+
+        let log = open_gc_log(dir.path(), WAL_FORMAT_V2);
+        assert_retained(&log, segments[1].1, everything);
+    }
+
+    #[test]
+    fn gc_boundary_reports_whole_segment_prefix() {
+        let dir = tempdir().unwrap();
+        let mut log = open_gc_log(dir.path(), WAL_FORMAT_V1);
+        fill_gc_log(&mut log, 3, 1);
+        let first_end = log.sealed_indexes[0].last_offset;
+        assert_eq!(log.gc_boundary(first_end - 1), 0);
+        assert_eq!(log.gc_boundary(first_end), first_end);
+        assert_eq!(log.gc_boundary(u64::MAX), log.sealed_indexes[2].last_offset);
+        assert!(log.retained_bytes() > 0);
     }
 }

@@ -204,6 +204,24 @@ impl PartitionBackend {
         }
     }
 
+    /// Exclusive end of the prefix `gc_sealed_below(watermark)` would delete.
+    pub fn gc_boundary(&self, watermark: u64) -> u64 {
+        match self {
+            Self::Local(log) => log.gc_boundary(watermark),
+            #[cfg(feature = "slate")]
+            Self::Slate(_) => 0,
+        }
+    }
+
+    /// WAL bytes held on local disk.
+    pub fn retained_bytes(&self) -> u64 {
+        match self {
+            Self::Local(log) => log.retained_bytes(),
+            #[cfg(feature = "slate")]
+            Self::Slate(_) => 0,
+        }
+    }
+
     /// Continue an empty or fully-below-`base` log at `base`.
     pub fn reset_base(&mut self, base: u64) -> Result<(), LogError> {
         match self {

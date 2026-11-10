@@ -444,6 +444,64 @@ impl DispatchEngine {
         self.telemetry.record_queue_rejected();
     }
 
+    /// WAL records that log retention must keep: pending retries, DLQ
+    /// transitions not yet finalized, and fleet leases, as
+    /// `(topic, partition, offset)`.
+    pub fn retention_pins(&self) -> Vec<(String, u32, u64)> {
+        let mut pins: Vec<_> = self
+            .retry_state
+            .pending()
+            .into_iter()
+            .map(|record| record.key)
+            .chain(
+                self.lifecycle
+                    .pending()
+                    .into_iter()
+                    .map(|transition| transition.source),
+            )
+            .map(|key| (key.topic, key.partition, key.offset))
+            .collect();
+        if let Some(leases) = &self.leases {
+            pins.extend(
+                leases
+                    .snapshot_for_status()
+                    .into_iter()
+                    .map(|job| (job.topic, job.partition, job.offset)),
+            );
+        }
+        pins
+    }
+
+    /// Drop retry and DLQ-transition records for offsets that retention has
+    /// already collected (`offset < base` in the log `in_log` selects). The
+    /// committed GC watermark proves those records were fully handled, and a
+    /// stale entry would otherwise block its lane and pin retention forever.
+    pub fn forget_collected(
+        &self,
+        in_log: impl Fn(&str, u32) -> bool,
+        base: u64,
+    ) -> Result<usize, DispatchError> {
+        let mut dropped = 0usize;
+        for record in self.retry_state.pending() {
+            if record.key.offset < base && in_log(&record.key.topic, record.key.partition) {
+                self.retry_state
+                    .clear(&record.key)
+                    .map_err(|error| DispatchError::Failed(error.to_string()))?;
+                dropped += 1;
+            }
+        }
+        for transition in self.lifecycle.pending() {
+            let source = &transition.source;
+            if source.offset < base && in_log(&source.topic, source.partition) {
+                self.lifecycle
+                    .clear(source)
+                    .map_err(|error| DispatchError::Failed(error.to_string()))?;
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
     pub fn telemetry_snapshot(&self) -> crate::telemetry::DispatchTelemetrySnapshot {
         let counters = self.telemetry.snapshot();
         let now = chrono::Utc::now().timestamp_millis();
@@ -2049,6 +2107,64 @@ mod tests {
         assert!(gap >= 2);
         assert_eq!(first.partition, second.partition);
         engine.shutdown_background().await;
+    }
+
+    #[test]
+    fn retention_pins_report_and_forget_collected_dispatch_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let engine = DispatchEngine::new_broker_only(broker, DispatchConfig::default());
+        let key = |topic: &str, offset| RetryKey {
+            topic: topic.into(),
+            partition: 0,
+            offset,
+            message_id: Uuid::new_v4(),
+        };
+        for (topic, offset) in [("jobs", 3), ("jobs", 9), ("other", 1)] {
+            engine
+                .retry_state
+                .schedule(RetryRecord {
+                    key: key(topic, offset),
+                    cursor_key: "lane".into(),
+                    fifo_key: None,
+                    attempts: 1,
+                    due_at_ms: 0,
+                    last_error: "503".into(),
+                })
+                .unwrap();
+        }
+        engine
+            .lifecycle
+            .prepare(DlqTransition {
+                source: key("jobs", 5),
+                cursor_key: "lane".into(),
+                reason: "exhausted".into(),
+                phase: DlqPhase::Prepared,
+                updated_at_ms: 0,
+            })
+            .unwrap();
+        let mut pins = engine.retention_pins();
+        pins.sort();
+        assert_eq!(
+            pins,
+            vec![
+                ("jobs".to_string(), 0, 3),
+                ("jobs".to_string(), 0, 5),
+                ("jobs".to_string(), 0, 9),
+                ("other".to_string(), 0, 1),
+            ]
+        );
+
+        let dropped = engine
+            .forget_collected(|topic, partition| topic == "jobs" && partition == 0, 6)
+            .unwrap();
+        assert_eq!(dropped, 2);
+        let mut pins = engine.retention_pins();
+        pins.sort();
+        assert_eq!(
+            pins,
+            vec![("jobs".to_string(), 0, 9), ("other".to_string(), 0, 1)]
+        );
     }
 
     #[tokio::test]

@@ -81,6 +81,19 @@ mod tests {
     }
 
     #[test]
+    fn fs_blob_delete_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let store = BlobStore::open_local(dir.path()).unwrap();
+        let reference = store.put_blob("default", Uuid::new_v4(), b"body").unwrap();
+        assert!(store.delete_blob(&reference).unwrap());
+        assert!(matches!(
+            store.get_blob(&reference),
+            Err(PayloadError::NotFound(_))
+        ));
+        assert!(!store.delete_blob(&reference).unwrap());
+    }
+
+    #[test]
     fn prepare_for_log_splits_large_body() {
         let dir = tempdir().unwrap();
         let store = BlobStore::open_local(dir.path()).unwrap();

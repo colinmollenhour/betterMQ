@@ -432,6 +432,13 @@ Fan-out vars are **group bookkeeping**, not DLQ TTL.
 | `BETTERMQ_ARCHIVE_MAX_RETRIES` | Attempts before a failing segment blocks ingest (default `5`); background retries continue until recovery |
 | `BETTERMQ_ARCHIVE_MAX_QUEUED_BYTES` | Archive queue byte cap (default 4 GiB) |
 | `BETTERMQ_ARCHIVE_MAX_LAG_MS` | Oldest outstanding archive age before ingest blocks (default 5 minutes) |
+| `BETTERMQ_RETENTION` | Automatic WAL retention (default on). `off` keeps every record and payload blob forever |
+| `BETTERMQ_RETENTION_INTERVAL_SECS` | Retention pass interval (default `60`) |
+| `BETTERMQ_RETENTION_MIN_AGE_SECS` | Never delete records younger than this, even when delivered (default `86400`) |
+| `BETTERMQ_RETENTION_SCAN_LIMIT` | Records the delivery frontier may advance per log per pass (default `100000`) |
+| `BETTERMQ_PAYLOAD_BLOB_GC_GRACE_SECS` | Delay before a collected record's payload blob is deleted (default `3600`) |
+
+**WAL retention.** With local storage, the broker deletes whole sealed WAL segments once every record in them is fully handled. That means delivered, or moved to the DLQ and then purged; for replicated cells it also means every replica has the range durably. It also requires the records to be older than `BETTERMQ_RETENTION_MIN_AGE_SECS` and, when archiving is configured, the segment to be archived. Pending retries, unfinished DLQ moves and fleet leases also hold retention back. DLQ records stay until they are purged by an operator or by `BETTERMQ_DLQ_RETENTION_DAYS`; with `BETTERMQ_SHARD_LAYOUT=v2`, DLQ records share the physical shard log, so unpurged DLQ records hold back that whole shard. Payload blobs of deleted or purged records are removed after `BETTERMQ_PAYLOAD_BLOB_GC_GRACE_SECS`. In a replicated cell the shard leader proposes the watermark to the controller, and every replica deletes below the committed value; without a controller quorum, nothing new is deleted. Size disks for the retention window plus your longest delivery backlog. Watch `bettermq_wal_retained_bytes_total`, `bettermq_retention_frontier`, `bettermq_gc_watermark` and `bettermq_retention_errors_total` in `/metrics`.
 
 S3/R2 credentials for Slate and archive are **not** `BETTERMQ_*`: `S3_ENDPOINT` or `R2_ENDPOINT`, plus `S3_ACCESS_KEY` / `R2_ACCESS_KEY` / `AWS_ACCESS_KEY_ID`, matching secret and region vars, and `S3_BUCKET` / `R2_BUCKET` (payload blobs: `S3_PAYLOAD_BUCKET` / `R2_PAYLOAD_BUCKET`). See [`engine/broker-storage/ARCHIVE.md`](../engine/broker-storage/ARCHIVE.md).
 

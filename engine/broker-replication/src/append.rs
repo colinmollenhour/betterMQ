@@ -24,6 +24,10 @@ const MAX_EPOCH_RECORDS: usize = 65_536;
 const CATCHUP_MAGIC: [u8; 4] = *b"BMQC";
 const CATCHUP_VERSION: u16 = 1;
 const CATCHUP_HEADER_LEN: usize = 32;
+/// v2 appends the source's retained `base_offset`; only sent when non-zero so
+/// peers that never collected a prefix still speak v1.
+const CATCHUP_VERSION_BASE: u16 = 2;
+const CATCHUP_HEADER_LEN_BASE: usize = 40;
 const MAX_CATCHUP_RECORDS: usize = 4096;
 
 #[derive(Debug, Error)]
@@ -381,6 +385,8 @@ fn default_catchup_max() -> usize {
 pub struct ReplicateCatchUpResponse {
     pub frames: Vec<ReplicateAppendRequest>,
     pub committed_hwm: u64,
+    #[serde(default)]
+    pub base_offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,6 +400,9 @@ pub struct ReplicateCatchUpRange {
     pub partition: u32,
     pub leader_generation: u64,
     pub committed_hwm: u64,
+    /// First offset the source still retains; frames below it were
+    /// collected by retention and cannot be served.
+    pub base_offset: u64,
     pub frames: Vec<CatchUpFrame>,
 }
 
@@ -404,14 +413,16 @@ impl ReplicateCatchUpRange {
                 "catch-up range has too many records".into(),
             ));
         }
-        let total = self
-            .frames
-            .iter()
-            .try_fold(CATCHUP_HEADER_LEN, |size, frame| {
-                size.checked_add(12)
-                    .and_then(|value| value.checked_add(frame.bytes.len()))
-                    .ok_or_else(|| ReplicateError::InvalidEpoch("catch-up length overflow".into()))
-            })?;
+        let (version, header_len) = if self.base_offset > 0 {
+            (CATCHUP_VERSION_BASE, CATCHUP_HEADER_LEN_BASE)
+        } else {
+            (CATCHUP_VERSION, CATCHUP_HEADER_LEN)
+        };
+        let total = self.frames.iter().try_fold(header_len, |size, frame| {
+            size.checked_add(12)
+                .and_then(|value| value.checked_add(frame.bytes.len()))
+                .ok_or_else(|| ReplicateError::InvalidEpoch("catch-up length overflow".into()))
+        })?;
         if total > MAX_DECODE_EPOCH_BYTES {
             return Err(ReplicateError::EpochTooLarge {
                 bytes: total,
@@ -420,12 +431,15 @@ impl ReplicateCatchUpRange {
         }
         let mut output = Vec::with_capacity(total);
         output.extend_from_slice(&CATCHUP_MAGIC);
-        output.extend_from_slice(&CATCHUP_VERSION.to_be_bytes());
+        output.extend_from_slice(&version.to_be_bytes());
         output.extend_from_slice(&0u16.to_be_bytes());
         output.extend_from_slice(&self.partition.to_be_bytes());
         output.extend_from_slice(&self.leader_generation.to_be_bytes());
         output.extend_from_slice(&self.committed_hwm.to_be_bytes());
         output.extend_from_slice(&(self.frames.len() as u32).to_be_bytes());
+        if version == CATCHUP_VERSION_BASE {
+            output.extend_from_slice(&self.base_offset.to_be_bytes());
+        }
         for frame in &self.frames {
             let len = u32::try_from(frame.bytes.len())
                 .map_err(|_| ReplicateError::InvalidEpoch("catch-up frame too large".into()))?;
@@ -448,11 +462,17 @@ impl ReplicateCatchUpRange {
                 "invalid catch-up range header".into(),
             ));
         }
-        if read_u16(body, 4)? != CATCHUP_VERSION {
-            return Err(ReplicateError::InvalidEpoch(
-                "unsupported catch-up range version".into(),
-            ));
-        }
+        let (header_len, base_offset) = match read_u16(body, 4)? {
+            CATCHUP_VERSION => (CATCHUP_HEADER_LEN, 0),
+            CATCHUP_VERSION_BASE if body.len() >= CATCHUP_HEADER_LEN_BASE => {
+                (CATCHUP_HEADER_LEN_BASE, read_u64(body, 32)?)
+            }
+            _ => {
+                return Err(ReplicateError::InvalidEpoch(
+                    "unsupported catch-up range version".into(),
+                ))
+            }
+        };
         let partition = read_u32(body, 8)?;
         let leader_generation = read_u64(body, 12)?;
         let committed_hwm = read_u64(body, 20)?;
@@ -462,7 +482,7 @@ impl ReplicateCatchUpRange {
                 "catch-up record count exceeds limit".into(),
             ));
         }
-        let mut cursor = CATCHUP_HEADER_LEN;
+        let mut cursor = header_len;
         let mut frames = Vec::with_capacity(count);
         for _ in 0..count {
             let offset = read_u64(body, cursor)?;
@@ -489,6 +509,7 @@ impl ReplicateCatchUpRange {
             partition,
             leader_generation,
             committed_hwm,
+            base_offset,
             frames,
         })
     }
@@ -524,6 +545,7 @@ impl ReplicateCatchUpRange {
             partition,
             leader_generation,
             committed_hwm: response.committed_hwm,
+            base_offset: response.base_offset,
             frames,
         })
     }
@@ -1007,6 +1029,7 @@ mod tests {
             partition: 7,
             leader_generation: 12,
             committed_hwm: 45,
+            base_offset: 0,
             frames: vec![
                 CatchUpFrame {
                     offset: 42,
@@ -1027,9 +1050,38 @@ mod tests {
     }
 
     #[test]
+    fn catch_up_range_carries_the_retained_base() {
+        let range = ReplicateCatchUpRange {
+            partition: 2,
+            leader_generation: 3,
+            committed_hwm: 900,
+            base_offset: 512,
+            frames: vec![CatchUpFrame {
+                offset: 512,
+                bytes: b"first retained".to_vec(),
+            }],
+        };
+        let encoded = range.encode_binary().unwrap();
+        assert_eq!(read_u16(&encoded, 4).unwrap(), CATCHUP_VERSION_BASE);
+        assert_eq!(
+            ReplicateCatchUpRange::decode_binary(&encoded).unwrap(),
+            range
+        );
+        // Without a collected prefix the v1 wire format is unchanged.
+        let v1 = ReplicateCatchUpRange {
+            base_offset: 0,
+            ..range
+        };
+        let encoded = v1.encode_binary().unwrap();
+        assert_eq!(read_u16(&encoded, 4).unwrap(), CATCHUP_VERSION);
+        assert_eq!(ReplicateCatchUpRange::decode_binary(&encoded).unwrap(), v1);
+    }
+
+    #[test]
     fn legacy_catch_up_json_remains_decodable() {
         let legacy = ReplicateCatchUpResponse {
             committed_hwm: 2,
+            base_offset: 0,
             frames: vec![ReplicateAppendRequest {
                 tenant_id: "tenant".into(),
                 topic: "jobs".into(),
@@ -1050,6 +1102,7 @@ mod tests {
             partition: 1,
             leader_generation: 1,
             committed_hwm: 0,
+            base_offset: 0,
             frames: Vec::new(),
         };
         let mut encoded = range.encode_binary().unwrap();

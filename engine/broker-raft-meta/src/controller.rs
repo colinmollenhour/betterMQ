@@ -126,6 +126,32 @@ pub struct ControllerState {
     pub gc_watermarks: HashMap<u32, u64>,
     #[serde(default)]
     pub rebalance: BTreeMap<u32, RebalanceOp>,
+    /// Committed retention watermark (exclusive) per log: storage namespace
+    /// (V1 topic, or `__physical` in V2) → partition → offset. Every replica
+    /// deletes below `min(watermark, local committed HWM)`.
+    #[serde(default)]
+    pub log_gc_watermarks: BTreeMap<String, BTreeMap<u32, u64>>,
+}
+
+impl ControllerState {
+    /// Committed retention watermark of one log (0 when none).
+    pub fn log_gc_watermark(&self, namespace: &str, partition: u32) -> u64 {
+        self.log_gc_watermarks
+            .get(namespace)
+            .and_then(|partitions| partitions.get(&partition))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// One log's proposed retention watermark, computed by its shard leader.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GcWatermarkProposal {
+    pub namespace: String,
+    pub partition: u32,
+    /// Shard leader term the watermark was computed under.
+    pub leader_term: u64,
+    pub watermark: u64,
 }
 
 impl ControllerState {
@@ -214,6 +240,7 @@ impl ControllerState {
             catalog_records: BTreeMap::new(),
             gc_watermarks: HashMap::new(),
             rebalance: BTreeMap::new(),
+            log_gc_watermarks: BTreeMap::new(),
         })
     }
 }
@@ -300,6 +327,14 @@ pub enum ControllerCommand {
     SetGcWatermark {
         shard: u32,
         watermark: u64,
+    },
+    /// Batch of retention watermarks from one node. Each entry is accepted
+    /// only if `leader_id` is the shard's placement leader at exactly
+    /// `leader_term` and the watermark does not move backwards; rejected
+    /// entries are skipped (the command fails only if nothing applied).
+    SetGcWatermarks {
+        leader_id: Uuid,
+        entries: Vec<GcWatermarkProposal>,
     },
     SetReplicationPolicy {
         factor: u32,
@@ -1126,6 +1161,43 @@ fn apply_command(
             }
             state.gc_watermarks.insert(shard, watermark);
         }
+        ControllerCommand::SetGcWatermarks { leader_id, entries } => {
+            let mut rejected = Vec::new();
+            let mut applied = 0usize;
+            for entry in entries {
+                let fenced = state.shards.get(&entry.partition).is_some_and(|placement| {
+                    placement.leader_id == leader_id && placement.leader_term == entry.leader_term
+                });
+                let current = state.log_gc_watermark(&entry.namespace, entry.partition);
+                if !fenced {
+                    rejected.push(format!(
+                        "{}/{}: {leader_id} is not the shard leader at term {}",
+                        entry.namespace, entry.partition, entry.leader_term
+                    ));
+                } else if entry.watermark < current {
+                    rejected.push(format!(
+                        "{}/{}: watermark cannot move backwards ({} < {current})",
+                        entry.namespace, entry.partition, entry.watermark
+                    ));
+                } else {
+                    state
+                        .log_gc_watermarks
+                        .entry(entry.namespace)
+                        .or_default()
+                        .insert(entry.partition, entry.watermark);
+                    applied += 1;
+                }
+            }
+            if applied == 0 && !rejected.is_empty() {
+                return Err(ControllerError::InvalidCommand(format!(
+                    "gc watermarks rejected: {}",
+                    rejected.join("; ")
+                )));
+            }
+            if !rejected.is_empty() {
+                tracing::warn!(?rejected, "some gc watermarks were rejected");
+            }
+        }
         ControllerCommand::SetReplicationPolicy { factor, min_isr } => {
             let factor = factor.max(1);
             state.replication_factor = factor;
@@ -1358,6 +1430,96 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    #[test]
+    fn gc_watermarks_are_fenced_to_the_shard_leader_term() {
+        let ids: Vec<_> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let config = ClusterConfig {
+            cluster_id: Uuid::new_v4(),
+            nodes: ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| crate::cluster::NodeConfig {
+                    id: *id,
+                    addr: format!("http://n{index}"),
+                    internal_url: None,
+                })
+                .collect(),
+            node_id: ids[0],
+            generation: 1,
+            hash_version: 1,
+        };
+        let mut state = ControllerState::from_v1(&config, 2, &HashMap::new(), None).unwrap();
+        let placement = state.shards[&0].clone();
+        let other = ids
+            .iter()
+            .copied()
+            .find(|id| *id != placement.leader_id)
+            .unwrap();
+        let proposal = |watermark, leader_term| GcWatermarkProposal {
+            namespace: "__physical".into(),
+            partition: 0,
+            leader_term,
+            watermark,
+        };
+        let submit = |state: &mut ControllerState, leader_id, entries| {
+            apply_command(
+                state,
+                ControllerCommand::SetGcWatermarks { leader_id, entries },
+            )
+        };
+
+        submit(
+            &mut state,
+            placement.leader_id,
+            vec![proposal(10, placement.leader_term)],
+        )
+        .unwrap();
+        assert_eq!(state.log_gc_watermark("__physical", 0), 10);
+        // Not the leader, or a stale term: rejected.
+        assert!(submit(&mut state, other, vec![proposal(20, placement.leader_term)]).is_err());
+        assert!(submit(
+            &mut state,
+            placement.leader_id,
+            vec![proposal(20, placement.leader_term + 1)]
+        )
+        .is_err());
+        // Backwards: rejected.
+        assert!(submit(
+            &mut state,
+            placement.leader_id,
+            vec![proposal(9, placement.leader_term)]
+        )
+        .is_err());
+        assert_eq!(state.log_gc_watermark("__physical", 0), 10);
+
+        // A batch applies its valid entries and skips the rest.
+        let stale_term = state.shards[&1].leader_term + 7;
+        submit(
+            &mut state,
+            placement.leader_id,
+            vec![
+                proposal(30, placement.leader_term),
+                GcWatermarkProposal {
+                    namespace: "__physical".into(),
+                    partition: 1,
+                    leader_term: stale_term,
+                    watermark: 5,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(state.log_gc_watermark("__physical", 0), 30);
+        assert_eq!(state.log_gc_watermark("__physical", 1), 0);
+
+        let decoded: ControllerState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(decoded.log_gc_watermark("__physical", 0), 30);
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy.as_object_mut().unwrap().remove("log_gc_watermarks");
+        let legacy: ControllerState = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.log_gc_watermark("__physical", 0), 0);
     }
 
     #[test]

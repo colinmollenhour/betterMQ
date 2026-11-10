@@ -142,6 +142,18 @@ impl FsBlobStore {
     }
 }
 
+impl FsBlobStore {
+    /// Remove a blob. Idempotent: a missing blob is not an error.
+    pub fn delete_blob(&self, reference: &PayloadRef) -> Result<bool, PayloadError> {
+        let path = self.path_for(&reference.bucket_key)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(PayloadError::Io(error)),
+        }
+    }
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     hex::encode(digest)

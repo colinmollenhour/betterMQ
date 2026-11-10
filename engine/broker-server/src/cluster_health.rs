@@ -318,6 +318,29 @@ async fn catch_up_shard(
                 replica_hwm: page.committed_hwm,
             });
         }
+        if page.base_offset > local_leo {
+            // The source already collected everything this node is missing
+            // below its base (all of it delivered under a committed GC
+            // watermark). Everything held locally is below that base, so
+            // continue the log at the base instead of refusing forever.
+            let log = state.broker.log_id(&topic, shard);
+            state
+                .broker
+                .reset_log_base(&log, page.base_offset)
+                .map_err(|e| {
+                    format!(
+                        "{topic}/{shard}: reset log base to {}: {e}",
+                        page.base_offset
+                    )
+                })?;
+            info!(
+                %topic,
+                shard,
+                local_leo,
+                base_offset = page.base_offset,
+                "catch-up source collected this prefix; continuing at its retained base"
+            );
+        }
 
         loop {
             let mut last_appended = None;
@@ -792,6 +815,7 @@ mod tests {
             partition: shard,
             leader_generation: 0,
             committed_hwm,
+            base_offset: 0,
             frames: frames
                 .into_iter()
                 .map(|(offset, bytes)| broker_replication::CatchUpFrame { offset, bytes })

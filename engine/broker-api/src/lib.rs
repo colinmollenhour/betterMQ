@@ -23,6 +23,7 @@ mod ops;
 mod publish_path;
 mod rate_limit;
 pub mod request_id;
+mod retention;
 mod routes;
 
 use axum::{extract::DefaultBodyLimit, routing::get, Json, Router};
@@ -68,6 +69,7 @@ pub use metrics::{
     record_fleet_claim_failure, record_scheduler_failure, record_shard_recovery_failure,
     set_fenced_shards, SchedulerFailure, ShardRecoveryFailure,
 };
+pub use retention::{compute_safe_watermark, run_retention_tick, spawn_retention_loop};
 
 /// Reject new ingest while allowing already-admitted requests to drain.
 pub fn begin_shutdown() {

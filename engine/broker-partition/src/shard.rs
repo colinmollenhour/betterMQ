@@ -56,6 +56,14 @@ enum ShardCommand {
         watermark: u64,
         reply: Reply<usize>,
     },
+    RetentionStatus {
+        watermark: u64,
+        reply: Reply<LogRetentionStatus>,
+    },
+    ResetBase {
+        base: u64,
+        reply: Reply<()>,
+    },
     Commit {
         offset: u64,
         reply: oneshot::Sender<Result<u64, String>>,
@@ -90,6 +98,18 @@ impl ShardCommand {
             _ => None,
         }
     }
+}
+
+/// Retention view of one log, read atomically on the shard actor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogRetentionStatus {
+    /// First retained offset.
+    pub base_offset: u64,
+    /// Exclusive end of the whole-segment prefix collectable below the
+    /// requested watermark (equals `base_offset` when nothing is).
+    pub gc_boundary: u64,
+    /// WAL bytes on local disk.
+    pub retained_bytes: u64,
 }
 
 /// Future returned by the commit coordinator for one requested offset.
@@ -235,6 +255,16 @@ impl ShardHandle {
 
     pub fn gc_sealed_below(&self, watermark: u64) -> Result<usize, LogError> {
         self.call(|reply| ShardCommand::GcSealed { watermark, reply })
+    }
+
+    pub fn retention_status(&self, watermark: u64) -> Result<LogRetentionStatus, LogError> {
+        self.call(|reply| ShardCommand::RetentionStatus { watermark, reply })
+    }
+
+    /// Continue an empty or fully-below-`base` log at `base` (follower
+    /// catch-up behind a leader that already collected the prefix).
+    pub fn reset_base(&self, base: u64) -> Result<(), LogError> {
+        self.call(|reply| ShardCommand::ResetBase { base, reply })
     }
 
     pub fn flush_durable(&self) -> Result<u64, LogError> {
@@ -449,6 +479,18 @@ fn process_non_commit(
             if result.as_ref().is_ok_and(|deleted| *deleted > 0) {
                 *dlq_counts.write() = rebuild_dlq_counts(backend).ok();
             }
+            let _ = reply.send(result);
+        }
+        ShardCommand::RetentionStatus { watermark, reply } => {
+            let _ = reply.send(Ok(LogRetentionStatus {
+                base_offset: backend.base_offset(),
+                gc_boundary: backend.gc_boundary(watermark),
+                retained_bytes: backend.retained_bytes(),
+            }));
+        }
+        ShardCommand::ResetBase { base, reply } => {
+            let result = backend.reset_base(base);
+            publish_backend_hwm(backend, committed_hwm);
             let _ = reply.send(result);
         }
         ShardCommand::Flush { reply } => {

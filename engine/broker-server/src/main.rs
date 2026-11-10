@@ -737,6 +737,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     if !broker_only {
         bg_tasks.push(spawn_dispatch_backfill_loop(app_state.clone()));
     }
+    if let Some(task) = broker_api::spawn_retention_loop(app_state.clone()) {
+        bg_tasks.push(task);
+    }
     if settings.dispatch_fleet {
         if let Some(h) = spawn_fleet_workers(app_state.clone()) {
             bg_tasks.push(h);

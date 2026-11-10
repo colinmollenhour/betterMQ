@@ -20,7 +20,8 @@ pub use controller::{
     ControllerCommandResponse, ControllerError, ControllerNode, ControllerRaft,
     ControllerSnapshotRequest, ControllerSnapshotResponse, ControllerState,
     ControllerVoteRequest as RaftVoteRequest, ControllerVoteResponse as RaftVoteResponse,
-    DrainReport, FanoutOutboxEntry, OpenRaftController, ShardPlacement, TypeConfig,
+    DrainReport, FanoutOutboxEntry, GcWatermarkProposal, OpenRaftController, ShardPlacement,
+    TypeConfig,
 };
 pub use durable_store::DurableRocksStore;
 pub use election::{elect_shard_leader, DEFAULT_PEER_TTL_MS};

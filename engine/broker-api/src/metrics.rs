@@ -324,6 +324,7 @@ pub struct NativeTelemetrySnapshot {
     pub archive: broker_storage::ArchiveLagStatus,
     pub dispatch: broker_dispatch::DispatchTelemetrySnapshot,
     pub fairness: broker_dispatch::TenantFairnessSnapshot,
+    pub retention: broker_partition::RetentionTelemetrySnapshot,
 }
 
 pub fn native_snapshot(state: &crate::AppState) -> NativeTelemetrySnapshot {
@@ -341,6 +342,7 @@ pub fn native_snapshot(state: &crate::AppState) -> NativeTelemetrySnapshot {
         archive: broker_storage::archive_lag_status(),
         dispatch: state.dispatch.telemetry_snapshot(),
         fairness: state.fair_queue.telemetry_snapshot(),
+        retention: broker_partition::retention_telemetry_snapshot(),
     }
 }
 
@@ -357,7 +359,105 @@ pub fn prometheus_text_with_native(native: &NativeTelemetrySnapshot) -> String {
     append_archive_metrics(&mut out, &native.archive);
     append_shared_metadata_metrics(&mut out, &broker_storage::shared_metadata_telemetry());
     append_dispatch_metrics(&mut out, &native.dispatch, &native.fairness);
+    append_retention_metrics(&mut out, &native.retention);
     out
+}
+
+/// Per-log retention gauges are capped so V1 topic counts cannot explode
+/// label cardinality; totals cover every log.
+const MAX_RETENTION_LOG_LABELS: usize = 256;
+
+fn append_retention_metrics(
+    out: &mut String,
+    snapshot: &broker_partition::RetentionTelemetrySnapshot,
+) {
+    out.push_str("# HELP bettermq_wal_retained_bytes WAL bytes on local disk per log\n");
+    out.push_str("# TYPE bettermq_wal_retained_bytes gauge\n");
+    out.push_str("# HELP bettermq_wal_base_offset First retained WAL offset per log\n");
+    out.push_str("# TYPE bettermq_wal_base_offset gauge\n");
+    out.push_str(
+        "# HELP bettermq_retention_frontier End of the fully delivered prefix per log (leader)\n",
+    );
+    out.push_str("# TYPE bettermq_retention_frontier gauge\n");
+    out.push_str("# HELP bettermq_retention_safe_watermark Safe GC watermark per log (leader)\n");
+    out.push_str("# TYPE bettermq_retention_safe_watermark gauge\n");
+    out.push_str("# HELP bettermq_gc_watermark GC watermark applied on this node per log\n");
+    out.push_str("# TYPE bettermq_gc_watermark gauge\n");
+    out.push_str(
+        "# HELP bettermq_retention_segments_deleted_total Sealed WAL segments deleted per log\n",
+    );
+    out.push_str("# TYPE bettermq_retention_segments_deleted_total counter\n");
+    let mut retained_total = 0u64;
+    for (index, (log, entry)) in snapshot.logs.iter().enumerate() {
+        retained_total = retained_total.saturating_add(entry.retained_bytes);
+        if index >= MAX_RETENTION_LOG_LABELS {
+            continue;
+        }
+        let (namespace, partition) = log.rsplit_once('/').unwrap_or((log.as_str(), ""));
+        let label = format!(
+            "log=\"{}\",partition=\"{}\"",
+            namespace.replace('\\', "\\\\").replace('"', "\\\""),
+            partition
+        );
+        out.push_str(&format!(
+            "bettermq_wal_retained_bytes{{{label}}} {}\n",
+            entry.retained_bytes
+        ));
+        out.push_str(&format!(
+            "bettermq_wal_base_offset{{{label}}} {}\n",
+            entry.base_offset
+        ));
+        if let Some(frontier) = entry.frontier {
+            out.push_str(&format!(
+                "bettermq_retention_frontier{{{label}}} {frontier}\n"
+            ));
+        }
+        if let Some(safe) = entry.safe_watermark {
+            out.push_str(&format!(
+                "bettermq_retention_safe_watermark{{{label}}} {safe}\n"
+            ));
+        }
+        if let Some(applied) = entry.gc_watermark {
+            out.push_str(&format!("bettermq_gc_watermark{{{label}}} {applied}\n"));
+        }
+        out.push_str(&format!(
+            "bettermq_retention_segments_deleted_total{{{label}}} {}\n",
+            entry.segments_deleted_total
+        ));
+    }
+    out.push_str("# HELP bettermq_wal_retained_bytes_total WAL bytes on local disk, all logs\n");
+    out.push_str("# TYPE bettermq_wal_retained_bytes_total gauge\n");
+    out.push_str(&format!(
+        "bettermq_wal_retained_bytes_total {retained_total}\n"
+    ));
+    out.push_str("# HELP bettermq_payload_blobs_deleted_total Payload blobs reclaimed\n");
+    out.push_str("# TYPE bettermq_payload_blobs_deleted_total counter\n");
+    out.push_str(&format!(
+        "bettermq_payload_blobs_deleted_total {}\n",
+        snapshot.blobs_deleted_total
+    ));
+    out.push_str(
+        "# HELP bettermq_payload_blob_delete_failures_total Payload blob deletes that failed\n",
+    );
+    out.push_str("# TYPE bettermq_payload_blob_delete_failures_total counter\n");
+    out.push_str(&format!(
+        "bettermq_payload_blob_delete_failures_total {}\n",
+        snapshot.blob_delete_failures_total
+    ));
+    out.push_str(
+        "# HELP bettermq_payload_blob_tombstones_pending Payload blobs awaiting deletion\n",
+    );
+    out.push_str("# TYPE bettermq_payload_blob_tombstones_pending gauge\n");
+    out.push_str(&format!(
+        "bettermq_payload_blob_tombstones_pending {}\n",
+        snapshot.blob_tombstones_pending
+    ));
+    out.push_str("# HELP bettermq_retention_errors_total Failed retention operations\n");
+    out.push_str("# TYPE bettermq_retention_errors_total counter\n");
+    out.push_str(&format!(
+        "bettermq_retention_errors_total {}\n",
+        snapshot.errors_total
+    ));
 }
 
 fn append_storage_metrics(out: &mut String, snapshot: &broker_storage::StorageTelemetrySnapshot) {
@@ -1240,12 +1340,40 @@ mod tests {
                 saturation_ratio: 8.0 / 1024.0,
                 saturated: false,
             },
+            retention: broker_partition::RetentionTelemetrySnapshot {
+                logs: [(
+                    "__physical/7".to_string(),
+                    broker_partition::LogRetentionTelemetry {
+                        retained_bytes: 4096,
+                        base_offset: 100,
+                        frontier: Some(140),
+                        safe_watermark: Some(120),
+                        gc_watermark: Some(120),
+                        limited_by: Some(broker_partition::RetentionLimit::MinAge),
+                        segments_deleted_total: 3,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                blobs_deleted_total: 2,
+                blob_delete_failures_total: 0,
+                blob_tombstones_pending: 1,
+                errors_total: 0,
+            },
         };
         let output = prometheus_text_with_native(&native);
         assert!(output.contains("bettermq_dispatch_delivery_outcomes_total{outcome=\"5xx\"} 3"));
         assert!(output.contains("bettermq_dispatch_webhook_duration_seconds_bucket{le=\"+Inf\"} 7"));
         assert!(output.contains("bettermq_dispatch_oldest_pending_age_seconds{shard=\"7\"} 10"));
         assert!(!output.contains("{,le="));
+        assert!(
+            output.contains("bettermq_wal_retained_bytes{log=\"__physical\",partition=\"7\"} 4096")
+        );
+        assert!(output.contains("bettermq_gc_watermark{log=\"__physical\",partition=\"7\"} 120"));
+        assert!(
+            output.contains("bettermq_retention_frontier{log=\"__physical\",partition=\"7\"} 140")
+        );
+        assert!(output.contains("bettermq_wal_retained_bytes_total 4096"));
         assert!(output.contains("bettermq_wal_epoch_total{shard=\"7\"} 3"));
         assert!(output.contains("bettermq_wal_records_per_fsync{shard=\"7\"} 6"));
         assert!(output.contains("bettermq_wal_fence_events_total{shard=\"7\"} 1"));
