@@ -74,3 +74,22 @@ Restore writes only paths validated as safe relative archive keys and verifies
 both byte length and SHA-256 before replacing a destination file. Segments
 newer than `--until-unix-ms` are skipped and counted in the report's `skipped`
 field.
+
+## Recovery coverage
+
+New WAL archives include a versioned per-segment recovery checkpoint: WAL format
+and shard identity, exclusive offset range, retained base, purge state at the
+checkpoint, and safe segment numbering. Restore requires a new or empty target.
+It validates a contiguous segment chain, frame/epoch integrity and checksums,
+writes WAL manifests and recovery metadata in an isolated staging directory, and
+opens every restored shard before atomically publishing the recovered tree.
+Any validation failure leaves the destination untouched and reports no restored
+segments. Pre-checkpoint archives can still be scrubbed, but restore refuses them
+rather than guessing a format or silently renumbering retained V1 records.
+
+Only sealed segments are covered. The active-WAL tail, purge operations after
+the archived checkpoint, RocksDB idempotency/dispatch indexes, payload blobs, and
+broker catalog/configuration require separate backups. Cursors may therefore
+reset and messages may be redelivered after disaster recovery. `--until-unix-ms`
+filters archive completion time, not message publication time; it fails if that
+selection leaves a gap in the retained chain.

@@ -1223,6 +1223,7 @@ impl PartitionLog {
         }
 
         let roll = self.meta.segment_roll_count;
+        let archived_first_offset = self.active_base_offset;
         let seg_path = self.dir.join(SEGMENTS_DIR).join(segment_file_name(roll));
         let wal_path = self.dir.join(WAL_FILE);
         if std::fs::symlink_metadata(&seg_path).is_ok() {
@@ -1314,6 +1315,16 @@ impl PartitionLog {
             .append(true)
             .read(true)
             .open(&wal_path)?;
+        if crate::archive::archive_configured() {
+            let checkpoint = crate::ArchiveCheckpoint {
+                wal_manifest: self.manifest.clone(),
+                meta: self.meta.clone(),
+                first_offset: archived_first_offset,
+                next_offset: self.meta.next_offset,
+            };
+            crate::archive_checkpoint::save_checkpoint(&seg_path, &checkpoint)
+                .map_err(|error| LogError::Io(io::Error::other(error.to_string())))?;
+        }
         crate::archive::enqueue_sealed_segment(&seg_path);
         // meta.json is a checkpoint: open reconciles the roll counter with
         // the segment files, so a failed save here cannot cause an overwrite.

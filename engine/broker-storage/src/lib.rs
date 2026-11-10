@@ -1,6 +1,8 @@
 //! Partition log storage (WAL + segments) and RocksDB / shared-meta indexes.
 
 mod archive;
+mod archive_checkpoint;
+mod archive_restore;
 mod backend;
 mod flock;
 mod indexes;
@@ -29,6 +31,7 @@ pub use archive::{
 };
 #[cfg(feature = "s3")]
 pub use archive::{restore_object_archive, restore_object_archive_until, scrub_object_archive};
+pub use archive_checkpoint::ArchiveCheckpoint;
 pub use backend::{PartitionBackend, StorageMode};
 pub use flock::FileLock;
 pub use indexes::{DedupEntry, IndexError, MetadataStore, MetadataWriteBatch};
