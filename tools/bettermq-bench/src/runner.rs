@@ -220,3 +220,129 @@ fn headline_summary(t: &TrialResult) -> String {
         format!("  ({})", parts.join(", "))
     }
 }
+
+/// Combine several results files into one: trials of the same scenario are
+/// pooled (so per-invocation runs interleaved with another build become one
+/// multi-trial result), metrics re-aggregated, and findings re-derived.
+pub fn merge(reports: Vec<RunReport>) -> anyhow::Result<RunReport> {
+    let mut iter = reports.into_iter();
+    let mut out = iter
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("nothing to merge"))?;
+    let mut order: Vec<String> = out.scenarios.iter().map(|s| s.id.clone()).collect();
+    let mut by_id: std::collections::BTreeMap<String, ScenarioResult> =
+        out.scenarios.drain(..).map(|s| (s.id.clone(), s)).collect();
+    for r in iter {
+        if out.calibration.is_none() {
+            out.calibration = r.calibration.clone();
+        }
+        if r.meta.started_at < out.meta.started_at {
+            out.meta.started_at = r.meta.started_at.clone();
+        }
+        if r.meta.finished_at > out.meta.finished_at {
+            out.meta.finished_at = r.meta.finished_at.clone();
+        }
+        for w in &r.env.warnings {
+            if !out.env.warnings.contains(w) {
+                out.env.warnings.push(w.clone());
+            }
+        }
+        for sc in r.scenarios {
+            match by_id.get_mut(&sc.id) {
+                Some(existing) => {
+                    existing.trials.extend(sc.trials);
+                    if let Some(e) = sc.error {
+                        existing.error = Some(match existing.error.take() {
+                            Some(prev) => format!("{prev}; {e}"),
+                            None => e,
+                        });
+                    }
+                }
+                None => {
+                    order.push(sc.id.clone());
+                    by_id.insert(sc.id.clone(), sc);
+                }
+            }
+        }
+    }
+    let mut max_trials = 0;
+    for id in &order {
+        let Some(sc) = by_id.remove(id) else { continue };
+        let mut sc = sc;
+        for (i, t) in sc.trials.iter_mut().enumerate() {
+            t.index = i as u32;
+        }
+        let mut findings = Vec::new();
+        for t in &sc.trials {
+            findings.extend(analysis::trial_findings(&FindingCtx {
+                scenario: &sc.id,
+                trial: t,
+            }));
+        }
+        findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
+        findings.dedup_by(|a, b| a.title == b.title);
+        sc.metrics = aggregate_metrics(&sc.trials);
+        let mut status = status_from(&findings, sc.trials.is_empty());
+        if sc.error.is_some() && status != Status::Error {
+            status = status.max(Status::Warn);
+        }
+        sc.status = status;
+        sc.findings = findings;
+        max_trials = max_trials.max(sc.trials.len());
+        out.scenarios.push(sc);
+    }
+    out.meta.repeats = max_trials as u32;
+    out.meta.command_line = format!("merged runs; first: {}", out.meta.command_line);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rep(trial_value: f64) -> RunReport {
+        let trial = TrialResult {
+            metrics: vec![Metric::new(
+                "m",
+                "M",
+                "ms",
+                trial_value,
+                Direction::LowerBetter,
+                "latency",
+            )],
+            ..Default::default()
+        };
+        RunReport {
+            schema: SCHEMA_VERSION,
+            meta: RunMeta::default(),
+            env: EnvInfo::default(),
+            calibration: None,
+            scenarios: vec![ScenarioResult {
+                id: "s".into(),
+                title: "S".into(),
+                description: String::new(),
+                params: Default::default(),
+                status: Status::Pass,
+                error: None,
+                metrics: Vec::new(),
+                trials: vec![trial],
+                findings: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn merge_pools_trials_and_recomputes_medians() {
+        let merged = merge(vec![rep(1.0), rep(9.0), rep(3.0)]).unwrap();
+        assert_eq!(merged.scenarios.len(), 1);
+        let sc = &merged.scenarios[0];
+        assert_eq!(sc.trials.len(), 3);
+        assert_eq!(
+            sc.trials.iter().map(|t| t.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(sc.metrics[0].value, 3.0);
+        assert_eq!(sc.metrics[0].samples.len(), 3);
+        assert_eq!(merged.meta.repeats, 3);
+    }
+}

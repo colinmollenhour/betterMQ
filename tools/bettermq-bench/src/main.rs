@@ -71,6 +71,14 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Pool several results files (e.g. one invocation per scenario and trial,
+    /// interleaved with another build) into one multi-trial result.
+    Merge {
+        inputs: Vec<PathBuf>,
+        /// Output directory (results.json plus the full report).
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// List scenarios.
     List,
 }
@@ -182,6 +190,21 @@ fn main() -> anyhow::Result<()> {
             let dir = out.unwrap_or_else(|| path.parent().unwrap_or(Path::new(".")).to_path_buf());
             report::write_all(&report, &dir)?;
             eprintln!("report written to {}", dir.display());
+            Ok(())
+        }
+        Cmd::Merge { inputs, out } => {
+            let reports = inputs
+                .iter()
+                .map(|p| report::load(&resolve_results(p)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let merged = runner::merge(reports)?;
+            report::write_all(&merged, &out)?;
+            eprintln!(
+                "merged {} files into {} ({} scenarios)",
+                inputs.len(),
+                out.display(),
+                merged.scenarios.len()
+            );
             Ok(())
         }
         Cmd::Slim { results, out } => {

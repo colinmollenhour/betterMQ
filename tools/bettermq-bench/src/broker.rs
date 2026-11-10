@@ -61,6 +61,9 @@ impl Broker {
             .arg("--listen")
             .arg(format!("127.0.0.1:{port}"))
             .env("BETTERMQ_ALLOW_PRIVATE_DESTINATIONS", "1")
+            // Newer builds require a one-time setup code from the startup log
+            // unless open setup is allowed; the harness bootstraps unattended.
+            .env("BETTERMQ_ALLOW_OPEN_SETUP", "1")
             .env("BETTERMQ_FSYNC", &cfg.fsync)
             .env("RUST_LOG", &cfg.rust_log)
             .env("NO_COLOR", "1")
