@@ -5,8 +5,8 @@
 #   MinIO (internal only): endpoint http://minio:9000  buckets bettermq + bettermq-payloads
 #
 # HONESTY: this compose runs a **single MinIO**. That is fine for laptop/dev and
-# single-node Slate. It is **not** multi-AZ object-store HA. For real HA, use a
-# managed S3/R2 (or a multi-node MinIO deployment) and 3+ brokers.
+# single-node Slate. Durable S3/R2 protects objects, not broker availability.
+# Multi-broker Slate is unsupported and rejected; use local-WAL HA instead.
 #
 # SECURITY: MinIO ports are NOT published to the host. Override with a compose
 # override file only for local debugging. Change MINIO_ROOT_* for anything beyond
@@ -14,7 +14,7 @@
 
 services:
   minio:
-    image: ${MINIO_IMAGE:?pin MINIO_IMAGE to a tested release tag or digest}
+    image: ${MINIO_IMAGE:?set MINIO_IMAGE to your maintained, digest-pinned MinIO image}
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER}
@@ -27,7 +27,7 @@ services:
       - minio-data:/data
 
   minio-init:
-    image: ${MINIO_MC_IMAGE:?pin MINIO_MC_IMAGE to a tested release tag or digest}
+    image: ${MINIO_MC_IMAGE:?set MINIO_MC_IMAGE to your maintained, digest-pinned MinIO client image}
     depends_on:
       - minio
     environment:

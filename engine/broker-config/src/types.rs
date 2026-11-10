@@ -365,6 +365,11 @@ impl BetterMqConfig {
 
         if let Some(cluster) = &self.cluster {
             if cluster.enabled {
+                if cluster.nodes.len() > 1 && matches!(self.storage, StorageConfig::Slate { .. }) {
+                    return Err(ConfigError::Invalid(
+                        broker_proto::SLATE_SINGLE_BROKER.into(),
+                    ));
+                }
                 if cluster.nodes.is_empty() {
                     return Err(ConfigError::Invalid(
                         "cluster.nodes must list at least one broker when cluster.enabled is true"
@@ -641,6 +646,17 @@ mod tests {
             path.parent(),
             cfg.cluster.unwrap().shared_meta_dir.as_deref()
         );
+    }
+
+    #[test]
+    fn slate_rejects_multi_broker_membership() {
+        let mut config = BetterMqConfig::template_cluster_local();
+        config.storage = BetterMqConfig::template_single_slate().storage;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains(broker_proto::SLATE_SINGLE_BROKER));
     }
 
     #[test]

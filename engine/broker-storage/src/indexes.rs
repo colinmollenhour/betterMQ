@@ -170,6 +170,22 @@ impl MetadataStore {
         })
     }
 
+    pub fn is_ready(&self) -> bool {
+        match &self.backend {
+            #[cfg(feature = "slate")]
+            MetaBackend::Slate(store) => store.is_ready(),
+            _ => true,
+        }
+    }
+
+    pub fn check_ready(&self) -> Result<(), IndexError> {
+        #[cfg(feature = "slate")]
+        if let MetaBackend::Slate(store) = &self.backend {
+            store.check_ready()?;
+        }
+        Ok(())
+    }
+
     /// Atomically apply one metadata epoch on RocksDB.
     ///
     /// Shared-file and Slate compatibility backends preserve the API but apply

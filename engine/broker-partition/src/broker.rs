@@ -510,7 +510,7 @@ impl Broker {
             #[cfg(feature = "slate")]
             {
                 if let Some(ref env) = slate {
-                    MetadataStore::open_slate(Arc::clone(&env.object_store), &env.cache_root)?
+                    MetadataStore::open_slate(Arc::clone(&env.object_store), &config.data_dir)?
                 } else {
                     MetadataStore::open(rocks_path)?
                 }
@@ -615,6 +615,7 @@ impl Broker {
 
     /// Returns fence generation when this node may append (cluster).
     fn require_shard_fence(&self, partition: u32) -> Result<Option<u64>, BrokerError> {
+        self.inner.metadata.check_ready()?;
         if let Some(check) = self.inner.shard_leader_check.lock().as_ref() {
             match check(partition) {
                 Some(gen) => Ok(Some(gen)),
@@ -877,6 +878,10 @@ impl Broker {
         &self.inner.config
     }
 
+    pub fn metadata_ready(&self) -> bool {
+        self.inner.metadata.is_ready()
+    }
+
     /// Force a WAL group flush on every open shard (shutdown / tests).
     pub fn flush_wal(&self) -> Result<(), BrokerError> {
         let handles: Vec<Arc<ShardHandle>> = {
@@ -1005,6 +1010,7 @@ impl Broker {
         &self,
         batch: PreparedShardBatch,
     ) -> Result<AppendedShardBatch, BrokerError> {
+        self.inner.metadata.check_ready()?;
         if batch.records.is_empty() {
             return Ok(AppendedShardBatch {
                 appended: Vec::new(),
@@ -1045,6 +1051,7 @@ impl Broker {
         mut batch: AppendedShardBatch,
         commit_dedup: bool,
     ) -> Result<(), BrokerError> {
+        self.inner.metadata.check_ready()?;
         if batch.appended.len() != batch.records.len() {
             return Err(BrokerError::InvalidConfig(
                 "appended batch result count mismatch".into(),

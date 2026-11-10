@@ -336,7 +336,7 @@ Background loops export these `/metrics` series: `bettermq_scheduler_failures_to
 | Env | Used for |
 |-----|----------|
 | `BETTERMQ_CLUSTER_SECRET` | Internal `/internal/v1/*` (replication, lease, catalog). Also an admin credential for `/admin/v1`, and the **only** one on a standalone `bettermq panel` (required there) |
-| `BETTERMQ_SHARED_META_DIR` | Local-WAL HA only: one shared filesystem for leases, cursors, catalogs, host breaker. Each node still has its own `--data-dir`. Skip this when nodes have no shared disk — use Slate + S3 instead |
+| `BETTERMQ_SHARED_META_DIR` | Local-WAL HA: one shared filesystem for leases, cursors, catalogs, host breaker. Each node has its own `--data-dir`. Slate is single-broker only, not a shared-disk-free HA alternative |
 | `BETTERMQ_BROKER_URLS` | Fleet/gateway: comma-separated broker base URLs |
 | `BETTERMQ_FLEET_CONCURRENCY` | Fleet in-flight jobs (default `1`) |
 | `BETTERMQ_FLEET_HOLDER` | Optional fleet worker id |
@@ -509,9 +509,7 @@ Settings persist in the Docker volume at `/data/bettermq.json`.
 | `docker-compose.yml` | Solo — local WAL |
 | `docker-compose.slate.yml` | Solo — Slate + MinIO (dev) |
 | `docker-compose.ha.yml` | HA LAN — 3 brokers + shared meta volume |
-| `docker-compose.ha-slate.yml` | HA multi-VPS — 3 brokers + MinIO/S3 |
 | `docker-compose.ha-fleet.yml` | HA + `--broker-only` + `--dispatch-fleet` (scale fleet) |
-| `docker-compose.ha-slate-fleet.yml` | Slate HA + fleet |
 
 ### Scale path
 
@@ -519,7 +517,6 @@ Settings persist in the Docker volume at `/data/bettermq.json`.
 |-------|---------|
 | Solo | `docker compose up -d` |
 | HA LAN | `BETTERMQ_CLUSTER_SECRET=… docker compose -f docker-compose.ha.yml up -d` |
-| HA + Slate | `… -f docker-compose.ha-slate.yml up -d` |
 | Egress fleet | `… -f docker-compose.ha-fleet.yml up -d --scale fleet=3` |
 
 Roles (one binary):
@@ -550,6 +547,14 @@ Fleet long waits (fleet workers only): `BETTERMQ_LONG_WAIT_TIER=15m|1h|6h|12h`.
 
 ### Slate + MinIO
 
+Upstream no longer publishes pullable MinIO container images. Build the pinned
+upstream release from source (see the `slate-minio` job in
+[`ci.yml`](../.github/workflows/ci.yml)), use a self-maintained image, or connect
+to another S3-compatible store through `S3_ENDPOINT`. For this compose, both
+`MINIO_IMAGE` and `MINIO_MC_IMAGE` remain required digest-pinned image references;
+the old `minio/minio` and `minio/mc` Docker Hub pins no longer work. CI builds
+the pinned source directly and does not rely on a third-party MinIO image.
+
 ```bash
 docker compose -f docker-compose.slate.yml up -d --build
 ```
@@ -560,7 +565,21 @@ In **Infrastructure → Storage**, choose SlateDB and set:
 - Buckets: `bettermq`, `bettermq-payloads` (payload bucket is **required**)
 - Access key / secret: set `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` (no compose defaults)
 
-**Note:** the MinIO in `docker-compose.slate.yml` is **one node**. Good for local/dev. Not real object-store HA. For production HA use a durable S3-compatible store (or multi-node MinIO) plus 3 brokers.
+**Slate supports one broker only.** Durable S3/R2 or multi-node MinIO protects stored objects but does not provide broker HA. Multi-broker Slate configuration, enrollment, and storage transitions are rejected. Use local-WAL HA for a multi-broker cell; the former HA Slate compose files have been removed.
+
+Slate claims `bettermq/_indexes.owner` atomically before opening any metadata
+database. Keep `data_dir/slate-node-id` across restarts. Another node is refused
+without opening (and fencing) the active database. To move storage, stop the old
+broker, then set `BETTERMQ_SLATE_TAKEOVER=PREVIOUS_OWNER_NODE_UUID` on the new
+broker for an ETag-conditional takeover. Remove this setting afterward. No TTL,
+automatic stealing, or automatic reopen is used. A fenced process is permanently
+not-ready and must be stopped.
+
+**Upgrade:** stop every legacy Slate writer before the first guarded start;
+older binaries ignore the owner marker. Single-node data, keys, and paths need
+no migration. Existing multi-broker Slate cells must stop and be reconfigured,
+not silently reduced to one broker. Markers remain after shutdown or a crash;
+the same stable node can restart, while another node requires explicit takeover.
 
 Any S3-compatible endpoint works the same way in the panel (endpoint, buckets, access key / secret).
 
@@ -587,7 +606,7 @@ Standalone panel: `BETTERMQ_CLUSTER_SECRET=… docker compose -f docker-compose.
 
 `/admin/v1` fails closed. Every route except `/admin/v1/health` needs `Authorization: Bearer <token>`: the local `sk_local_…` API token (embedded panel) or `BETTERMQ_CLUSTER_SECRET`. Before a panel password is set, admin calls return `401` (`auth_not_configured`); a standalone panel without a cluster secret rejects every admin call. Registering a remote cell (`POST /admin/v1/cells`) requires `adminToken`, that cell's own `sk_local_…` token; leave it blank on update to keep the saved one. Federated cell queries authenticate to each cell with only that token (never the caller's bearer or the cluster secret); a cell without one is reported as `cell credential not configured`. Responses show `adminTokenConfigured` instead of the token, and `cell-registry.json` is written with mode `0600`.
 
-Local WAL HA still requires `BETTERMQ_SHARED_META_DIR` (shared volume/NFS). Separate servers without shared FS → Slate + S3.
+Local WAL HA requires `BETTERMQ_SHARED_META_DIR` (shared volume). Slate + S3 is not a supported multi-broker alternative.
 
 See [BACKUP.md](BACKUP.md) for backup/restore and host-breaker cold-start notes.
 
@@ -596,7 +615,7 @@ See [BACKUP.md](BACKUP.md) for backup/restore and host-breaker cold-start notes.
 | Topic | Reality |
 |-------|---------|
 | Delivery | **At-least-once** — use message / idempotency keys in handlers |
-| HA model | Fenced shard leaders + quorum/Slate + shared meta — **not** full Raft |
+| HA model | Local WAL: fenced shard leaders + quorum + shared metadata; Slate: single broker only |
 | MinIO single-node | Dev only; not object-store HA |
 | Host breaker | Shared via `BETTERMQ_SHARED_META_DIR/host_breaker.json` when set; otherwise in-memory (lost on restart) |
 | Fleet | Not in `cluster.nodes`; claims via internal lease API |

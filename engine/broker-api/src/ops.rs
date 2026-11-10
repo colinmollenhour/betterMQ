@@ -13,6 +13,7 @@ pub struct ReadyResponse {
     pub ready: bool,
     pub cluster_healthy: bool,
     pub auth_configured: bool,
+    pub metadata_ready: bool,
     /// False while any local partition log is quarantined or fenced.
     pub storage_healthy: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -149,12 +150,14 @@ pub fn ready_snapshot(state: &AppState) -> ReadyResponse {
     };
     let storage_faults = shard_storage_faults(broker_storage::storage_faults());
     let storage_healthy = storage_faults.is_empty();
+    let metadata_ready = state.broker.metadata_ready();
     ReadyResponse {
-        ready: auth_configured && cluster_healthy && storage_healthy,
+        ready: auth_configured && cluster_healthy && storage_healthy && metadata_ready,
         cluster_healthy,
         auth_configured,
         storage_healthy,
         storage_faults,
+        metadata_ready,
     }
 }
 

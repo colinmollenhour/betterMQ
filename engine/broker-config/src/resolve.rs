@@ -162,6 +162,11 @@ fn resolve_serve_with_env(
         StorageConfig::Local => (StorageMode::Local, None),
         StorageConfig::Slate { s3 } => (StorageMode::Slate, Some(s3.clone())),
     };
+    if storage == StorageMode::Slate && cluster_enabled {
+        return Err(ConfigError::Invalid(
+            broker_proto::SLATE_SINGLE_BROKER.into(),
+        ));
+    }
 
     let auth = match (&base.auth, &overrides.database_url) {
         (_, Some(url)) if !url.is_empty() => ResolvedAuth::Cloud {
@@ -468,4 +473,19 @@ mod tests {
             );
         }
     }
+}
+#[test]
+fn slate_rejects_cluster_cli_override() {
+    let config = BetterMqConfig::template_single_slate();
+    let error = resolve_serve(
+        Some(&config),
+        &ServeOverrides {
+            cluster: Some(true),
+            ..ServeOverrides::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains(broker_proto::SLATE_SINGLE_BROKER));
 }

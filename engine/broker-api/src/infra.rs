@@ -22,6 +22,35 @@ use uuid::Uuid;
 
 const JOIN_TOKEN_TTL_MS: i64 = 60 * 60 * 1000;
 
+fn check_slate_membership(
+    active: StorageMode,
+    cfg: &BetterMqConfig,
+    nodes: usize,
+) -> Result<(), ApiError> {
+    if nodes > 1
+        && (active == StorageMode::Slate || matches!(cfg.storage, StorageConfig::Slate { .. }))
+    {
+        return Err(ApiError::BadRequest(
+            broker_storage::SLATE_SINGLE_BROKER.into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod slate_gate_tests {
+    use super::*;
+    #[test]
+    fn saved_or_active_slate_rejects_growth() {
+        let local = BetterMqConfig::template_single_local();
+        let slate = BetterMqConfig::template_single_slate();
+        assert!(check_slate_membership(StorageMode::Local, &slate, 2).is_err());
+        assert!(check_slate_membership(StorageMode::Slate, &local, 2).is_err());
+        assert!(check_slate_membership(StorageMode::Slate, &slate, 1).is_ok());
+        assert!(check_slate_membership(StorageMode::Local, &local, 3).is_ok());
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct InfraStatusResponse {
     pub managed_config: bool,
@@ -633,6 +662,17 @@ pub async fn infra_update_storage(
         _ => false,
     };
     cfg.storage = next_storage;
+    let nodes = cfg
+        .cluster
+        .as_ref()
+        .map_or(0, |cluster| cluster.nodes.len())
+        .max(
+            state
+                .cluster
+                .as_ref()
+                .map_or(0, |cluster| cluster.runtime.config().nodes.len()),
+        );
+    check_slate_membership(active_storage_mode(&state), &cfg, nodes)?;
     cfg.validate()
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     save_managed_config(&dir, &cfg).map_err(io_err)?;
@@ -703,6 +743,13 @@ pub async fn infra_cluster_create(
             "cluster membership already exists; create cannot replace it".into(),
         ));
     }
+    check_slate_membership(
+        active_storage_mode(&state),
+        &cfg,
+        cfg.cluster
+            .as_ref()
+            .map_or(1, |cluster| cluster.nodes.len()),
+    )?;
     let token = format!("join_{}", Uuid::new_v4().simple());
     let expires = Utc::now().timestamp_millis() + JOIN_TOKEN_TTL_MS;
 
@@ -852,6 +899,13 @@ pub async fn infra_cluster_register(
     }
     let mut cfg = load_or_default_config(&state)?;
     let url = body.public_url.trim().trim_end_matches('/').to_string();
+    check_slate_membership(
+        active_storage_mode(&state),
+        &cfg,
+        cfg.cluster
+            .as_ref()
+            .map_or(2, |cluster| cluster.nodes.len() + 1),
+    )?;
     let node_name = body.node_name.trim().to_string();
     {
         let cluster = cfg
@@ -926,6 +980,8 @@ pub async fn infra_cluster_join(
                 .into(),
         ));
     }
+    let local_config = load_or_default_config(&state)?;
+    check_slate_membership(active_storage_mode(&state), &local_config, 2)?;
     let seed = body.seed_url.trim().trim_end_matches('/');
     // Prefer header over query string so join tokens are not written to access logs.
     let bootstrap_url = format!("{seed}/v1/infra/join/bootstrap");
@@ -1270,10 +1326,13 @@ pub async fn infra_cluster_sync(
         }
     }
 
+    check_slate_membership(active_storage_mode(&state), &cfg, nodes.len())?;
     let mut cfg = cfg;
     if let Some(c) = cfg.cluster.as_mut() {
         c.nodes = nodes.clone();
     }
+    cfg.validate()
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     save_managed_config(&dir, &cfg).map_err(io_err)?;
     ensure_cluster_config(&cfg, &dir).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
@@ -1326,6 +1385,7 @@ pub async fn internal_cluster_apply_membership(
 ) -> Result<Json<ApplyMembershipResponse>, ApiError> {
     let dir = data_dir(&state);
     let mut cfg = load_or_default_config(&state)?;
+    check_slate_membership(active_storage_mode(&state), &cfg, body.nodes.len())?;
     let Some(cluster) = cfg.cluster.as_mut() else {
         return Err(ApiError::BadRequest("not in a cluster".into()));
     };

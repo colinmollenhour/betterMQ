@@ -4,6 +4,8 @@ mod atomic_file;
 pub mod codec;
 pub use atomic_file::write_secret_atomic;
 pub mod epoch;
+pub const SLATE_SINGLE_BROKER: &str =
+    "Slate storage supports a single broker; multi-broker Slate is unsupported";
 pub mod paths;
 pub mod record;
 pub mod recover;

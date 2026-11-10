@@ -43,14 +43,13 @@ class ComposeTests(unittest.TestCase):
                     self.assertTrue(service["image"].startswith("ghcr.io/colinmollenhour/bettermq:"))
 
     def test_fleet_bootstrap_gates_on_liveness(self):
-        for name in ("docker-compose.ha-fleet.yml", "docker-compose.ha-slate-fleet.yml"):
+        for name in ("docker-compose.ha-fleet.yml",):
             services = config(name)["services"]
             for dependency in services["fleet"]["depends_on"]:
                 self.assertIn("http://localhost:8080/healthz", services[dependency]["healthcheck"]["test"])
 
     def test_slate_init_failure_is_fatal(self):
-        for name in ("docker-compose.slate.yml", "docker-compose.ha-slate.yml",
-                     "docker-compose.ha-slate-fleet.yml"):
+        for name in ("docker-compose.slate.yml",):
             with self.subTest(name=name):
                 services = config(name)["services"]
                 self.assertFalse(services["minio"].get("ports"))

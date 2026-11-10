@@ -20,6 +20,8 @@ mod slate;
 mod slate_indexes;
 #[cfg(feature = "slate")]
 mod slate_log;
+#[cfg(feature = "slate")]
+mod slate_owner;
 mod state_index;
 mod telemetry;
 #[cfg(feature = "slate")]
@@ -37,7 +39,7 @@ pub use archive::{
 };
 pub use archive_checkpoint::ArchiveCheckpoint;
 pub use archive_source::ArchiveSource;
-pub use backend::{PartitionBackend, StorageMode};
+pub use backend::{PartitionBackend, StorageMode, SLATE_SINGLE_BROKER};
 pub use flock::FileLock;
 pub use indexes::{DedupEntry, IndexError, MetadataStore, MetadataWriteBatch};
 pub use log::{storage_faults, FsyncMode, LogError, PartitionLog, PartitionLogConfig};

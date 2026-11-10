@@ -13,6 +13,8 @@ pub enum StorageMode {
     Slate,
 }
 
+pub use broker_proto::SLATE_SINGLE_BROKER;
+
 impl StorageMode {
     pub fn from_env() -> Self {
         match std::env::var("BETTERMQ_STORAGE")

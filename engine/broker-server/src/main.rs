@@ -548,6 +548,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         return serve_panel_from_settings(&settings).await;
     }
 
+    if settings.storage == broker_config::StorageMode::Slate && settings.cluster_enabled {
+        anyhow::bail!(broker_storage::SLATE_SINGLE_BROKER);
+    }
+
     std::fs::create_dir_all(&settings.data_dir)
         .with_context(|| format!("create data dir {}", settings.data_dir.display()))?;
 
