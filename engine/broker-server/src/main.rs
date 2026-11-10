@@ -1150,22 +1150,7 @@ fn spawn_schedule_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
 
             let now = Utc::now().timestamp_millis();
 
-            for pending in state.schedule.pop_due(now) {
-                let id = pending.id;
-                let deliver_at_ms = pending.deliver_at_ms;
-                let ok = fire_scheduled_publish(&state, pending.request.clone()).await;
-                if ok {
-                    if let Err(e) = state.schedule.complete(id) {
-                        tracing::warn!(error = %e, "schedule complete persist failed");
-                    }
-                } else if let Err(e) = state.schedule.requeue(broker_schedule::ScheduledPublish {
-                    id,
-                    deliver_at_ms,
-                    request: pending.request,
-                }) {
-                    tracing::warn!(error = %e, "schedule requeue after failed fire failed");
-                }
-            }
+            fire_due_schedules(&state, state.schedule.pop_due(now)).await;
 
             for job in state.crons.pop_due(now) {
                 tracing::info!(cron_id = %job.id, queue = %job.request.topic, "cron tick");
@@ -1189,6 +1174,54 @@ fn spawn_schedule_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+/// Delayed publishes fired concurrently per batch.
+const SCHEDULE_FIRE_CONCURRENCY: usize = 32;
+/// Completions persisted per journal append (and fsync). Bounds how many
+/// already-published jobs a crash can make the scheduler fire again.
+const SCHEDULE_COMPLETE_BATCH: usize = 256;
+
+/// Fire due delayed publishes with bounded concurrency. Each batch's
+/// successes are removed from the schedule journal in one append, on the
+/// blocking pool; failures go back onto the heap for the next tick.
+async fn fire_due_schedules(state: &Arc<AppState>, due: Vec<broker_schedule::ScheduledPublish>) {
+    let limit = Arc::new(tokio::sync::Semaphore::new(SCHEDULE_FIRE_CONCURRENCY));
+    let mut due = due.into_iter().peekable();
+    while due.peek().is_some() {
+        let mut firing = tokio::task::JoinSet::new();
+        for job in due.by_ref().take(SCHEDULE_COMPLETE_BATCH) {
+            let state = state.clone();
+            let limit = limit.clone();
+            firing.spawn(async move {
+                let _permit = limit.acquire_owned().await;
+                let ok = fire_scheduled_publish(&state, job.request.clone()).await;
+                (job, ok)
+            });
+        }
+        let mut completed = Vec::new();
+        while let Some(joined) = firing.join_next().await {
+            match joined {
+                Ok((job, true)) => completed.push(job.id),
+                Ok((job, false)) => {
+                    if let Err(e) = state.schedule.requeue(job) {
+                        tracing::warn!(error = %e, "schedule requeue after failed fire failed");
+                    }
+                }
+                // The job stays in flight; its durable Add makes a restart fire it again.
+                Err(e) => tracing::warn!(error = %e, "scheduled fire task failed"),
+            }
+        }
+        if completed.is_empty() {
+            continue;
+        }
+        let schedule = state.schedule.clone();
+        match tokio::task::spawn_blocking(move || schedule.complete_many(&completed)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "schedule complete persist failed"),
+            Err(e) => tracing::warn!(error = %e, "schedule complete task failed"),
+        }
+    }
 }
 
 /// Returns true when the publish was accepted (including duplicates).
@@ -1454,5 +1487,93 @@ mod tests {
         .await
         .expect("group flusher advances the commit HWM");
         flusher.abort();
+    }
+
+    fn local_state(dir: &tempfile::TempDir) -> Arc<AppState> {
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        Arc::new(AppState {
+            schedule: ScheduleQueue::open(dir.path()).unwrap(),
+            crons: CronRegistry::open(dir.path()).unwrap(),
+            dispatch: DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default()),
+            broker,
+            leases: broker_dispatch::LeaseTable::new(),
+            cluster: None,
+            local_auth: None,
+            fair_queue: Arc::new(broker_dispatch::TenantFairQueue::new()),
+            catalog_tombstones: CatalogTombstones::open(dir.path()).unwrap(),
+            dispatch_fleet: false,
+            broker_only: true,
+            #[cfg(feature = "cloud")]
+            auth: None,
+            #[cfg(feature = "cloud")]
+            control_plane: None,
+        })
+    }
+
+    fn scheduled(topic: &str) -> broker_schedule::ScheduledPublishRequest {
+        broker_schedule::ScheduledPublishRequest {
+            topic: topic.into(),
+            routing_key: "rk".into(),
+            payload: "body".into(),
+            payload_encoding: None,
+            idempotency_key: None,
+            priority: None,
+            parallelism: None,
+            flow_id: None,
+            queue_id: None,
+            destination: None,
+            flow: None,
+            max_retries: None,
+            retry_backoff: None,
+            method: None,
+            headers: None,
+            sign: None,
+            request: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn due_schedules_fire_in_batches_and_requeue_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_state(&dir);
+        state
+            .broker
+            .create_subscription(broker_partition::CreateSubscriptionRequest {
+                topic: "jobs".into(),
+                url: "http://example.invalid/hook".into(),
+                secret: "sec".into(),
+                parallelism: None,
+                default_max_retries: None,
+                retry_backoff: None,
+            })
+            .unwrap();
+        let jobs = SCHEDULE_COMPLETE_BATCH + 10;
+        for _ in 0..jobs {
+            state.schedule.schedule(scheduled("jobs"), 0).unwrap();
+        }
+        let missing = state
+            .schedule
+            .schedule(scheduled("no-such-queue"), 0)
+            .unwrap();
+
+        fire_due_schedules(&state, state.schedule.pop_due(i64::MAX)).await;
+
+        assert_eq!(
+            state
+                .broker
+                .list_topic_messages("jobs", jobs * 2)
+                .unwrap()
+                .len(),
+            jobs
+        );
+        let left = state.schedule.list();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, missing.id);
+        // The failed job is back on the heap, not stuck in flight.
+        assert_eq!(state.schedule.pop_due(i64::MAX).len(), 1);
+
+        drop(state);
+        let reopened = ScheduleQueue::open(dir.path()).unwrap();
+        assert_eq!(reopened.list().len(), 1, "completions are durable");
     }
 }

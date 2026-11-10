@@ -404,6 +404,24 @@ impl ScheduleQueue {
         Ok(())
     }
 
+    /// Remove several fired jobs with one journal append and one fsync.
+    pub fn complete_many(&self, ids: &[Uuid]) -> Result<(), ScheduleError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.state.lock();
+        self.append_ops(
+            &mut state,
+            ids.iter().map(|id| JournalOp::Remove { id: *id }).collect(),
+        )?;
+        for id in ids {
+            state.in_flight.remove(id);
+        }
+        state.journal_ops += ids.len();
+        self.maybe_compact(&mut state);
+        Ok(())
+    }
+
     /// Put a failed fire back onto the heap. Its original durable Add remains
     /// in the journal until a successful completion appends Remove.
     pub fn requeue(&self, job: ScheduledPublish) -> Result<(), ScheduleError> {
@@ -429,21 +447,36 @@ impl ScheduleQueue {
     }
 
     fn append_op(&self, state: &mut ScheduleState, op: JournalOp) -> Result<(), ScheduleError> {
+        self.append_ops(state, vec![op])
+    }
+
+    /// Append records in one write followed by one fsync. A crash can tear
+    /// only the final line, which `open` ignores.
+    fn append_ops(
+        &self,
+        state: &mut ScheduleState,
+        ops: Vec<JournalOp>,
+    ) -> Result<(), ScheduleError> {
         if let Some(parent) = self.journal_path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        let mut sequence = state.sequence;
+        let mut buffer = Vec::new();
+        for op in ops {
+            sequence = sequence.saturating_add(1);
+            let record = JournalRecord {
+                version: SCHEDULE_STATE_VERSION,
+                sequence,
+                op,
+            };
+            serde_json::to_writer(&mut buffer, &record)?;
+            buffer.push(b'\n');
         }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.journal_path)?;
-        let sequence = state.sequence.saturating_add(1);
-        let record = JournalRecord {
-            version: SCHEDULE_STATE_VERSION,
-            sequence,
-            op,
-        };
-        serde_json::to_writer(&mut file, &record)?;
-        file.write_all(b"\n")?;
+        file.write_all(&buffer)?;
         file.sync_data()?;
         broker_storage::set_secret_file_mode(&self.journal_path);
         state.sequence = sequence;
@@ -605,6 +638,33 @@ mod schedule_tests {
 
         let queue = ScheduleQueue::open(dir.path()).unwrap();
         assert!(queue.list().is_empty());
+    }
+
+    #[test]
+    fn complete_many_removes_a_batch_in_one_append() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        let ids: Vec<_> = (0..5)
+            .map(|_| queue.schedule(request(), 0).unwrap().id)
+            .collect();
+        let due = queue.pop_due(i64::MAX);
+        assert_eq!(due.len(), 5);
+        let journal = dir.path().join("schedule.journal");
+        let before = std::fs::read(&journal).unwrap().len();
+
+        queue.complete_many(&ids[..3]).unwrap();
+        let appended = std::fs::read(&journal).unwrap()[before..].to_vec();
+        assert_eq!(appended.iter().filter(|b| **b == b'\n').count(), 3);
+        assert_eq!(queue.list().len(), 2, "remaining jobs stay in flight");
+        drop(queue);
+
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        let mut left: Vec<_> = queue.list().into_iter().map(|job| job.id).collect();
+        left.sort();
+        let mut expected = ids[3..].to_vec();
+        expected.sort();
+        assert_eq!(left, expected);
+        queue.complete_many(&[]).unwrap();
     }
 
     #[test]
