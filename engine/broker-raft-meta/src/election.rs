@@ -118,6 +118,7 @@ mod tests {
             replicas: replicas.to_vec(),
             learners: Vec::new(),
             isr: isr.to_vec(),
+            committed_hwm: 0,
         }
     }
 

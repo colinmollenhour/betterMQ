@@ -766,14 +766,15 @@ impl ReplicationClient {
         self
     }
 
-    pub(crate) fn targets_for_shard(
-        &self,
-        shard: u32,
-    ) -> (Vec<broker_raft_meta::NodeConfig>, usize) {
+    pub(crate) fn targets_for_shard(&self, shard: u32) -> broker_raft_meta::ReplicationTargets {
         if let Some(runtime) = &self.runtime {
             return runtime.replication_targets(shard);
         }
-        (self.cluster.peer_nodes(), self.cluster.quorum_size())
+        broker_raft_meta::ReplicationTargets {
+            replicas: self.cluster.peer_nodes(),
+            learners: Vec::new(),
+            min_isr: self.cluster.quorum_size(),
+        }
     }
 
     pub fn with_config(cluster: ClusterConfig) -> Self {
@@ -877,10 +878,17 @@ impl ReplicationClient {
                 .map_err(|_| ReplicateError::Closed)?,
         );
         let encoded = bytes::Bytes::from(req.encode_binary()?);
-        let (peers, quorum) = self.targets_for_shard(req.partition);
+        let targets = self.targets_for_shard(req.partition);
+        let quorum = targets.min_isr;
         let stream = self.progress_stream(&req.topic);
+        let peers: Vec<_> = targets
+            .replicas
+            .into_iter()
+            .map(|peer| (peer, true))
+            .chain(targets.learners.into_iter().map(|peer| (peer, false)))
+            .collect();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(peers.len().max(1));
-        for peer in peers {
+        for (peer, replica) in peers {
             let url = format!("{}/internal/v1/replicate/batch", peer.internal_base());
             let http = self.http.clone();
             let body = encoded.clone();
@@ -892,7 +900,8 @@ impl ReplicationClient {
             let leader_epoch = req.leader_epoch;
             // A peer that is out of sync or under repair still receives the
             // push, but only a completed repair makes it count again.
-            let counted = self.counts_toward_quorum(&stream, partition, peer.id);
+            // Learners are caught up the same way but never count.
+            let counted = replica && self.counts_toward_quorum(&stream, partition, peer.id);
             tokio::spawn(async move {
                 let peer_id = peer.id;
                 let builder = Self::apply_cluster_secret(
@@ -1050,7 +1059,7 @@ impl ReplicationClient {
                     .entry(entry.partition)
                     .or_insert_with(|| {
                         self.targets_for_shard(entry.partition)
-                            .0
+                            .replicas
                             .into_iter()
                             .map(|peer| peer.id)
                             .collect()
@@ -1125,7 +1134,7 @@ fn env_bytes(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)

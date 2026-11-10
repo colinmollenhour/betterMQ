@@ -129,6 +129,10 @@ pub struct ShardPlacement {
     pub learners: Vec<Uuid>,
     #[serde(default)]
     pub isr: Vec<Uuid>,
+    /// Leader's durable log end when it last reported the ISR: the physical
+    /// shard log end for V2 layouts, 0 where a shard has one log per topic.
+    #[serde(default)]
+    pub committed_hwm: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -280,6 +284,7 @@ impl ControllerState {
                     isr: replicas.clone(),
                     learners: Vec::new(),
                     replicas,
+                    committed_hwm: 0,
                 },
             );
         }
@@ -380,9 +385,21 @@ pub enum ControllerCommand {
         add: Option<Uuid>,
         remove: Option<Uuid>,
     },
+    /// Submitted by the shard leader once it has verified the learner holds
+    /// its whole log; rejected from anyone else.
     PromoteLearner {
         shard: u32,
         node_id: Uuid,
+        leader_id: Uuid,
+        leader_term: u64,
+    },
+    /// The shard leader's measured in-sync replica set.
+    UpdateIsr {
+        shard: u32,
+        leader_id: Uuid,
+        leader_term: u64,
+        isr: Vec<Uuid>,
+        committed_hwm: u64,
     },
     CompleteRebalance {
         shard: u32,
@@ -780,46 +797,45 @@ impl OpenRaftController {
                 .map(|id| raft_id(*id))
                 .collect()
         };
-        let current: BTreeSet<_> = self
-            .raft
-            .metrics()
-            .borrow()
-            .membership_config
-            .membership()
-            .voter_ids()
-            .collect();
+        let (current, members): (BTreeSet<_>, BTreeSet<_>) = {
+            let metrics = self.raft.metrics();
+            let metrics = metrics.borrow();
+            let membership = metrics.membership_config.membership();
+            (
+                membership.voter_ids().collect(),
+                membership.nodes().map(|(id, _)| *id).collect(),
+            )
+        };
+        // Every broker joins as a learner first (voters are promoted below);
+        // the others stay non-voting learners, so brokers added after
+        // bootstrap receive catalog records and committed placement and can
+        // validate replication epochs.
         let mut node_by_raft: BTreeMap<NodeId, String> = BTreeMap::new();
         for node in &self.config.nodes {
             node_by_raft.insert(raft_id(node.id), node.internal_base().to_owned());
         }
-        for node in state.data_nodes.values() {
+        for node in state.data_nodes.values().filter(|node| node.broker) {
             node_by_raft
                 .entry(raft_id(node.id))
                 .or_insert_with(|| node.addr.clone());
         }
-        let known: BTreeSet<_> = self
-            .raft
-            .metrics()
-            .borrow()
-            .membership_config
-            .membership()
-            .nodes()
-            .map(|(id, _)| *id)
-            .collect();
         for (id, addr) in &node_by_raft {
-            if !known.contains(id) {
+            if !members.contains(id) {
                 self.raft
                     .add_learner(*id, BasicNode::new(addr), false)
                     .await
                     .map_err(|error| ControllerError::Raft(error.to_string()))?;
             }
         }
-        if desired != current {
-            self.raft
-                .change_membership(desired, true)
-                .await
-                .map_err(|error| ControllerError::Raft(error.to_string()))?;
+        if desired == current {
+            return Ok(());
         }
+        // Removed voters that are still data nodes are re-added as learners on
+        // the next pass; decommissioned ones drop out of the group.
+        self.raft
+            .change_membership(desired, false)
+            .await
+            .map_err(|error| ControllerError::Raft(error.to_string()))?;
         Ok(())
     }
 
@@ -859,22 +875,17 @@ impl OpenRaftController {
     pub async fn drain_data_node(&self, node_id: Uuid) -> Result<DrainReport, ControllerError> {
         let state = self.state();
         let min_isr = state.min_isr.max(1) as usize;
-        let mut last_copy = Vec::new();
         let mut shards = Vec::new();
         for placement in state.shards.values() {
             let holds = placement.replicas.contains(&node_id)
                 || placement.isr.contains(&node_id)
                 || placement.leader_id == node_id
                 || placement.learners.contains(&node_id);
-            if !holds {
-                continue;
-            }
-            shards.push(placement.shard);
-            let remaining_isr = placement.isr.iter().filter(|id| **id != node_id).count();
-            if placement.isr.contains(&node_id) && remaining_isr < min_isr {
-                last_copy.push(placement.shard);
+            if holds {
+                shards.push(placement.shard);
             }
         }
+        let last_copy = drain_last_copy_shards(&state, node_id, min_isr);
         if !last_copy.is_empty() {
             return Err(ControllerError::InvalidCommand(format!(
                 "refuse drain: node is last ISR copy for shards {last_copy:?} (minISR={min_isr})"
@@ -997,6 +1008,42 @@ fn pending_fanout_bytes(state: &ControllerState) -> usize {
                 .saturating_add(entry.progress_json.len())
         })
         .fold(0usize, usize::saturating_add)
+}
+
+/// Reject a shard-leader report unless it comes from the committed leader in
+/// its committed term, so a deposed leader cannot rewrite placement.
+fn check_shard_leader(
+    placement: &ShardPlacement,
+    leader_id: Uuid,
+    leader_term: u64,
+) -> Result<(), ControllerError> {
+    if placement.leader_id != leader_id || placement.leader_term != leader_term {
+        return Err(ControllerError::InvalidCommand(format!(
+            "shard {} report from {leader_id}@{leader_term} is not from the committed leader {}@{}",
+            placement.shard, placement.leader_id, placement.leader_term
+        )));
+    }
+    Ok(())
+}
+
+/// Shards on which `node_id` holds an ISR copy that draining would take
+/// below `min_isr`.
+pub(crate) fn drain_last_copy_shards(
+    state: &ControllerState,
+    node_id: Uuid,
+    min_isr: usize,
+) -> Vec<u32> {
+    let mut shards: Vec<_> = state
+        .shards
+        .values()
+        .filter(|placement| {
+            placement.isr.contains(&node_id)
+                && placement.isr.iter().filter(|id| **id != node_id).count() < min_isr
+        })
+        .map(|placement| placement.shard)
+        .collect();
+    shards.sort_unstable();
+    shards
 }
 
 /// Validates fully before mutating, so an `Err` leaves `state` untouched.
@@ -1343,10 +1390,21 @@ fn apply_command(
                 );
                 vec![StateKey::Shard(shard), StateKey::Rebalance(shard)]
             }
-            ControllerCommand::PromoteLearner { shard, node_id } => {
+            ControllerCommand::PromoteLearner {
+                shard,
+                node_id,
+                leader_id,
+                leader_term,
+            } => {
                 let placement = state.shards.get_mut(&shard).ok_or_else(|| {
                     ControllerError::InvalidCommand(format!("unknown shard {shard}"))
                 })?;
+                check_shard_leader(placement, leader_id, leader_term)?;
+                if !placement.learners.contains(&node_id) {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "{node_id} is not a learner of shard {shard}"
+                    )));
+                }
                 placement.learners.retain(|id| *id != node_id);
                 if !placement.replicas.contains(&node_id) {
                     placement.replicas.push(node_id);
@@ -1354,6 +1412,47 @@ fn apply_command(
                 if !placement.isr.contains(&node_id) {
                     placement.isr.push(node_id);
                 }
+                vec![StateKey::Shard(shard)]
+            }
+            ControllerCommand::UpdateIsr {
+                shard,
+                leader_id,
+                leader_term,
+                isr,
+                committed_hwm,
+            } => {
+                let placement = state.shards.get_mut(&shard).ok_or_else(|| {
+                    ControllerError::InvalidCommand(format!("unknown shard {shard}"))
+                })?;
+                check_shard_leader(placement, leader_id, leader_term)?;
+                if !isr.contains(&leader_id) {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "ISR for shard {shard} must contain its leader"
+                    )));
+                }
+                if let Some(stranger) = isr
+                    .iter()
+                    .find(|id| **id != leader_id && !placement.replicas.contains(id))
+                {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "{stranger} is not a replica of shard {shard}"
+                    )));
+                }
+                // Keep replica order so leader choice stays deterministic.
+                let mut ordered: Vec<Uuid> = placement
+                    .replicas
+                    .iter()
+                    .copied()
+                    .filter(|id| isr.contains(id))
+                    .collect();
+                if !ordered.contains(&leader_id) {
+                    ordered.insert(0, leader_id);
+                }
+                if ordered == placement.isr && committed_hwm == placement.committed_hwm {
+                    return Ok(Vec::new());
+                }
+                placement.isr = ordered;
+                placement.committed_hwm = committed_hwm;
                 vec![StateKey::Shard(shard)]
             }
             ControllerCommand::CompleteRebalance { shard } => {
@@ -1977,6 +2076,95 @@ mod tests {
     }
 
     #[test]
+    fn measured_isr_is_leader_fenced_and_drives_drain_safety() {
+        let ids: Vec<_> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let config = ClusterConfig {
+            cluster_id: Uuid::new_v4(),
+            nodes: ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| crate::cluster::NodeConfig {
+                    id: *id,
+                    addr: format!("http://n{index}"),
+                    internal_url: None,
+                })
+                .collect(),
+            node_id: ids[0],
+            generation: 1,
+            hash_version: 1,
+        };
+        let mut state = ControllerState::from_v1(&config, 1, &HashMap::new(), None).unwrap();
+        let placement = state.shards[&0].clone();
+        let leader = placement.leader_id;
+        let others: Vec<_> = placement
+            .replicas
+            .iter()
+            .copied()
+            .filter(|id| *id != leader)
+            .collect();
+        assert!(drain_last_copy_shards(&state, others[0], 2).is_empty());
+
+        // A deposed leader (stale term) cannot rewrite the ISR.
+        let before = state.clone();
+        assert!(apply_command(
+            &mut state,
+            ControllerCommand::UpdateIsr {
+                shard: 0,
+                leader_id: leader,
+                leader_term: placement.leader_term.wrapping_sub(1),
+                isr: vec![leader],
+                committed_hwm: 9,
+            },
+        )
+        .is_err());
+        assert!(apply_command(
+            &mut state,
+            ControllerCommand::UpdateIsr {
+                shard: 0,
+                leader_id: others[0],
+                leader_term: placement.leader_term,
+                isr: vec![others[0]],
+                committed_hwm: 9,
+            },
+        )
+        .is_err());
+        assert_eq!(state, before);
+
+        // The leader reports one follower lagging.
+        apply_command(
+            &mut state,
+            ControllerCommand::UpdateIsr {
+                shard: 0,
+                leader_id: leader,
+                leader_term: placement.leader_term,
+                isr: vec![others[0], leader],
+                committed_hwm: 9,
+            },
+        )
+        .unwrap();
+        let shard = &state.shards[&0];
+        assert_eq!(shard.isr.len(), 2);
+        assert!(!shard.isr.contains(&others[1]));
+        assert_eq!(shard.committed_hwm, 9);
+        // With minISR=2 the remaining in-sync follower is now the last spare
+        // copy: draining it is refused, draining the lagging one is not.
+        assert_eq!(drain_last_copy_shards(&state, others[0], 2), vec![0]);
+        assert!(drain_last_copy_shards(&state, others[1], 2).is_empty());
+        // ISR members must be replicas.
+        assert!(apply_command(
+            &mut state,
+            ControllerCommand::UpdateIsr {
+                shard: 0,
+                leader_id: leader,
+                leader_term: placement.leader_term,
+                isr: vec![leader, Uuid::new_v4()],
+                committed_hwm: 9,
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
     fn controller_commands_update_versioned_state() {
         let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
         let config = ClusterConfig {
@@ -2355,11 +2543,29 @@ mod tests {
                 },
             )
             .unwrap();
+            let (leader_id, leader_term) = (
+                state.shards[&shard].leader_id,
+                state.shards[&shard].leader_term,
+            );
+            // Only the committed shard leader may promote.
+            assert!(apply_command(
+                &mut state,
+                ControllerCommand::PromoteLearner {
+                    shard,
+                    node_id: ids[2],
+                    leader_id,
+                    leader_term: leader_term + 1,
+                },
+            )
+            .is_err());
+            assert!(!state.shards[&shard].isr.contains(&ids[2]));
             apply_command(
                 &mut state,
                 ControllerCommand::PromoteLearner {
                     shard,
                     node_id: ids[2],
+                    leader_id,
+                    leader_term,
                 },
             )
             .unwrap();

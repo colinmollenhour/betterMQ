@@ -2004,6 +2004,8 @@ async fn expand_replication(
                 if placement.replicas.contains(&new_id) {
                     continue;
                 }
+                // The broker joins as a learner. Each shard leader copies its
+                // log and promotes it only once the copy is verified.
                 if !placement.learners.contains(&new_id) {
                     controller
                         .submit(ControllerCommand::BeginRebalance {
@@ -2013,41 +2015,41 @@ async fn expand_replication(
                         })
                         .await
                         .map_err(|e| e.to_string())?;
+                    actions.push(format!("shard_{shard}_learning"));
                 }
-                controller
-                    .submit(ControllerCommand::PromoteLearner {
-                        shard,
-                        node_id: new_id,
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?;
-                controller
-                    .submit(ControllerCommand::CompleteRebalance { shard })
-                    .await
-                    .map_err(|e| e.to_string())?;
-                actions.push(format!("shard_{shard}_add"));
             }
         }
     }
     let snap = controller.state();
+    let mut pending: Vec<u32> = snap
+        .shards
+        .values()
+        .filter(|s| !s.learners.is_empty())
+        .map(|s| s.shard)
+        .collect();
+    pending.sort_unstable();
+    let factor = snap.replication_factor.max(1) as usize;
+    // HA readiness comes from the leaders' measured ISR, not from placement.
     let ha_ready = snap.replication_factor >= 3
+        && pending.is_empty()
         && snap
             .shards
             .values()
-            .all(|s| s.isr.len() >= snap.min_isr.max(2) as usize);
+            .all(|s| s.replicas.len() >= factor && s.isr.len() >= factor);
     Ok(serde_json::json!({
         "ok": true,
         "dataNodes": data_count,
         "replicationFactor": snap.replication_factor,
         "minIsr": snap.min_isr,
         "haReady": ha_ready,
+        "pendingShards": pending,
         "actions": actions,
         "warning": if data_count == 2 {
             Some("RF=2 / minISR=2 — both nodes must be up. Add a third broker for HA.")
         } else if data_count >= 4 && snap.replication_factor == 3 {
             Some("RF stays 3. Extra brokers add shard capacity, not a fourth copy.")
         } else if data_count >= 3 && !ha_ready {
-            Some("Expanding replicas to RF=3…")
+            Some("Copying shards to RF=3. haReady becomes true once every shard leader has verified its replicas in sync; poll this endpoint or GET /admin/v1/shards.")
         } else {
             None
         },

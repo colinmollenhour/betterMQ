@@ -1,6 +1,7 @@
 //! Replicate encoded log frames to peer brokers (quorum ack).
 
 mod append;
+mod isr;
 mod repair;
 mod telemetry;
 
@@ -12,8 +13,8 @@ pub use append::{
     DLQ_ENVELOPE_ALLOWANCE,
 };
 pub use repair::{
-    FollowerFence, RepairObserver, ReplicaLogSource, ReplicaPositionConflict,
-    ReplicateTruncateRequest, ReplicateTruncateResponse,
+    FollowerFence, ReplicaLogSource, ReplicaPositionConflict, ReplicateTruncateRequest,
+    ReplicateTruncateResponse,
 };
 pub use telemetry::{
     ReplicationShardTelemetrySnapshot, ReplicationTelemetrySnapshot,

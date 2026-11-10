@@ -162,6 +162,17 @@ impl ClusterConfig {
     }
 }
 
+/// Where one shard's epochs go; see [`ClusterRuntime::replication_targets`].
+#[derive(Debug, Clone)]
+pub struct ReplicationTargets {
+    /// Replica peers (excluding this node).
+    pub replicas: Vec<NodeConfig>,
+    /// Learners being caught up; pushed to but not counted toward quorum.
+    pub learners: Vec<NodeConfig>,
+    /// Acks required including this node.
+    pub min_isr: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SchedulerLease {
     pub holder: Uuid,
@@ -510,23 +521,60 @@ impl ClusterRuntime {
         self.config.nodes.iter().map(|n| n.id).collect()
     }
 
-    pub fn replication_targets(&self, shard: u32) -> (Vec<NodeConfig>, usize) {
+    /// Peers to replicate `shard` to, resolved from committed membership:
+    /// replicas (whose acks count toward `min_isr`) and learners (which are
+    /// sent every epoch but never counted). Falls back to the startup node
+    /// list without a controller.
+    pub fn replication_targets(&self, shard: u32) -> ReplicationTargets {
         let replicas = self.replica_ids_for_shard(shard);
-        let peers = self
-            .config
-            .peer_nodes()
-            .into_iter()
-            .filter(|peer| replicas.contains(&peer.id))
-            .collect::<Vec<_>>();
-        let rf = replicas.len().max(1);
-        let min_isr = self
+        let state = self
             .controller
             .as_ref()
-            .map(|c| c.state().min_isr as usize)
+            .map(|controller| controller.state());
+        let learner_ids = state
+            .as_ref()
+            .and_then(|state| state.shards.get(&shard))
+            .map(|placement| placement.learners.clone())
+            .unwrap_or_default();
+        let resolve = |id: Uuid| -> Option<NodeConfig> {
+            if id == self.config.node_id {
+                return None;
+            }
+            // The startup config carries the node's private `internal_url`.
+            let internal_url = self
+                .config
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .and_then(|node| node.internal_url.clone());
+            state
+                .as_ref()
+                .and_then(|state| state.data_nodes.get(&id).map(|node| node.addr.clone()))
+                .or_else(|| self.config.node_addr(id))
+                .map(|addr| NodeConfig {
+                    id,
+                    addr,
+                    internal_url,
+                })
+        };
+        let peers = replicas.iter().copied().filter_map(resolve).collect();
+        let learners = learner_ids
+            .into_iter()
+            .filter(|id| !replicas.contains(id))
+            .filter_map(resolve)
+            .collect();
+        let rf = replicas.len().max(1);
+        let min_isr = state
+            .as_ref()
+            .map(|state| state.min_isr as usize)
             .filter(|v| *v > 0)
             .unwrap_or(if rf >= 3 { 2 } else { 1 })
             .clamp(1, rf);
-        (peers, min_isr)
+        ReplicationTargets {
+            replicas: peers,
+            learners,
+            min_isr,
+        }
     }
 
     pub fn is_replica_for_shard(&self, shard: u32) -> bool {

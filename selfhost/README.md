@@ -640,6 +640,11 @@ Prefer compose profiles above, or run **one broker per server**. Two `all` nodes
 3. On broker 1, **Add node**, paste **This panel connects here**. Two local processes: `http://127.0.0.1:8082`. Panel on the laptop and brokers in Docker: that published port, then tick **Other brokers cannot use that URL** and enter `http://broker2:8080`.
 4. Restart every cluster node when the join response says so.
 5. Later add broker 3 the same way for HA. Optional 4th = capacity, not RF=4.
+   Growing to RF=3 is not instant: the new broker joins each shard as a
+   learner, the shard leader copies its log, and only then promotes it to an
+   in-sync replica. `POST /admin/v1/expand-rf` returns `haReady: false` with
+   `pendingShards` until every shard's leader has verified the copy; the
+   in-sync set shown in `GET /admin/v1/shards` is measured by the leaders.
 6. Dispatch / gateway / panel: same form, other profile. They are **not** replicas.
 
 Regenerating the API token (Settings) revokes it for every client and pushes the new credentials to every peer, which accept them because they carry a newer version; the response lists any peer that did not apply them (that peer still accepts the old token until **Re-sync**).

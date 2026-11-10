@@ -342,7 +342,9 @@ async fn catch_up_shard(
     // health view: a briefly "dead" replica may hold acknowledged records.
     let node_id = cluster.runtime.config().node_id;
     let replicas = cluster.runtime.replica_ids_for_shard(shard);
-    let (mut peers, min_isr) = cluster.runtime.replication_targets(shard);
+    // Learners are still being seeded and never hold acknowledged records.
+    let targets = cluster.runtime.replication_targets(shard);
+    let (mut peers, min_isr) = (targets.replicas, targets.min_isr);
     let required = required_catch_up_answers(replicas.len(), min_isr, replicas.contains(&node_id));
     for topic in discover_topics(state) {
         let mut local_leo = state
@@ -664,8 +666,9 @@ pub fn spawn_cluster_health_monitor(
             if !runtime.has_controller_lease() {
                 continue;
             }
-            // Backstop for followers that missed pushes without a failed RPC.
-            cluster.replication.wake_repairs();
+            // Repair lagging followers (backstop for missed pushes), catch up
+            // and promote learners, and commit the measured ISR of led shards.
+            cluster.replication.maintain_led_shards().await;
 
             repair_ticks = repair_ticks.wrapping_add(1);
             if repair_ticks % LEGACY_REPAIR_RETRY_TICKS == 0 {

@@ -85,17 +85,11 @@ pub trait ReplicaLogSource: Send + Sync + 'static {
     ) -> Result<Vec<(u64, Vec<u8>)>, String>;
 }
 
-/// Notified when repair confirms a peer holds the leader's whole log.
-pub trait RepairObserver: Send + Sync + 'static {
-    fn caught_up(&self, stream: &str, shard: u32, peer: Uuid, log_end: u64);
-}
-
 pub(crate) type RepairKey = (String, u32, Uuid);
 
 #[derive(Default)]
 pub(crate) struct RepairRegistry {
-    source: OnceLock<Arc<dyn ReplicaLogSource>>,
-    observer: OnceLock<Arc<dyn RepairObserver>>,
+    pub(crate) source: OnceLock<Arc<dyn ReplicaLogSource>>,
     /// Running repairs; the flag asks the running task for another pass.
     active: Mutex<HashMap<RepairKey, bool>>,
 }
@@ -124,10 +118,6 @@ impl ReplicationClient {
     /// Give repair access to the local log. Without it, repair is disabled.
     pub fn set_log_source(&self, source: Arc<dyn ReplicaLogSource>) {
         let _ = self.repair.source.set(source);
-    }
-
-    pub fn set_repair_observer(&self, observer: Arc<dyn RepairObserver>) {
-        let _ = self.repair.observer.set(observer);
     }
 
     pub fn repair_in_progress(&self, stream: &str, shard: u32, peer: Uuid) -> bool {
@@ -159,13 +149,7 @@ impl ReplicationClient {
             loop {
                 let result = client.repair_once(&key.0, key.1, &peer).await;
                 match &result {
-                    Ok(Some(log_end)) => {
-                        failures = 0;
-                        if let Some(observer) = client.repair.observer.get() {
-                            observer.caught_up(&key.0, key.1, peer.id, *log_end);
-                        }
-                    }
-                    Ok(None) => failures = 0,
+                    Ok(_) => failures = 0,
                     Err(error) => {
                         failures += 1;
                         warn!(
@@ -220,10 +204,11 @@ impl ReplicationClient {
             if !runtime.is_leader_for_shard(entry.partition) {
                 continue;
             }
-            if let Some(peer) = self
-                .targets_for_shard(entry.partition)
-                .0
+            let targets = self.targets_for_shard(entry.partition);
+            if let Some(peer) = targets
+                .replicas
                 .into_iter()
+                .chain(targets.learners)
                 .find(|peer| peer.id == entry.peer_id)
             {
                 self.schedule_repair(&entry.topic, entry.partition, peer);
@@ -1053,6 +1038,51 @@ mod tests {
         settle(&harness).await;
         assert_eq!(harness.follower.ids(), ids(&leader));
         assert!(in_sync(&harness));
+    }
+
+    #[tokio::test]
+    async fn learner_counts_as_caught_up_only_after_repair_copies_everything() {
+        let leader: Vec<_> = (0..5).map(|_| frame(Uuid::new_v4())).collect();
+        let harness = harness(leader.clone(), Vec::new()).await;
+        let streams = vec!["orders".to_string()];
+        assert!(!harness
+            .client
+            .learner_caught_up(&streams, 0, harness.peer.id));
+        // A learner's hot-path acks never mark it in sync.
+        crate::append::update_progress(
+            &harness.client.progress,
+            ProgressUpdate {
+                stream: "orders",
+                partition: 0,
+                peer_id: harness.peer.id,
+                leader_hwm: 5,
+                durable_hwm: 5,
+                success: true,
+                may_mark_in_sync: false,
+                log_end: None,
+            },
+        );
+        assert!(!harness
+            .client
+            .learner_caught_up(&streams, 0, harness.peer.id));
+        harness
+            .client
+            .schedule_repair("orders", 0, harness.peer.clone());
+        settle(&harness).await;
+        assert_eq!(harness.follower.ids(), ids(&leader));
+        assert!(harness
+            .client
+            .learner_caught_up(&streams, 0, harness.peer.id));
+        // New records on the leader make it lag again until repaired.
+        harness
+            .leader_log
+            .0
+            .lock()
+            .unwrap()
+            .push(frame(Uuid::new_v4()));
+        assert!(!harness
+            .client
+            .learner_caught_up(&streams, 0, harness.peer.id));
     }
 
     #[test]

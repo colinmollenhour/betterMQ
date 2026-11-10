@@ -14,7 +14,9 @@ mod placement;
 mod rocks_store;
 mod telemetry;
 
-pub use cluster::{ClusterConfig, ClusterError, ClusterRuntime, NodeConfig, SchedulerLease};
+pub use cluster::{
+    ClusterConfig, ClusterError, ClusterRuntime, NodeConfig, ReplicationTargets, SchedulerLease,
+};
 pub use controller::{
     raft_id, ControllerAppendRequest, ControllerAppendResponse, ControllerCommand,
     ControllerCommandResponse, ControllerError, ControllerNode, ControllerRaft,
