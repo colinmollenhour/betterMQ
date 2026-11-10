@@ -1481,6 +1481,120 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn standalone_reads_come_from_the_controller_not_made_up_values() {
+        use axum::routing::{get, post};
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = seen.clone();
+        let record_gc = seen.clone();
+        let controller = Router::new()
+            .route(
+                "/admin/v1/readyz",
+                get(move |headers: axum::http::HeaderMap| {
+                    let record = record.clone();
+                    async move {
+                        record.lock().unwrap().push(
+                            headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        Json(serde_json::json!({
+                            "ready": false, "cluster_healthy": false, "auth_configured": true
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/admin/v1/gc/{shard}",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let record = record_gc.clone();
+                    async move {
+                        record.lock().unwrap().push(format!("gc {body}"));
+                        Json(serde_json::json!({ "deletedSegments": 3 }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, controller).await.unwrap() });
+
+        let mut admin = AdminState::remote(format!("http://{addr}/"), CellRegistry::default());
+        admin.cluster_secret = Some("cluster-secret".into());
+        {
+            let registry = admin.cell_registry.read();
+            assert_eq!(
+                registry.cells.len(),
+                1,
+                "controller registered as default cell"
+            );
+            assert_eq!(registry.cells[0].controller_url, format!("http://{addr}"));
+        }
+        let app = admin_router(admin);
+        let (status, body) = admin_json(app.clone(), "GET", "/admin/v1/readyz", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], "cell_credential_missing");
+
+        let (status, _) = admin_json(
+            app.clone(),
+            "POST",
+            "/admin/v1/cells",
+            Some(serde_json::json!({
+                "id": "default", "region": "default",
+                "controllerUrl": format!("http://{addr}"), "adminToken": "sk_local_ctrl"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = admin_json(app.clone(), "GET", "/admin/v1/readyz", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["ready"], false,
+            "controller's real readiness is reported"
+        );
+        let (status, body) = admin_json(
+            app,
+            "POST",
+            "/admin/v1/gc/2",
+            Some(serde_json::json!({ "watermark": 7 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deletedSegments"], 3);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[
+                "Bearer sk_local_ctrl".to_string(),
+                r#"gc {"watermark":7}"#.to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_reports_an_unreachable_or_missing_controller() {
+        let mut registry = CellRegistry::default();
+        registry.cells.push(CellRecord {
+            id: "default".into(),
+            region: "r".into(),
+            controller_url: "http://127.0.0.1:9".into(),
+            label: None,
+            admin_token: Some("sk_local_x".into()),
+        });
+        let mut admin = AdminState::remote("http://127.0.0.1:9".into(), registry);
+        admin.cluster_secret = Some("cluster-secret".into());
+        let (status, body) =
+            admin_json(admin_router(admin), "GET", "/admin/v1/cluster", None).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["code"], "upstream_unavailable");
+
+        let mut admin = AdminState::remote_with_path(None, CellRegistry::default(), None);
+        admin.cluster_secret = Some("cluster-secret".into());
+        let (status, body) = admin_json(admin_router(admin), "GET", "/admin/v1/nodes", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "no_controller");
+    }
+
     async fn admin_json(
         app: Router,
         method: &str,
@@ -1510,11 +1624,8 @@ mod tests {
     async fn cell_admin_token_is_required_kept_and_redacted() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("cell-registry.json");
-        let mut admin = AdminState::remote_with_path(
-            "http://127.0.0.1:9".into(),
-            CellRegistry::default(),
-            Some(path.clone()),
-        );
+        let mut admin =
+            AdminState::remote_with_path(None, CellRegistry::default(), Some(path.clone()));
         admin.cluster_secret = Some("cluster-secret".into());
         let app = admin_router(admin);
         let cell = |token: Option<&str>| {

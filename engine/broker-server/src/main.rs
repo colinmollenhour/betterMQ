@@ -897,11 +897,14 @@ async fn serve_panel(args: PanelArgs) -> anyhow::Result<()> {
 async fn serve_panel_from_settings(settings: &ResolvedServeSettings) -> anyhow::Result<()> {
     let registry_path = settings.data_dir.join("cell-registry.json");
     let registry = broker_api::CellRegistry::load(&registry_path);
-    let controller = settings
-        .controller_url
-        .clone()
-        .unwrap_or_else(|| format!("http://{}", settings.listen));
-    let state = AdminState::remote_with_path(controller, registry, Some(registry_path));
+    if settings.controller_url.is_none() {
+        tracing::warn!("standalone panel has no --controller; cell reads will return 503");
+    }
+    let state = AdminState::remote_with_path(
+        settings.controller_url.clone(),
+        registry,
+        Some(registry_path),
+    );
     let app = admin_router(state)
         .route("/panel", get(|| async { Redirect::permanent("/panel/") }))
         .nest("/panel/", panel::resolve_router())
