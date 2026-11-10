@@ -421,7 +421,7 @@ Fan-out vars are **group bookkeeping**, not DLQ TTL.
 | `BETTERMQ_SHARD_COUNT` | New v2 cells: physical shard count (default 256). Never remaps an existing `shard-layout.json` |
 | `BETTERMQ_SHARD_QUEUE_CAPACITY` | Per-shard I/O queue (default `1024`, clamp 1–65536) |
 | `BETTERMQ_SEGMENT_READER_CACHE` | Open WAL segment file cache (default `64`, clamp 1–4096) |
-| `BETTERMQ_METADATA_RECOVER` | `empty` allows replacing corrupt JSON meta with defaults |
+| `BETTERMQ_METADATA_RECOVER` | `empty` allows replacing corrupt JSON meta with defaults. For schedule/cron files, without it startup keeps failing while the file (or a `*.json.corrupt.<ts>` copy) is unreadable and no `.tmp`/`.bak` is usable; the choice is persisted, so set it for one start only |
 | `BETTERMQ_MAX_REPLICATION_EPOCH_BYTES` | Replication epoch size (default 16 MiB, max 64 MiB). Also sets the local-WAL cell body limit (`cell_max_inline_body`: the cap minus about 1.2 MiB of framing and a 64 KiB dead-letter allowance) |
 | `BETTERMQ_MAX_REPLICATION_IN_FLIGHT_BYTES` | Replication in-flight bytes (default 64 MiB) |
 | `BETTERMQ_ARCHIVE_DIR` | Directory for async copies of sealed WAL segments |
