@@ -35,6 +35,7 @@ mod docs;
 #[cfg(test)]
 mod failover_tests;
 mod panel;
+mod quorum_repair;
 mod security;
 mod startup_banner;
 use tracing::info;
@@ -660,6 +661,15 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     } else {
         None
     };
+    // Multi-node local-WAL cells deliver only quorum-durable records (D2).
+    // Single node and Slate keep the local committed watermark.
+    if cluster
+        .as_ref()
+        .is_some_and(|c| c.runtime.config().node_count() > 1)
+        && storage == StorageMode::Local
+    {
+        broker.enable_quorum_gating();
+    }
     if let Some(ref c) = cluster {
         c.attach_local_log(broker.clone(), &settings.data_dir)
             .context("open replica fence")?;
@@ -712,6 +722,14 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             cluster.catalog_ready() && cluster.runtime.is_leader_for_shard(p)
         }));
     }
+    if broker.quorum_gating() {
+        // After a restart every shard is a takeover: the health monitor
+        // catches it up, the quorum repair task verifies its tail and lifts
+        // the fence.
+        for shard in 0..broker.layout().shard_count {
+            dispatch.fence_partition(shard);
+        }
+    }
     // One bounded pass at boot; the backfill loop continues if work remains.
     let boot_backfill_more = !broker_only && dispatch.backfill_pending();
 
@@ -740,6 +758,19 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     if settings.cluster_enabled {
         if let Some(h) = spawn_cluster_catalog_sync(app_state.clone()) {
             bg_tasks.push(h);
+        }
+    }
+    if let (Some(c), true) = (&app_state.cluster, app_state.broker.quorum_gating()) {
+        bg_tasks.push(quorum_repair::spawn_quorum_repair(
+            c.clone(),
+            app_state.clone(),
+        ));
+        // With a shared metadata dir every node already sees the cursors.
+        if settings.cluster_shared_meta_dir.is_none() {
+            bg_tasks.push(quorum_repair::spawn_cursor_checkpoints(
+                c.clone(),
+                app_state.clone(),
+            ));
         }
     }
     if let Some(ref c) = app_state.cluster {

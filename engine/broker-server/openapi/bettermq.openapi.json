@@ -1172,6 +1172,19 @@
       "MetricsResponse": {
         "type": "object",
         "properties": {
+          "quorum": {
+            "type": "object",
+            "description": "Quorum-gated dispatch in multi-node local-WAL cells (absent elsewhere). Dispatch only delivers records proven on a replication quorum.",
+            "properties": {
+              "max_lag_records": { "type": "integer", "format": "uint64", "description": "Largest count of locally committed records not yet proven on a quorum, per log" },
+              "total_lag_records": { "type": "integer", "format": "uint64" },
+              "logs_lagging": { "type": "integer" },
+              "pending_ranges": { "type": "integer", "description": "Quorum-proven epochs waiting behind an unproven gap" },
+              "fenced_partitions": { "type": "integer", "description": "Partitions taken over whose dispatch waits for quorum verification" },
+              "dlq_pending_prepared": { "type": "integer", "format": "uint64" },
+              "dlq_pending_committed": { "type": "integer", "format": "uint64" }
+            }
+          },
           "blocked_hosts": {
             "type": "integer"
           },

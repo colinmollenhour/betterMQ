@@ -12,7 +12,7 @@ use broker_partition::{Broker, PublishRequest, DIRECT_TOPIC};
 use broker_proto::RetryDefaults;
 use broker_storage::StoredMessage;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -175,6 +175,8 @@ pub enum LeasedFailure {
 }
 
 type ShardLeaderFn = Arc<dyn Fn(u32) -> bool + Send + Sync>;
+/// `(topic, committed watermark at takeover)` logs to verify before unfencing.
+type RecoveryTargets = Vec<(String, u64)>;
 type InFlightSet = Arc<parking_lot::Mutex<HashSet<(String, u32, u64)>>>;
 
 #[derive(Debug)]
@@ -281,6 +283,10 @@ pub struct DispatchEngine {
     claim_rates: crate::lease::ClaimRates,
     /// Striped per-lane locks around cursor advancement (see `commit_dispatch_offset`).
     cursor_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
+    /// Partitions taken over but not yet verified: dispatch is fenced until
+    /// each `(topic, target)` log is quorum-verified up to `target` (`None`
+    /// while the local log is still being caught up).
+    recovering: Arc<parking_lot::Mutex<HashMap<u32, Option<RecoveryTargets>>>>,
 }
 
 impl DispatchEngine {
@@ -358,6 +364,7 @@ impl DispatchEngine {
                     .map(|_| tokio::sync::Mutex::new(()))
                     .collect(),
             ),
+            recovering: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         };
         if let Some(handle) = engine.memory_guard.spawn_monitor() {
             engine.background.lock().push(handle);
@@ -580,10 +587,101 @@ impl DispatchEngine {
     }
 
     fn shard_leader(&self, partition: u32) -> bool {
-        self.is_shard_leader
-            .as_ref()
-            .map(|f| f(partition))
-            .unwrap_or(true)
+        !self.is_fenced(partition)
+            && self
+                .is_shard_leader
+                .as_ref()
+                .map(|f| f(partition))
+                .unwrap_or(true)
+    }
+
+    /// Stop dispatch for `partition` (this node is taking it over). It stays
+    /// fenced until [`DispatchEngine::set_recovery_targets`] names the logs
+    /// to verify and [`DispatchEngine::complete_recovery`] reconciles cursors.
+    pub fn fence_partition(&self, partition: u32) {
+        self.recovering.lock().entry(partition).or_insert(None);
+    }
+
+    /// After catch-up: dispatch stays fenced until every `(topic, target)` log
+    /// is quorum-verified up to `target` (its committed watermark now).
+    /// Identity-less completion markers above the current quorum watermark
+    /// stop counting from here on.
+    pub fn set_recovery_targets(&self, partition: u32, targets: Vec<(String, u64)>) {
+        for (topic, _) in &targets {
+            if let Err(error) = self.broker.freeze_legacy_completion_trust(topic, partition) {
+                warn!(%error, %topic, partition, "freeze legacy completion trust failed");
+            }
+        }
+        self.recovering.lock().insert(partition, Some(targets));
+    }
+
+    pub fn is_fenced(&self, partition: u32) -> bool {
+        self.recovering.lock().contains_key(&partition)
+    }
+
+    /// Fenced partitions whose catch-up finished, with their targets.
+    pub fn recovery_targets(&self) -> Vec<(u32, Vec<(String, u64)>)> {
+        let mut out: Vec<_> = self
+            .recovering
+            .lock()
+            .iter()
+            .filter_map(|(partition, targets)| {
+                targets
+                    .as_ref()
+                    .map(|targets| (*partition, targets.clone()))
+            })
+            .collect();
+        out.sort_by_key(|(partition, _)| *partition);
+        out
+    }
+
+    /// Finish a takeover once its targets are quorum-verified: clamp every
+    /// lane cursor of `partition` to the quorum watermark of its log (a cursor
+    /// above it could skip an offset that now holds a different record),
+    /// rescan, and lift the fence. Returns how many cursors were clamped.
+    pub fn complete_recovery(&self, partition: u32) -> Result<usize, DispatchError> {
+        let Some(Some(targets)) = self.recovering.lock().get(&partition).cloned() else {
+            return Ok(0);
+        };
+        for (topic, target) in &targets {
+            let quorum = self.broker.quorum_hwm(topic, partition)?;
+            if quorum < *target {
+                return Err(DispatchError::Failed(format!(
+                    "{topic}/{partition}: quorum watermark {quorum} below takeover target {target}"
+                )));
+            }
+        }
+        let mut clamped = 0;
+        for (tenant, lane, cursor) in self.broker.dispatch_offsets_for_partition(partition)? {
+            let topic = self.lane_topic(&lane);
+            let quorum = self.broker.quorum_hwm(&topic, partition)?;
+            if cursor > quorum {
+                self.broker
+                    .reset_dispatch_offset(&tenant, &lane, partition, quorum)?;
+                clamped += 1;
+            }
+        }
+        self.scan.reset_partitions(&[partition]);
+        self.recovering.lock().remove(&partition);
+        info!(
+            partition,
+            clamped, "dispatch recovery complete; partition unfenced"
+        );
+        Ok(clamped)
+    }
+
+    /// Topic whose log a lane cursor counts offsets in.
+    fn lane_topic(&self, lane: &str) -> String {
+        let Ok(id) = Uuid::parse_str(lane) else {
+            return DIRECT_TOPIC.to_string();
+        };
+        if let Ok(Some(queue)) = self.broker.get_queue_by_id(id) {
+            return queue.topic;
+        }
+        if let Ok(Some(member)) = self.broker.get_group_member(id) {
+            return broker_partition::group_topic(member.group_id);
+        }
+        DIRECT_TOPIC.to_string()
     }
 
     pub fn enqueue(&self, job: DeliveryJob) {
@@ -1132,7 +1230,9 @@ impl DispatchEngine {
                 return Ok(());
             }
         };
-        let committed_hwm = self.broker.committed_hwm(&job.topic, job.partition)?;
+        // Quorum-gated in a cell: never deliver a record before it is known
+        // to survive failover.
+        let committed_hwm = self.broker.dispatch_hwm(&job.topic, job.partition)?;
         if job.offset >= committed_hwm {
             self.defer_job(job, Duration::from_millis(250), "awaiting_commit");
             return Ok(());
@@ -1252,7 +1352,7 @@ impl DispatchEngine {
             }
         }
         self.memory_guard.wait_below_limit().await;
-        let committed_hwm = self.broker.committed_hwm(&msg.topic, msg.partition)?;
+        let committed_hwm = self.broker.dispatch_hwm(&msg.topic, msg.partition)?;
         if msg.offset >= committed_hwm {
             return Err(DispatchError::Uncommitted);
         }
@@ -1289,11 +1389,13 @@ impl DispatchEngine {
         }
         if self
             .broker
-            .is_dispatch_complete(
+            .is_delivery_complete(
+                &msg.topic,
                 &tenant_id,
                 &lane_owner.to_string(),
                 msg.partition,
                 msg.offset,
+                msg.id,
             )
             .unwrap_or(false)
         {
@@ -1303,6 +1405,7 @@ impl DispatchEngine {
                 &lane_owner.to_string(),
                 msg.partition,
                 msg.offset,
+                msg.id,
             )
             .await?;
             self.lifecycle
@@ -1368,6 +1471,7 @@ impl DispatchEngine {
                         &lane_owner.to_string(),
                         msg.partition,
                         msg.offset,
+                        msg.id,
                     )
                     .await?;
                     info!(
@@ -1479,6 +1583,7 @@ impl DispatchEngine {
         Ok(())
     }
 
+    /// Complete the delivery of `message_id` at `offset` and advance the lane cursor.
     pub async fn commit_cursor(
         &self,
         tenant_id: &str,
@@ -1486,8 +1591,9 @@ impl DispatchEngine {
         cursor_key: &str,
         partition: u32,
         offset: u64,
+        message_id: Uuid,
     ) -> Result<(), DispatchError> {
-        self.commit_dispatch_offset(tenant_id, topic, cursor_key, partition, offset)
+        self.commit_dispatch_offset(tenant_id, topic, cursor_key, partition, offset, message_id)
             .await?;
         self.retry_state
             .clear_offset(topic, partition, offset)
@@ -1514,6 +1620,7 @@ impl DispatchEngine {
         cursor_key: &str,
         partition: u32,
         offset: u64,
+        message_id: Uuid,
     ) -> Result<(), DispatchError> {
         // Completions of one lane run concurrently; serialise the
         // read-compute-write so a slower task cannot write a cursor computed
@@ -1528,12 +1635,14 @@ impl DispatchEngine {
         }
         let newly_completed = !self
             .broker
-            .is_dispatch_complete(tenant_id, cursor_key, partition, offset)?;
-        // Persist completion first. Reconstruct the contiguous cursor entirely
-        // from durable completion keys so restart does not lose gap state.
+            .is_delivery_complete(topic, tenant_id, cursor_key, partition, offset, message_id)?;
+        // Persist completion first, with the message identity, so a marker can
+        // never be mistaken for a different record reusing this offset.
         self.broker
-            .mark_dispatch_complete(tenant_id, cursor_key, partition, offset)?;
-        let hwm = self.broker.committed_hwm(topic, partition)?;
+            .mark_dispatch_complete_for(tenant_id, cursor_key, partition, offset, message_id)?;
+        // The cursor never passes the quorum watermark: its prefix has a
+        // stable identity, so a cursor skip is always safe.
+        let hwm = self.broker.dispatch_hwm(topic, partition)?;
         let mut next = cursor;
         const PAGE: usize = 256;
         'scan: while next < hwm {
@@ -1546,14 +1655,17 @@ impl DispatchEngine {
             }
             let count = messages.len();
             for msg in messages {
+                if msg.offset >= hwm {
+                    next = hwm;
+                    break 'scan;
+                }
                 next = msg.offset.saturating_add(1);
                 if broker_partition::flow_lane_owner(&msg).to_string() != cursor_key {
                     continue;
                 }
-                if !self
-                    .broker
-                    .is_dispatch_complete(tenant_id, cursor_key, partition, msg.offset)?
-                {
+                if !self.broker.is_delivery_complete(
+                    topic, tenant_id, cursor_key, partition, msg.offset, msg.id,
+                )? {
                     next = msg.offset;
                     break 'scan;
                 }
@@ -1563,7 +1675,7 @@ impl DispatchEngine {
                 break;
             }
         }
-        if next != cursor {
+        if next > cursor {
             self.broker
                 .set_dispatch_offset(tenant_id, cursor_key, partition, next)?;
         }
@@ -1615,8 +1727,15 @@ impl DispatchEngine {
         } else {
             msg.tenant_id.clone()
         };
-        self.commit_dispatch_offset(&tenant, &msg.topic, &cursor_key, msg.partition, msg.offset)
-            .await?;
+        self.commit_dispatch_offset(
+            &tenant,
+            &msg.topic,
+            &cursor_key,
+            msg.partition,
+            msg.offset,
+            msg.id,
+        )
+        .await?;
         self.clear_retry(msg)?;
         self.lifecycle
             .clear(&source)
@@ -2366,7 +2485,14 @@ mod tests {
         let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
         let tenant = broker.tenant();
         engine
-            .commit_cursor(&tenant, &topic, &lane, partition, second.offset.unwrap())
+            .commit_cursor(
+                &tenant,
+                &topic,
+                &lane,
+                partition,
+                second.offset.unwrap(),
+                second.message_id.unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2385,7 +2511,14 @@ mod tests {
 
         let restarted = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
         restarted
-            .commit_cursor(&tenant, &topic, &lane, partition, first.offset.unwrap())
+            .commit_cursor(
+                &tenant,
+                &topic,
+                &lane,
+                partition,
+                first.offset.unwrap(),
+                first.message_id.unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2440,10 +2573,11 @@ mod tests {
                 response.topic,
                 response.partition.unwrap(),
                 response.offset.unwrap(),
+                response.message_id.unwrap(),
             ));
         }
         broker.flush_wal().unwrap();
-        let (topic, partition, first) = offsets[0].clone();
+        let (topic, partition, first, _) = offsets[0].clone();
         let last = offsets.last().unwrap().2;
         let lane = broker_partition::flow_lane_owner(
             &broker.read_message(&topic, partition, first).unwrap(),
@@ -2454,13 +2588,13 @@ mod tests {
         let tasks: Vec<_> = offsets
             .iter()
             .rev()
-            .map(|(topic, partition, offset)| {
+            .map(|(topic, partition, offset, id)| {
                 let engine = engine.clone();
                 let (topic, lane, tenant) = (topic.clone(), lane.clone(), tenant.clone());
-                let (partition, offset) = (*partition, *offset);
+                let (partition, offset, id) = (*partition, *offset, *id);
                 tokio::spawn(async move {
                     engine
-                        .commit_cursor(&tenant, &topic, &lane, partition, offset)
+                        .commit_cursor(&tenant, &topic, &lane, partition, offset, id)
                         .await
                         .unwrap();
                 })

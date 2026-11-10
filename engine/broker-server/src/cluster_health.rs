@@ -19,7 +19,7 @@ use uuid::Uuid;
 /// Health ticks (2 s) between retries of unrepaired legacy payloads.
 const LEGACY_REPAIR_RETRY_TICKS: u64 = 30;
 
-fn discover_topics(state: &AppState) -> HashSet<String> {
+pub(crate) fn discover_topics(state: &AppState) -> HashSet<String> {
     let mut topics = HashSet::from([broker_partition::DIRECT_TOPIC.to_string()]);
     if let Ok(queues) = state.broker.list_queues() {
         topics.extend(queues.into_iter().map(|queue| queue.topic));
@@ -720,6 +720,14 @@ pub fn spawn_cluster_health_monitor(
                     shards = ?gained_shards,
                     "failover: this node gained shard leadership; catching up durable prefixes"
                 );
+                // Quorum-gated cells: no dispatch on a taken-over shard until its
+                // tail is re-verified on minISR and cursors are reconciled.
+                let gated = state.broker.quorum_gating();
+                if gated {
+                    for shard in &gained_shards {
+                        dispatch.fence_partition(*shard);
+                    }
+                }
                 sync_catalog_from_peers(&state).await;
                 let mut caught_up = Vec::new();
                 for shard in gained_shards {
@@ -733,6 +741,12 @@ pub fn spawn_cluster_health_monitor(
                                     shard,
                                     unresolved = repair.unresolved,
                                     "shard serving with unrepaired legacy payloads; retrying periodically"
+                                );
+                            }
+                            if gated {
+                                dispatch.set_recovery_targets(
+                                    shard,
+                                    crate::quorum_repair::recovery_targets(&state, shard),
                                 );
                             }
                             runtime.set_shard_ready(shard, true);
@@ -762,7 +776,12 @@ pub fn spawn_cluster_health_monitor(
                         }
                     }
                 }
-                if !caught_up.is_empty() {
+                if !caught_up.is_empty() && gated {
+                    info!(
+                        shards = ?caught_up,
+                        "failover catch-up complete; ingest open, dispatch waits for quorum verification"
+                    );
+                } else if !caught_up.is_empty() {
                     info!(shards = ?caught_up, "failover catch-up complete; shards unfenced");
                     // Catch-up may have rewritten these logs; rescan them.
                     dispatch.reset_dispatch_scan(&caught_up);

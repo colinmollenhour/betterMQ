@@ -504,7 +504,9 @@ fn claim_with_overrides(
             if !is_leader(partition) {
                 continue;
             }
-            let Ok(committed_hwm) = broker.committed_hwm(&topic, partition) else {
+            // Quorum-gated in a cell: claims never carry a record that may not
+            // survive failover.
+            let Ok(committed_hwm) = broker.dispatch_hwm(&topic, partition) else {
                 continue;
             };
             let view = match engine
@@ -574,16 +576,15 @@ fn claim_with_overrides(
                 }
                 // The index may lag completions made elsewhere; confirm.
                 let done = broker
-                    .dispatch_offset(&entry.tenant_id, &entry.cursor_key, partition)
-                    .is_ok_and(|cursor| entry.offset < cursor)
-                    || broker
-                        .is_dispatch_complete(
-                            &entry.tenant_id,
-                            &entry.cursor_key,
-                            partition,
-                            entry.offset,
-                        )
-                        .unwrap_or(false);
+                    .is_delivery_complete(
+                        &topic,
+                        &entry.tenant_id,
+                        &entry.cursor_key,
+                        partition,
+                        entry.offset,
+                        entry.message_id,
+                    )
+                    .unwrap_or(false);
                 if done {
                     engine.scan().mark_done(&topic, partition, entry.offset);
                     continue;

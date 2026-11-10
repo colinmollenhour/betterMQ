@@ -21,10 +21,12 @@ fn map_lease(e: LeaseError) -> ApiError {
 }
 
 fn is_dispatch_leader(state: &AppState, partition: u32) -> bool {
-    match &state.cluster {
-        None => true,
-        Some(c) => c.runtime.is_leader_for_shard(partition),
-    }
+    // A partition being recovered after takeover is fenced for fleet claims too.
+    !state.dispatch.is_fenced(partition)
+        && match &state.cluster {
+            None => true,
+            Some(c) => c.runtime.is_leader_for_shard(partition),
+        }
 }
 
 fn generation(state: &AppState, partition: u32) -> u64 {
@@ -51,7 +53,7 @@ fn validate_token(
     if generation_token != current_generation {
         return Err(map_lease(LeaseError::Conflict));
     }
-    let hwm = state.broker.committed_hwm(topic, partition)?;
+    let hwm = state.broker.dispatch_hwm(topic, partition)?;
     if offset >= hwm {
         return Err(map_lease(LeaseError::Other(
             "lease offset is not committed".into(),
@@ -119,7 +121,7 @@ fn resolve_completion_job(
         attempts: 0,
         committed_hwm: state
             .broker
-            .committed_hwm(identity.topic, identity.partition)?,
+            .dispatch_hwm(identity.topic, identity.partition)?,
         cursor_key: identity.cursor_key.to_string(),
         message: None,
     })
@@ -189,6 +191,7 @@ pub async fn lease_complete(
             &job.cursor_key,
             job.partition,
             job.offset,
+            job.message_id,
         )
         .await
     {

@@ -59,6 +59,9 @@ pub(crate) enum MetadataOperation {
         subscription_id: String,
         partition: u32,
         offset: u64,
+        /// The delivered record, so a later reader can tell whether the marker
+        /// belongs to the record now stored at `offset`. `None` = legacy marker.
+        message_id: Option<Uuid>,
     },
 }
 
@@ -111,8 +114,39 @@ impl MetadataWriteBatch {
                 subscription_id: subscription_id.into(),
                 partition,
                 offset,
+                message_id: None,
             });
     }
+
+    /// [`Self::mark_dispatch_complete`] recording the delivered message id.
+    pub fn mark_dispatch_complete_for(
+        &mut self,
+        tenant_id: impl Into<String>,
+        subscription_id: impl Into<String>,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
+    ) {
+        self.operations
+            .push(MetadataOperation::MarkDispatchComplete {
+                tenant_id: tenant_id.into(),
+                subscription_id: subscription_id.into(),
+                partition,
+                offset,
+                message_id: Some(message_id),
+            });
+    }
+}
+
+/// Durable completion marker of one dispatch offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchCompletion {
+    Missing,
+    /// Written before markers carried the message id (or by a backend that
+    /// does not store it): the offset is complete, identity unknown.
+    Legacy,
+    /// Completed delivery of this message id.
+    Message(Uuid),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,7 +253,7 @@ enum MetaBackend {
         sync_writes: WriteOptions,
         control: RocksControl,
     },
-    Shared(SharedMetadataStore),
+    Shared(Box<SharedMetadataStore>),
     #[cfg(feature = "slate")]
     Slate(SlateMetadataStore),
 }
@@ -254,7 +288,7 @@ impl MetadataStore {
                     )?;
                 }
                 return Ok(Self {
-                    backend: MetaBackend::Shared(store),
+                    backend: MetaBackend::Shared(Box::new(store)),
                     retention_ms,
                 });
             }
@@ -406,10 +440,17 @@ impl MetadataStore {
                             subscription_id,
                             partition,
                             offset,
-                        } => completions.push((tenant_id, subscription_id, partition, offset)),
+                            message_id,
+                        } => completions.push((
+                            tenant_id,
+                            subscription_id,
+                            partition,
+                            offset,
+                            message_id,
+                        )),
                     }
                 }
-                for (tenant, sub, partition, offset) in completions {
+                for (tenant, sub, partition, offset, message_id) in completions {
                     let cursor_key = Self::dispatch_key(&tenant, &sub, partition);
                     let cursor = match cursors.get(&cursor_key) {
                         Some(value) => *value,
@@ -419,8 +460,11 @@ impl MetadataStore {
                             .unwrap_or(0),
                     };
                     if offset >= cursor {
-                        rocks_batch
-                            .put(Self::complete_key(&tenant, &sub, partition, offset), [1u8]);
+                        let key = Self::complete_key(&tenant, &sub, partition, offset);
+                        match message_id {
+                            Some(id) => rocks_batch.put(key, id.as_bytes()),
+                            None => rocks_batch.put(key, [1u8]),
+                        }
                     }
                 }
                 db.write_opt(rocks_batch, sync_writes)?;
@@ -454,11 +498,14 @@ impl MetadataStore {
                             partition,
                             next_offset,
                         )?,
+                        // Slate cells share one object-store log, so offsets are
+                        // never reused across leaders; markers stay identity-less.
                         MetadataOperation::MarkDispatchComplete {
                             tenant_id,
                             subscription_id,
                             partition,
                             offset,
+                            ..
                         } => self.mark_dispatch_complete(
                             &tenant_id,
                             &subscription_id,
@@ -650,6 +697,134 @@ impl MetadataStore {
                 let mut batch = MetadataWriteBatch::default();
                 batch.mark_dispatch_complete(tenant_id, subscription_id, partition, offset);
                 self.write_batch(batch)
+            }
+        }
+    }
+
+    /// Mark `offset` complete for the delivery of `message_id`, so a later
+    /// reader can tell whether the marker belongs to the record now stored at
+    /// that offset.
+    pub fn mark_dispatch_complete_for(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
+    ) -> Result<(), IndexError> {
+        let mut batch = MetadataWriteBatch::default();
+        batch.mark_dispatch_complete_for(tenant_id, subscription_id, partition, offset, message_id);
+        self.write_batch(batch)
+    }
+
+    /// The completion marker at `offset` (ignores the lane cursor).
+    pub fn dispatch_completion(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<DispatchCompletion, IndexError> {
+        match &self.backend {
+            MetaBackend::Shared(s) => {
+                Ok(s.dispatch_completion(tenant_id, subscription_id, partition, offset)?)
+            }
+            #[cfg(feature = "slate")]
+            MetaBackend::Slate(s) => Ok(
+                if s.is_dispatch_complete(tenant_id, subscription_id, partition, offset)? {
+                    DispatchCompletion::Legacy
+                } else {
+                    DispatchCompletion::Missing
+                },
+            ),
+            MetaBackend::Rocks { db, .. } => {
+                let key = Self::complete_key(tenant_id, subscription_id, partition, offset);
+                Ok(match db.get(key)? {
+                    None => DispatchCompletion::Missing,
+                    Some(bytes) => Uuid::from_slice(&bytes)
+                        .map(DispatchCompletion::Message)
+                        .unwrap_or(DispatchCompletion::Legacy),
+                })
+            }
+        }
+    }
+
+    /// Drop a completion marker that belongs to a different record.
+    pub fn clear_dispatch_complete(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<(), IndexError> {
+        match &self.backend {
+            MetaBackend::Shared(s) => {
+                s.clear_dispatch_complete(tenant_id, subscription_id, partition, offset)?;
+                Ok(())
+            }
+            #[cfg(feature = "slate")]
+            MetaBackend::Slate(_) => Ok(()),
+            MetaBackend::Rocks {
+                db,
+                sync_writes,
+                control,
+            } => {
+                let _mutation = control
+                    .mutation
+                    .lock()
+                    .map_err(|_| std::io::Error::other("metadata mutation lock poisoned"))?;
+                let key = Self::complete_key(tenant_id, subscription_id, partition, offset);
+                db.delete_opt(key, sync_writes)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Every lane cursor of `partition` as `(tenant, lane, next_offset)`.
+    pub fn dispatch_offsets_for_partition(
+        &self,
+        partition: u32,
+    ) -> Result<Vec<(String, String, u64)>, IndexError> {
+        Ok(self
+            .dispatch_offsets()?
+            .into_iter()
+            .filter(|(_, _, p, _)| *p == partition)
+            .map(|(tenant, lane, _, offset)| (tenant, lane, offset))
+            .collect())
+    }
+
+    /// Every lane cursor as `(tenant, lane, partition, next_offset)`. Slate
+    /// stores cursors in the shared object store, where every node already
+    /// sees them, so it reports none.
+    pub fn dispatch_offsets(&self) -> Result<Vec<(String, String, u32, u64)>, IndexError> {
+        match &self.backend {
+            MetaBackend::Shared(s) => Ok(s.dispatch_offsets()?),
+            #[cfg(feature = "slate")]
+            MetaBackend::Slate(_) => Ok(Vec::new()),
+            MetaBackend::Rocks { db, .. } => {
+                let parse = |key: &str| -> Option<(String, String, u32)> {
+                    let (rest, partition) = key.rsplit_once(":p")?;
+                    let partition = partition.parse().ok()?;
+                    let (tenant, lane) = rest.rsplit_once(':')?;
+                    Some((tenant.to_string(), lane.to_string(), partition))
+                };
+                let prefix = b"disp:";
+                let mut out = Vec::new();
+                for item in db.prefix_iterator(prefix) {
+                    let (key, value) = item?;
+                    if !key.starts_with(prefix) {
+                        break;
+                    }
+                    let Ok(key) = std::str::from_utf8(&key[prefix.len()..]) else {
+                        continue;
+                    };
+                    if let Some((tenant, lane, partition)) = parse(key) {
+                        let offset =
+                            u64::from_le_bytes(value.as_ref().try_into().unwrap_or([0; 8]));
+                        out.push((tenant, lane, partition, offset));
+                    }
+                }
+                Ok(out)
             }
         }
     }
@@ -1082,5 +1257,50 @@ mod tests {
         batch.set_dispatch_offset("tenant", "queue", 0, 5);
         store.write_batch(batch).unwrap();
         assert_eq!(store.dispatch_offset("tenant", "queue", 0).unwrap(), 20);
+    }
+
+    #[test]
+    fn completion_markers_carry_message_identity() {
+        let dir = tempdir().unwrap();
+        let store = MetadataStore::open(dir.path()).unwrap();
+        let id = Uuid::new_v4();
+        store
+            .mark_dispatch_complete_for("tenant", "queue", 1, 9, id)
+            .unwrap();
+        store
+            .mark_dispatch_complete("tenant", "queue", 1, 10)
+            .unwrap();
+        assert_eq!(
+            store.dispatch_completion("tenant", "queue", 1, 9).unwrap(),
+            DispatchCompletion::Message(id)
+        );
+        assert_eq!(
+            store.dispatch_completion("tenant", "queue", 1, 10).unwrap(),
+            DispatchCompletion::Legacy
+        );
+        store
+            .clear_dispatch_complete("tenant", "queue", 1, 9)
+            .unwrap();
+        assert_eq!(
+            store.dispatch_completion("tenant", "queue", 1, 9).unwrap(),
+            DispatchCompletion::Missing
+        );
+
+        store.set_dispatch_offset("tenant", "queue", 1, 40).unwrap();
+        store.set_dispatch_offset("ten:ant", "other", 1, 7).unwrap();
+        store.set_dispatch_offset("tenant", "queue", 2, 5).unwrap();
+        let mut cursors = store.dispatch_offsets_for_partition(1).unwrap();
+        cursors.sort();
+        assert_eq!(
+            cursors,
+            vec![
+                ("ten:ant".into(), "other".into(), 7),
+                ("tenant".into(), "queue".into(), 40)
+            ]
+        );
+        store
+            .reset_dispatch_offset("tenant", "queue", 1, 12)
+            .unwrap();
+        assert_eq!(store.dispatch_offset("tenant", "queue", 1).unwrap(), 12);
     }
 }

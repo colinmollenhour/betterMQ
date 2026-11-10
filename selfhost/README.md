@@ -272,6 +272,14 @@ the original available until its accepted work is delivered or recovered. For a
 cluster, coordinate the procedure across all replicas; do not switch nodes one
 at a time. Simply changing configuration does not move messages.
 
+**Delivery in multi-node local-WAL cells.** Dispatch (local workers and fleet claims) only delivers a record once it is durable on a replication quorum (local fsync plus minISR). Each shard log keeps a persisted quorum watermark next to its WAL; `/metrics` reports how far it trails local durability (`quorum.max_lag_records`). A record whose replication failed is not delivered until a background task re-replicates it to a quorum. When a node takes over a shard (failover or restart) it catches up, re-verifies its tail on minISR, clamps lane cursors to the verified prefix and only then resumes dispatch (`quorum.fenced_partitions`). Completion markers carry the message id, so an offset reused after failover is never skipped. Single node and Slate storage are unchanged.
+
+What this means for producers:
+
+- A `5xx` from enqueue means the outcome is unknown, not that the message was dropped. A record that got a `5xx` but survives on a replica may still be delivered, including after a failover. Retry with an idempotency key.
+- Delivery is at-least-once. After a takeover, messages delivered in the last moments before the failover can be delivered again. Cells without `BETTERMQ_SHARED_META_DIR` share lane cursors between brokers every 2 seconds, so that window is about 2 seconds plus any messages completed out of order above a cursor.
+- Upgrading an existing cell: each shard starts without a quorum watermark and re-verifies its retained log on minISR before delivering. Large retained logs take a while; delivery of new messages on a shard waits for it.
+
 ### `bettermq config`
 
 ```bash

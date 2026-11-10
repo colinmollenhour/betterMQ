@@ -756,24 +756,45 @@ async fn submit_local_leader_batch(
             }
             let replication = cluster.replication.clone();
             let wait_topic = topic;
+            let quorum_broker = state.broker.clone();
             commit_tasks.spawn(async move {
                 let mut committed_hwm = 0;
                 for request in requests {
+                    let epoch_first = request.first_offset;
                     let epoch_last = request.last_offset()?;
                     let broker = broker.clone();
                     let wait_topic = wait_topic.clone();
-                    let local = async move {
-                        broker
-                            .wait_committed(&wait_topic, partition, epoch_last)
-                            .await
-                            .map_err(|error| {
-                                broker_replication::ReplicateError::InvalidEpoch(error.to_string())
-                            })
+                    let local = {
+                        let wait_topic = wait_topic.clone();
+                        async move {
+                            broker
+                                .wait_committed(&wait_topic, partition, epoch_last)
+                                .await
+                                .map_err(|error| {
+                                    broker_replication::ReplicateError::InvalidEpoch(
+                                        error.to_string(),
+                                    )
+                                })
+                        }
                     };
                     committed_hwm = replication
                         .replicate_batch_with_local(request, local)
                         .await?
                         .committed_hwm;
+                    // Dispatch sees the epoch only once it is quorum-durable and
+                    // the watermark is persisted.
+                    quorum_broker
+                        .record_quorum_commit(
+                            &wait_topic,
+                            partition,
+                            epoch_first,
+                            epoch_last.saturating_add(1),
+                        )
+                        .map_err(|error| {
+                            broker_replication::ReplicateError::InvalidEpoch(format!(
+                                "persist quorum watermark: {error}"
+                            ))
+                        })?;
                 }
                 Ok::<_, broker_replication::ReplicateError>((
                     appended,

@@ -332,7 +332,17 @@ async fn replicate_if_needed(
         })
         .await
     {
-        Ok(outcome) => Ok(outcome.committed_hwm),
+        Ok(outcome) => {
+            // Expose the record to dispatch only once it is quorum-durable,
+            // and only after the watermark is persisted.
+            state
+                .broker
+                .record_quorum_commit(&resp.topic, partition, offset, offset.saturating_add(1))
+                .map_err(|e| {
+                    ApiError::ReplicationFailed(format!("persist quorum watermark: {e}"))
+                })?;
+            Ok(outcome.committed_hwm)
+        }
         Err(e) => {
             warn!(error = %e, "replication durable quorum failed");
             Err(ApiError::ReplicationFailed(e.to_string()))
@@ -1910,6 +1920,51 @@ pub async fn internal_replicate_truncate(
         log_end,
     })
     .into_response())
+}
+
+/// Lane cursors a shard leader shares with its peers, so a node taking over
+/// a shard in a cell without shared metadata does not redeliver everything the
+/// previous leader already delivered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchCursorCheckpoint {
+    pub leader_id: Uuid,
+    pub cursors: Vec<DispatchCursorEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DispatchCursorEntry {
+    pub tenant_id: String,
+    pub lane: String,
+    pub partition: u32,
+    pub next_offset: u64,
+}
+
+/// Apply a peer's cursor checkpoint. Only cursors of shards the sender leads
+/// (and this node does not) are taken, and only forwards: the setter is
+/// monotonic, and a takeover clamps cursors to the verified quorum prefix.
+pub async fn internal_dispatch_cursors(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DispatchCursorCheckpoint>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(cluster) = &state.cluster else {
+        return Err(ApiError::BadRequest("cluster mode not enabled".into()));
+    };
+    let mut applied = 0usize;
+    for entry in body.cursors {
+        if cluster.runtime.elect_leader_for_shard(entry.partition) != Some(body.leader_id)
+            || cluster.runtime.is_leader_for_shard(entry.partition)
+        {
+            continue;
+        }
+        state.broker.set_dispatch_offset(
+            &entry.tenant_id,
+            &entry.lane,
+            entry.partition,
+            entry.next_offset,
+        )?;
+        applied += 1;
+    }
+    Ok(Json(serde_json::json!({ "applied": applied })))
 }
 
 pub async fn internal_replicate_catch_up(

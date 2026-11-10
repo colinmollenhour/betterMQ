@@ -6,7 +6,7 @@ use crate::flock::FileLock;
 use crate::indexes::{DedupEntry, MetadataOperation};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -25,6 +25,8 @@ const MAX_SNAPSHOT: u64 = 256 * 1024 * 1024;
 type DedupKey = (String, String);
 type CursorKey = (String, String, u32);
 const COMPLETION_BYTES: usize = 32;
+/// Extra allowance for a completion marker that records its message id.
+const COMPLETION_ID_BYTES: usize = 24;
 
 struct CursorProjection {
     cursor: Option<u64>,
@@ -84,6 +86,10 @@ enum Operation {
     SetDispatchOffset(CursorKey, u64),
     MarkDispatchComplete(CursorKey, u64),
     ResetDispatchOffset(CursorKey, u64, u64),
+    /// Completion of the delivery of a specific message id.
+    MarkDispatchCompleteFor(CursorKey, u64, Uuid),
+    /// Drop a completion marker that belongs to a different record.
+    ClearDispatchComplete(CursorKey, u64),
 }
 
 impl From<MetadataOperation> for Operation {
@@ -108,7 +114,15 @@ impl From<MetadataOperation> for Operation {
                 subscription_id,
                 partition,
                 offset,
+                message_id: None,
             } => Self::MarkDispatchComplete((tenant_id, subscription_id, partition), offset),
+            MetadataOperation::MarkDispatchComplete {
+                tenant_id,
+                subscription_id,
+                partition,
+                offset,
+                message_id: Some(id),
+            } => Self::MarkDispatchCompleteFor((tenant_id, subscription_id, partition), offset, id),
         }
     }
 }
@@ -120,6 +134,9 @@ struct Snapshot {
     completed: Vec<(CursorKey, BTreeSet<u64>)>,
     #[serde(default)]
     generations: Vec<(CursorKey, u64)>,
+    /// Message ids of identity-aware completion markers (a subset of `completed`).
+    #[serde(default)]
+    completed_ids: Vec<(CursorKey, Vec<(u64, Uuid)>)>,
 }
 
 #[derive(Default)]
@@ -127,6 +144,7 @@ struct Index {
     dedup: HashMap<DedupKey, DedupEntry>,
     dispatch: HashMap<CursorKey, u64>,
     completed: HashMap<CursorKey, BTreeSet<u64>>,
+    completed_ids: HashMap<CursorKey, BTreeMap<u64, Uuid>>,
     generations: HashMap<CursorKey, u64>,
     bytes: usize,
     entry_count: usize,
@@ -167,14 +185,16 @@ impl Index {
                     0
                 });
                 *cursor = (*cursor).max(value);
+                let floor = *cursor;
                 if let Some(completed) = self.completed.get_mut(&key) {
-                    let retained = completed.split_off(cursor);
+                    let retained = completed.split_off(&floor);
                     self.bytes = self
                         .bytes
                         .saturating_sub(completed.len() * COMPLETION_BYTES);
                     self.entry_count -= completed.len();
                     *completed = retained;
                 }
+                self.drop_ids_below(&key, floor);
             }
             Operation::MarkDispatchComplete(key, offset) => {
                 if offset >= self.dispatch.get(&key).copied().unwrap_or(0) {
@@ -188,7 +208,38 @@ impl Index {
                     }
                 }
             }
+            Operation::MarkDispatchCompleteFor(key, offset, id) => {
+                if offset >= self.dispatch.get(&key).copied().unwrap_or(0) {
+                    self.apply(Operation::MarkDispatchComplete(key.clone(), offset));
+                    if self
+                        .completed_ids
+                        .entry(key)
+                        .or_default()
+                        .insert(offset, id)
+                        .is_none()
+                    {
+                        self.bytes += COMPLETION_ID_BYTES;
+                    }
+                }
+            }
+            Operation::ClearDispatchComplete(key, offset) => {
+                if let Some(set) = self.completed.get_mut(&key) {
+                    if set.remove(&offset) {
+                        self.bytes = self.bytes.saturating_sub(COMPLETION_BYTES);
+                        self.entry_count -= 1;
+                    }
+                }
+                if let Some(ids) = self.completed_ids.get_mut(&key) {
+                    if ids.remove(&offset).is_some() {
+                        self.bytes = self.bytes.saturating_sub(COMPLETION_ID_BYTES);
+                    }
+                    if ids.is_empty() {
+                        self.completed_ids.remove(&key);
+                    }
+                }
+            }
             Operation::ResetDispatchOffset(key, offset, generation) => {
+                self.drop_ids_below(&key, u64::MAX);
                 if self.dispatch.insert(key.clone(), offset).is_none() {
                     self.entry_count += 1;
                     self.bytes += Self::cursor_weight(&key);
@@ -202,6 +253,16 @@ impl Index {
                 if self.generations.insert(key.clone(), generation).is_none() {
                     self.bytes += Self::cursor_weight(&key);
                 }
+            }
+        }
+    }
+    fn drop_ids_below(&mut self, key: &CursorKey, floor: u64) {
+        if let Some(ids) = self.completed_ids.get_mut(key) {
+            let retained = ids.split_off(&floor);
+            self.bytes = self.bytes.saturating_sub(ids.len() * COMPLETION_ID_BYTES);
+            *ids = retained;
+            if ids.is_empty() {
+                self.completed_ids.remove(key);
             }
         }
     }
@@ -227,6 +288,11 @@ impl Index {
                 .iter()
                 .map(|(key, value)| (key.clone(), *value))
                 .collect(),
+            completed_ids: self
+                .completed_ids
+                .iter()
+                .map(|(key, ids)| (key.clone(), ids.iter().map(|(o, id)| (*o, *id)).collect()))
+                .collect(),
         }
     }
     fn from_snapshot(snapshot: Snapshot) -> Self {
@@ -241,6 +307,11 @@ impl Index {
             index.completed.entry(key.clone()).or_default();
             for value in values {
                 index.apply(Operation::MarkDispatchComplete(key.clone(), value));
+            }
+        }
+        for (key, ids) in snapshot.completed_ids {
+            for (offset, id) in ids {
+                index.apply(Operation::MarkDispatchCompleteFor(key.clone(), offset, id));
             }
         }
         index.generations = snapshot.generations.into_iter().collect();
@@ -275,8 +346,12 @@ impl Index {
                         *value = Some(entry.clone());
                     }
                 }
+                // Clearing a marker only frees space; ignoring it keeps the
+                // projection an upper bound.
+                Operation::ClearDispatchComplete(..) => {}
                 Operation::SetDispatchOffset(key, _)
                 | Operation::MarkDispatchComplete(key, _)
+                | Operation::MarkDispatchCompleteFor(key, _, _)
                 | Operation::ResetDispatchOffset(key, _, _) => {
                     let state = cursors
                         .entry(key.clone())
@@ -303,8 +378,12 @@ impl Index {
                             state.cursor = Some(next);
                             state.added = state.added.split_off(&next);
                         }
-                        Operation::MarkDispatchComplete(_, offset) => {
+                        Operation::MarkDispatchComplete(_, offset)
+                        | Operation::MarkDispatchCompleteFor(_, offset, _) => {
                             if *offset >= state.cursor.unwrap_or(0) {
+                                if matches!(op, Operation::MarkDispatchCompleteFor(..)) {
+                                    bytes += COMPLETION_ID_BYTES;
+                                }
                                 state.completed_present = true;
                                 if state.cleared
                                     || !self
@@ -358,6 +437,11 @@ impl Index {
                 .generations
                 .keys()
                 .map(Self::cursor_weight)
+                .sum::<usize>()
+            + self
+                .completed_ids
+                .values()
+                .map(|ids| ids.len() * COMPLETION_ID_BYTES)
                 .sum::<usize>();
     }
 
@@ -1025,6 +1109,64 @@ impl SharedMetadataStore {
             value,
         )])
     }
+    pub fn clear_dispatch_complete(
+        &self,
+        tenant: &str,
+        sub: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<(), SharedIndexError> {
+        self.commit(vec![Operation::ClearDispatchComplete(
+            (tenant.into(), sub.into(), partition),
+            offset,
+        )])
+    }
+    /// The completion marker at `offset` (ignores the lane cursor).
+    pub fn dispatch_completion(
+        &self,
+        tenant: &str,
+        sub: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<crate::indexes::DispatchCompletion, SharedIndexError> {
+        use crate::indexes::DispatchCompletion;
+        let key = (tenant.into(), sub.into(), partition);
+        self.locked(|cache| {
+            if let Some(id) = cache
+                .index
+                .completed_ids
+                .get(&key)
+                .and_then(|ids| ids.get(&offset))
+            {
+                return Ok(DispatchCompletion::Message(*id));
+            }
+            Ok(
+                if cache
+                    .index
+                    .completed
+                    .get(&key)
+                    .is_some_and(|set| set.contains(&offset))
+                {
+                    DispatchCompletion::Legacy
+                } else {
+                    DispatchCompletion::Missing
+                },
+            )
+        })
+    }
+    /// Every lane cursor as `(tenant, lane, partition, next_offset)`.
+    pub fn dispatch_offsets(&self) -> Result<Vec<(String, String, u32, u64)>, SharedIndexError> {
+        self.locked(|cache| {
+            Ok(cache
+                .index
+                .dispatch
+                .iter()
+                .map(|((tenant, lane, partition), offset)| {
+                    (tenant.clone(), lane.clone(), *partition, *offset)
+                })
+                .collect())
+        })
+    }
     pub fn is_dispatch_complete(
         &self,
         tenant: &str,
@@ -1571,6 +1713,56 @@ mod tests {
         .unwrap();
         assert_eq!(b.get_dedup("tenant", "key").unwrap().unwrap().offset, 1);
         assert_eq!(b.dispatch_offset("tenant", "lane", 0).unwrap(), 9);
+    }
+
+    #[test]
+    fn shared_completion_markers_carry_identity_and_survive_reload() {
+        use crate::indexes::DispatchCompletion;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SharedMetadataStore::open(dir.path()).unwrap();
+        let id = uuid::Uuid::new_v4();
+        store
+            .apply_batch(vec![MetadataOperation::MarkDispatchComplete {
+                tenant_id: "tenant".into(),
+                subscription_id: "lane".into(),
+                partition: 0,
+                offset: 4,
+                message_id: Some(id),
+            }])
+            .unwrap();
+        store
+            .mark_dispatch_complete("tenant", "lane", 0, 5)
+            .unwrap();
+        let reopened = SharedMetadataStore::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .dispatch_completion("tenant", "lane", 0, 4)
+                .unwrap(),
+            DispatchCompletion::Message(id)
+        );
+        assert_eq!(
+            reopened
+                .dispatch_completion("tenant", "lane", 0, 5)
+                .unwrap(),
+            DispatchCompletion::Legacy
+        );
+        reopened
+            .set_dispatch_offset("tenant", "lane", 0, 6)
+            .unwrap();
+        assert_eq!(
+            reopened
+                .dispatch_completion("tenant", "lane", 0, 4)
+                .unwrap(),
+            DispatchCompletion::Missing
+        );
+        reopened
+            .reset_dispatch_offset("tenant", "lane", 0, 2)
+            .unwrap();
+        assert_eq!(reopened.dispatch_offset("tenant", "lane", 0).unwrap(), 2);
+        assert_eq!(
+            reopened.dispatch_offsets().unwrap(),
+            vec![("tenant".to_string(), "lane".to_string(), 0, 2)]
+        );
     }
 
     #[test]

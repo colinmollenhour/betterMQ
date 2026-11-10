@@ -12,6 +12,7 @@ mod layout;
 pub mod payload;
 mod payload_repair;
 mod priority;
+mod quorum;
 mod retention;
 mod shard;
 mod subscriptions;
@@ -33,8 +34,8 @@ pub use broker::{
     decoded_body_len, decoded_payload_len, AppendedRecordRef, AppendedShardBatch, Broker,
     BrokerConfig, BrokerError, CreateSubscriptionRequest, CreateSubscriptionResponse,
     DestinationSnapshot, LogId, PendingDedup, PreparedPublishBatch, PreparedShardBatch,
-    PreparedShardKey, PublishRequest, PublishResponse, ScheduledInfo, TopicMessagePage,
-    DEDUP_IN_FLIGHT_WAIT, DEFAULT_PARTITIONS, DEFAULT_TENANT,
+    PreparedShardKey, PublishRequest, PublishResponse, QuorumStatus, ScheduledInfo,
+    TopicMessagePage, DEDUP_IN_FLIGHT_WAIT, DEFAULT_PARTITIONS, DEFAULT_TENANT,
 };
 pub use flows::{FlowProfile, FlowProfileError, FlowProfileRegistry};
 pub use groups::{DispatchGroup, GroupError, GroupMember, GroupRegistry};

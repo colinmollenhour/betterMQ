@@ -545,8 +545,24 @@ struct BrokerInner {
     shard_open_locks: Mutex<ShardOpenLocks>,
     dedup_reservations: Arc<DedupReservations>,
     shard_leader_check: Mutex<Option<ShardFenceFn>>,
+    /// Gate dispatch on the quorum watermark (multi-node local-WAL cells).
+    quorum_gating: std::sync::atomic::AtomicBool,
+    quorum: RwLock<HashMap<(String, u32), Arc<crate::quorum::QuorumWatermark>>>,
     #[cfg(feature = "slate")]
     slate: Option<SlateEnv>,
+}
+
+/// Quorum watermark of one log namespace (observability).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct QuorumStatus {
+    pub namespace: String,
+    pub partition: u32,
+    pub quorum_hwm: u64,
+    pub committed_hwm: u64,
+    /// Committed records not yet proven on a replication quorum.
+    pub lag: u64,
+    /// Quorum-proven epochs waiting for an unproven gap below them.
+    pub pending_ranges: usize,
 }
 
 impl Broker {
@@ -788,6 +804,8 @@ impl Broker {
                 shard_open_locks: Mutex::new(HashMap::new()),
                 dedup_reservations: Arc::new(DedupReservations::default()),
                 shard_leader_check: Mutex::new(None),
+                quorum_gating: std::sync::atomic::AtomicBool::new(false),
+                quorum: RwLock::new(HashMap::new()),
                 #[cfg(feature = "slate")]
                 slate,
             }),
@@ -1071,6 +1089,260 @@ impl Broker {
     pub fn committed_hwm(&self, topic: &str, partition: u32) -> Result<u64, BrokerError> {
         let handle = self.shard_handle(topic, partition)?;
         Ok(handle.committed_hwm())
+    }
+
+    /// Gate dispatch on the quorum watermark. Called once at startup for a
+    /// multi-node cell on local WAL storage; single node and Slate keep the
+    /// local committed watermark (their durability is local / shared storage).
+    pub fn enable_quorum_gating(&self) {
+        self.inner
+            .quorum_gating
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn quorum_gating(&self) -> bool {
+        self.inner
+            .quorum_gating
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn quorum_watermark(
+        &self,
+        topic: &str,
+        partition: u32,
+    ) -> Result<Arc<crate::quorum::QuorumWatermark>, BrokerError> {
+        let namespace = self.inner.layout.storage_namespace(topic).to_string();
+        let key = (namespace, partition);
+        if let Some(existing) = self.inner.quorum.read().get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+        let mut map = self.inner.quorum.write();
+        if let Some(existing) = map.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+        let dir = if self.inner.layout.is_physical() {
+            self.inner
+                .layout
+                .physical_shard_dir(&self.inner.config.data_dir, partition)
+        } else {
+            partition_dir(
+                &self.inner.config.data_dir,
+                &self.tenant(),
+                topic,
+                partition,
+            )?
+        };
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| BrokerError::Storage(broker_storage::LogError::Io(error)))?;
+        let watermark = Arc::new(
+            crate::quorum::QuorumWatermark::open(&dir)
+                .map_err(|error| BrokerError::Storage(broker_storage::LogError::Io(error)))?,
+        );
+        map.insert(key, Arc::clone(&watermark));
+        Ok(watermark)
+    }
+
+    /// Exclusive end of the prefix dispatch may deliver: the committed
+    /// watermark, capped by the quorum watermark when quorum gating is on.
+    pub fn dispatch_hwm(&self, topic: &str, partition: u32) -> Result<u64, BrokerError> {
+        let committed = self.committed_hwm(topic, partition)?;
+        if !self.quorum_gating() {
+            return Ok(committed);
+        }
+        Ok(committed.min(self.quorum_watermark(topic, partition)?.get()))
+    }
+
+    /// Quorum watermark (the committed watermark when gating is off).
+    pub fn quorum_hwm(&self, topic: &str, partition: u32) -> Result<u64, BrokerError> {
+        if !self.quorum_gating() {
+            return self.committed_hwm(topic, partition);
+        }
+        Ok(self.quorum_watermark(topic, partition)?.get())
+    }
+
+    /// Record that `[start, end)` of this log is durable on a replication
+    /// quorum; persists and returns the contiguous quorum watermark.
+    pub fn record_quorum_commit(
+        &self,
+        topic: &str,
+        partition: u32,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, BrokerError> {
+        self.quorum_watermark(topic, partition)?
+            .record(start, end)
+            .map_err(|error| BrokerError::Storage(broker_storage::LogError::Io(error)))
+    }
+
+    /// Identity-less completion markers count only below this offset: above
+    /// it the offset may hold a different record than the one completed.
+    pub fn legacy_completion_trusted_below(
+        &self,
+        topic: &str,
+        partition: u32,
+    ) -> Result<u64, BrokerError> {
+        if !self.quorum_gating() {
+            return Ok(u64::MAX);
+        }
+        Ok(self
+            .quorum_watermark(topic, partition)?
+            .trusted_legacy_below())
+    }
+
+    /// Pin the legacy-marker trust point at the current quorum watermark
+    /// (on taking over a shard, before its tail is re-verified).
+    pub fn freeze_legacy_completion_trust(
+        &self,
+        topic: &str,
+        partition: u32,
+    ) -> Result<(), BrokerError> {
+        if self.quorum_gating() {
+            self.quorum_watermark(topic, partition)?
+                .freeze_legacy_trust();
+        }
+        Ok(())
+    }
+
+    /// Quorum watermarks loaded so far, with their lag behind the local
+    /// committed watermark.
+    pub fn quorum_status(&self) -> Vec<QuorumStatus> {
+        if !self.quorum_gating() {
+            return Vec::new();
+        }
+        let loaded: Vec<_> = self
+            .inner
+            .quorum
+            .read()
+            .iter()
+            .map(|((namespace, partition), wm)| (namespace.clone(), *partition, Arc::clone(wm)))
+            .collect();
+        let mut out: Vec<QuorumStatus> = loaded
+            .into_iter()
+            .map(|(namespace, partition, wm)| {
+                let quorum_hwm = wm.get();
+                let committed_hwm = self
+                    .committed_hwm(&namespace, partition)
+                    .unwrap_or(quorum_hwm);
+                QuorumStatus {
+                    lag: committed_hwm.saturating_sub(quorum_hwm),
+                    namespace,
+                    partition,
+                    quorum_hwm,
+                    committed_hwm,
+                    pending_ranges: wm.pending_ranges(),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.namespace, a.partition).cmp(&(&b.namespace, b.partition)));
+        out
+    }
+
+    /// Mark `offset` complete for the delivery of `message_id`.
+    pub fn mark_dispatch_complete_for(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
+    ) -> Result<(), BrokerError> {
+        self.inner.metadata.mark_dispatch_complete_for(
+            tenant_id,
+            subscription_id,
+            partition,
+            offset,
+            message_id,
+        )?;
+        Ok(())
+    }
+
+    /// Whether the record `message_id` at `offset` of `topic` was delivered or
+    /// dead-lettered. Identity-aware: a completion marker for a different
+    /// message (offset reused after failover) is dropped and reports false; an
+    /// identity-less legacy marker counts only below the legacy trust point.
+    /// Offsets below the lane cursor are complete (cursors never pass the
+    /// quorum watermark, whose prefix has a stable identity).
+    pub fn is_delivery_complete(
+        &self,
+        topic: &str,
+        tenant_id: &str,
+        subscription_id: &str,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
+    ) -> Result<bool, BrokerError> {
+        if offset < self.dispatch_offset(tenant_id, subscription_id, partition)? {
+            return Ok(true);
+        }
+        Ok(
+            match self.inner.metadata.dispatch_completion(
+                tenant_id,
+                subscription_id,
+                partition,
+                offset,
+            )? {
+                broker_storage::DispatchCompletion::Missing => false,
+                broker_storage::DispatchCompletion::Message(id) if id == message_id => true,
+                broker_storage::DispatchCompletion::Message(_) => {
+                    self.inner.metadata.clear_dispatch_complete(
+                        tenant_id,
+                        subscription_id,
+                        partition,
+                        offset,
+                    )?;
+                    false
+                }
+                broker_storage::DispatchCompletion::Legacy => {
+                    offset < self.legacy_completion_trusted_below(topic, partition)?
+                }
+            },
+        )
+    }
+
+    /// All lane cursors of `partition` as `(tenant, lane, next_offset)`.
+    pub fn dispatch_offsets_for_partition(
+        &self,
+        partition: u32,
+    ) -> Result<Vec<(String, String, u64)>, BrokerError> {
+        Ok(self
+            .inner
+            .metadata
+            .dispatch_offsets_for_partition(partition)?)
+    }
+
+    /// Every lane cursor as `(tenant, lane, partition, next_offset)`.
+    pub fn all_dispatch_offsets(&self) -> Result<Vec<(String, String, u32, u64)>, BrokerError> {
+        Ok(self.inner.metadata.dispatch_offsets()?)
+    }
+
+    /// Encoded frames of every record in the log namespace of `topic` from
+    /// `from_offset`, for quorum (re-)verification. In V2 this covers every
+    /// topic of the physical shard. Stops at `max_records` or `max_bytes`
+    /// (at least one frame).
+    pub fn namespace_replication_frames(
+        &self,
+        topic: &str,
+        partition: u32,
+        from_offset: u64,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>, BrokerError> {
+        let batch = self.shard_handle(topic, partition)?.read_range(
+            partition,
+            from_offset,
+            max_records.max(1),
+        )?;
+        let mut out = Vec::with_capacity(batch.len());
+        let mut bytes = 0usize;
+        for msg in batch {
+            let frame = encode_replication_frame(&msg)?;
+            bytes = bytes.saturating_add(frame.len());
+            if !out.is_empty() && bytes > max_bytes {
+                break;
+            }
+            out.push((msg.offset, frame));
+        }
+        Ok(out)
     }
 
     /// Block until `offset` is on the shard's committed high watermark.
@@ -1907,11 +2179,10 @@ impl Broker {
         Ok(Ok(ReservationOutcome::Acquired(token)))
     }
 
-    /// Record idempotency after replication quorum (or immediately on a single node).
-    /// Integration point: cells MUST use D2's authoritative quorum HWM here;
-    /// until that lane is integrated this returns the local durable HWM.
+    /// End of the prefix a dedup hit may point into: the persisted quorum
+    /// watermark in quorum-gated cells (D2), else the local durable HWM.
     fn dedup_visible_hwm(&self, topic: &str, partition: u32) -> Result<u64, BrokerError> {
-        self.committed_hwm(topic, partition)
+        self.dispatch_hwm(topic, partition)
     }
 
     fn verify_dedup_hit(
@@ -2290,7 +2561,7 @@ impl Broker {
             };
             cursor = last.saturating_add(1);
             for msg in msgs {
-                let frame = Self::replication_frame(&msg)?;
+                let frame = encode_replication_frame(&msg)?;
                 if !out.is_empty() && bytes.saturating_add(frame.len()) > max_bytes {
                     return Ok(out);
                 }
@@ -2302,36 +2573,6 @@ impl Broker {
             }
         }
         Ok(out)
-    }
-
-    fn replication_frame(msg: &StoredMessage) -> Result<Vec<u8>, BrokerError> {
-        let header = LogRecord {
-            id: msg.id,
-            tenant_id: msg.tenant_id.clone(),
-            topic: msg.topic.clone(),
-            routing_key: msg.routing_key.clone(),
-            idempotency_key: None,
-            published_at_ms: msg.published_at_ms,
-            priority: msg.priority,
-            flow_parallelism: msg.flow_parallelism,
-            flow_key: msg.flow_key.clone(),
-            flow_rate: msg.flow_rate,
-            flow_period_secs: msg.flow_period_secs,
-            queue_id: msg.queue_id,
-            group_id: msg.group_id,
-            group_member_id: msg.group_member_id,
-            flow_profile_id: msg.flow_profile_id,
-            destination_url: msg.destination_url.clone(),
-            destination_secret: msg.destination_secret.clone(),
-            max_retries: msg.max_retries,
-            retry_backoff: msg.retry_backoff.clone(),
-            http_method: msg.http_method.clone(),
-            http_headers_json: msg.http_headers_json.clone(),
-            http_sign: msg.http_sign,
-            payload_ref_json: msg.payload_ref_json.clone(),
-        };
-        broker_proto::encode_frame_vec(&header, &msg.payload)
-            .map_err(|e| BrokerError::Storage(broker_storage::LogError::Record(e)))
     }
 
     /// Follower reconciliation: drop this replica's records at or above
@@ -2800,6 +3041,37 @@ pub fn decoded_body_len(payload: &str, encoding: Option<&str>) -> usize {
         }
         _ => payload.len(),
     }
+}
+
+/// Re-encode a stored record as the frame followers append.
+fn encode_replication_frame(msg: &StoredMessage) -> Result<Vec<u8>, BrokerError> {
+    let header = LogRecord {
+        id: msg.id,
+        tenant_id: msg.tenant_id.clone(),
+        topic: msg.topic.clone(),
+        routing_key: msg.routing_key.clone(),
+        idempotency_key: None,
+        published_at_ms: msg.published_at_ms,
+        priority: msg.priority,
+        flow_parallelism: msg.flow_parallelism,
+        flow_key: msg.flow_key.clone(),
+        flow_rate: msg.flow_rate,
+        flow_period_secs: msg.flow_period_secs,
+        queue_id: msg.queue_id,
+        group_id: msg.group_id,
+        group_member_id: msg.group_member_id,
+        flow_profile_id: msg.flow_profile_id,
+        destination_url: msg.destination_url.clone(),
+        destination_secret: msg.destination_secret.clone(),
+        max_retries: msg.max_retries,
+        retry_backoff: msg.retry_backoff.clone(),
+        http_method: msg.http_method.clone(),
+        http_headers_json: msg.http_headers_json.clone(),
+        http_sign: msg.http_sign,
+        payload_ref_json: msg.payload_ref_json.clone(),
+    };
+    broker_proto::encode_frame_vec(&header, &msg.payload)
+        .map_err(|e| BrokerError::Storage(broker_storage::LogError::Record(e)))
 }
 
 fn decode_payload(req: &PublishRequest) -> Result<Vec<u8>, BrokerError> {

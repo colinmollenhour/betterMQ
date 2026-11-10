@@ -231,7 +231,14 @@ impl<'a> CursorCache<'a> {
         }
     }
 
-    fn is_done(&mut self, tenant: &str, cursor_key: &str, offset: u64) -> bool {
+    fn is_done(
+        &mut self,
+        topic: &str,
+        tenant: &str,
+        cursor_key: &str,
+        offset: u64,
+        message_id: Uuid,
+    ) -> bool {
         let partition = self.partition;
         let broker = self.broker;
         let cursor = *self
@@ -244,7 +251,7 @@ impl<'a> CursorCache<'a> {
             });
         offset < cursor
             || broker
-                .is_dispatch_complete(tenant, cursor_key, partition, offset)
+                .is_delivery_complete(topic, tenant, cursor_key, partition, offset, message_id)
                 .unwrap_or(false)
     }
 }
@@ -278,7 +285,8 @@ impl DispatchScan {
         partition: u32,
         record_budget: usize,
     ) -> Result<PendingView, BrokerError> {
-        let hwm = broker.committed_hwm(topic, partition)?;
+        // Only quorum-visible records are indexed (dispatch gate).
+        let hwm = broker.dispatch_hwm(topic, partition)?;
         let scan = self.partition_scan(topic, partition);
         let mut scan = scan.lock();
         if hwm < scan.scanned_to {
@@ -289,7 +297,13 @@ impl DispatchScan {
         let mut cursors = CursorCache::new(broker, partition);
         if scan.last_recheck.elapsed() >= RECHECK_EVERY {
             scan.pending.retain(|_, entry| {
-                !cursors.is_done(&entry.tenant_id, &entry.cursor_key, entry.offset)
+                !cursors.is_done(
+                    &entry.topic,
+                    &entry.tenant_id,
+                    &entry.cursor_key,
+                    entry.offset,
+                    entry.message_id,
+                )
             });
             scan.last_recheck = Instant::now();
         }
@@ -313,7 +327,7 @@ impl DispatchScan {
                 }
                 let cursor_key = broker_partition::flow_lane_owner(&msg).to_string();
                 let tenant_id = dispatch_tenant(broker, &msg);
-                if !cursors.is_done(&tenant_id, &cursor_key, msg.offset) {
+                if !cursors.is_done(topic, &tenant_id, &cursor_key, msg.offset, msg.id) {
                     scan.pending.insert(
                         msg.offset,
                         PendingEntry {

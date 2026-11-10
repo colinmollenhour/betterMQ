@@ -67,7 +67,7 @@ pub use cluster::{
     build_cluster_status, catalog_peer_targets, enqueue_dispatch_after_publish,
     publish_with_cluster, push_catalog_to_recovered_peer, spawn_cluster_catalog_sync,
     sync_catalog_from_peers, ClusterGossipRequest, ClusterGossipResponse, ClusterHandle as Cluster,
-    ClusterStatusResponse,
+    ClusterStatusResponse, DispatchCursorCheckpoint, DispatchCursorEntry,
 };
 pub use gateway::GatewayOnlyState;
 pub use local_auth::{close_setup_window, open_setup_window};
@@ -315,6 +315,10 @@ fn internal_cluster_route_table() -> Router<Arc<AppState>> {
         .route(
             "/internal/v1/replicate/batch",
             axum::routing::post(cluster::internal_replicate_batch),
+        )
+        .route(
+            "/internal/v1/dispatch/cursors",
+            axum::routing::post(cluster::internal_dispatch_cursors),
         )
         .route(
             "/internal/v1/replicate/catch-up",

@@ -79,6 +79,44 @@ pub struct MetricsResponse {
     pub memory_percent: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_percent: Option<f32>,
+    /// Quorum-gated dispatch (multi-node local-WAL cells only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quorum: Option<DispatchQuorumMetrics>,
+}
+
+/// How far dispatch visibility trails local durability, and what is blocked.
+#[derive(Debug, Default, Serialize)]
+pub struct DispatchQuorumMetrics {
+    /// Largest number of committed records not yet proven on a quorum, per log.
+    pub max_lag_records: u64,
+    pub total_lag_records: u64,
+    pub logs_lagging: usize,
+    /// Quorum-proven epochs waiting behind an unproven gap.
+    pub pending_ranges: usize,
+    /// Partitions taken over whose dispatch waits for quorum verification.
+    pub fenced_partitions: usize,
+    pub dlq_pending_prepared: u64,
+    pub dlq_pending_committed: u64,
+}
+
+fn quorum_metrics(state: &AppState) -> Option<DispatchQuorumMetrics> {
+    if !state.broker.quorum_gating() {
+        return None;
+    }
+    let mut metrics = DispatchQuorumMetrics::default();
+    for status in state.broker.quorum_status() {
+        metrics.max_lag_records = metrics.max_lag_records.max(status.lag);
+        metrics.total_lag_records = metrics.total_lag_records.saturating_add(status.lag);
+        metrics.logs_lagging += usize::from(status.lag > 0);
+        metrics.pending_ranges += status.pending_ranges;
+    }
+    metrics.fenced_partitions = (0..state.broker.shard_count())
+        .filter(|p| state.dispatch.is_fenced(*p))
+        .count();
+    let telemetry = state.dispatch.telemetry_snapshot();
+    metrics.dlq_pending_prepared = telemetry.dlq_pending_prepared;
+    metrics.dlq_pending_committed = telemetry.dlq_pending_committed;
+    Some(metrics)
 }
 
 #[derive(Debug, Serialize)]
@@ -237,7 +275,7 @@ pub fn metrics_snapshot(state: &AppState) -> MetricsResponse {
         _ => None,
     };
     let ingest = crate::metrics::snapshot();
-    metrics_snapshot_from(
+    let mut snapshot = metrics_snapshot_from(
         blocked.len(),
         guard.is_critical(),
         cluster_enabled,
@@ -247,7 +285,9 @@ pub fn metrics_snapshot(state: &AppState) -> MetricsResponse {
         memory_limit_mb,
         memory_percent,
         resources.cpu_percent,
-    )
+    );
+    snapshot.quorum = quorum_metrics(state);
+    snapshot
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -275,6 +315,7 @@ fn metrics_snapshot_from(
         memory_limit_mb,
         memory_percent,
         cpu_percent,
+        quorum: None,
     }
 }
 
