@@ -1203,6 +1203,7 @@ impl PartitionLog {
             if let Err(error) = self.wal.sync_all() {
                 self.telemetry
                     .record_fsync(pending_records, started.elapsed(), false);
+                self.fence(format!("WAL fsync before segment roll failed: {error}"));
                 return Err(error.into());
             }
             self.telemetry
@@ -1308,7 +1309,11 @@ impl PartitionLog {
                 return Ok(out);
             }
         }
-        for (&offset, pos) in self.index.range(start_offset..) {
+        let end = self.high_watermark();
+        if start_offset >= end {
+            return Ok(out);
+        }
+        for (&offset, pos) in self.index.range(start_offset..end) {
             if out.len() >= max_messages {
                 break;
             }
@@ -1375,8 +1380,16 @@ impl PartitionLog {
         Ok(())
     }
 
+    /// Exclusive offset of the last readable record. A fenced log only
+    /// exposes what was fsynced before the failure: records written after
+    /// it may never have reached the disk, so they must not be dispatched or
+    /// replicated.
     pub fn high_watermark(&self) -> u64 {
-        self.meta.next_offset
+        if self.fenced.is_some() {
+            self.committed_hwm
+        } else {
+            self.meta.next_offset
+        }
     }
 
     /// Exclusive offset of the last durable (fsynced) record.
@@ -1571,7 +1584,14 @@ impl PartitionLog {
 
     /// Persist WAL if there are unflushed writes. `meta.json` is a checkpoint,
     /// not the commit path — recovery reconstructs `next_offset` from the WAL.
+    ///
+    /// A failed WAL fsync fences the log: Linux may already have dropped the
+    /// dirty pages it could not write, so a later fsync can succeed without
+    /// those records ever reaching the disk. Every later barrier fails, and
+    /// records above the committed HWM stay hidden, until a reopen rebuilds
+    /// the log from what is actually on disk.
     pub fn flush_durable(&mut self) -> Result<(), LogError> {
+        self.ensure_writable()?;
         if !self.dirty {
             return Ok(());
         }
@@ -1581,13 +1601,16 @@ impl PartitionLog {
             self.fail_next_sync = false;
             self.telemetry
                 .record_fsync(pending_records, started.elapsed(), false);
-            return Err(LogError::Io(io::Error::other("injected fsync failure")));
+            let error = io::Error::other("injected fsync failure");
+            self.fence(format!("WAL fsync failed: {error}"));
+            return Err(LogError::Io(error));
         }
         let persist_sync = self.config.fsync != FsyncMode::Os;
         if persist_sync {
             if let Err(error) = self.wal.sync_data() {
                 self.telemetry
                     .record_fsync(pending_records, started.elapsed(), false);
+                self.fence(format!("WAL fsync failed: {error}"));
                 return Err(error.into());
             }
         }
@@ -2595,17 +2618,54 @@ mod tests {
     }
 
     #[test]
-    fn injected_fsync_failure_does_not_advance_hwm() {
-        let dir = tempdir().unwrap();
-        let mut log = PartitionLog::open(dir.path(), group_cfg(Duration::from_secs(60))).unwrap();
-        log.append(0, sample_record("t"), b"value".to_vec())
+    fn fsync_failure_fences_the_log_until_reopen() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            let mut log = PartitionLog::open_for_shard(
+                dir.path(),
+                group_cfg(Duration::from_secs(60)),
+                0,
+                format,
+            )
             .unwrap();
-        log.inject_fsync_failure();
-        assert!(log.sync().unwrap_err().to_string().contains("injected"));
-        assert_eq!(log.committed_hwm(), 0);
-        assert!(log.is_dirty());
-        log.sync().unwrap();
-        assert_eq!(log.committed_hwm(), 1);
+            log.append(0, sample_record("t"), b"synced".to_vec())
+                .unwrap();
+            log.sync().unwrap();
+            log.append(0, sample_record("t"), b"unsynced".to_vec())
+                .unwrap();
+            log.inject_fsync_failure();
+            assert!(log.sync().unwrap_err().to_string().contains("injected"));
+            assert_eq!(log.committed_hwm(), 1);
+            assert!(log.fenced_reason().unwrap().contains("fsync"));
+
+            // A retried fsync must not certify the records of the failed one.
+            assert!(matches!(log.sync(), Err(LogError::Fenced(_))));
+            assert!(matches!(log.flush_durable(), Err(LogError::Fenced(_))));
+            assert_eq!(log.committed_hwm(), 1);
+            assert!(matches!(
+                log.append(0, sample_record("t"), b"later".to_vec()),
+                Err(LogError::Fenced(_))
+            ));
+            // Nothing past the last good barrier is served for dispatch or
+            // replication.
+            assert_eq!(log.high_watermark(), 1);
+            assert_payload_sequence(&log, &[b"synced"]);
+            drop(log);
+
+            // Reopening rebuilds from disk, which decides what survived.
+            let mut log = PartitionLog::open_for_shard(
+                dir.path(),
+                group_cfg(Duration::from_secs(60)),
+                0,
+                format,
+            )
+            .unwrap();
+            assert!(log.fenced_reason().is_none());
+            assert!(log.high_watermark() >= 1);
+            log.append(0, sample_record("t"), b"after".to_vec())
+                .unwrap();
+            log.sync().unwrap();
+        }
     }
 
     fn wal_len(dir: &Path) -> u64 {

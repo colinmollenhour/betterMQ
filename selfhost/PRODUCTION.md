@@ -55,6 +55,9 @@ Recovery never discards records it cannot prove were unacknowledged:
   it out of the shard directory once its records are restored or written off.
 - `bettermq_wal_quarantine_events_total` counts detections and refused opens.
   `bettermq_wal_fence_events_total` counts shards that stopped accepting writes
-  after a WAL write could not be rolled back. A fenced shard recovers when the
-  broker restarts and the log is rebuilt from disk. Alert on any increase of
-  either counter.
+  after a WAL fsync failed or a failed WAL write could not be rolled back. A
+  retried fsync can succeed after Linux has already dropped the pages it could
+  not write, so a fenced shard never acknowledges again in that process: its
+  appends and commits fail, and it serves only records fsynced before the
+  failure. It recovers when the broker restarts and the log is rebuilt from
+  disk. Alert on any increase of either counter.

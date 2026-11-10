@@ -1,5 +1,5 @@
 use broker_proto::LogRecord;
-use broker_storage::{FsyncMode, PartitionLog, PartitionLogConfig};
+use broker_storage::{FsyncMode, LogError, PartitionLog, PartitionLogConfig};
 use std::io::Write;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -82,7 +82,7 @@ fn always_mode_fsyncs_each_acknowledgeable_append() {
 }
 
 #[test]
-fn injected_fsync_failure_blocks_commit_hwm_until_retry_succeeds() {
+fn injected_fsync_failure_fences_commit_hwm_until_reopen() {
     let directory = tempdir().unwrap();
     let mut log = PartitionLog::open(directory.path(), config(FsyncMode::Group)).unwrap();
     log.append(0, record(0), vec![b'x'; 256]).unwrap();
@@ -93,11 +93,19 @@ fn injected_fsync_failure_blocks_commit_hwm_until_retry_succeeds() {
     let error = log.sync().unwrap_err();
     assert!(error.to_string().contains("injected fsync failure"));
     assert_eq!(log.committed_hwm(), 0);
-    assert!(log.is_dirty());
 
-    log.sync().unwrap();
-    assert_eq!(log.committed_hwm(), 1);
-    assert!(!log.is_dirty());
+    // fsyncgate: a retry that succeeds proves nothing about the pages the
+    // failed fsync dropped, so the log stays fenced.
+    assert!(matches!(log.sync(), Err(LogError::Fenced(_))));
+    assert_eq!(log.committed_hwm(), 0);
+    assert!(log.append(0, record(1), vec![b'x'; 256]).is_err());
+    assert!(log.read_range(0, 0, 10).unwrap().is_empty());
+    drop(log);
+
+    let mut reopened = PartitionLog::open(directory.path(), config(FsyncMode::Group)).unwrap();
+    reopened.append(0, record(2), vec![b'x'; 256]).unwrap();
+    reopened.sync().unwrap();
+    assert_eq!(reopened.committed_hwm(), reopened.high_watermark());
 }
 
 #[test]

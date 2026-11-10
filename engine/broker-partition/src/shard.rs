@@ -609,5 +609,14 @@ mod tests {
             .to_string()
             .contains("injected fsync failure"));
         assert_eq!(handle.committed_hwm(), 0);
+
+        // The shard stays fenced: a later commit must not succeed on a
+        // retried fsync and cover the records of the failed one.
+        let retry = handle.request_commit(1).unwrap().wait().await;
+        assert!(retry.unwrap_err().to_string().contains("fenced"));
+        assert!(handle
+            .append_batch(0, vec![(record(Uuid::new_v4()), b"c".to_vec())], None)
+            .is_err());
+        assert_eq!(handle.committed_hwm(), 0);
     }
 }
