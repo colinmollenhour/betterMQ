@@ -13,7 +13,7 @@ use broker_proto::RetryDefaults;
 use broker_storage::StoredMessage;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -269,6 +269,8 @@ pub struct DispatchEngine {
     telemetry: Arc<crate::telemetry::DispatchTelemetry>,
     pressure_logs: Arc<PressureLogs>,
     background: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
+    scan: crate::scan::DispatchScan,
+    backfill_rotation: Arc<AtomicUsize>,
 }
 
 impl DispatchEngine {
@@ -296,6 +298,7 @@ impl DispatchEngine {
             RetryState::open(&broker.config().data_dir).expect("open durable dispatch retry state");
         let lifecycle = LifecycleStore::open(&broker.config().data_dir)
             .expect("open durable dispatch lifecycle state");
+        let scan = crate::scan::DispatchScan::open(Some(&broker.config().data_dir));
         let engine = Self {
             broker,
             config,
@@ -337,6 +340,8 @@ impl DispatchEngine {
             telemetry: Arc::new(crate::telemetry::DispatchTelemetry::new()),
             pressure_logs: Arc::new(PressureLogs::default()),
             background: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            scan,
+            backfill_rotation: Arc::new(AtomicUsize::new(0)),
         };
         if let Some(handle) = engine.memory_guard.spawn_monitor() {
             engine.background.lock().push(handle);
@@ -627,14 +632,16 @@ impl DispatchEngine {
         }
     }
 
-    /// Re-enqueue undelivered messages after restart (CP2.5 / CP7a).
-    /// Pages per partition from cursor → high-water mark (no global 50k cliff).
-    pub fn backfill_pending(&self) {
-        if self.memory_guard.is_critical() {
-            info!("dispatch backfill skipped: memory critical");
-            return;
-        }
-        let tenant_id = self.broker.config().tenant_id.clone();
+    pub(crate) fn broker(&self) -> &Broker {
+        &self.broker
+    }
+
+    pub(crate) fn scan(&self) -> &crate::scan::DispatchScan {
+        &self.scan
+    }
+
+    /// Topics that carry push deliveries (direct publishes and queues), sorted.
+    pub(crate) fn dispatch_topics(&self) -> Vec<String> {
         let mut topics: HashSet<String> = HashSet::new();
         topics.insert(DIRECT_TOPIC.to_string());
         if let Ok(queues) = self.broker.list_endpoints() {
@@ -642,83 +649,121 @@ impl DispatchEngine {
                 topics.insert(q.topic);
             }
         }
+        let mut topics: Vec<String> = topics
+            .into_iter()
+            .filter(|topic| !broker_partition::is_dlq_topic(topic))
+            .collect();
+        topics.sort();
+        topics
+    }
 
+    /// Forget scan progress for `partitions`, e.g. after this node gained their
+    /// leadership and caught its log up from peers. The next pass rescans them.
+    pub fn reset_dispatch_scan(&self, partitions: &[u32]) {
+        self.scan.reset_partitions(partitions);
+    }
+
+    /// Re-enqueue undelivered messages (restart, dropped live work, leadership gain).
+    ///
+    /// Each pass reads only records added since the previous pass (see
+    /// [`crate::scan`]) and stops after a time budget, rotating where the next
+    /// pass starts. Returns true when work remains, so the caller should run
+    /// the next pass soon instead of waiting for the regular interval. This is
+    /// blocking storage work: call it from a blocking thread.
+    pub fn backfill_pending(&self) -> bool {
+        if self.memory_guard.is_critical() {
+            info!("dispatch backfill skipped: memory critical");
+            return false;
+        }
+        let Ok(partition_count) = self.broker.partition_count(DIRECT_TOPIC) else {
+            return false;
+        };
+        let targets: Vec<(String, u32)> = self
+            .dispatch_topics()
+            .into_iter()
+            .flat_map(|topic| (0..partition_count).map(move |p| (topic.clone(), p)))
+            .filter(|(_, partition)| self.shard_leader(*partition))
+            .collect();
+        if targets.is_empty() {
+            return false;
+        }
+        let deadline = Instant::now() + BACKFILL_PASS_BUDGET;
+        let start = self.backfill_rotation.load(Ordering::Relaxed) % targets.len();
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let mut enqueued = 0u64;
-        const PAGE: usize = 500;
-        for topic in topics {
-            if broker_partition::is_dlq_topic(&topic) {
-                continue;
+        let mut more = false;
+        'targets: for step in 0..targets.len() {
+            let index = (start + step) % targets.len();
+            if Instant::now() >= deadline {
+                self.backfill_rotation.store(index, Ordering::Relaxed);
+                more = true;
+                break;
             }
-            let Ok(partition_count) = self.broker.partition_count(&topic) else {
-                continue;
-            };
-            for partition in 0..partition_count {
-                if !self.shard_leader(partition) {
+            let (topic, partition) = &targets[index];
+            let view =
+                match self
+                    .scan
+                    .refresh(&self.broker, topic, *partition, BACKFILL_RECORD_BUDGET)
+                {
+                    Ok(view) => view,
+                    Err(error) => {
+                        warn!(%error, %topic, partition, "dispatch backfill scan failed");
+                        continue;
+                    }
+                };
+            more |= !view.caught_up;
+            let hwm = self.broker.committed_hwm(topic, *partition).unwrap_or(0);
+            for entry in view.entries {
+                // Backlog telemetry also on broker-only (fleet) brokers, which
+                // deliver nothing themselves and so never enqueue.
+                self.observe_pending_entry(&entry, hwm);
+                if !self.workers_enabled {
                     continue;
                 }
-                // Walk messages in pages; broker list API may still cap — use offset cursor.
-                let mut from_offset = 0u64;
-                while let Ok(messages) =
-                    self.broker
-                        .list_topic_messages_from(&topic, partition, from_offset, PAGE)
+                // A due-later retry is owned by the defer scheduler; re-enqueueing
+                // it (or offsets fenced behind it) would only churn the queue.
+                if self
+                    .blocking_entry_retry(&entry)
+                    .is_some_and(|record| record.due_at_ms > now_ms)
                 {
-                    if messages.is_empty() {
-                        break;
-                    }
-                    let mut advanced = false;
-                    for msg in &messages {
-                        from_offset = from_offset.max(msg.offset.saturating_add(1));
-                        advanced = true;
-                        if msg
-                            .destination_url
-                            .as_ref()
-                            .map(|u| u.is_empty())
-                            .unwrap_or(true)
-                        {
-                            continue;
-                        }
-                        let lane_owner = broker_partition::flow_lane_owner(msg);
-                        let cursor = self
-                            .broker
-                            .dispatch_offset(&tenant_id, &lane_owner.to_string(), msg.partition)
-                            .unwrap_or(0);
-                        if msg.offset < cursor {
-                            continue;
-                        }
-                        if self
-                            .broker
-                            .is_dispatch_complete(
-                                &tenant_id,
-                                &lane_owner.to_string(),
-                                msg.partition,
-                                msg.offset,
-                            )
-                            .unwrap_or(false)
-                        {
-                            continue;
-                        }
-                        let hwm = self.broker.committed_hwm(&topic, partition).unwrap_or(0);
-                        if msg.offset >= hwm {
-                            continue;
-                        }
-                        self.observe_pending(msg, hwm);
-                        self.enqueue(DeliveryJob::live(
-                            msg.topic.clone(),
-                            msg.partition,
-                            msg.offset,
-                            msg.id,
-                        ));
-                        enqueued += 1;
-                    }
-                    if !advanced || messages.len() < PAGE {
-                        break;
-                    }
+                    continue;
                 }
+                if self.high_tx.capacity() == 0 {
+                    self.backfill_rotation.store(index, Ordering::Relaxed);
+                    more = true;
+                    break 'targets;
+                }
+                self.enqueue(DeliveryJob::live(
+                    entry.topic,
+                    entry.partition,
+                    entry.offset,
+                    entry.message_id,
+                ));
+                enqueued += 1;
             }
         }
         if enqueued > 0 {
-            info!(enqueued, "dispatch backfill enqueued pending messages");
+            info!(
+                enqueued,
+                more, "dispatch backfill enqueued pending messages"
+            );
         }
+        more
+    }
+
+    fn observe_pending_entry(&self, entry: &crate::scan::PendingEntry, hwm: u64) {
+        let cursor = self
+            .broker
+            .dispatch_offset(&entry.tenant_id, &entry.cursor_key, entry.partition)
+            .unwrap_or(0);
+        self.telemetry
+            .record_pending(entry.partition, &entry.cursor_key, cursor, hwm);
+        self.telemetry.record_pending_age(
+            entry.partition,
+            &entry.cursor_key,
+            entry.offset,
+            entry.published_at_ms,
+        );
     }
 
     fn observe_pending(&self, msg: &StoredMessage, hwm: u64) {
@@ -760,6 +805,11 @@ impl DispatchEngine {
         }
     }
 }
+
+/// Wall-clock budget of one backfill pass.
+const BACKFILL_PASS_BUDGET: Duration = Duration::from_secs(2);
+/// New log records one backfill pass reads per `(topic, partition)`.
+const BACKFILL_RECORD_BUDGET: usize = 16_384;
 
 impl DispatchEngine {
     fn spawn_workers(&self, mut high_rx: mpsc::Receiver<DeliveryJob>) {
@@ -904,7 +954,7 @@ impl DispatchEngine {
         }
     }
 
-    fn fifo_retry_key(msg: &StoredMessage) -> Option<String> {
+    pub(crate) fn fifo_retry_key(msg: &StoredMessage) -> Option<String> {
         if !broker_partition::delivery_uses_flow_control(msg) {
             return None;
         }
@@ -923,6 +973,32 @@ impl DispatchEngine {
                 )
             })
             .or_else(|| self.retry_state.get(&Self::retry_key(msg)))
+    }
+
+    /// [`Self::blocking_delivery_retry`] for a scanned entry.
+    pub(crate) fn blocking_entry_retry(
+        &self,
+        entry: &crate::scan::PendingEntry,
+    ) -> Option<RetryRecord> {
+        entry
+            .fifo_key
+            .as_deref()
+            .and_then(|flow| {
+                self.retry_state.blocking_retry(
+                    &entry.cursor_key,
+                    flow,
+                    entry.partition,
+                    entry.offset,
+                )
+            })
+            .or_else(|| {
+                self.retry_state.get(&RetryKey {
+                    topic: entry.topic.clone(),
+                    partition: entry.partition,
+                    offset: entry.offset,
+                    message_id: entry.message_id,
+                })
+            })
     }
 
     fn clear_retry(&self, msg: &StoredMessage) -> Result<(), DispatchError> {
@@ -1212,9 +1288,6 @@ impl DispatchEngine {
             self.lifecycle
                 .clear(&Self::retry_key(msg))
                 .map_err(|error| DispatchError::Failed(error.to_string()))?;
-            let _ = self
-                .broker
-                .try_purge_message(&msg.topic, msg.partition, msg.offset);
             return Ok(());
         }
         let mut delivery_msg = msg.clone();
@@ -1277,10 +1350,7 @@ impl DispatchEngine {
                         msg.offset,
                     )
                     .await?;
-                    let _ = self
-                        .broker
-                        .try_purge_message(&msg.topic, msg.partition, msg.offset);
-                    debug!(
+                    info!(
                         lane_owner = %lane_owner,
                         queue = %msg.topic,
                         destination = %redacted_destination(url),
@@ -1413,6 +1483,7 @@ impl DispatchEngine {
             .broker
             .dispatch_offset(tenant_id, cursor_key, partition)?;
         if offset < cursor {
+            self.scan.mark_done(topic, partition, offset);
             return Ok(());
         }
         let newly_completed = !self
@@ -1456,6 +1527,7 @@ impl DispatchEngine {
             self.broker
                 .set_dispatch_offset(tenant_id, cursor_key, partition, next)?;
         }
+        self.scan.mark_done(topic, partition, offset);
         self.telemetry
             .record_completion(partition, cursor_key, cursor, next, hwm, newly_completed);
         let next_head = if next < hwm {
@@ -1509,9 +1581,6 @@ impl DispatchEngine {
         self.lifecycle
             .clear(&source)
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
-        let _ = self
-            .broker
-            .try_purge_message(&msg.topic, msg.partition, msg.offset);
         Ok(())
     }
 

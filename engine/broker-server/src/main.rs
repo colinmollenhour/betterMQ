@@ -712,9 +712,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             cluster.catalog_ready() && cluster.runtime.is_leader_for_shard(p)
         }));
     }
-    if !broker_only {
-        dispatch.backfill_pending();
-    }
+    // One bounded pass at boot; the backfill loop continues if work remains.
+    let boot_backfill_more = !broker_only && dispatch.backfill_pending();
 
     let app_state = Arc::new(AppState {
         broker,
@@ -758,7 +757,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         bg_tasks.push(spawn_wal_group_flusher(app_state.broker.clone()));
     }
     if !broker_only {
-        bg_tasks.push(spawn_dispatch_backfill_loop(app_state.clone()));
+        bg_tasks.push(spawn_dispatch_backfill_loop(
+            app_state.clone(),
+            boot_backfill_more,
+        ));
     }
     if let Some(task) = broker_api::spawn_retention_loop(app_state.clone()) {
         bg_tasks.push(task);
@@ -1215,13 +1217,29 @@ fn spawn_wal_group_flusher(broker: Broker) -> tokio::task::JoinHandle<()> {
     })
 }
 
-fn spawn_dispatch_backfill_loop(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+/// Regular backfill cadence once the pending-work index has caught up.
+const BACKFILL_INTERVAL: Duration = Duration::from_secs(30);
+/// Delay before the next pass while a backlog is still being scanned.
+const BACKFILL_CONTINUE: Duration = Duration::from_secs(1);
+
+fn spawn_dispatch_backfill_loop(
+    state: Arc<AppState>,
+    mut more: bool,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        interval.tick().await; // skip immediate tick (boot already backfills)
         loop {
-            interval.tick().await;
-            state.dispatch.backfill_pending();
+            let wait = if more {
+                BACKFILL_CONTINUE
+            } else {
+                BACKFILL_INTERVAL
+            };
+            tokio::time::sleep(wait).await;
+            let dispatch = state.dispatch.clone();
+            // Storage scans and metadata lookups block; keep them off the
+            // async workers that serve ingest and replication.
+            more = tokio::task::spawn_blocking(move || dispatch.backfill_pending())
+                .await
+                .unwrap_or(false);
         }
     })
 }

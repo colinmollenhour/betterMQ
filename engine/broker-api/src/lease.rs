@@ -131,7 +131,7 @@ pub async fn lease_claim(
 ) -> Result<Json<ClaimResponse>, ApiError> {
     let state_ref = state.as_ref();
     let resp = claim_from_broker(
-        &state_ref.broker,
+        &state_ref.dispatch,
         &state_ref.leases,
         Some(state_ref.fair_queue.as_ref()),
         &req.holder,
@@ -196,12 +196,6 @@ pub async fn lease_complete(
         return Err(ApiError::Broker(broker_partition::BrokerError::Storage(
             broker_storage::LogError::Io(std::io::Error::other(e.to_string())),
         )));
-    }
-    if let Err(e) = state
-        .broker
-        .try_purge_message(&job.topic, job.partition, job.offset)
-    {
-        tracing::warn!(error = %e, "lease complete: purge failed");
     }
     Ok(StatusCode::NO_CONTENT)
 }

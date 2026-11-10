@@ -764,7 +764,10 @@ pub fn spawn_cluster_health_monitor(
                 }
                 if !caught_up.is_empty() {
                     info!(shards = ?caught_up, "failover catch-up complete; shards unfenced");
-                    dispatch.backfill_pending();
+                    // Catch-up may have rewritten these logs; rescan them.
+                    dispatch.reset_dispatch_scan(&caught_up);
+                    let dispatch = dispatch.clone();
+                    let _ = tokio::task::spawn_blocking(move || dispatch.backfill_pending()).await;
                 }
             }
             broker_api::set_fenced_shards(

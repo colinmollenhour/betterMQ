@@ -173,8 +173,10 @@ async fn destroy_acceptor_then_deliver(len: usize, mode: Mode) {
         }
         Mode::Fleet => {
             let leases = LeaseTable::new();
+            let worker =
+                DispatchEngine::new_broker_only(survivor.clone(), DispatchConfig::default());
             let claimed = broker_dispatch::claim_from_broker(
-                survivor,
+                &worker,
                 &leases,
                 None,
                 "fleet-worker",
@@ -191,8 +193,6 @@ async fn destroy_acceptor_then_deliver(len: usize, mode: Mode) {
                 .expect("claimed the surviving record");
             let message = job.message.expect("claim carries the message");
             assert_eq!(message.payload, body, "claim carries the inline body");
-            let worker =
-                DispatchEngine::new_broker_only(survivor.clone(), DispatchConfig::default());
             worker
                 .push_http_only(&message, job.committed_hwm)
                 .await

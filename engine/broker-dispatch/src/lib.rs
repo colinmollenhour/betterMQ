@@ -11,6 +11,7 @@ mod lifecycle;
 mod memory_guard;
 mod outbound;
 mod retry_state;
+mod scan;
 mod telemetry;
 mod worker;
 

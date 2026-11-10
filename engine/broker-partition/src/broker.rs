@@ -2225,6 +2225,38 @@ impl Broker {
         Ok(out)
     }
 
+    /// Read at most `max_records` shard records from `from_offset` (inclusive)
+    /// and keep those belonging to `topic`. Unlike [`Broker::list_topic_messages_from`]
+    /// the work is bounded by records read, not by matches, so a scan over a
+    /// shared V2 shard cannot read the whole shard to find a few matches.
+    /// Returns the matches and the offset to resume from (`from_offset` when
+    /// nothing was read).
+    pub fn scan_topic_messages(
+        &self,
+        topic: &str,
+        partition: u32,
+        from_offset: u64,
+        max_records: usize,
+    ) -> Result<(Vec<StoredMessage>, u64), BrokerError> {
+        if max_records == 0 {
+            return Ok((Vec::new(), from_offset));
+        }
+        let batch =
+            self.shard_handle(topic, partition)?
+                .read_range(partition, from_offset, max_records)?;
+        let next = batch
+            .last()
+            .map(|message| message.offset.saturating_add(1))
+            .unwrap_or(from_offset);
+        Ok((
+            batch
+                .into_iter()
+                .filter(|message| message.topic == topic)
+                .collect(),
+            next,
+        ))
+    }
+
     /// Encoded frames from `from_offset` (inclusive) for follower catch-up.
     pub fn replication_frames(
         &self,
@@ -2407,18 +2439,6 @@ impl Broker {
             }
         }
         Ok(deleted)
-    }
-
-    /// Delivery no longer physically purges; delivered records are reclaimed
-    /// by automatic sealed-segment retention (`RetentionStore`). Kept so
-    /// callers compile; always returns false.
-    pub fn try_purge_message(
-        &self,
-        _topic: &str,
-        _partition: u32,
-        _offset: u64,
-    ) -> Result<bool, BrokerError> {
-        Ok(false)
     }
 
     /// Resolve the routing identity and storage topic before choosing a leader.

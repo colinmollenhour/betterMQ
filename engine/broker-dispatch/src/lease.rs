@@ -1,19 +1,18 @@
 //! Job lease protocol (Phase B): claim / heartbeat / complete / fail.
 //! Shard leader owns CAS pending→leased; fleet and in-process dispatch use the same path.
 
-use broker_partition::Broker;
-use broker_partition::DIRECT_TOPIC;
 use broker_storage::StoredMessage;
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::fairness::TenantFairQueue;
+use crate::worker::DispatchEngine;
 
 #[derive(Debug, Error)]
 pub enum LeaseError {
@@ -220,7 +219,15 @@ impl LeaseTable {
         Ok(entry.job)
     }
 
-    fn purge_expired(&self) {
+    /// Leased right now, without first purging expired leases (callers that
+    /// check many offsets purge once up front with [`LeaseTable::purge_expired`]).
+    pub(crate) fn offset_leased(&self, topic: &str, partition: u32, offset: u64) -> bool {
+        self.leased_offsets
+            .lock()
+            .contains_key(&(topic.to_string(), partition, offset))
+    }
+
+    pub(crate) fn purge_expired(&self) {
         let now = Utc::now().timestamp_millis();
         let mut map = self.inner.lock();
         let mut offsets = self.leased_offsets.lock();
@@ -255,6 +262,7 @@ impl LeaseTable {
     }
 }
 
+#[cfg(test)]
 fn cursor_key_for(msg: &StoredMessage) -> String {
     broker_partition::flow_lane_owner(msg).to_string()
 }
@@ -264,7 +272,10 @@ fn cursor_key_for(msg: &StoredMessage) -> String {
 const CLAIM_PAYLOAD_BUDGET: usize = 32 * 1024 * 1024;
 
 /// Load a blob-backed body into `msg` and verify it against its reference.
-fn resolve_payload(broker: &Broker, msg: &mut StoredMessage) -> Result<(), String> {
+fn resolve_payload(
+    broker: &broker_partition::Broker,
+    msg: &mut StoredMessage,
+) -> Result<(), String> {
     let Some(reference) = msg.payload_ref_json.as_deref() else {
         return Ok(());
     };
@@ -279,10 +290,18 @@ fn resolve_payload(broker: &Broker, msg: &mut StoredMessage) -> Result<(), Strin
     verify_payload(&reference, &msg.payload)
 }
 
-/// Shared claim selection used by HTTP lease API and in-process dispatch.
+/// New log records one claim reads per `(topic, partition)` while extending
+/// the pending-work index.
+const CLAIM_RECORD_BUDGET: usize = 4_096;
+
+/// Shared claim selection used by the HTTP lease API.
+///
+/// Candidates come from the engine's incremental pending-work index, so a
+/// claim reads only records appended since the previous claim instead of the
+/// whole retained log.
 #[allow(clippy::too_many_arguments)]
 pub fn claim_from_broker(
-    broker: &Broker,
+    engine: &DispatchEngine,
     leases: &LeaseTable,
     fair_queue: Option<&TenantFairQueue>,
     holder: &str,
@@ -292,35 +311,22 @@ pub fn claim_from_broker(
     is_leader: &dyn Fn(u32) -> bool,
     generation: &dyn Fn(u32) -> u64,
 ) -> ClaimResponse {
+    let broker = engine.broker();
     let max = max_jobs.clamp(1, MAX_CLAIM_JOBS);
     let ttl = lease_ttl_ms.max(5_000);
     let now = Utc::now().timestamp_millis();
     let mut jobs = Vec::new();
     let mut claimed_bytes = 0usize;
 
-    let mut topics: HashSet<String> = HashSet::new();
-    topics.insert(DIRECT_TOPIC.to_string());
-    if let Ok(queues) = broker.list_endpoints() {
-        for q in queues {
-            topics.insert(q.topic);
-        }
-    }
-
     // Fairness: order topics by tenant WFQ score (lower = prefer).
-    let mut topic_list: Vec<String> = topics.into_iter().collect();
+    let mut topic_list = engine.dispatch_topics();
     if let Some(fq) = fair_queue {
-        topic_list.sort_by_key(|t| {
-            let tenant = broker.tenant();
-            fq.schedule_score(&format!("{tenant}:{t}"))
-        });
-    } else {
-        topic_list.sort();
+        let tenant = broker.tenant();
+        topic_list.sort_by_key(|t| fq.schedule_score(&format!("{tenant}:{t}")));
     }
+    leases.purge_expired();
 
     'outer: for topic in topic_list {
-        if broker_partition::is_dlq_topic(&topic) {
-            continue;
-        }
         let Ok(pc) = broker.partition_count(&topic) else {
             continue;
         };
@@ -333,87 +339,86 @@ pub fn claim_from_broker(
             if !is_leader(partition) {
                 continue;
             }
-            let tenant = broker.tenant();
             let Ok(committed_hwm) = broker.committed_hwm(&topic, partition) else {
                 continue;
             };
-            let mut from_offset = 0u64;
-            const PAGE: usize = 256;
-            while from_offset < committed_hwm {
-                let Ok(batch) =
-                    broker.list_topic_messages_from(&topic, partition, from_offset, PAGE)
-                else {
-                    break;
-                };
-                if batch.is_empty() {
-                    break;
+            let view = match engine
+                .scan()
+                .refresh(broker, &topic, partition, CLAIM_RECORD_BUDGET)
+            {
+                Ok(view) => view,
+                Err(error) => {
+                    tracing::warn!(%error, %topic, partition, "lease claim scan failed");
+                    continue;
                 }
-                let batch_len = batch.len();
-                let mut advanced = false;
-                for msg in batch {
-                    from_offset = from_offset.max(msg.offset.saturating_add(1));
-                    advanced = true;
-                    if jobs.len() >= max {
-                        break 'outer;
-                    }
-                    if msg.offset >= committed_hwm {
-                        break;
-                    }
-                    let ck = cursor_key_for(&msg);
-                    let cursor = broker.dispatch_offset(&tenant, &ck, partition).unwrap_or(0);
-                    if msg.offset < cursor
-                        || broker
-                            .is_dispatch_complete(&tenant, &ck, partition, msg.offset)
-                            .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    if leases.is_offset_leased(&topic, partition, msg.offset) {
-                        continue;
-                    }
-                    // Blob-backed bodies are loaded and verified here, so a claim
-                    // is always deliverable as-is; an unreadable blob is never
-                    // leased (the message stays pending: no empty body, no DLQ).
-                    let mut msg = msg;
-                    if let Err(error) = resolve_payload(broker, &mut msg) {
-                        tracing::warn!(
-                            %error,
-                            %topic,
+            };
+            for entry in view.entries {
+                if jobs.len() >= max {
+                    break 'outer;
+                }
+                if leases.offset_leased(&topic, partition, entry.offset) {
+                    continue;
+                }
+                // The index may lag completions made elsewhere; confirm.
+                let done = broker
+                    .dispatch_offset(&entry.tenant_id, &entry.cursor_key, partition)
+                    .is_ok_and(|cursor| entry.offset < cursor)
+                    || broker
+                        .is_dispatch_complete(
+                            &entry.tenant_id,
+                            &entry.cursor_key,
                             partition,
-                            offset = msg.offset,
-                            message_id = %msg.id,
-                            "lease claim withheld: payload blob could not be loaded"
-                        );
-                        continue;
-                    }
-                    if !jobs.is_empty()
-                        && claimed_bytes.saturating_add(msg.payload.len()) > CLAIM_PAYLOAD_BUDGET
-                    {
-                        break 'outer;
-                    }
-                    let payload_len = msg.payload.len();
-                    let lease_id = Uuid::new_v4();
-                    let claimed = ClaimedJob {
-                        lease_id,
-                        topic: topic.clone(),
+                            entry.offset,
+                        )
+                        .unwrap_or(false);
+                if done {
+                    engine.scan().mark_done(&topic, partition, entry.offset);
+                    continue;
+                }
+                let Ok(msg) = broker.read_message(&topic, partition, entry.offset) else {
+                    continue;
+                };
+                if msg.id != entry.message_id {
+                    continue;
+                }
+                // Blob-backed bodies are loaded and verified here, so a claim is
+                // always deliverable as-is; an unreadable blob is never leased
+                // (the message stays pending, never an empty body or a DLQ).
+                let mut msg = msg;
+                if let Err(error) = resolve_payload(broker, &mut msg) {
+                    tracing::warn!(
+                        %error,
+                        %topic,
                         partition,
-                        offset: msg.offset,
-                        message_id: msg.id,
-                        expires_at_ms: now + ttl,
-                        generation: generation(partition),
-                        committed_hwm,
-                        cursor_key: ck,
-                        message: Some(msg),
-                    };
-                    if !leases.try_insert(holder.to_string(), claimed.clone()) {
-                        continue;
-                    }
-                    claimed_bytes = claimed_bytes.saturating_add(payload_len);
-                    jobs.push(claimed);
+                        offset = msg.offset,
+                        message_id = %msg.id,
+                        "lease claim withheld: payload blob could not be loaded"
+                    );
+                    continue;
                 }
-                if !advanced || batch_len < PAGE {
-                    break;
+                if !jobs.is_empty()
+                    && claimed_bytes.saturating_add(msg.payload.len()) > CLAIM_PAYLOAD_BUDGET
+                {
+                    break 'outer;
                 }
+                let payload_len = msg.payload.len();
+                let claimed = ClaimedJob {
+                    lease_id: Uuid::new_v4(),
+                    topic: topic.clone(),
+                    partition,
+                    offset: msg.offset,
+                    message_id: msg.id,
+                    expires_at_ms: now + ttl,
+                    generation: generation(partition),
+                    committed_hwm,
+                    cursor_key: entry.cursor_key,
+                    message: Some(msg),
+                };
+                if !leases.try_insert(holder.to_string(), claimed.clone()) {
+                    continue;
+                }
+                claimed_bytes = claimed_bytes.saturating_add(payload_len);
+                jobs.push(claimed);
             }
         }
     }
@@ -640,7 +645,8 @@ pub fn long_wait_tier_secs() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use broker_partition::{BrokerConfig, FlowSpec, PublishRequest};
+    use crate::worker::DispatchConfig;
+    use broker_partition::{Broker, BrokerConfig, FlowSpec, PublishRequest};
 
     #[test]
     fn lease_insert_heartbeat_take() {
@@ -773,8 +779,9 @@ mod tests {
             .unwrap();
 
         let leases = LeaseTable::new();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
         let claimed = claim_from_broker(
-            &broker,
+            &engine,
             &leases,
             None,
             "worker",
@@ -793,7 +800,7 @@ mod tests {
             .mark_dispatch_complete(&tenant, &lane_b, partition, second_msg.offset)
             .unwrap();
         let again = claim_from_broker(
-            &broker,
+            &engine,
             &leases,
             None,
             "worker",
