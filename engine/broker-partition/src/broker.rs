@@ -1176,19 +1176,6 @@ impl Broker {
         Ok(())
     }
 
-    /// Physically delete sealed segments at or below the durable GC watermark.
-    pub fn gc_sealed_below(&self, shard: u32, watermark: u64) -> Result<usize, BrokerError> {
-        let topic = if self.inner.layout.is_physical() {
-            "__physical"
-        } else {
-            return Ok(0);
-        };
-        let handle = self.shard_handle(topic, shard)?;
-        handle
-            .gc_sealed_below(watermark)
-            .map_err(BrokerError::Storage)
-    }
-
     /// The physical log holding `topic` on `partition`.
     pub fn log_id(&self, topic: &str, partition: u32) -> LogId {
         LogId {

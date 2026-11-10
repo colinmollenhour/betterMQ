@@ -1,6 +1,7 @@
 //! Public HTTP surface for the BetterMQ data plane.
 
 mod admin;
+mod admin_audit;
 mod admission;
 mod auth;
 mod batch;
@@ -56,6 +57,7 @@ fn http_body_limit_bytes() -> usize {
 pub use admin::{
     router as admin_router, validate_attach_url, AdminState, CellMember, CellRecord, CellRegistry,
 };
+pub use admin_audit::{AdminAuditEvent, AdminAuditLog};
 pub use catalog_tombstones::CatalogTombstones;
 pub use cluster::{
     build_cluster_status, catalog_peer_targets, enqueue_dispatch_after_publish,

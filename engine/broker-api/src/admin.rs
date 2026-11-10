@@ -29,6 +29,14 @@ pub struct AdminState {
     pub cell_registry: Arc<parking_lot::RwLock<CellRegistry>>,
     pub cluster_secret: Option<String>,
     pub registry_path: Option<PathBuf>,
+    pub audit: Arc<crate::admin_audit::AdminAuditLog>,
+}
+
+/// `admin-audit.jsonl` beside the cell registry (or the broker data dir).
+fn audit_log_path(registry_path: Option<&PathBuf>, local: Option<&AppState>) -> Option<PathBuf> {
+    registry_path
+        .and_then(|path| path.parent().map(|dir| dir.join("admin-audit.jsonl")))
+        .or_else(|| local.map(|state| state.broker.config().data_dir.join("admin-audit.jsonl")))
 }
 
 impl AdminState {
@@ -56,12 +64,17 @@ impl AdminState {
                 tracing::warn!(%error, path = %path.display(), "cell registry save failed");
             }
         }
+        let audit = Arc::new(crate::admin_audit::AdminAuditLog::open(audit_log_path(
+            registry_path.as_ref(),
+            Some(&state),
+        )));
         Self {
             local: Some(state),
             remote_controller: None,
             cell_registry: Arc::new(parking_lot::RwLock::new(registry)),
             cluster_secret: crate::cluster_auth::cluster_secret(),
             registry_path,
+            audit,
         }
     }
 
@@ -88,12 +101,17 @@ impl AdminState {
                 tracing::warn!(%error, path = %path.display(), "cell registry save failed");
             }
         }
+        let audit = Arc::new(crate::admin_audit::AdminAuditLog::open(audit_log_path(
+            registry_path.as_ref(),
+            None,
+        )));
         Self {
             local: None,
             remote_controller: controller,
             cell_registry: Arc::new(parking_lot::RwLock::new(registry)),
             cluster_secret: crate::cluster_auth::cluster_secret(),
             registry_path,
+            audit,
         }
     }
 
@@ -371,11 +389,11 @@ pub struct CellFailure {
 #[derive(Debug, Deserialize)]
 pub struct AuditQuery {
     #[serde(default)]
-    #[allow(dead_code)]
     pub limit: Option<usize>,
 }
 
 pub fn router(state: AdminState) -> Router {
+    let audit = Arc::clone(&state.audit);
     // Every route except health sits behind `admin_auth`, so a new route cannot
     // forget the check.
     let protected = Router::new()
@@ -404,6 +422,10 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/v1/health", get(admin_health))
         .merge(protected)
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            audit,
+            crate::admin_audit::audit_admin_mutations,
+        ))
 }
 
 async fn admin_auth(
@@ -716,9 +738,13 @@ async fn admin_readyz(
 }
 
 async fn audit_log(
-    Query(_q): Query<AuditQuery>,
+    State(state): State<AdminState>,
+    Query(query): Query<AuditQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    Ok(Json(serde_json::json!({ "events": [] })))
+    let limit = query.limit.unwrap_or(100).clamp(1, 1_000);
+    Ok(Json(
+        serde_json::json!({ "events": state.audit.recent(limit) }),
+    ))
 }
 
 async fn list_cells(
@@ -1119,47 +1145,162 @@ async fn start_rebalance(
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GcRequest {
+    /// Exclusive offset: delete whole sealed segments entirely below it.
     watermark: u64,
+    /// Queue topic; required with shard layout V1 (one log per topic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topic: Option<String>,
 }
 
+type GcError = (StatusCode, Json<serde_json::Value>);
+
+fn gc_error(status: StatusCode, code: &str, error: impl std::fmt::Display) -> GcError {
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string(), "code": code })),
+    )
+}
+
+/// Manual GC: validated against the same safe watermark as automatic
+/// retention (409 with the safe value above it, never silently clamped),
+/// committed through the controller in a replicated cell, applied locally,
+/// and every failure surfaced.
 async fn advance_gc(
     State(state): State<AdminState>,
     Path(shard): Path<u32>,
     Json(body): Json<GcRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    let Some(local) = &state.local else {
+) -> Result<Json<serde_json::Value>, GcError> {
+    let Some(local) = state.local.clone() else {
+        // Standalone panel: the controller's broker validates and applies.
         let path = format!("gc/{shard}");
         return proxy_controller(&state, reqwest::Method::POST, &path, Some(to_json(&body)))
             .await
-            .map(Json);
+            .map(Json)
+            .map_err(|(status, Json(error))| {
+                (
+                    status,
+                    Json(serde_json::to_value(error).unwrap_or_default()),
+                )
+            });
     };
-    if let Some(cluster) = &local.cluster {
-        if let Some(controller) = cluster.runtime.controller() {
-            let _ = controller
-                .submit(broker_raft_meta::ControllerCommand::SetGcWatermark {
-                    shard,
-                    watermark: body.watermark,
-                })
-                .await
-                .map_err(|err| {
-                    (
-                        StatusCode::CONFLICT,
-                        Json(AdminErrorBody {
-                            error: err.to_string(),
-                            code: "gc_rejected",
-                        }),
-                    )
-                })?;
+    let broker = &local.broker;
+    if broker.config().storage != broker_storage::StorageMode::Local {
+        return Err(gc_error(
+            StatusCode::CONFLICT,
+            "gc_unsupported",
+            "segment GC applies to local WAL storage only",
+        ));
+    }
+    if shard >= broker.shard_count() {
+        return Err(gc_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_shard",
+            format!("shard {shard} out of range (0..{})", broker.shard_count()),
+        ));
+    }
+    let log = if broker.layout().is_physical() {
+        broker.log_id("", shard)
+    } else {
+        let Some(topic) = body.topic.as_deref().filter(|topic| !topic.is_empty()) else {
+            return Err(gc_error(
+                StatusCode::BAD_REQUEST,
+                "topic_required",
+                "shard layout v1 keeps one log per topic: pass \"topic\"",
+            ));
+        };
+        broker.log_id(topic, shard)
+    };
+    let replicated = local
+        .cluster
+        .as_ref()
+        .filter(|cluster| cluster.runtime.config().node_count() > 1);
+    if let Some(cluster) = replicated {
+        if cluster.runtime.controller().is_none() {
+            return Err(gc_error(
+                StatusCode::CONFLICT,
+                "retention_paused",
+                "replicated cell without an OpenRaft controller cannot agree on GC",
+            ));
+        }
+        if !cluster.runtime.is_leader_for_shard(shard) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("this node does not lead shard {shard}"),
+                    "code": "not_shard_leader",
+                    "leader": cluster.runtime.leader_http_base_for_shard(shard),
+                })),
+            ));
         }
     }
-    let deleted = local
-        .broker
-        .gc_sealed_below(shard, body.watermark)
-        .unwrap_or(0);
+
+    let config = broker_partition::RetentionConfig::from_env();
+    let compute_state = Arc::clone(&local);
+    let compute_log = log.clone();
+    let safe = tokio::task::spawn_blocking(move || {
+        crate::retention::compute_safe_watermark(&compute_state, &compute_log, &config)
+    })
+    .await
+    .map_err(|error| gc_error(StatusCode::INTERNAL_SERVER_ERROR, "gc_failed", error))?
+    .map_err(|error| gc_error(StatusCode::INTERNAL_SERVER_ERROR, "gc_failed", error))?;
+    if body.watermark > safe.safe {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "watermark {} is above the safe watermark {} (limited by {:?})",
+                    body.watermark, safe.safe, safe.limited_by
+                ),
+                "code": "gc_above_safe_watermark",
+                "requested": body.watermark,
+                "safeWatermark": safe.safe,
+                "limitedBy": safe.limited_by,
+            })),
+        ));
+    }
+
+    if let Some(cluster) = replicated {
+        let controller = cluster.runtime.controller().expect("checked above");
+        if body.watermark > controller.state().log_gc_watermark(&log.namespace, shard) {
+            controller
+                .submit(ControllerCommand::SetGcWatermarks {
+                    leader_id: cluster.runtime.config().node_id,
+                    entries: vec![broker_raft_meta::GcWatermarkProposal {
+                        namespace: log.namespace.clone(),
+                        partition: shard,
+                        leader_term: cluster.runtime.shard_generation(shard),
+                        watermark: body.watermark,
+                    }],
+                })
+                .await
+                .map_err(|error| gc_error(StatusCode::CONFLICT, "gc_rejected", error))?;
+        }
+    }
+    let apply_state = Arc::clone(&local);
+    let apply_log = log.clone();
+    let watermark = body.watermark;
+    let report = tokio::task::spawn_blocking(move || {
+        crate::retention::apply_watermark(&apply_state, &apply_log, watermark)
+    })
+    .await
+    .map_err(|error| gc_error(StatusCode::INTERNAL_SERVER_ERROR, "gc_failed", error))?
+    .map_err(|error| gc_error(StatusCode::INTERNAL_SERVER_ERROR, "gc_failed", error))?;
+    tracing::info!(
+        %log,
+        watermark,
+        safe = safe.safe,
+        base_offset = report.base_offset,
+        segments = report.segments_deleted,
+        "manual GC applied"
+    );
     Ok(Json(serde_json::json!({
         "shard": shard,
-        "watermark": body.watermark,
-        "deletedSegments": deleted,
+        "log": log.namespace,
+        "watermark": watermark,
+        "safeWatermark": safe.safe,
+        "baseOffset": report.base_offset,
+        "deletedSegments": report.segments_deleted,
+        "blobsTombstoned": report.blobs_tombstoned,
     })))
 }
 
@@ -1916,6 +2057,193 @@ async fn expand_replication(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod manual_gc {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::Request;
+        use broker_dispatch::{DispatchConfig, DispatchEngine, LeaseTable};
+        use broker_partition::{Broker, BrokerConfig, PublishRequest};
+        use broker_schedule::{CronRegistry, ScheduleQueue};
+        use broker_storage::{FsyncMode, PartitionLogConfig};
+        use tower::ServiceExt;
+
+        fn state(dir: &std::path::Path) -> Arc<AppState> {
+            let mut config = BrokerConfig::new(dir.to_path_buf());
+            config.partitions = 1;
+            config.log = PartitionLogConfig {
+                segment_max_bytes: 2048,
+                fsync: FsyncMode::Always,
+                group_interval: std::time::Duration::from_millis(5),
+            };
+            let broker = Broker::open(config).unwrap();
+            Arc::new(AppState {
+                broker: broker.clone(),
+                schedule: ScheduleQueue::open(dir).unwrap(),
+                crons: CronRegistry::open(dir).unwrap(),
+                dispatch: DispatchEngine::new_broker_only(broker, DispatchConfig::default()),
+                leases: LeaseTable::new(),
+                cluster: None,
+                local_auth: None,
+                fair_queue: Arc::new(broker_dispatch::TenantFairQueue::new()),
+                catalog_tombstones: crate::catalog_tombstones::CatalogTombstones::open(dir)
+                    .unwrap(),
+                dispatch_fleet: false,
+                broker_only: false,
+                #[cfg(feature = "cloud")]
+                auth: None,
+                #[cfg(feature = "cloud")]
+                control_plane: None,
+            })
+        }
+
+        fn publish(state: &AppState, count: usize) -> Vec<u64> {
+            (0..count)
+                .map(|index| {
+                    state
+                        .broker
+                        .publish(PublishRequest {
+                            topic: String::new(),
+                            queue_id: None,
+                            group_id: None,
+                            group_member_id: None,
+                            routing_key: "lane".into(),
+                            payload: format!("{index}-{}", "x".repeat(200)),
+                            payload_encoding: None,
+                            idempotency_key: None,
+                            delay_ms: None,
+                            priority: None,
+                            flow_id: None,
+                            url: Some("http://127.0.0.1:9/h".into()),
+                            secret: Some("s".into()),
+                            routing_id: None,
+                            destination: None,
+                            flow: None,
+                            parallelism: None,
+                            max_retries: None,
+                            retry_backoff: None,
+                            method: None,
+                            headers: None,
+                            sign: None,
+                            request: None,
+                        })
+                        .unwrap()
+                        .offset
+                        .unwrap()
+                })
+                .collect()
+        }
+
+        async fn post_gc(app: &Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/admin/v1/gc/0")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer sk_local_secret")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn manual_gc_rejects_unsafe_watermarks_and_is_audited() {
+            std::env::set_var("BETTERMQ_RETENTION_MIN_AGE_SECS", "0");
+            let dir = tempfile::tempdir().unwrap();
+            let local = state(dir.path());
+            let offsets = publish(&local, 80);
+            let log = local.broker.log_id(broker_partition::DIRECT_TOPIC, 0);
+            for message in local.broker.read_log(&log, 0, 10_000).unwrap() {
+                if message.offset < offsets[50] {
+                    local
+                        .broker
+                        .mark_dispatch_complete(
+                            &message.tenant_id,
+                            &broker_partition::flow_lane_owner(&message).to_string(),
+                            message.partition,
+                            message.offset,
+                        )
+                        .unwrap();
+                }
+            }
+            let mut admin = AdminState::local(Arc::clone(&local));
+            admin.cluster_secret = Some("sk_local_secret".into());
+            let app = router(admin);
+
+            // V1 needs the topic.
+            let (status, body) = post_gc(&app, serde_json::json!({ "watermark": 1 })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["code"], "topic_required");
+
+            // Above the safe watermark: refused with the safe value, nothing deleted.
+            let (status, body) = post_gc(
+                &app,
+                serde_json::json!({ "watermark": offsets[70], "topic": "__direct" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["code"], "gc_above_safe_watermark");
+            assert_eq!(body["safeWatermark"], offsets[50]);
+            assert_eq!(
+                local
+                    .broker
+                    .log_retention_status(&log, 0)
+                    .unwrap()
+                    .base_offset,
+                0
+            );
+
+            // At the safe watermark: applied.
+            let (status, body) = post_gc(
+                &app,
+                serde_json::json!({ "watermark": offsets[50], "topic": "__direct" }),
+            )
+            .await;
+            std::env::remove_var("BETTERMQ_RETENTION_MIN_AGE_SECS");
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(body["deletedSegments"].as_u64().unwrap() > 0);
+            let base = local
+                .broker
+                .log_retention_status(&log, 0)
+                .unwrap()
+                .base_offset;
+            assert!(base > 0 && base <= offsets[50]);
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get("/admin/v1/audit")
+                        .header("authorization", "Bearer sk_local_secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let audit: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let events = audit["events"].as_array().unwrap();
+            let statuses: Vec<_> = events.iter().map(|event| event["status"].clone()).collect();
+            assert_eq!(statuses, vec![200, 409, 400]);
+            assert_eq!(events[0]["path"], "/admin/v1/gc/0");
+            assert_eq!(events[0]["params"]["watermark"], offsets[50]);
+            let caller = events[0]["caller"].as_str().unwrap();
+            assert!(caller.starts_with("bearer:") && !caller.contains("sk_local"));
+            // Persisted for restarts.
+            let reopened = AdminAuditLog::open(Some(dir.path().join("admin-audit.jsonl")));
+            assert_eq!(reopened.recent(10).len(), 3);
+        }
+    }
+
+    use crate::admin_audit::AdminAuditLog;
 
     #[test]
     fn cell_registry_survives_roundtrip() {

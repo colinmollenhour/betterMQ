@@ -122,6 +122,9 @@ pub struct ControllerState {
     pub min_isr: u32,
     #[serde(default)]
     pub catalog_records: BTreeMap<String, CatalogRecord>,
+    /// Legacy per-shard watermark from the removed `SetGcWatermark` command.
+    /// It was accepted unvalidated, so it is kept only for decoding old state
+    /// and never consumed; see `log_gc_watermarks`.
     #[serde(default)]
     pub gc_watermarks: HashMap<u32, u64>,
     #[serde(default)]
@@ -323,10 +326,6 @@ pub enum ControllerCommand {
     },
     CompleteRebalance {
         shard: u32,
-    },
-    SetGcWatermark {
-        shard: u32,
-        watermark: u64,
     },
     /// Batch of retention watermarks from one node. Each entry is accepted
     /// only if `leader_id` is the shard's placement leader at exactly
@@ -1152,15 +1151,6 @@ fn apply_command(
                 }
             }
         }
-        ControllerCommand::SetGcWatermark { shard, watermark } => {
-            let current = state.gc_watermarks.get(&shard).copied().unwrap_or(0);
-            if watermark < current {
-                return Err(ControllerError::InvalidCommand(format!(
-                    "gc watermark for shard {shard} cannot move backwards ({watermark} < {current})"
-                )));
-            }
-            state.gc_watermarks.insert(shard, watermark);
-        }
         ControllerCommand::SetGcWatermarks { leader_id, entries } => {
             let mut rejected = Vec::new();
             let mut applied = 0usize;
@@ -1414,22 +1404,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.catalog_epoch, 1);
-        apply_command(
-            &mut state,
-            ControllerCommand::SetGcWatermark {
-                shard: 0,
-                watermark: 10,
-            },
-        )
-        .unwrap();
-        assert!(apply_command(
-            &mut state,
-            ControllerCommand::SetGcWatermark {
-                shard: 0,
-                watermark: 9,
-            },
-        )
-        .is_err());
+        let placement = state.shards[&0].clone();
+        let proposal = |watermark| ControllerCommand::SetGcWatermarks {
+            leader_id: placement.leader_id,
+            entries: vec![GcWatermarkProposal {
+                namespace: "__physical".into(),
+                partition: 0,
+                leader_term: placement.leader_term,
+                watermark,
+            }],
+        };
+        apply_command(&mut state, proposal(10)).unwrap();
+        assert!(apply_command(&mut state, proposal(9)).is_err());
     }
 
     #[test]
