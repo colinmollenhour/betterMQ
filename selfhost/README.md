@@ -323,7 +323,8 @@ The public repo reads **92** `BETTERMQ_*` names used by self-host. **16** are CL
 | `BETTERMQ_ALLOW_QUERY_SECRET` | Deprecated: accept GET publish `?secret=` (`1`) |
 | `BETTERMQ_METRICS_TOKEN` | Bearer / header gate for `/metrics` (required in HA compose files) |
 | `BETTERMQ_JOIN_TOKEN_QUERY` | Allow join token in query string (`1`/`true`/`yes`) |
-| `BETTERMQ_TRUST_PROXY` | Trust `X-Forwarded-For` for rate-limit client IP |
+| `BETTERMQ_TRUST_PROXY` | Use `X-Forwarded-For` for the auth rate-limit client IP, only when the connection comes from a trusted proxy; the client is the right-most hop that is not a trusted proxy. Without it, the socket peer address is used |
+| `BETTERMQ_TRUSTED_PROXIES` | Comma-separated proxy CIDRs/IPs for `BETTERMQ_TRUST_PROXY` (default: loopback and private ranges) |
 
 #### Cluster, fleet, identity
 

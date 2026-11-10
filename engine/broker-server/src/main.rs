@@ -744,7 +744,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let (listener, app) = bound.remove(0);
     for (listener, app) in bound {
         bg_tasks.push(tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
         }));
     }
 
@@ -770,7 +774,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         signal_notice.notify_one();
     };
 
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown);
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown);
     let mut server = Box::pin(std::future::IntoFuture::into_future(server));
     tokio::select! {
         result = &mut server => {
@@ -915,10 +923,13 @@ async fn serve_panel_from_settings(settings: &ResolvedServeSettings) -> anyhow::
         begin_shutdown();
         info!("panel shutdown signal received; draining HTTP");
     };
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("panel HTTP server exited")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("panel HTTP server exited")
 }
 
 async fn serve_gateway_only(settings: &ResolvedServeSettings) -> anyhow::Result<()> {
@@ -956,10 +967,13 @@ async fn serve_gateway_only(settings: &ResolvedServeSettings) -> anyhow::Result<
         begin_shutdown();
         info!("gateway shutdown signal received; draining HTTP");
     };
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("gateway HTTP server exited")
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("gateway HTTP server exited")
 }
 
 async fn shutdown_signal() {

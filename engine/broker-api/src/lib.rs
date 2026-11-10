@@ -1063,6 +1063,42 @@ mod tests {
         assert!(store.is_configured());
     }
 
+    #[tokio::test]
+    async fn auth_rate_limit_is_per_client_and_returns_429() {
+        let dir = tempdir().unwrap();
+        let store = broker_local_auth::LocalAuthStore::open(dir.path()).unwrap();
+        store.setup("password1234").unwrap();
+        let mut state = test_state(&dir);
+        state.local_auth = Some(Arc::new(store));
+        let app = router(state);
+        let attempt =
+            |peer: &'static str| {
+                let app = app.clone();
+                async move {
+                    let mut req = Request::builder()
+                        .method("POST")
+                        .uri("/v1/local-auth/regenerate")
+                        .header("content-type", "application/json")
+                        .header("x-forwarded-for", uuid::Uuid::new_v4().to_string())
+                        .body(Body::from(r#"{"password":"wrong-password"}"#))
+                        .unwrap();
+                    req.extensions_mut().insert(axum::extract::ConnectInfo(
+                        std::net::SocketAddr::new(peer.parse().unwrap(), 40000),
+                    ));
+                    app.oneshot(req).await.unwrap().status()
+                }
+            };
+        for _ in 0..5 {
+            assert_eq!(attempt("203.0.113.10").await, StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(attempt("203.0.113.10").await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            attempt("203.0.113.11").await,
+            StatusCode::BAD_REQUEST,
+            "another client is not locked out by the first one"
+        );
+    }
+
     #[test]
     fn setup_codes_are_random_and_readable() {
         let _guard = ENV_LOCK.lock().unwrap();

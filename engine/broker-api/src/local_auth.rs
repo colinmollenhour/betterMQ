@@ -14,9 +14,59 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
+const AUTH_ATTEMPTS_PER_WINDOW: u32 = 5;
+const AUTH_RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Concurrent Argon2 operations (each ~19 MiB and tens of ms of CPU).
+const ARGON2_CONCURRENCY: usize = 2;
+const ARGON2_QUEUE_WAIT: Duration = Duration::from_secs(10);
+
 fn auth_rate_limiter() -> &'static RateLimiter {
     static LIM: OnceLock<RateLimiter> = OnceLock::new();
-    LIM.get_or_init(|| RateLimiter::new(5, Duration::from_secs(60)))
+    LIM.get_or_init(|| RateLimiter::new(AUTH_ATTEMPTS_PER_WINDOW, AUTH_RATE_WINDOW))
+}
+
+fn argon2_slots() -> &'static tokio::sync::Semaphore {
+    static SLOTS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(ARGON2_CONCURRENCY))
+}
+
+/// Socket peer address, when the server was started with connect info.
+pub(crate) struct PeerIp(pub Option<std::net::IpAddr>);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|info| info.0.ip()),
+        ))
+    }
+}
+
+/// Run a password-hashing operation off the async workers, bounded so a
+/// burst of attempts cannot exhaust CPU or memory.
+async fn run_argon2<T, F>(op: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, LocalAuthError> + Send + 'static,
+{
+    let _permit = tokio::time::timeout(ARGON2_QUEUE_WAIT, argon2_slots().acquire())
+        .await
+        .map_err(|_| ApiError::TooManyRequests {
+            retry_after_ms: 1_000,
+            message: "auth service busy — try again shortly".into(),
+        })?
+        .map_err(|_| ApiError::BadRequest("password processing unavailable".into()))?;
+    tokio::task::spawn_blocking(op)
+        .await
+        .map_err(|_| ApiError::BadRequest("password processing failed".into()))?
+        .map_err(map_local_err)
 }
 
 /// First-boot claim window. `None` means locked (unless env overrides).
@@ -254,26 +304,29 @@ async fn propagate_local_auth(state: &AppState) -> Option<crate::cluster::AuthPr
     }
 }
 
-fn enforce_auth_rate(headers: &HeaderMap) -> Result<(), ApiError> {
-    let key = client_ip_key(headers, None);
+fn enforce_auth_rate(headers: &HeaderMap, peer: Option<std::net::IpAddr>) -> Result<(), ApiError> {
+    let key = client_ip_key(headers, peer);
     if !auth_rate_limiter().check(&format!("local-auth:{key}")) {
-        return Err(ApiError::BadRequest(
-            "too many auth attempts — try again later".into(),
-        ));
+        return Err(ApiError::TooManyRequests {
+            retry_after_ms: AUTH_RATE_WINDOW.as_millis() as u64,
+            message: "too many auth attempts — try again later".into(),
+        });
     }
     Ok(())
 }
 
 async fn local_setup(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer): PeerIp,
     headers: HeaderMap,
     Json(body): Json<SetupBody>,
 ) -> Result<Json<TokenResponse>, ApiError> {
-    enforce_auth_rate(&headers)?;
+    enforce_auth_rate(&headers, peer)?;
     setup_unlocked()?;
     check_setup_code(body.setup_code.as_deref())?;
-    let store = local_store(&state)?;
-    let token = store.setup(&body.password).map_err(map_local_err)?;
+    let store = local_store(&state)?.clone();
+    let password = body.password;
+    let token = run_argon2(move || store.setup(&password)).await?;
     *SETUP_CODE.lock().unwrap() = None;
     let propagation = propagate_local_auth(&state).await;
     Ok(Json(TokenResponse {
@@ -285,12 +338,14 @@ async fn local_setup(
 
 async fn local_regenerate(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer): PeerIp,
     headers: HeaderMap,
     Json(body): Json<PasswordBody>,
 ) -> Result<Json<TokenResponse>, ApiError> {
-    enforce_auth_rate(&headers)?;
-    let store = local_store(&state)?;
-    let token = store.regenerate(&body.password).map_err(map_local_err)?;
+    enforce_auth_rate(&headers, peer)?;
+    let store = local_store(&state)?.clone();
+    let password = body.password;
+    let token = run_argon2(move || store.regenerate(&password)).await?;
     let propagation = propagate_local_auth(&state).await;
     Ok(Json(TokenResponse {
         token,
