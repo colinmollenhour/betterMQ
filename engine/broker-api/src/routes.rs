@@ -290,6 +290,11 @@ impl IntoResponse for ApiError {
             }
             ApiError::Broker(e) => {
                 let (status, code, msg) = match &e {
+                    BrokerError::Index(_) => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "metadata_unavailable",
+                        "metadata unavailable; retry after storage recovers".to_string(),
+                    ),
                     BrokerError::QueueNotFound(_) | BrokerError::FlowProfileNotFound(_) => {
                         (StatusCode::NOT_FOUND, "not_found", e.to_string())
                     }
@@ -341,6 +346,18 @@ mod tests {
                 .retryable
         );
         assert!(ApiError::Unavailable("fsync".into()).failure().retryable);
+    }
+
+    #[test]
+    fn metadata_failure_returns_retryable_503() {
+        let response = ApiError::from(BrokerError::Index(broker_storage::IndexError::Io(
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "metadata lock deadline exceeded",
+            ),
+        )))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

@@ -45,6 +45,9 @@ enum ShardCommand {
     HighWatermark {
         reply: Reply<u64>,
     },
+    BaseOffset {
+        reply: Reply<u64>,
+    },
     Purge {
         offsets: Vec<u64>,
         reply: Reply<usize>,
@@ -215,6 +218,9 @@ impl ShardHandle {
 
     pub fn high_watermark(&self) -> Result<u64, LogError> {
         self.call(|reply| ShardCommand::HighWatermark { reply })
+    }
+    pub fn base_offset(&self) -> Result<u64, LogError> {
+        self.call(|reply| ShardCommand::BaseOffset { reply })
     }
 
     pub fn purge_offset(&self, offset: u64) -> Result<bool, LogError> {
@@ -404,6 +410,9 @@ fn process_non_commit(
         }
         ShardCommand::HighWatermark { reply } => {
             let _ = reply.send(Ok(backend.high_watermark()));
+        }
+        ShardCommand::BaseOffset { reply } => {
+            let _ = reply.send(Ok(backend.base_offset()));
         }
         ShardCommand::Purge { offsets, reply } => {
             let present: Vec<_> = offsets

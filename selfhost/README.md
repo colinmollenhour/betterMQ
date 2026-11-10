@@ -337,6 +337,11 @@ Background loops export these `/metrics` series: `bettermq_scheduler_failures_to
 |-----|----------|
 | `BETTERMQ_CLUSTER_SECRET` | Internal `/internal/v1/*` (replication, lease, catalog). Also an admin credential for `/admin/v1`, and the **only** one on a standalone `bettermq panel` (required there) |
 | `BETTERMQ_SHARED_META_DIR` | Local-WAL HA: one shared filesystem for leases, cursors, catalogs, host breaker. Each node has its own `--data-dir`. Slate is single-broker only, not a shared-disk-free HA alternative |
+| `BETTERMQ_DEDUP_RETENTION_SECS` | Idempotency-key retention in seconds; default and minimum `604800` (seven days). Overrides config `dedupRetention` (alias `dedup_retention`) |
+| `BETTERMQ_SHARED_META_LOCK_TIMEOUT_MS` | Shared metadata lock deadline per local/cross-process lock; default `2000` ms, maximum `60000` ms. Timeout returns HTTP `503` |
+| `BETTERMQ_SHARED_META_MAX_ENTRIES` | Shared dedup/cursor/completion entry cap; default `1000000`. New writes beyond capacity fail closed |
+| `BETTERMQ_SHARED_META_MAX_BYTES` | Estimated live shared metadata byte cap; default and maximum `268435456` (256 MiB). Serialized snapshots are also capped at 256 MiB |
+| `BETTERMQ_SHARED_META_COMPACT_BYTES` | Journal compaction threshold; default `33554432` (32 MiB), maximum `268435456` (256 MiB), or four times the estimated live set if smaller |
 | `BETTERMQ_BROKER_URLS` | Fleet/gateway: comma-separated broker base URLs |
 | `BETTERMQ_FLEET_CONCURRENCY` | Fleet in-flight jobs (default `1`) |
 | `BETTERMQ_FLEET_HOLDER` | Optional fleet worker id |
@@ -610,12 +615,25 @@ Local WAL HA requires `BETTERMQ_SHARED_META_DIR` (shared volume). Slate + S3 is 
 
 See [BACKUP.md](BACKUP.md) for backup/restore and host-breaker cold-start notes.
 
+### Shared metadata and retry retention
+
+Idempotency keys remain **tenant-wide**, including retries with a different topic or no routing key. Keys are guaranteed for `dedupRetention` seconds after insertion, default seven days. This guarantee survives WAL retention: a known mapping below the safely reclaimed log base still counts as a duplicate. After expiry, the same key can enqueue a new message. Local RocksDB periodically sweeps expired mappings; shared metadata removes them during compaction. All brokers in a cell must use the same retention setting. Existing mappings receive a persisted migration grace window when upgraded, rather than expiring immediately.
+
+Dedup hits verify message identity and the visible committed prefix before returning a duplicate. A topic-less legacy mapping whose record has already been reclaimed cannot be verified. It retains the pre-upgrade duplicate behavior, does not acquire a guessed topic, and increments `bettermq_legacy_unverifiable_dedup_hits_total`.
+
+Shared dedup/cursors use `meta-manifest.json`, an immutable `indexes.<generation>.snap`, and a checksummed append-only `indexes.<generation>.log`. Each broker replays only new journal bytes, reloading the snapshot after a generation change. One metadata batch takes one cell-wide exclusive lock and one append durability barrier. The shared volume is still **one failure domain** for dedup, cursors, leases, and catalogs. Its loss makes the cell unavailable and loses that metadata; RF=3 WAL copies do not replace it, even though acknowledged message records remain on the replicas. Back up the shared metadata with the cell.
+
+The filesystem must provide coherent cross-host `flock`, atomic rename, and file/directory fsync. Startup probes local lock exclusion and durability operations; these probes cannot certify a network filesystem's cross-host or power-loss behavior. A broker remembers the shared-store UUID in its own data directory and refuses a missing/replaced metadata store on restart. Storage errors or lock timeouts make readiness fail closed; uncertain persistence fences that handle until restart. Capacity exhaustion rejects writes, not existing lookups. Slow shared-storage fsync, including NFS latency, directly raises ingest p99 and serializes ingest with dispatch updates. **Shared-meta HA has not passed the throughput gates in [PRODUCTION.md](PRODUCTION.md)**; qualify the actual shared filesystem and mixed workload before deployment.
+
+Upgrading the legacy `indexes.json` format requires a coordinated restart of every broker. Linux migration uses atomic rename exchange to replace `indexes.json` with a directory barrier, retaining the original as `indexes.json.migrated`; old binaries then fail instead of overwriting the new store. The import is resumable after interruption. Do not remove that barrier or run old writers alongside new ones. Restore a consistent manifest/snapshot/log generation after corruption; `BETTERMQ_METADATA_RECOVER=empty` is an explicit data-loss recovery option, not automatic fallback.
+
 ### Honesty
 
 | Topic | Reality |
 |-------|---------|
 | Delivery | **At-least-once** — use message / idempotency keys in handlers |
 | HA model | Local WAL: fenced shard leaders + quorum + shared metadata; Slate: single broker only |
+| Shared metadata capacity | Incremental indexed journal, but one cell-wide lock/fsync and bounded memory; not a qualified high-throughput HA backend |
 | MinIO single-node | Dev only; not object-store HA |
 | Host breaker | Shared via `BETTERMQ_SHARED_META_DIR/host_breaker.json` when set; otherwise in-memory (lost on restart) |
 | Fleet | Not in `cluster.nodes`; claims via internal lease API |

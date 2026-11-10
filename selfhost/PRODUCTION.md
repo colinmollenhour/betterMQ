@@ -26,6 +26,41 @@ Record hardware, filesystem, fsync mode, payload distribution, batch size, and
 open-loop offered load with every result. A saturated closed-loop benchmark is
 not a launch result.
 
+### Shared metadata qualification
+
+The local-WAL HA profile shares dedup/cursor metadata on one filesystem. Its
+incremental journal avoids whole-history rewrites, but every metadata batch
+still serializes on a cell-wide lock and shared-storage fsync. The volume is a
+single availability and metadata failure domain; RF=3 message replication does
+not replicate this metadata. Network filesystem latency directly affects ingest
+p99. **Gate 3 remains unverified for shared-meta HA.**
+
+The ignored `shared_indexes::tests::metadata_microbenchmark` in `broker-storage`
+measures local metadata append batches only, with no HTTP, RF=3 quorum, dispatch,
+TLS, or cross-host filesystem contention. It is a diagnostic, not a launch
+result. Run the mixed ingest/dispatch load generator in `tools/bettermq-loadgen`
+against the actual supported shared filesystem and record the above settings
+before claiming any gate.
+
+Local diagnostic measured on 2026-11-10: Linux x86-64, Intel Core Ultra 9 285H,
+ext4 on an LVM volume, debug test build, one writer, 500 transactions per case,
+unique tenant-wide keys, one journal `fdatasync` per batch, no HTTP/TLS, message
+WAL, replication, or dispatch. The development host also ran other builds.
+
+| Records per batch | Records | Measured records/s | Batch p99 |
+|---|---:|---:|---:|
+| 1 | 500 | 21 | 50.809 ms |
+| 64 | 32,000 | 1,804 | 64.926 ms |
+
+These numbers do **not** meet or waive the RF=3 gate. They demonstrate why
+shared-storage latency and batch size require deployment-specific qualification.
+To repeat the metadata-only diagnostic, point `BETTERMQ_TEST_BENCH_DIR` at an
+existing directory on the filesystem being tested (not tmpfs), then run:
+
+```bash
+cargo test -p broker-storage --features slate metadata_microbenchmark -- --ignored --nocapture
+```
+
 ## Soak and fault gates
 
 - Pull requests that change durability, admission, replication, archive, or

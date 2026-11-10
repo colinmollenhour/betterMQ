@@ -12,7 +12,7 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use thiserror::Error;
 
@@ -34,10 +34,18 @@ pub enum SlateIndexError {
 
 const INDEX_DB_PATH: &str = "bettermq/_indexes";
 
+impl From<slatedb::Error> for SlateIndexError {
+    fn from(error: slatedb::Error) -> Self {
+        Self::Slate(error.to_string())
+    }
+}
+
 pub struct SlateMetadataStore {
     db: Arc<Db>,
     poisoned: AtomicBool,
     _owner: SlateOwner,
+    migration_ms: u64,
+    mutation: Mutex<()>,
 }
 
 impl SlateMetadataStore {
@@ -69,10 +77,42 @@ impl SlateMetadataStore {
             )?;
         let db = block_on_slate(Db::open(INDEX_DB_PATH, store))
             .map_err(|error| SlateIndexError::Slate(error.to_string()))?;
+        let db = Arc::new(db);
+        let migration_db = db.clone();
+        let migration_ms = block_on_slate(async move {
+            const KEY: &[u8] = b"_meta/dedup-migration-ms";
+            if let Some(bytes) = migration_db.get(KEY).await? {
+                Ok::<_, SlateIndexError>(u64::from_le_bytes(
+                    bytes.as_ref().try_into().map_err(|_| {
+                        SlateIndexError::Slate("invalid dedup migration epoch".into())
+                    })?,
+                ))
+            } else {
+                let now = crate::indexes::now_ms();
+                let mut batch = WriteBatch::new();
+                batch.put_bytes(
+                    Bytes::from_static(KEY),
+                    Bytes::copy_from_slice(&now.to_le_bytes()),
+                );
+                migration_db
+                    .write_with_options(
+                        batch,
+                        &WriteOptions {
+                            await_durable: true,
+                            seqnum: 0,
+                        },
+                    )
+                    .await?;
+                migration_db.flush().await?;
+                Ok(now)
+            }
+        })?;
         Ok(Self {
-            db: Arc::new(db),
+            db,
             poisoned: AtomicBool::new(false),
             _owner: owner,
+            migration_ms,
+            mutation: Mutex::new(()),
         })
     }
 
@@ -141,7 +181,10 @@ impl SlateMetadataStore {
     ) -> Result<Option<DedupEntry>, SlateIndexError> {
         let key = Self::dedup_key(tenant, key);
         self.io(|db| async move { db.get(key).await })?
-            .map(|bytes| broker_proto::decode(&bytes).map_err(Into::into))
+            .map(|bytes| {
+                DedupEntry::decoded(&bytes, self.migration_ms)
+                    .map_err(|error| SlateIndexError::Slate(error.to_string()))
+            })
             .transpose()
     }
 
@@ -155,7 +198,11 @@ impl SlateMetadataStore {
         let mut batch = WriteBatch::new();
         batch.put_bytes(
             Bytes::from(Self::dedup_key(tenant, key)),
-            Bytes::from(broker_proto::encode(entry)?),
+            Bytes::from(
+                entry
+                    .encoded()
+                    .map_err(|error| SlateIndexError::Slate(error.to_string()))?,
+            ),
         );
         self.write(batch)
     }
@@ -187,7 +234,9 @@ impl SlateMetadataStore {
         partition: u32,
         next_offset: u64,
     ) -> Result<(), SlateIndexError> {
+        let _mutation = self.mutation.lock().map_err(|_| SlateIndexError::Fenced)?;
         let current = self.dispatch_offset(tenant, subscription, partition)?;
+        let next_offset = current.max(next_offset);
         let mut batch = WriteBatch::new();
         batch.put_bytes(
             Bytes::from(Self::dispatch_key(tenant, subscription, partition)),
@@ -206,6 +255,10 @@ impl SlateMetadataStore {
         partition: u32,
         offset: u64,
     ) -> Result<(), SlateIndexError> {
+        let _mutation = self.mutation.lock().map_err(|_| SlateIndexError::Fenced)?;
+        if offset < self.dispatch_offset(tenant, subscription, partition)? {
+            return Ok(());
+        }
         let mut batch = WriteBatch::new();
         batch.put_bytes(
             Bytes::from(Self::complete_key(tenant, subscription, partition, offset)),
@@ -233,6 +286,51 @@ mod tests {
 
     fn close(store: SlateMetadataStore) {
         block_on_slate(async move { store.db.close().await }).unwrap();
+    }
+
+    #[test]
+    fn versioned_and_legacy_dedup_share_a_durable_migration_epoch() {
+        #[derive(serde::Serialize)]
+        struct Legacy {
+            message_id: Uuid,
+            offset: u64,
+            partition: u32,
+        }
+        let objects: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let node = Uuid::new_v4();
+        let store = SlateMetadataStore::open_as(objects.clone(), node, None).unwrap();
+        let id = Uuid::new_v4();
+        let mut batch = WriteBatch::new();
+        batch.put_bytes(
+            Bytes::from(SlateMetadataStore::dedup_key("t", "old")),
+            Bytes::from(
+                broker_proto::encode(&Legacy {
+                    message_id: id,
+                    offset: 3,
+                    partition: 0,
+                })
+                .unwrap(),
+            ),
+        );
+        store.write(batch).unwrap();
+        let old = store.get_dedup("t", "old").unwrap().unwrap();
+        assert_eq!(old.message_id, id);
+        assert_eq!(old.inserted_at_ms, store.migration_ms);
+        let epoch = store.migration_ms;
+        store
+            .put_dedup("t", "new", &DedupEntry::new(id, 4, 0, "jobs".into()))
+            .unwrap();
+        store.set_dispatch_offset("t", "s", 0, 10).unwrap();
+        store.set_dispatch_offset("t", "s", 0, 3).unwrap();
+        assert_eq!(store.dispatch_offset("t", "s", 0).unwrap(), 10);
+        close(store);
+        let store = SlateMetadataStore::open_as(objects, node, None).unwrap();
+        assert_eq!(
+            store.get_dedup("t", "old").unwrap().unwrap().inserted_at_ms,
+            epoch
+        );
+        assert_eq!(store.get_dedup("t", "new").unwrap().unwrap().topic, "jobs");
+        close(store);
     }
 
     #[test]

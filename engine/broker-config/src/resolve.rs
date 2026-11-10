@@ -33,6 +33,7 @@ pub struct ServeOverrides {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedServeSettings {
+    pub dedup_retention: u64,
     pub listen: SocketAddr,
     pub data_dir: PathBuf,
     pub storage: StorageMode,
@@ -76,6 +77,10 @@ pub enum ResolvedAuth {
 impl ResolvedServeSettings {
     /// Set process env vars consumed by existing broker crates (backward compatible).
     pub fn apply_env(&self) {
+        std::env::set_var(
+            "BETTERMQ_DEDUP_RETENTION_SECS",
+            self.dedup_retention.to_string(),
+        );
         std::env::set_var("BETTERMQ_DATA_DIR", &self.data_dir);
         let storage = match self.storage {
             StorageMode::Local => "local",
@@ -133,6 +138,20 @@ fn resolve_serve_with_env(
         .unwrap_or_else(BetterMqConfig::template_single_local);
     base.validate()?;
     apply_runtime_env(&mut base, &env)?;
+    let dedup_retention = match std::env::var("BETTERMQ_DEDUP_RETENTION_SECS") {
+        Ok(value) => value.parse::<u64>().map_err(|error| {
+            ConfigError::Invalid(format!("invalid BETTERMQ_DEDUP_RETENTION_SECS: {error}"))
+        })?,
+        Err(std::env::VarError::NotPresent) => base.dedup_retention,
+        Err(error) => return Err(ConfigError::Invalid(error.to_string())),
+    };
+    if dedup_retention < broker_proto::DEFAULT_DEDUP_RETENTION_SECS
+        || dedup_retention.checked_mul(1000).is_none()
+    {
+        return Err(ConfigError::Invalid(
+            "dedup_retention must cover the seven-day client retry window".into(),
+        ));
+    }
 
     let configured_public = base
         .listeners
@@ -248,6 +267,7 @@ fn resolve_serve_with_env(
     });
 
     Ok(ResolvedServeSettings {
+        dedup_retention,
         listen,
         data_dir,
         storage,

@@ -6,6 +6,8 @@ pub use atomic_file::write_secret_atomic;
 pub mod epoch;
 pub const SLATE_SINGLE_BROKER: &str =
     "Slate storage supports a single broker; multi-broker Slate is unsupported";
+/// Documented minimum client retry window; deployments may retain keys longer.
+pub const DEFAULT_DEDUP_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 pub mod paths;
 pub mod record;
 pub mod recover;

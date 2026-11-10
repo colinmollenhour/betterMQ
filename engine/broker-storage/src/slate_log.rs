@@ -64,6 +64,24 @@ const META_NEXT_OFFSET: &[u8] = b"meta/next_offset";
 #[cfg(feature = "slate")]
 const META_LEADER_GEN: &[u8] = b"meta/leader_generation";
 
+#[cfg(feature = "slate")]
+pub fn slate_topics(store: Arc<dyn ObjectStore>, tenant: &str) -> Result<Vec<String>, LogError> {
+    let tenant = broker_proto::sanitize_path_segment(tenant)
+        .map_err(|error| LogError::Slate(error.to_string()))?;
+    let prefix = object_store::path::Path::from(format!("bettermq/{tenant}/topics"));
+    block_on_slate(async move {
+        let listing = store
+            .list_with_delimiter(Some(&prefix))
+            .await
+            .map_err(|error| LogError::Slate(error.to_string()))?;
+        Ok(listing
+            .common_prefixes
+            .into_iter()
+            .filter_map(|path| path.parts().last().map(|part| part.as_ref().to_string()))
+            .collect())
+    })
+}
+
 /// Stable object-store prefix shared by every broker in a cluster (not per-node `data_dir`).
 #[cfg(feature = "slate")]
 pub fn slate_db_path(

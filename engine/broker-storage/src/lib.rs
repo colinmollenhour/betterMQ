@@ -15,6 +15,11 @@ mod migration;
 #[cfg(feature = "s3")]
 mod s3_store;
 mod shared_indexes;
+mod shared_meta_metrics;
+pub use shared_meta_metrics::{
+    record_legacy_unverifiable_dedup_hit, shared_metadata_telemetry, SharedMetadataHistogram,
+    SharedMetadataTelemetry,
+};
 mod slate;
 #[cfg(feature = "slate")]
 mod slate_indexes;
@@ -25,7 +30,7 @@ mod slate_owner;
 mod state_index;
 mod telemetry;
 #[cfg(feature = "slate")]
-pub use slate_log::slate_db_path;
+pub use slate_log::{slate_db_path, slate_topics};
 
 pub use archive::{
     archive_admission_blocked, archive_lag_status, restore_local_archive,

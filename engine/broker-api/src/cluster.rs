@@ -327,11 +327,12 @@ async fn publish_on_leader(
         {
             state.broker.commit_publish_dedup(
                 key,
-                broker_partition::DedupEntry {
+                broker_partition::DedupEntry::new(
                     message_id,
                     offset,
                     partition,
-                },
+                    resp.topic.clone(),
+                ),
             )?;
         }
     }

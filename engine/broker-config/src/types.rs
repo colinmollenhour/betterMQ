@@ -41,6 +41,13 @@ pub struct BetterMqConfig {
     pub panel: Option<crate::components::PanelSection>,
     #[serde(default)]
     pub replication: Option<crate::components::ReplicationPolicyConfig>,
+    /// Idempotency retention in seconds, at least the seven-day retry window.
+    #[serde(default = "default_dedup_retention", alias = "dedup_retention")]
+    pub dedup_retention: u64,
+}
+
+fn default_dedup_retention() -> u64 {
+    broker_proto::DEFAULT_DEDUP_RETENTION_SECS
 }
 
 fn default_version() -> u32 {
@@ -275,6 +282,14 @@ impl ClusterNode {
 
 impl BetterMqConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.dedup_retention < default_dedup_retention()
+            || self.dedup_retention.checked_mul(1000).is_none()
+        {
+            return Err(ConfigError::Invalid(
+                "dedup_retention must cover the documented seven-day retry window (604800 seconds)"
+                    .into(),
+            ));
+        }
         if self.version != crate::components::CONFIG_VERSION_V1
             && self.version != crate::components::CONFIG_VERSION_V2
         {
@@ -505,6 +520,7 @@ impl BetterMqConfig {
             listeners: None,
             panel: None,
             replication: None,
+            dedup_retention: default_dedup_retention(),
         }
     }
 
@@ -536,6 +552,7 @@ impl BetterMqConfig {
             listeners: None,
             panel: None,
             replication: None,
+            dedup_retention: default_dedup_retention(),
         }
     }
 
@@ -584,6 +601,7 @@ impl BetterMqConfig {
             listeners: None,
             panel: None,
             replication: Some(crate::components::ReplicationPolicyConfig::default()),
+            dedup_retention: default_dedup_retention(),
         }
     }
 
@@ -618,6 +636,7 @@ impl BetterMqConfig {
             listeners: None,
             panel: None,
             replication: None,
+            dedup_retention: default_dedup_retention(),
         }
     }
 }
@@ -646,6 +665,27 @@ mod tests {
             path.parent(),
             cfg.cluster.unwrap().shared_meta_dir.as_deref()
         );
+    }
+
+    #[test]
+    fn dedup_retention_defaults_and_rejects_short_retry_windows() {
+        let mut config = BetterMqConfig::template_single_local();
+        assert_eq!(config.dedup_retention, 604800);
+        let mut json = serde_json::to_value(&config).unwrap();
+        json.as_object_mut().unwrap().remove("dedupRetention");
+        let legacy: BetterMqConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(legacy.dedup_retention, 604800);
+        json["dedup_retention"] = serde_json::json!(1209600);
+        assert_eq!(
+            serde_json::from_value::<BetterMqConfig>(json)
+                .unwrap()
+                .dedup_retention,
+            1209600
+        );
+        config.dedup_retention = 60;
+        assert!(config.validate().is_err());
+        config.dedup_retention = u64::MAX;
+        assert!(config.validate().is_err());
     }
 
     #[test]

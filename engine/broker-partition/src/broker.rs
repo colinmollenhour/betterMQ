@@ -878,6 +878,24 @@ impl Broker {
         &self.inner.config
     }
 
+    /// Explicit promotion/admin rewind. The caller must fence dispatch first;
+    /// normal cursor writes never regress. Clears completion gaps atomically.
+    pub fn reset_dispatch_offset(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        partition: u32,
+        next_offset: u64,
+    ) -> Result<(), BrokerError> {
+        self.inner.metadata.reset_dispatch_offset(
+            tenant_id,
+            subscription_id,
+            partition,
+            next_offset,
+        )?;
+        Ok(())
+    }
+
     pub fn metadata_ready(&self) -> bool {
         self.inner.metadata.is_ready()
     }
@@ -1071,6 +1089,24 @@ impl Broker {
         }
 
         if commit_dedup {
+            // The HTTP path already waited for local/quorum commit. Synchronous
+            // Broker callers must establish the same local durability ordering
+            // before publishing a mapping and releasing its reservation, or a
+            // concurrent retry would correctly reject that not-yet-visible hit.
+            // Keyless records publish no mapping, so they keep the configured
+            // fsync policy (group commit stays asynchronous).
+            let has_mapping = batch
+                .records
+                .iter()
+                .any(|record| record.idempotency_key.is_some());
+            if let (true, Some(last), Some(first)) =
+                (has_mapping, batch.last_offset(), batch.records.first())
+            {
+                let shard = self.shard_handle(&first.topic, first.partition)?;
+                if shard.committed_hwm() <= last {
+                    shard.flush_durable()?;
+                }
+            }
             let tenant_id = self.tenant();
             let mut metadata = MetadataWriteBatch::default();
             for (record, (stored, _)) in batch.records.iter().zip(&batch.appended) {
@@ -1078,11 +1114,12 @@ impl Broker {
                     metadata.put_dedup(
                         tenant_id.clone(),
                         key,
-                        DedupEntry {
-                            message_id: stored.id,
-                            offset: stored.offset,
-                            partition: stored.partition,
-                        },
+                        DedupEntry::new(
+                            stored.id,
+                            stored.offset,
+                            stored.partition,
+                            stored.topic.clone(),
+                        ),
                     );
                 }
             }
@@ -1353,7 +1390,19 @@ impl Broker {
                 }
             }
             if let Some(entry) = self.inner.metadata.get_dedup(tenant_id, idempotency_key)? {
-                return Ok(ReservationOutcome::Existing(entry));
+                if let Some(topic) = self.verify_dedup_hit(tenant_id, &entry)? {
+                    if entry.topic.is_empty() && !topic.is_empty() {
+                        let mut migrated = entry.clone();
+                        migrated.topic = topic;
+                        self.inner
+                            .metadata
+                            .put_dedup(tenant_id, idempotency_key, &migrated)?;
+                    }
+                    return Ok(ReservationOutcome::Existing(entry));
+                }
+                self.inner
+                    .metadata
+                    .delete_dedup(tenant_id, idempotency_key)?;
             }
             let mut pending = self.inner.dedup_reservations.pending.lock();
             if pending.insert(key.clone()) {
@@ -1367,6 +1416,95 @@ impl Broker {
     }
 
     /// Record idempotency after replication quorum (or immediately on a single node).
+    /// Integration point: cells MUST use D2's authoritative quorum HWM here;
+    /// until that lane is integrated this returns the local durable HWM.
+    fn dedup_visible_hwm(&self, topic: &str, partition: u32) -> Result<u64, BrokerError> {
+        self.committed_hwm(topic, partition)
+    }
+
+    fn verify_dedup_hit(
+        &self,
+        tenant: &str,
+        entry: &DedupEntry,
+    ) -> Result<Option<String>, BrokerError> {
+        let legacy_topic_unknown = entry.topic.is_empty() && !self.inner.layout.is_physical();
+        let topics = if !entry.topic.is_empty() {
+            vec![entry.topic.clone()]
+        } else if self.inner.layout.is_physical() {
+            vec![DIRECT_TOPIC.to_string()]
+        } else {
+            #[cfg(feature = "slate")]
+            if let Some(slate) = &self.inner.slate {
+                broker_storage::slate_topics(slate.object_store.clone(), tenant)?
+            } else {
+                self.local_dedup_topics(tenant)?
+            }
+            #[cfg(not(feature = "slate"))]
+            self.local_dedup_topics(tenant)?
+        };
+        let mut ambiguous_reclaimed_topic = false;
+        for topic in topics {
+            let shard = self.shard_handle(&topic, entry.partition)?;
+            // D4's safe retained base proves a reclaimed record was committed
+            // and dispatched. Keep its durable mapping throughout the TTL.
+            if entry.offset < shard.base_offset()? {
+                if legacy_topic_unknown {
+                    ambiguous_reclaimed_topic = true;
+                    continue;
+                }
+                return Ok(Some(topic));
+            }
+            if entry.offset >= self.dedup_visible_hwm(&topic, entry.partition)? {
+                continue;
+            }
+            match shard.read_range(entry.partition, entry.offset, 1) {
+                Ok(messages)
+                    if messages.iter().any(|message| {
+                        message.offset == entry.offset && message.id == entry.message_id
+                    }) =>
+                {
+                    return Ok(Some(topic))
+                }
+                Ok(_) | Err(broker_storage::LogError::OffsetNotFound(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if ambiguous_reclaimed_topic {
+            // Keep pre-upgrade behavior when retention makes a topic-less
+            // legacy mapping unverifiable. Do not invent a topic to migrate.
+            broker_storage::record_legacy_unverifiable_dedup_hit();
+            return Ok(Some(String::new()));
+        }
+        Ok(None)
+    }
+
+    fn local_dedup_topics(&self, tenant: &str) -> Result<Vec<String>, BrokerError> {
+        let tenant = broker_proto::sanitize_path_segment(tenant)?;
+        let path = self.inner.config.data_dir.join("partitions").join(tenant);
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(broker_storage::LogError::Io(error).into()),
+        };
+        let mut topics = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(broker_storage::LogError::Io)?;
+            if entry
+                .file_type()
+                .map_err(broker_storage::LogError::Io)?
+                .is_dir()
+            {
+                topics.push(
+                    entry.file_name().into_string().map_err(|_| {
+                        BrokerError::InvalidConfig("non-UTF8 topic directory".into())
+                    })?,
+                );
+            }
+        }
+        topics.sort();
+        Ok(topics)
+    }
+
     pub fn commit_publish_dedup(
         &self,
         idempotency_key: &str,
@@ -2516,6 +2654,221 @@ mod tests {
                 .unwrap();
         }
         prepared.finish().unwrap()
+    }
+
+    #[test]
+    fn stale_dedup_identity_and_missing_or_uncommitted_records_are_misses() {
+        let dir = tempdir().unwrap();
+        let broker = open_v2_broker(dir.path(), 1);
+        let original = broker.publish(direct_request("original", None)).unwrap();
+        broker.flush_wal().unwrap();
+        for (key, message_id, offset) in [
+            ("wrong-id", Uuid::new_v4(), original.offset.unwrap()),
+            ("missing", Uuid::new_v4(), 500),
+        ] {
+            broker
+                .inner
+                .metadata
+                .put_dedup(
+                    &broker.tenant(),
+                    key,
+                    &DedupEntry::new(message_id, offset, 0, DIRECT_TOPIC.into()),
+                )
+                .unwrap();
+            let retry = broker
+                .publish(direct_request("retry", Some(key.into())))
+                .unwrap();
+            assert!(!retry.duplicate);
+            assert_ne!(retry.message_id, Some(message_id));
+        }
+    }
+
+    #[test]
+    fn legacy_topic_discovery_preserves_tenant_wide_cross_topic_retry() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        for topic in ["orders", "invoices"] {
+            broker
+                .create_subscription(CreateSubscriptionRequest {
+                    topic: topic.into(),
+                    url: "http://127.0.0.1:9/hook".into(),
+                    secret: "s".into(),
+                    parallelism: None,
+                    default_max_retries: None,
+                    retry_backoff: None,
+                })
+                .unwrap();
+        }
+        let mut request = queue_request("orders", "body");
+        request.idempotency_key = Some("tenant-key".into());
+        let original = broker.publish(request).unwrap();
+        broker.flush_wal().unwrap();
+        let mut legacy = broker
+            .inner
+            .metadata
+            .get_dedup(&broker.tenant(), "tenant-key")
+            .unwrap()
+            .unwrap();
+        legacy.topic.clear();
+        broker
+            .inner
+            .metadata
+            .put_dedup(&broker.tenant(), "tenant-key", &legacy)
+            .unwrap();
+        let mut retry = queue_request("invoices", "different-body");
+        retry.idempotency_key = Some("tenant-key".into());
+        let response = broker.publish(retry).unwrap();
+        assert!(response.duplicate);
+        assert_eq!(response.message_id, original.message_id);
+        assert_eq!(
+            broker
+                .inner
+                .metadata
+                .get_dedup(&broker.tenant(), "tenant-key")
+                .unwrap()
+                .unwrap()
+                .topic,
+            "orders"
+        );
+    }
+
+    #[test]
+    fn wal_retention_keeps_dedup_until_its_retry_window_expires() {
+        let dir = tempdir().unwrap();
+        let layout = ShardLayout {
+            version: LAYOUT_V2,
+            shard_count: 1,
+            route_hash_version: broker_proto::HASH_VERSION_V2,
+        };
+        broker_storage::atomic_write_file(
+            &ShardLayout::path(dir.path()),
+            &serde_json::to_vec(&layout).unwrap(),
+        )
+        .unwrap();
+        let mut config = BrokerConfig::new(dir.path().to_path_buf());
+        config.log.segment_max_bytes = 1;
+        config.log.fsync = broker_storage::FsyncMode::Always;
+        let broker = Broker::open(config).unwrap();
+        let original = broker
+            .publish(direct_request("body", Some("retained-key".into())))
+            .unwrap();
+        broker.publish(direct_request("later", None)).unwrap();
+        broker.flush_wal().unwrap();
+        let shard = broker.shard_handle(DIRECT_TOPIC, 0).unwrap();
+        assert!(shard.gc_sealed_below(2).unwrap() > 0);
+        assert!(shard.base_offset().unwrap() > original.offset.unwrap());
+        let response = broker
+            .publish(direct_request("retry", Some("retained-key".into())))
+            .unwrap();
+        assert!(response.duplicate);
+        assert_eq!(response.message_id, original.message_id);
+    }
+
+    #[test]
+    fn legacy_unverifiable_reclaimed_hit_keeps_pre_upgrade_duplicate_behavior() {
+        let dir = tempdir().unwrap();
+        let mut config = BrokerConfig::new(dir.path().to_path_buf());
+        config.log.segment_max_bytes = 1;
+        config.log.fsync = broker_storage::FsyncMode::Always;
+        let broker = Broker::open(config).unwrap();
+        let original = broker
+            .publish(direct_request("body", Some("legacy-gc".into())))
+            .unwrap();
+        let partition = original.partition.unwrap();
+        let shard = broker.shard_handle(DIRECT_TOPIC, partition).unwrap();
+        assert!(shard.gc_sealed_below(original.offset.unwrap() + 1).unwrap() > 0);
+        let mut entry = broker
+            .inner
+            .metadata
+            .get_dedup(&broker.tenant(), "legacy-gc")
+            .unwrap()
+            .unwrap();
+        entry.topic.clear();
+        broker
+            .inner
+            .metadata
+            .put_dedup(&broker.tenant(), "legacy-gc", &entry)
+            .unwrap();
+        let before = broker_storage::shared_metadata_telemetry().legacy_unverifiable_dedup_hits;
+        let response = broker
+            .publish(direct_request("retry", Some("legacy-gc".into())))
+            .unwrap();
+        assert!(response.duplicate);
+        assert_eq!(response.message_id, original.message_id);
+        assert!(
+            broker_storage::shared_metadata_telemetry().legacy_unverifiable_dedup_hits > before
+        );
+        assert!(broker
+            .inner
+            .metadata
+            .get_dedup(&broker.tenant(), "legacy-gc")
+            .unwrap()
+            .unwrap()
+            .topic
+            .is_empty());
+    }
+
+    #[test]
+    fn shared_dedup_survives_process_exit_before_reply() {
+        const CHILD: &str = "BETTERMQ_TEST_BROKER_SHARED_CRASH_DIR";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let broker = Broker::open(BrokerConfig::new(std::path::PathBuf::from(dir))).unwrap();
+            broker
+                .publish(direct_request("body", Some("crash-key".into())))
+                .unwrap();
+            broker.flush_wal().unwrap();
+            // The durable batch succeeded; omit the reply and all destructors.
+            std::process::exit(73);
+        }
+        let dir = tempdir().unwrap();
+        let shared = tempdir().unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "broker::tests::shared_dedup_survives_process_exit_before_reply",
+            ])
+            .env(CHILD, dir.path())
+            .env("BETTERMQ_SHARED_META_DIR", shared.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(73),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        // Reopen in an isolated child to avoid changing process-wide env while
+        // unrelated unit tests open their local stores.
+        let retry = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "broker::tests::shared_dedup_retry_worker"])
+            .env(CHILD, dir.path())
+            .env("BETTERMQ_SHARED_META_DIR", shared.path())
+            .output()
+            .unwrap();
+        assert!(
+            retry.status.success(),
+            "{}",
+            String::from_utf8_lossy(&retry.stderr)
+        );
+    }
+
+    #[test]
+    fn shared_dedup_retry_worker() {
+        let Some(dir) = std::env::var_os("BETTERMQ_TEST_BROKER_SHARED_CRASH_DIR") else {
+            return;
+        };
+        let broker = Broker::open(BrokerConfig::new(std::path::PathBuf::from(dir))).unwrap();
+        let old = broker
+            .inner
+            .metadata
+            .get_dedup(&broker.tenant(), "crash-key")
+            .unwrap()
+            .unwrap();
+        let response = broker
+            .publish(direct_request("retry", Some("crash-key".into())))
+            .unwrap();
+        assert!(response.duplicate);
+        assert_eq!(response.message_id, Some(old.message_id));
     }
 
     #[test]

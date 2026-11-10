@@ -341,6 +341,7 @@ pub fn prometheus_text_with_native(native: &NativeTelemetrySnapshot) -> String {
         append_controller_metrics(&mut out, controller);
     }
     append_archive_metrics(&mut out, &native.archive);
+    append_shared_metadata_metrics(&mut out, &broker_storage::shared_metadata_telemetry());
     append_dispatch_metrics(&mut out, &native.dispatch, &native.fairness);
     out
 }
@@ -576,6 +577,68 @@ fn append_controller_metrics(
         "bettermq_controller_required_quorum {}\n",
         snapshot.required_quorum
     ));
+}
+
+fn append_shared_metadata_metrics(
+    out: &mut String,
+    snapshot: &broker_storage::SharedMetadataTelemetry,
+) {
+    for (name, description, histogram) in [
+        (
+            "bettermq_shared_metadata_lock_wait_seconds",
+            "Shared metadata flock wait",
+            &snapshot.lock_wait,
+        ),
+        (
+            "bettermq_shared_metadata_fsync_seconds",
+            "Shared metadata append and durability latency",
+            &snapshot.fsync,
+        ),
+    ] {
+        out.push_str(&format!(
+            "# HELP {name} {description}\n# TYPE {name} histogram\n"
+        ));
+        append_histogram(
+            out,
+            name,
+            "",
+            &broker_storage::FSYNC_BUCKET_US.map(|edge| edge as f64 / 1_000_000.0),
+            &histogram.buckets,
+            histogram.count,
+            histogram.sum_us as f64 / 1_000_000.0,
+        );
+    }
+    for (name, description, value) in [
+        (
+            "bettermq_shared_metadata_replay_bytes_total",
+            "Shared metadata incrementally replayed bytes",
+            snapshot.replay_bytes,
+        ),
+        (
+            "bettermq_shared_metadata_compactions_total",
+            "Shared metadata published generations",
+            snapshot.compactions,
+        ),
+        (
+            "bettermq_shared_metadata_errors_total",
+            "Shared metadata failed operations",
+            snapshot.errors,
+        ),
+        (
+            "bettermq_shared_metadata_expired_entries_total",
+            "Expired dedup mappings removed by shared metadata compaction",
+            snapshot.expired_entries,
+        ),
+        (
+            "bettermq_legacy_unverifiable_dedup_hits_total",
+            "Legacy dedup hits retained without record verification after WAL reclamation",
+            snapshot.legacy_unverifiable_dedup_hits,
+        ),
+    ] {
+        out.push_str(&format!(
+            "# HELP {name} {description}\n# TYPE {name} counter\n{name} {value}\n"
+        ));
+    }
 }
 
 fn append_archive_metrics(out: &mut String, snapshot: &broker_storage::ArchiveLagStatus) {
@@ -995,6 +1058,16 @@ mod tests {
         assert_eq!(REJECTIONS_BY_REASON[5].load(Ordering::Relaxed), before);
     }
     use super::*;
+
+    #[test]
+    fn shared_metadata_histograms_have_valid_unlabelled_buckets() {
+        let mut out = String::new();
+        append_shared_metadata_metrics(&mut out, &broker_storage::shared_metadata_telemetry());
+        assert!(out.contains("bettermq_shared_metadata_lock_wait_seconds_bucket{le=\"+Inf\"}"));
+        assert!(out.contains("bettermq_shared_metadata_fsync_seconds_bucket{le=\"0.0001\"}"));
+        assert!(out.contains("bettermq_legacy_unverifiable_dedup_hits_total"));
+        assert!(!out.contains("{,"));
+    }
 
     #[test]
     fn finite_histogram_boundaries_use_microsecond_precision() {
