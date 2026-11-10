@@ -69,10 +69,15 @@ impl FileLock {
         Ok(Self { file })
     }
 
-    pub fn try_exclusive(path: &Path) -> std::io::Result<Self> {
+    /// Like [`Self::exclusive`] but returns `Ok(None)` instead of waiting
+    /// when another process (or open file) already holds the lock.
+    pub fn try_exclusive(path: &Path) -> std::io::Result<Option<Self>> {
         let file = Self::open(path)?;
-        file.try_lock_exclusive()?;
-        Ok(Self { file })
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 }
 

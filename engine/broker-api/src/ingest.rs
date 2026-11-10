@@ -276,6 +276,80 @@ mod tests {
         assert_eq!(json["limit"], 1_000);
     }
 
+    use crate::test_support::cell_state;
+
+    fn assert_nothing_written(state: &AppState, dir: &tempfile::TempDir) {
+        assert_eq!(state.schedule.count(), 0);
+        let journal = dir.path().join("schedule.journal");
+        assert!(!journal.exists() || std::fs::metadata(&journal).unwrap().len() == 0);
+        assert!(
+            state
+                .broker
+                .list_topic_messages(broker_partition::DIRECT_TOPIC, 10)
+                .unwrap_or_default()
+                .is_empty(),
+            "nothing reached the WAL"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delay_in_a_cell_is_rejected_before_any_write() {
+        std::env::set_var("BETTERMQ_ALLOW_PRIVATE_DESTINATIONS", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let state = cell_state(&dir);
+        for delay in [Some(5_000), Some(0)] {
+            let error = submit_one(&state, sample(delay), None).await.unwrap_err();
+            assert!(
+                matches!(&error, ApiError::NotImplemented(message) if message == DELAY_UNSUPPORTED_IN_CELL),
+                "{error:?}"
+            );
+        }
+        assert_nothing_written(&state, &dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mixed_delay_batch_in_a_cell_is_rejected_whole() {
+        std::env::set_var("BETTERMQ_ALLOW_PRIVATE_DESTINATIONS", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let state = cell_state(&dir);
+        let requests = vec![sample(None), sample(Some(1_000)), sample(None)];
+
+        let outcomes = submit_batch(
+            &state,
+            None,
+            IngestBatch::from_requests(requests.clone()).unwrap(),
+        )
+        .await;
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes
+            .iter()
+            .all(|outcome| matches!(outcome.result, Err(ApiError::NotImplemented(_)))));
+        assert_eq!(
+            outcomes.iter().map(|o| o.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        let (status, axum::Json(body)) =
+            crate::batch::delayed_batch_response(&requests).expect("rejected");
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!((body.accepted, body.failed), (0, 3));
+        assert!(body.results[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("record 1 sets delay"));
+        assert_eq!(
+            body.results[1].error.as_deref(),
+            Some(DELAY_UNSUPPORTED_IN_CELL)
+        );
+        assert_nothing_written(&state, &dir);
+    }
+
+    #[test]
+    fn immediate_records_are_not_gated() {
+        assert!(delayed_batch_rejections(&[sample(None), sample(None)]).is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn local_api_batch_uses_one_shard_commit_epoch() {
         let dir = tempfile::tempdir().unwrap();
@@ -353,11 +427,54 @@ pub struct IngestFailure {
     pub retry_after_ms: Option<u64>,
 }
 
+/// Delayed jobs live in a node-local journal that is not replicated, so a
+/// configured cell (even a one-member one, since membership can grow) refuses
+/// them outright instead of acknowledging what it cannot keep durable.
+pub(crate) const DELAY_UNSUPPORTED_IN_CELL: &str =
+    "delayed delivery is not supported in multi-node cells in this release";
+
+pub(crate) fn delay_unsupported_in_cell() -> ApiError {
+    ApiError::NotImplemented(DELAY_UNSUPPORTED_IN_CELL.into())
+}
+
+/// True when `delay` (including an explicit `0`) must be refused here.
+pub(crate) fn rejects_delay(state: &AppState, req: &PublishRequest) -> bool {
+    state.cluster.is_some() && req.delay_ms.is_some()
+}
+
+/// Per-record rejections for a batch that carries a delayed record in a
+/// cell: the whole batch is refused and nothing is committed.
+pub(crate) fn delayed_batch_rejections<'a>(
+    requests: impl IntoIterator<Item = &'a PublishRequest>,
+) -> Option<Vec<(usize, String, String)>> {
+    let requests: Vec<_> = requests.into_iter().collect();
+    let first = requests.iter().position(|req| req.delay_ms.is_some())?;
+    Some(
+        requests
+            .iter()
+            .enumerate()
+            .map(|(index, req)| {
+                let error = if req.delay_ms.is_some() {
+                    DELAY_UNSUPPORTED_IN_CELL.to_string()
+                } else {
+                    format!(
+                        "batch rejected: record {first} sets delay; {DELAY_UNSUPPORTED_IN_CELL}"
+                    )
+                };
+                (index, req.topic.clone(), error)
+            })
+            .collect(),
+    )
+}
+
 pub(crate) async fn ingest_one_validated(
     state: &Arc<AppState>,
     mut req: PublishRequest,
     meter: Option<crate::metering::IngestMeter>,
 ) -> Result<PublishResponse, ApiError> {
+    if rejects_delay(state, &req) {
+        return Err(delay_unsupported_in_cell());
+    }
     let _permit =
         crate::admission::check_admission(state, meter.map(|m| m.tenant_id), req.payload.len())?;
     // Local-WAL cells keep bodies inline: refuse an oversize body here,
@@ -748,6 +865,22 @@ pub async fn submit_batch(
     ingest: Option<crate::metering::IngestAuth>,
     batch: IngestBatch,
 ) -> Vec<IngestOutcome> {
+    if state.cluster.is_some() {
+        if let Some(rejections) = delayed_batch_rejections(batch.records.iter().map(|env| &env.req))
+        {
+            return rejections
+                .into_iter()
+                .map(|(index, topic, _)| {
+                    record_rejected();
+                    IngestOutcome {
+                        index,
+                        topic,
+                        result: Err(delay_unsupported_in_cell()),
+                    }
+                })
+                .collect();
+        }
+    }
     let mut immediate = Vec::new();
     let mut out = Vec::with_capacity(batch.records.len());
     for (index, env) in batch.records.into_iter().enumerate() {

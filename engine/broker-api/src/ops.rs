@@ -389,7 +389,7 @@ pub async fn block_host(
 pub async fn aggregate_ops_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let local_leases = state.leases.active_count() as u64;
     let blocked = state.dispatch.host_blocker().blocked_hosts().len();
-    let delayed = state.schedule.count();
+    let schedule = crate::metrics::ScheduleTelemetry::from_state(&state);
     let targets = crate::cluster::catalog_peer_targets(&state);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -426,7 +426,10 @@ pub async fn aggregate_ops_status(State(state): State<Arc<AppState>>) -> Json<se
         "local": {
             "active_leases": local_leases,
             "blocked_hosts": blocked,
-            "delayed": delayed,
+            "delayed": schedule.delayed_pending,
+            "delayed_legacy_pending": schedule.legacy_delayed_pending,
+            "delayed_legacy_imported": schedule.legacy_imported.delayed,
+            "crons_legacy_imported": schedule.legacy_imported.crons,
             "broker_only": state.broker_only,
             "dispatch_fleet": state.dispatch_fleet,
         },

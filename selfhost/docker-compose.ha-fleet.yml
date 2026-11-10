@@ -16,6 +16,9 @@ x-broker: &broker
   environment: &broker-env
     BETTERMQ_INTERNAL_LISTEN: 0.0.0.0:9080
     BETTERMQ_CLUSTER_SECRET: ${BETTERMQ_CLUSTER_SECRET:?set BETTERMQ_CLUSTER_SECRET}
+    # Leases, cursors, catalogs and host breaker only. Delayed-job and cron
+    # journals stay in each broker's own data dir; delayed delivery and cron
+    # create/update return 501 in a cell (see README "Scheduling in a cell").
     BETTERMQ_SHARED_META_DIR: /cluster-shared/meta
     BETTERMQ_METRICS_TOKEN: ${BETTERMQ_METRICS_TOKEN:?set BETTERMQ_METRICS_TOKEN}
   volumes:

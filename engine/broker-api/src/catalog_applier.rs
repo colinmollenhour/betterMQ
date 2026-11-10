@@ -1106,11 +1106,23 @@ mod tests {
         )
         .await;
         assert!(matches!(response, Err(ApiError::Conflict(_))));
+        // D1: cron create/update are refused in a cell; delete commits a tombstone.
         let cron = json!({"every_seconds":60, "url":"https://example.com/hook", "secret":"s", "body":"scheduled"});
-        let (status, _, cron) =
+        let (status, _, body) =
             request(&api, "POST", "/v1/crons", cron, Uuid::new_v4(), None).await;
-        assert_eq!(status, StatusCode::CREATED, "{cron}");
-        let cron_id = cron["cron_id"].as_str().unwrap();
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        let existing = state
+            .crons
+            .create_with_kind(
+                broker_schedule::ScheduleKind::Interval { every_seconds: 60 },
+                serde_json::from_value(json!({
+                    "topic": "", "payload": "scheduled", "idempotency_key": null,
+                    "destination": {"url": "https://example.com/hook", "secret": "s"}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let cron_id = existing.id.to_string();
         for action in ["pause", "resume"] {
             let (status, _, body) = request(
                 &api,
@@ -1121,7 +1133,7 @@ mod tests {
                 None,
             )
             .await;
-            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
         }
         let (status, _, _) = request(
             &api,

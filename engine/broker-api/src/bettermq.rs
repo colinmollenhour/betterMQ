@@ -1991,6 +1991,7 @@ impl From<ScheduleError> for DelayedApiError {
             ScheduleError::UnsupportedVersion(version) => DelayedApiError::Internal(format!(
                 "unsupported delayed schedule version: {version}"
             )),
+            ScheduleError::Locked(_) => DelayedApiError::Internal(e.to_string()),
         }
     }
 }
@@ -2349,7 +2350,9 @@ async fn create_cron(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateCronRequest>,
 ) -> Result<(StatusCode, Json<CronResponse>), CronApiError> {
-    let mutation = crate::catalog_applier::begin(&state)?;
+    // D1: cron definitions cannot be created or changed in a multi-node cell
+    // (node-local execution state); delete stays allowed.
+    reject_cron_mutation_in_cell(&state)?;
     let schedule = parse_schedule_kind(&req)?;
     let scheduled = build_cron_scheduled_request(&state, &req).await?;
     // Every fire must fit the cell's inline body limit; refuse up front.
@@ -2357,23 +2360,7 @@ async fn create_cron(
         .broker
         .check_body(&scheduled.payload, scheduled.payload_encoding.as_deref())
         .map_err(ApiError::from)?;
-    let job = if state.cluster.is_some() {
-        let mut job = broker_schedule::CronRegistry::prepare_with_kind(schedule, scheduled)?;
-        job.id = mutation.id("default", CatalogKind::Cron);
-        mutation
-            .commit(
-                &state,
-                "default".into(),
-                CatalogKind::Cron,
-                job.id,
-                &job,
-                false,
-            )
-            .await?;
-        state.crons.get(job.id)?
-    } else {
-        state.crons.create_with_kind(schedule, scheduled)?
-    };
+    let job = state.crons.create_with_kind(schedule, scheduled)?;
     Ok((StatusCode::CREATED, Json(to_cron_response(job))))
 }
 
@@ -2399,25 +2386,8 @@ async fn pause_cron(
     State(state): State<Arc<AppState>>,
     Path(cron_id): Path<Uuid>,
 ) -> Result<Json<CronResponse>, CronApiError> {
-    let job = if state.cluster.is_some() {
-        let mutation = crate::catalog_applier::begin(&state)?;
-        let mut job = state.crons.get(cron_id)?;
-        job.paused = true;
-        job.updated_at_ms = chrono::Utc::now().timestamp_millis();
-        mutation
-            .commit(
-                &state,
-                "default".into(),
-                CatalogKind::Cron,
-                cron_id,
-                &job,
-                false,
-            )
-            .await?;
-        state.crons.get(cron_id)?
-    } else {
-        state.crons.pause(cron_id)?
-    };
+    reject_cron_mutation_in_cell(&state)?;
+    let job = state.crons.pause(cron_id)?;
     Ok(Json(to_cron_response(job)))
 }
 
@@ -2425,25 +2395,8 @@ async fn resume_cron(
     State(state): State<Arc<AppState>>,
     Path(cron_id): Path<Uuid>,
 ) -> Result<Json<CronResponse>, CronApiError> {
-    let job = if state.cluster.is_some() {
-        let mutation = crate::catalog_applier::begin(&state)?;
-        let mut job = state.crons.get(cron_id)?;
-        job.paused = false;
-        job.updated_at_ms = chrono::Utc::now().timestamp_millis();
-        mutation
-            .commit(
-                &state,
-                "default".into(),
-                CatalogKind::Cron,
-                cron_id,
-                &job,
-                false,
-            )
-            .await?;
-        state.crons.get(cron_id)?
-    } else {
-        state.crons.resume(cron_id)?
-    };
+    reject_cron_mutation_in_cell(&state)?;
+    let job = state.crons.resume(cron_id)?;
     Ok(Json(to_cron_response(job)))
 }
 
@@ -2471,12 +2424,24 @@ async fn delete_cron(
     Ok((StatusCode::OK, Json(to_cron_response(removed))))
 }
 
+/// Cron state is node-local and not quorum-replicated, so a cell refuses
+/// creating or changing crons. Delete stays allowed so operators can clean up.
+fn reject_cron_mutation_in_cell(state: &AppState) -> Result<(), CronApiError> {
+    if state.cluster.is_some() {
+        return Err(CronApiError::NotImplemented(
+            crate::cluster::CRON_MUTATION_UNSUPPORTED_IN_CELL.into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 enum CronApiError {
     Api(ApiError),
     InvalidCron(String),
     BadRequest(String),
     NotFound(Uuid),
+    NotImplemented(String),
     Internal(String),
 }
 
@@ -2496,6 +2461,10 @@ impl From<CronError> for CronApiError {
             CronError::Io(e) => CronApiError::Internal(e.to_string()),
             CronError::Serde(e) => CronApiError::Internal(e.to_string()),
             CronError::MetadataLoad(e) => CronApiError::Internal(e.to_string()),
+            CronError::Locked(path) => CronApiError::Internal(format!(
+                "cron journal {} is locked by another process",
+                path.display()
+            )),
         }
     }
 }
@@ -2508,6 +2477,7 @@ impl IntoResponse for CronApiError {
                 (StatusCode::BAD_REQUEST, m)
             }
             CronApiError::NotFound(id) => (StatusCode::NOT_FOUND, format!("cron not found: {id}")),
+            CronApiError::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, m),
             CronApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };
         let body = serde_json::json!({ "error": msg });
@@ -2541,5 +2511,79 @@ impl IntoResponse for FlowApiError {
         };
         let body = serde_json::json!({ "error": msg });
         (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod cell_cron_tests {
+    use super::*;
+    use crate::test_support::cell_state;
+
+    fn cron_body() -> CreateCronRequest {
+        serde_json::from_value(serde_json::json!({
+            "every_seconds": 60,
+            "url": "https://example.com/hook",
+            "secret": "s",
+            "body": "x",
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cron_create_and_update_are_501_in_a_cell_but_delete_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = cell_state(&dir);
+        let error = create_cron(State(state.clone()), Json(cron_body()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(state.crons.list().is_empty());
+
+        // A pre-upgrade cron already on this node: pause/resume refused,
+        // delete allowed.
+        let job = state
+            .crons
+            .create_with_kind(
+                broker_schedule::ScheduleKind::Interval { every_seconds: 60 },
+                build_cron_scheduled_request(&state, &cron_body())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+        for response in [
+            pause_cron(State(state.clone()), Path(job.id))
+                .await
+                .unwrap_err()
+                .into_response(),
+            resume_cron(State(state.clone()), Path(job.id))
+                .await
+                .unwrap_err()
+                .into_response(),
+        ] {
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        }
+        assert!(!state.crons.get(job.id).unwrap().paused);
+
+        let mut peer_copy = job.clone();
+        peer_copy.paused = true;
+        peer_copy.updated_at_ms += 1;
+        let pushed = crate::cluster::internal_catalog_cron(
+            State(state.clone()),
+            Json(crate::cluster::CatalogCronUpsert { job: peer_copy }),
+        )
+        .await;
+        assert!(matches!(pushed, Err(ApiError::NotImplemented(_))));
+        assert!(!state.crons.get(job.id).unwrap().paused);
+
+        // Delete is not gated; in a cell it commits a catalog tombstone, which
+        // this controller-less fixture cannot do (503, not 501). The committed
+        // delete path is covered by the catalog applier tests.
+        let error = delete_cron(State(state.clone()), Path(job.id))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

@@ -32,6 +32,44 @@ pub struct BatchEnqueueResponse {
 #[cfg(feature = "cloud")]
 const CLOUD_MAX_BATCH_MESSAGES: usize = MAX_BATCH_MESSAGES;
 
+/// 501 with one explicit rejected outcome per record when a batch sent to a
+/// cell carries any delayed record. Checked before anything is committed.
+pub(crate) fn delayed_batch_response<'a>(
+    requests: impl IntoIterator<Item = &'a broker_partition::PublishRequest>,
+) -> Option<(StatusCode, Json<BatchEnqueueResponse>)> {
+    let rejections = crate::ingest::delayed_batch_rejections(requests)?;
+    let failed = rejections.len();
+    let results = rejections
+        .into_iter()
+        .map(|(index, topic, error)| {
+            crate::metrics::record_rejected();
+            crate::ingest::IngestItemResult {
+                index,
+                accepted: false,
+                message_id: None,
+                topic,
+                partition: None,
+                offset: None,
+                duplicate: false,
+                commit_epoch: None,
+                scheduled: None,
+                failure: Some(crate::routes::ApiError::NotImplemented(error.clone()).failure()),
+                error: Some(error),
+            }
+        })
+        .collect();
+    Some((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(BatchEnqueueResponse {
+            accepted: 0,
+            failed,
+            partial: false,
+            message_ids: Vec::new(),
+            results,
+        }),
+    ))
+}
+
 async fn enqueue_batch_inner(
     state: Arc<AppState>,
     ingest: Option<Extension<crate::metering::IngestAuth>>,
@@ -43,6 +81,11 @@ async fn enqueue_batch_inner(
         return Err(ApiError::BadRequest(format!(
             "batch exceeds max size of {max_messages}"
         )));
+    }
+    if state.cluster.is_some() {
+        if let Some(rejected) = delayed_batch_response(&body.messages) {
+            return Ok(rejected);
+        }
     }
     if state.uses_cloud_auth() {
         #[cfg(feature = "cloud")]

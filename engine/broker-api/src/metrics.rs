@@ -6,7 +6,7 @@ use std::time::Duration;
 static ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static DUPLICATE: AtomicU64 = AtomicU64::new(0);
 static REJECTED: AtomicU64 = AtomicU64::new(0);
-const REJECTION_REASONS: [&str; 9] = [
+const REJECTION_REASONS: [&str; 10] = [
     "invalid_request",
     "unauthorized",
     "not_found",
@@ -16,8 +16,9 @@ const REJECTION_REASONS: [&str; 9] = [
     "saturated",
     "tenant_saturated",
     "broker_error",
+    "not_supported_in_cell",
 ];
-static REJECTIONS_BY_REASON: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+static REJECTIONS_BY_REASON: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 static ACK_COUNT: AtomicU64 = AtomicU64::new(0);
 static ACK_SUM_US: AtomicU64 = AtomicU64::new(0);
 /// Non-cumulative bucket storage for 1, 2, 5, 10, 20, 50, 100, 250, 500, 1000 ms.
@@ -184,6 +185,7 @@ pub(crate) fn record_single_outcome<T>(
             ApiError::Overloaded { .. } => 6,
             ApiError::TooManyRequests { .. } => 7,
             ApiError::Broker(_) => 8,
+            ApiError::NotImplemented(_) => 9,
             ApiError::Upstream { status, .. } => {
                 let code = error.failure().code;
                 REJECTION_REASONS
@@ -316,7 +318,32 @@ pub fn prometheus_text() -> String {
     out
 }
 
+/// Delayed-job queue state. In a cell every local delayed job is a legacy job
+/// from before the cell gate, kept with node-local durability until it fires.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScheduleTelemetry {
+    pub delayed_pending: usize,
+    pub legacy_delayed_pending: usize,
+    pub legacy_imported: broker_schedule::LegacyImportTotals,
+}
+
+impl ScheduleTelemetry {
+    pub fn from_state(state: &crate::AppState) -> Self {
+        let delayed_pending = state.schedule.count();
+        Self {
+            delayed_pending,
+            legacy_delayed_pending: if state.cluster.is_some() {
+                delayed_pending
+            } else {
+                0
+            },
+            legacy_imported: broker_schedule::legacy_import_totals(),
+        }
+    }
+}
+
 pub struct NativeTelemetrySnapshot {
+    pub schedule: ScheduleTelemetry,
     pub storage: broker_storage::StorageTelemetrySnapshot,
     pub partition: broker_partition::PartitionTelemetrySnapshot,
     pub replication: Option<broker_replication::ReplicationTelemetrySnapshot>,
@@ -330,6 +357,7 @@ pub struct NativeTelemetrySnapshot {
 
 pub fn native_snapshot(state: &crate::AppState) -> NativeTelemetrySnapshot {
     NativeTelemetrySnapshot {
+        schedule: ScheduleTelemetry::from_state(state),
         storage: broker_storage::storage_telemetry_snapshot(),
         partition: broker_partition::partition_telemetry_snapshot(),
         replication: state
@@ -363,6 +391,7 @@ pub fn prometheus_text_with_native(native: &NativeTelemetrySnapshot) -> String {
     append_dispatch_metrics(&mut out, &native.dispatch, &native.fairness);
     append_retention_metrics(&mut out, &native.retention);
     append_payload_repair_metrics(&mut out, &native.payload_repair);
+    append_schedule_metrics(&mut out, &native.schedule);
     out
 }
 
@@ -489,6 +518,35 @@ fn append_retention_metrics(
     out.push_str(&format!(
         "bettermq_retention_errors_total {}\n",
         snapshot.errors_total
+    ));
+}
+
+fn append_schedule_metrics(out: &mut String, snapshot: &ScheduleTelemetry) {
+    out.push_str("# HELP bettermq_schedule_delayed_pending Delayed jobs waiting on this node\n");
+    out.push_str("# TYPE bettermq_schedule_delayed_pending gauge\n");
+    out.push_str(&format!(
+        "bettermq_schedule_delayed_pending {}\n",
+        snapshot.delayed_pending
+    ));
+    out.push_str(
+        "# HELP bettermq_schedule_legacy_delayed_pending Pre-upgrade delayed jobs in a cell, node-local until they fire\n",
+    );
+    out.push_str("# TYPE bettermq_schedule_legacy_delayed_pending gauge\n");
+    out.push_str(&format!(
+        "bettermq_schedule_legacy_delayed_pending {}\n",
+        snapshot.legacy_delayed_pending
+    ));
+    out.push_str(
+        "# HELP bettermq_schedule_legacy_imported_total Jobs imported from the legacy shared meta dir\n",
+    );
+    out.push_str("# TYPE bettermq_schedule_legacy_imported_total counter\n");
+    out.push_str(&format!(
+        "bettermq_schedule_legacy_imported_total{{kind=\"delayed\"}} {}\n",
+        snapshot.legacy_imported.delayed
+    ));
+    out.push_str(&format!(
+        "bettermq_schedule_legacy_imported_total{{kind=\"cron\"}} {}\n",
+        snapshot.legacy_imported.crons
     ));
 }
 
@@ -1252,6 +1310,14 @@ mod tests {
     #[test]
     fn prometheus_renders_real_native_snapshots_with_bounded_labels() {
         let native = NativeTelemetrySnapshot {
+            schedule: ScheduleTelemetry {
+                delayed_pending: 4,
+                legacy_delayed_pending: 4,
+                legacy_imported: broker_schedule::LegacyImportTotals {
+                    delayed: 3,
+                    crons: 1,
+                },
+            },
             storage: broker_storage::StorageTelemetrySnapshot {
                 shards: vec![broker_storage::StorageShardTelemetrySnapshot {
                     shard: 7,
@@ -1435,6 +1501,8 @@ mod tests {
         assert!(output.contains("bettermq_dispatch_dlq_failures_total 1"));
         assert!(output.contains("bettermq_dispatch_completion_gap_records{shard=\"7\"} 4"));
         assert!(output.contains("bettermq_dispatch_destination_hosts_blocked 1"));
+        assert!(output.contains("bettermq_schedule_legacy_delayed_pending 4"));
+        assert!(output.contains("bettermq_schedule_legacy_imported_total{kind=\"delayed\"} 3"));
         assert!(output.contains("bettermq_dispatch_fairness_tracked_tenants 8"));
         assert!(!output.contains("topic="));
         assert!(!output.contains("peer="));

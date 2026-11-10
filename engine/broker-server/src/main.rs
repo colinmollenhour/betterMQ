@@ -1224,9 +1224,54 @@ fn spawn_dispatch_backfill_loop(state: Arc<AppState>) -> tokio::task::JoinHandle
     })
 }
 
+/// How long after start a node keeps re-scanning the legacy shared meta dir
+/// for schedule state written by nodes still on an older release.
+fn legacy_schedule_import_window() -> Duration {
+    std::env::var("BETTERMQ_LEGACY_SCHEDULE_IMPORT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(3_600))
+}
+
+const LEGACY_SCHEDULE_IMPORT_EVERY: Duration = Duration::from_secs(30);
+
+/// Import pre-upgrade schedule state from `BETTERMQ_SHARED_META_DIR`: crons on
+/// every node (only the scheduler holder fires them), delayed jobs only on the
+/// scheduler holder, which then owns and fires them.
+async fn import_legacy_schedule_state(
+    state: &Arc<AppState>,
+    shared_dir: std::path::PathBuf,
+    scheduler_leader: bool,
+) {
+    let schedule = state.schedule.clone();
+    let crons = state.crons.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let crons = crons.import_legacy_shared(&shared_dir);
+        let delayed = scheduler_leader.then(|| schedule.import_legacy_shared(&shared_dir));
+        (crons, delayed)
+    })
+    .await;
+    match result {
+        Ok((crons, delayed)) => {
+            if let Err(error) = crons {
+                tracing::warn!(%error, "legacy shared cron import failed; will retry");
+            }
+            if let Some(Err(error)) = delayed {
+                tracing::warn!(%error, "legacy shared delayed-job import failed; will retry");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "legacy schedule import task failed"),
+    }
+}
+
 fn spawn_schedule_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(200));
+        let legacy_shared_dir =
+            std::env::var_os("BETTERMQ_SHARED_META_DIR").map(std::path::PathBuf::from);
+        let import_until = tokio::time::Instant::now() + legacy_schedule_import_window();
+        let mut next_import = tokio::time::Instant::now();
         loop {
             interval.tick().await;
             let scheduler_leader = match &state.cluster {
@@ -1242,57 +1287,68 @@ fn spawn_schedule_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
                     c.runtime.is_scheduler_leader()
                 }
             };
-            if !scheduler_leader {
-                continue;
+            if let Some(shared_dir) = &legacy_shared_dir {
+                let tick = tokio::time::Instant::now();
+                if tick >= next_import && tick < import_until {
+                    next_import = tick + LEGACY_SCHEDULE_IMPORT_EVERY;
+                    import_legacy_schedule_state(&state, shared_dir.clone(), scheduler_leader)
+                        .await;
+                }
             }
 
             let now = Utc::now().timestamp_millis();
 
+            // Delayed jobs are node-local. In a cell no new ones are accepted,
+            // so every node drains its own pre-upgrade jobs through the quorum
+            // publish path (deduplicated by their `delay:<uuid>` key) rather
+            // than waiting to win the scheduler lease.
             fire_due_schedules(&state, state.schedule.pop_due(now), now).await;
+            if scheduler_leader {
+                fire_due_crons(&state, now).await;
+            }
+        }
+    })
+}
 
-            for job in state.crons.pop_due(now) {
-                tracing::info!(cron_id = %job.id, queue = %job.request.topic, "cron tick");
-                let mut req = job.request.clone();
-                // Per-firing key: a user key alone would dedupe every later tick.
-                req.idempotency_key = Some(job.fire_idempotency_key());
-                match fire_scheduled_publish(&state, req).await {
-                    Ok(()) => {
-                        if let Err(e) = state.crons.commit_fire(job.id) {
-                            broker_api::record_scheduler_failure(
-                                broker_api::SchedulerFailure::Persist,
-                            );
-                            tracing::warn!(error = %e, cron_id = %job.id, "cron commit_fire failed");
-                        }
-                    }
-                    Err(failure) => {
-                        broker_api::record_scheduler_failure(broker_api::SchedulerFailure::CronFire);
-                        match state.crons.fail_fire(&job, failure, now) {
-                            Ok(broker_schedule::FireRetry::Retry {
-                                attempt,
-                                retry_at_ms,
-                            }) => tracing::warn!(
-                                cron_id = %job.id,
-                                attempt,
-                                retry_in_ms = retry_at_ms - now,
-                                "cron fire failed; will retry"
-                            ),
-                            Ok(broker_schedule::FireRetry::GiveUp { attempt }) => tracing::error!(
-                                cron_id = %job.id,
-                                attempt,
-                                "cron occurrence skipped: publish failed permanently"
-                            ),
-                            Err(e) => {
-                                broker_api::record_scheduler_failure(
-                                    broker_api::SchedulerFailure::Persist,
-                                );
-                                tracing::warn!(error = %e, cron_id = %job.id, "cron fail_fire failed")
-                            }
-                        }
+/// Fire due crons. Only the scheduler holder calls this.
+async fn fire_due_crons(state: &Arc<AppState>, now: i64) {
+    for job in state.crons.pop_due(now) {
+        tracing::info!(cron_id = %job.id, queue = %job.request.topic, "cron tick");
+        let mut req = job.request.clone();
+        // Per-firing key: a user key alone would dedupe every later tick.
+        req.idempotency_key = Some(job.fire_idempotency_key());
+        match fire_scheduled_publish(state, req).await {
+            Ok(()) => {
+                if let Err(e) = state.crons.commit_fire(job.id) {
+                    broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
+                    tracing::warn!(error = %e, cron_id = %job.id, "cron commit_fire failed");
+                }
+            }
+            Err(failure) => {
+                broker_api::record_scheduler_failure(broker_api::SchedulerFailure::CronFire);
+                match state.crons.fail_fire(&job, failure, now) {
+                    Ok(broker_schedule::FireRetry::Retry {
+                        attempt,
+                        retry_at_ms,
+                    }) => tracing::warn!(
+                        cron_id = %job.id,
+                        attempt,
+                        retry_in_ms = retry_at_ms - now,
+                        "cron fire failed; will retry"
+                    ),
+                    Ok(broker_schedule::FireRetry::GiveUp { attempt }) => tracing::error!(
+                        cron_id = %job.id,
+                        attempt,
+                        "cron occurrence skipped: publish failed permanently"
+                    ),
+                    Err(e) => {
+                        broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
+                        tracing::warn!(error = %e, cron_id = %job.id, "cron fail_fire failed")
                     }
                 }
             }
         }
-    })
+    }
 }
 
 /// Delayed publishes fired concurrently per batch.
@@ -1830,5 +1886,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.headers()["x-request-id"], "from-gateway");
+    }
+}
+
+#[cfg(test)]
+mod schedule_worker_tests {
+    use super::*;
+
+    fn one_node_cell_state(dir: &tempfile::TempDir) -> Arc<AppState> {
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let node = uuid::Uuid::new_v4();
+        let config = broker_raft_meta::ClusterConfig {
+            cluster_id: uuid::Uuid::new_v4(),
+            nodes: vec![broker_raft_meta::NodeConfig {
+                id: node,
+                addr: "http://broker0:8080".into(),
+                internal_url: None,
+            }],
+            node_id: node,
+            generation: 1,
+            hash_version: 1,
+        };
+        Arc::new(AppState {
+            broker: broker.clone(),
+            schedule: ScheduleQueue::open(dir.path()).unwrap(),
+            crons: CronRegistry::open(dir.path()).unwrap(),
+            dispatch: DispatchEngine::new_broker_only(broker, DispatchConfig::default()),
+            leases: broker_dispatch::LeaseTable::new(),
+            cluster: Some(Cluster::new(
+                broker_raft_meta::ClusterRuntime::from_config_only(config),
+            )),
+            local_auth: None,
+            fair_queue: Arc::new(broker_dispatch::TenantFairQueue::new()),
+            catalog_tombstones: CatalogTombstones::open(dir.path()).unwrap(),
+            dispatch_fleet: false,
+            broker_only: true,
+            #[cfg(feature = "cloud")]
+            auth: None,
+            #[cfg(feature = "cloud")]
+            control_plane: None,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_delayed_job_fires_on_a_node_without_the_scheduler_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = one_node_cell_state(&dir);
+        let cluster = state.cluster.as_ref().unwrap();
+        assert!(!cluster.runtime.is_scheduler_leader());
+        let scheduled = state
+            .schedule
+            .schedule(
+                broker_schedule::ScheduledPublishRequest {
+                    topic: broker_partition::DIRECT_TOPIC.into(),
+                    routing_key: "legacy".into(),
+                    payload: "body".into(),
+                    payload_encoding: None,
+                    idempotency_key: Some(format!("delay:{}", uuid::Uuid::new_v4())),
+                    priority: None,
+                    parallelism: None,
+                    flow_id: None,
+                    queue_id: None,
+                    destination: Some(broker_partition::DestinationSnapshot {
+                        queue_id: None,
+                        url: "https://example.com/hook".into(),
+                        secret: "secret".into(),
+                    }),
+                    flow: None,
+                    max_retries: None,
+                    retry_backoff: None,
+                    method: None,
+                    headers: None,
+                    sign: None,
+                    request: None,
+                },
+                0,
+            )
+            .unwrap();
+
+        let now = scheduled.deliver_at_ms;
+        fire_due_schedules(&state, state.schedule.pop_due(now), now).await;
+
+        assert_eq!(state.schedule.count(), 0, "fired and completed");
+        let published = state
+            .broker
+            .list_topic_messages(broker_partition::DIRECT_TOPIC, 10)
+            .unwrap();
+        assert_eq!(published.len(), 1);
     }
 }

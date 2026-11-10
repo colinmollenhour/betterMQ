@@ -846,6 +846,11 @@ async fn gateway_only_submit(
             "batch exceeds max size of {MAX_HT_BATCH_MESSAGES}"
         )));
     }
+    // A storage-free gateway always fronts a cell; shard sub-batches commit
+    // independently, so refuse a batch with any delayed record as a whole.
+    if let Some(rejected) = crate::batch::delayed_batch_response(&body.messages) {
+        return Ok(rejected);
+    }
     let mut batch = IngestBatch::from_requests(body.messages)?;
     let tenant_name = ingest
         .map(|auth| auth.tenant_id.to_string())
@@ -1087,6 +1092,10 @@ pub async fn gateway_enqueue(
         return crate::batch::batch_enqueue(State(state), ingest, plan, Json(body)).await;
         #[cfg(not(feature = "cloud"))]
         return crate::batch::batch_enqueue(State(state), ingest, Json(body)).await;
+    }
+    // Shard sub-batches commit independently, so refuse the whole batch first.
+    if let Some(rejected) = crate::batch::delayed_batch_response(&body.messages) {
+        return Ok(rejected);
     }
 
     #[cfg(feature = "cloud")]

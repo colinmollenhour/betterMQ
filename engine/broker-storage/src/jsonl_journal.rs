@@ -73,6 +73,20 @@ impl JsonlJournal {
         Ok(lines)
     }
 
+    /// Read every complete record line without modifying the file (for
+    /// journals owned by another process). A torn unterminated tail is
+    /// ignored; a complete unterminated document is returned.
+    pub fn read_lines_readonly(&self) -> std::io::Result<Vec<Vec<u8>>> {
+        let Some(bytes) = self.read_file()? else {
+            return Ok(Vec::new());
+        };
+        let (mut lines, _, tail) = split_records(&bytes);
+        if let Tail::Complete(record) = tail {
+            lines.push(record);
+        }
+        Ok(lines)
+    }
+
     fn read_file(&self) -> std::io::Result<Option<Vec<u8>>> {
         match std::fs::read(&self.path) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -312,6 +326,19 @@ mod tests {
             parse(&journal.read_lines().unwrap()),
             vec![Rec { n: 1 }, Rec { n: 2 }, Rec { n: 3 }]
         );
+    }
+
+    #[test]
+    fn readonly_read_leaves_torn_tail_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.journal");
+        std::fs::write(&path, b"{\"n\":1}\n{\"n\"").unwrap();
+        let journal = JsonlJournal::new(&path);
+        assert_eq!(
+            parse(&journal.read_lines_readonly().unwrap()),
+            vec![Rec { n: 1 }]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"n\":1}\n{\"n\"");
     }
 
     #[test]

@@ -1,12 +1,14 @@
 //! Delayed enqueue (`delay`) and recurring cron schedules.
 
 mod cron;
+mod legacy;
 mod persist;
 mod retry;
 
-use broker_storage::JsonlJournal;
+use broker_storage::{FileLock, JsonlJournal};
 use chrono::Utc;
 pub use cron::{normalize_cron, CronError, CronJob, CronRegistry, ScheduleKind};
+pub use legacy::{legacy_import_totals, LegacyImport, LegacyImportTotals};
 use parking_lot::Mutex;
 use persist::{load_json_with_recovery, persist_json_atomic, JsonLoadSource, MetadataLoadError};
 pub use retry::{
@@ -35,6 +37,10 @@ pub enum ScheduleError {
     UnsupportedVersion(u16),
     #[error(transparent)]
     MetadataLoad(#[from] MetadataLoadError),
+    #[error(
+        "schedule journal {0} is in use by another process; every broker needs its own data dir"
+    )]
+    Locked(PathBuf),
 }
 
 fn deserialize_flexible_payload<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -160,6 +166,8 @@ pub struct ScheduleQueue {
     path: PathBuf,
     journal: JsonlJournal,
     state: Arc<Mutex<ScheduleState>>,
+    /// Exclusive ownership of the journal for the life of the queue.
+    _lock: Arc<FileLock>,
 }
 
 #[derive(Default)]
@@ -205,29 +213,50 @@ enum ScheduleSnapshotCompat {
 const SCHEDULE_STATE_VERSION: u16 = 1;
 const JOURNAL_COMPACT_OPS: usize = 1024;
 
-fn meta_file_path(data_dir: &std::path::Path, name: &str) -> std::path::PathBuf {
-    if let Ok(shared) = std::env::var("BETTERMQ_SHARED_META_DIR") {
-        let dir = std::path::PathBuf::from(shared);
-        let _ = std::fs::create_dir_all(&dir);
-        return dir.join(name);
+/// Parse one journal line: a versioned record, or a bare op from early releases.
+fn parse_journal_line(line: &[u8], sequence: u64) -> Result<JournalRecord, ScheduleError> {
+    match serde_json::from_slice::<JournalRecord>(line) {
+        Ok(record) => Ok(record),
+        Err(record_error) => match serde_json::from_slice::<JournalOp>(line) {
+            Ok(op) => Ok(JournalRecord {
+                version: SCHEDULE_STATE_VERSION,
+                sequence: sequence.saturating_add(1),
+                op,
+            }),
+            Err(_) => Err(ScheduleError::Serde(record_error)),
+        },
     }
-    data_dir.join(name)
+}
+
+fn snapshot_items(snapshot: ScheduleSnapshotCompat) -> Result<(Vec<HeapItem>, u64), ScheduleError> {
+    match snapshot {
+        ScheduleSnapshotCompat::Current(snapshot) => {
+            if snapshot.version != SCHEDULE_STATE_VERSION {
+                return Err(ScheduleError::UnsupportedVersion(snapshot.version));
+            }
+            Ok((snapshot.items, snapshot.sequence))
+        }
+        ScheduleSnapshotCompat::Legacy(items) => Ok((items, 0)),
+    }
+}
+
+/// Take the journal's exclusive lock (`<journal>.lock`) or fail: two processes
+/// appending to one journal with separate in-memory state lose jobs.
+pub(crate) fn lock_journal(journal: &Path) -> std::io::Result<Option<FileLock>> {
+    FileLock::try_exclusive(journal)
 }
 
 impl ScheduleQueue {
+    /// Open the node-local delayed queue in `data_dir`. Never shared between
+    /// processes: the journal is locked exclusively for the queue's lifetime.
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, ScheduleError> {
-        let path = meta_file_path(data_dir.as_ref(), "schedule.json");
-        let journal = JsonlJournal::new(path.with_extension("journal"));
+        let path = data_dir.as_ref().join("schedule.json");
+        let journal_path = path.with_extension("journal");
+        let lock = lock_journal(&journal_path)?
+            .ok_or_else(|| ScheduleError::Locked(journal_path.clone()))?;
+        let journal = JsonlJournal::new(journal_path);
         let loaded = load_json_with_recovery(&path, || ScheduleSnapshotCompat::Legacy(Vec::new()))?;
-        let (items, mut sequence) = match loaded.value {
-            ScheduleSnapshotCompat::Current(snapshot) => {
-                if snapshot.version != SCHEDULE_STATE_VERSION {
-                    return Err(ScheduleError::UnsupportedVersion(snapshot.version));
-                }
-                (snapshot.items, snapshot.sequence)
-            }
-            ScheduleSnapshotCompat::Legacy(items) => (items, 0),
-        };
+        let (items, mut sequence) = snapshot_items(loaded.value)?;
         if !matches!(
             loaded.source,
             JsonLoadSource::Main | JsonLoadSource::Missing
@@ -242,17 +271,7 @@ impl ScheduleQueue {
         let mut heap: BinaryHeap<HeapItem> = items.into_iter().collect();
         let mut journal_ops = 0usize;
         for line in journal.read_lines()? {
-            let record = match serde_json::from_slice::<JournalRecord>(&line) {
-                Ok(record) => record,
-                Err(record_error) => match serde_json::from_slice::<JournalOp>(&line) {
-                    Ok(op) => JournalRecord {
-                        version: SCHEDULE_STATE_VERSION,
-                        sequence: sequence.saturating_add(1),
-                        op,
-                    },
-                    Err(_) => return Err(ScheduleError::Serde(record_error)),
-                },
-            };
+            let record = parse_journal_line(&line, sequence)?;
             if record.version != SCHEDULE_STATE_VERSION {
                 return Err(ScheduleError::UnsupportedVersion(record.version));
             }
@@ -289,7 +308,98 @@ impl ScheduleQueue {
                 sequence,
                 journal_ops,
             })),
+            _lock: Arc::new(lock),
         })
+    }
+
+    /// Import delayed jobs that older releases stored under the shared meta
+    /// dir. Run it only on the node that fires schedules (the scheduler
+    /// holder): imported jobs become this node's local jobs.
+    ///
+    /// The live shared files are renamed aside before they are read
+    /// (`schedule.json.importing-<ts>`, then `.imported-<ts>` once done), so a
+    /// node still on an older release that appends later writes a new file
+    /// for the next pass. Shared files are never truncated or rewritten. Ids
+    /// and deadlines are preserved; a ledger beside the local journal keeps
+    /// re-scans and interrupted passes from importing a job twice.
+    pub fn import_legacy_shared(&self, shared_dir: &Path) -> Result<LegacyImport, ScheduleError> {
+        let mut report = LegacyImport::default();
+        if !shared_dir.is_dir() || legacy::is_same_dir(shared_dir, &self.path) {
+            return Ok(report);
+        }
+        let Some(_import_lock) = FileLock::try_exclusive(&shared_dir.join("schedule-import"))?
+        else {
+            return Ok(report);
+        };
+        let groups = legacy::claim(shared_dir, "schedule.json", "schedule.journal")?;
+        if groups.is_empty() {
+            return Ok(report);
+        }
+        // Shared journals had several writers with colliding sequence numbers,
+        // so apply records in file order instead of filtering by sequence.
+        let mut found: HashMap<Uuid, HeapItem> = HashMap::new();
+        for group in &groups {
+            if let Some(snapshot) = &group.snapshot {
+                let parsed: ScheduleSnapshotCompat =
+                    serde_json::from_slice(&std::fs::read(snapshot)?)?;
+                for item in snapshot_items(parsed)?.0 {
+                    found.insert(item.id, item);
+                }
+            }
+            if let Some(journal) = &group.journal {
+                for line in JsonlJournal::new(journal).read_lines_readonly()? {
+                    let record = parse_journal_line(&line, 0)?;
+                    if record.version != SCHEDULE_STATE_VERSION {
+                        return Err(ScheduleError::UnsupportedVersion(record.version));
+                    }
+                    match record.op {
+                        JournalOp::Add { item } => {
+                            found.insert(item.id, item);
+                        }
+                        JournalOp::Remove { id } => {
+                            found.remove(&id);
+                        }
+                    }
+                }
+            }
+            report.sources.extend(group.files().cloned());
+        }
+        let mut ledger = legacy::Ledger::load(self.path.with_extension("imported.json"))?;
+        {
+            let mut state = self.state.lock();
+            let mut items: Vec<_> = found.into_values().collect();
+            items.sort_by_key(|item| (item.deliver_at_ms, item.id));
+            for mut item in items {
+                let local = state.in_flight.contains_key(&item.id)
+                    || state.heap.iter().any(|queued| queued.id == item.id);
+                if local || ledger.contains(&item.id) {
+                    report.skipped += 1;
+                    ledger.insert(item.id);
+                    continue;
+                }
+                item.not_before_ms = 0;
+                self.append_op(&mut state, JournalOp::Add { item: item.clone() })?;
+                ledger.insert(item.id);
+                state
+                    .listing
+                    .insert((item.deliver_at_ms, item.id), item.summary());
+                state.heap.push(item);
+                state.journal_ops += 1;
+                report.imported += 1;
+            }
+            self.maybe_compact(&mut state);
+        }
+        ledger.save()?;
+        legacy::finish(&groups)?;
+        legacy::record_imported_delayed(report.imported);
+        info!(
+            shared_dir = %shared_dir.display(),
+            imported = report.imported,
+            skipped = report.skipped,
+            files = report.sources.len(),
+            "imported legacy shared delayed jobs"
+        );
+        Ok(report)
     }
 
     pub fn schedule(
@@ -334,6 +444,7 @@ impl ScheduleQueue {
             .collect()
     }
 
+    /// Jobs waiting to fire, including ones being fired now.
     pub fn count(&self) -> usize {
         self.state.lock().listing.len()
     }
@@ -797,6 +908,183 @@ mod schedule_tests {
         let mut expected = vec![first.id, second.id];
         expected.sort();
         assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn second_open_of_same_journal_is_refused() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        let clone = queue.clone();
+        assert!(matches!(
+            ScheduleQueue::open(dir.path()),
+            Err(ScheduleError::Locked(_))
+        ));
+        drop(queue);
+        assert!(
+            matches!(
+                ScheduleQueue::open(dir.path()),
+                Err(ScheduleError::Locked(_))
+            ),
+            "a live clone still owns the journal"
+        );
+        drop(clone);
+        ScheduleQueue::open(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn shared_meta_dir_is_ignored() {
+        let _guard = LOCK.lock().unwrap();
+        let local = tempdir().unwrap();
+        let shared = tempdir().unwrap();
+        unsafe { std::env::set_var("BETTERMQ_SHARED_META_DIR", shared.path()) };
+        let opened = ScheduleQueue::open(local.path());
+        unsafe { std::env::remove_var("BETTERMQ_SHARED_META_DIR") };
+        opened.unwrap().schedule(request(), 60_000).unwrap();
+        assert!(local.path().join("schedule.journal").exists());
+        assert!(!shared.path().join("schedule.journal").exists());
+    }
+
+    /// Append `queue`'s journal lines to `shared`'s journal, as a second
+    /// legacy writer with its own (colliding) sequence numbers would.
+    fn append_journal(from: &Path, to: &Path) {
+        let lines = std::fs::read(from.join("schedule.journal")).unwrap();
+        let mut existing = std::fs::read(to.join("schedule.journal")).unwrap_or_default();
+        existing.extend_from_slice(&lines);
+        std::fs::write(to.join("schedule.journal"), existing).unwrap();
+    }
+
+    fn ids(queue: &ScheduleQueue) -> Vec<Uuid> {
+        let mut ids: Vec<_> = queue.list().into_iter().map(|job| job.id).collect();
+        ids.sort();
+        ids
+    }
+
+    fn sorted(mut ids: Vec<Uuid>) -> Vec<Uuid> {
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn legacy_shared_import_preserves_jobs_and_is_idempotent() {
+        let shared = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let local = tempdir().unwrap();
+
+        // Two legacy writers on one shared journal, sequences colliding.
+        let writer = ScheduleQueue::open(shared.path()).unwrap();
+        let a = writer.schedule(request(), 60_000).unwrap();
+        let b = writer.schedule(request(), 120_000).unwrap();
+        writer.cancel(a.id).unwrap();
+        drop(writer);
+        let second = ScheduleQueue::open(other.path()).unwrap();
+        let c = second.schedule(request(), 30_000).unwrap();
+        drop(second);
+        append_journal(other.path(), shared.path());
+
+        let queue = ScheduleQueue::open(local.path()).unwrap();
+        let report = queue.import_legacy_shared(shared.path()).unwrap();
+        assert_eq!(report.imported, 2);
+        assert_eq!(ids(&queue), sorted(vec![b.id, c.id]));
+        let listed = queue.list();
+        let imported_b = listed.iter().find(|job| job.id == b.id).unwrap();
+        assert_eq!(imported_b.deliver_at_ms, b.deliver_at_ms);
+        assert!(!shared.path().join("schedule.journal").exists());
+        assert!(std::fs::read_dir(shared.path()).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("schedule.journal.imported-")));
+
+        // Re-scan: nothing new.
+        assert_eq!(
+            queue.import_legacy_shared(shared.path()).unwrap().imported,
+            0
+        );
+
+        // A late append from an old node (re-adding b, plus a new d) after b
+        // already fired here: only d is imported.
+        let job = queue.pop_due(i64::MAX);
+        for fired in job {
+            if fired.id == b.id {
+                queue.complete(fired.id).unwrap();
+            } else {
+                queue.fail(fired, FireFailure::Transient, 0).unwrap();
+            }
+        }
+        let late = tempdir().unwrap();
+        let old_node = ScheduleQueue::open(late.path()).unwrap();
+        let d = old_node.schedule(request(), 10_000).unwrap();
+        drop(old_node);
+        std::fs::copy(
+            late.path().join("schedule.journal"),
+            shared.path().join("schedule.journal"),
+        )
+        .unwrap();
+        let mut bytes = std::fs::read(shared.path().join("schedule.journal")).unwrap();
+        bytes.extend_from_slice(
+            &serde_json::to_vec(&JournalRecord {
+                version: SCHEDULE_STATE_VERSION,
+                sequence: 1,
+                op: JournalOp::Add {
+                    item: HeapItem {
+                        deliver_at_ms: b.deliver_at_ms,
+                        id: b.id,
+                        request: request(),
+                        not_before_ms: 0,
+                    },
+                },
+            })
+            .unwrap(),
+        );
+        bytes.push(b'\n');
+        std::fs::write(shared.path().join("schedule.journal"), bytes).unwrap();
+
+        let report = queue.import_legacy_shared(shared.path()).unwrap();
+        assert_eq!(report.imported, 1);
+        assert_eq!(report.skipped, 1);
+        drop(queue);
+        let reopened = ScheduleQueue::open(local.path()).unwrap();
+        assert_eq!(ids(&reopened), sorted(vec![c.id, d.id]));
+    }
+
+    #[test]
+    fn interrupted_legacy_import_resumes_from_claimed_files() {
+        let shared = tempdir().unwrap();
+        let local = tempdir().unwrap();
+        let writer = ScheduleQueue::open(shared.path()).unwrap();
+        let a = writer.schedule(request(), 60_000).unwrap();
+        drop(writer);
+        // Crash right after the claim rename, before anything was imported.
+        std::fs::rename(
+            shared.path().join("schedule.journal"),
+            shared
+                .path()
+                .join("schedule.journal.importing-20260101T000000.000000000Z"),
+        )
+        .unwrap();
+
+        let queue = ScheduleQueue::open(local.path()).unwrap();
+        assert_eq!(
+            queue.import_legacy_shared(shared.path()).unwrap().imported,
+            1
+        );
+        assert_eq!(ids(&queue), vec![a.id]);
+        assert!(shared
+            .path()
+            .join("schedule.journal.imported-20260101T000000.000000000Z")
+            .exists());
+    }
+
+    #[test]
+    fn legacy_import_from_own_data_dir_is_a_no_op() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        queue.schedule(request(), 60_000).unwrap();
+        assert_eq!(
+            queue.import_legacy_shared(dir.path()).unwrap(),
+            LegacyImport::default()
+        );
+        assert!(dir.path().join("schedule.journal").exists());
     }
 
     #[test]

@@ -164,6 +164,8 @@ pub enum ApiError {
         retry_after: Option<axum::http::HeaderValue>,
         body: axum::body::Bytes,
     },
+    /// Feature not available in this deployment shape (HTTP 501).
+    NotImplemented(String),
     Overloaded {
         retry_after_ms: u64,
         message: String,
@@ -183,7 +185,8 @@ impl std::fmt::Display for ApiError {
             | Self::NotFound(message)
             | Self::Conflict(message)
             | Self::Unavailable(message)
-            | Self::ReplicationFailed(message) => formatter.write_str(message),
+            | Self::ReplicationFailed(message)
+            | Self::NotImplemented(message) => formatter.write_str(message),
             Self::Overloaded { message, .. } | Self::TooManyRequests { message, .. } => {
                 formatter.write_str(message)
             }
@@ -210,6 +213,7 @@ impl ApiError {
             Self::Conflict(_) => ("conflict", false, None),
             Self::Unavailable(_) => ("unavailable", true, None),
             Self::ReplicationFailed(_) => ("replication_failed", true, None),
+            Self::NotImplemented(_) => ("not_supported_in_cell", false, None),
             Self::Overloaded { retry_after_ms, .. } => ("saturated", true, Some(*retry_after_ms)),
             Self::TooManyRequests { retry_after_ms, .. } => {
                 ("tenant_saturated", true, Some(*retry_after_ms))
@@ -319,6 +323,11 @@ impl IntoResponse for ApiError {
             ApiError::ReplicationFailed(msg) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response(),
+            ApiError::NotImplemented(msg) => (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({ "error": msg, "code": "not_supported_in_cell" })),
             )
                 .into_response(),
             ApiError::Overloaded {

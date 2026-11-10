@@ -99,13 +99,16 @@ pub(crate) fn import(
     }
     let mut locks = Vec::new();
     for source in &sources {
+        let in_use = |detail: String| {
+            error(format!(
+                "{} is in use; stop the shared catalog owner before retrying{detail}",
+                source.display()
+            ))
+        };
         locks.push(
-            broker_storage::FileLock::try_exclusive(source).map_err(|e| {
-                error(format!(
-                    "{} is in use; stop the shared catalog owner before retrying: {e}",
-                    source.display()
-                ))
-            })?,
+            broker_storage::FileLock::try_exclusive(source)
+                .map_err(|e| in_use(format!(": {e}")))?
+                .ok_or_else(|| in_use(String::new()))?,
         );
     }
     let mut pending = pending.unwrap_or_else(|| Import {

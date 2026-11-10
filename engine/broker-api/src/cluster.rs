@@ -916,7 +916,14 @@ pub fn apply_catalog_snapshot(state: &AppState, snap: &CatalogSnapshot) -> Resul
             .upsert_group_member_catalog(member.clone())
             .map_err(ApiError::Broker)?;
     }
-    for job in &snap.crons {
+    // Catalog sync must not create or change crons in a cell (they are
+    // node-local there); deletes still arrive through tombstones.
+    let crons = if state.cluster.is_some() {
+        &[][..]
+    } else {
+        &snap.crons[..]
+    };
+    for job in crons {
         if !catalog_item_alive(job.id, job.updated_at_ms, &tombstones) {
             continue;
         }
@@ -1405,10 +1412,20 @@ pub async fn internal_catalog_delete_flow(
     Ok(StatusCode::OK)
 }
 
+pub(crate) const CRON_MUTATION_UNSUPPORTED_IN_CELL: &str =
+    "creating or changing crons is not supported in multi-node cells in this release";
+
 pub async fn internal_catalog_cron(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogCronUpsert>,
 ) -> Result<StatusCode, ApiError> {
+    // Peer pushes (e.g. from a node still on an older release) must not
+    // bypass the public create/update gate.
+    if state.cluster.is_some() {
+        return Err(ApiError::NotImplemented(
+            CRON_MUTATION_UNSUPPORTED_IN_CELL.into(),
+        ));
+    }
     apply_catalog_snapshot(
         &state,
         &CatalogSnapshot {

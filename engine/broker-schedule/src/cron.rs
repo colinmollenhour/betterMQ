@@ -1,11 +1,12 @@
 //! Recurring schedules: cron expression or fixed interval, file-backed.
 
+use crate::legacy::{self, LegacyImport};
 use crate::persist::{
     load_json_with_recovery, persist_json_atomic, JsonLoadSource, MetadataLoadError,
 };
 use crate::retry::{self, FireFailure, FireRetry};
 use crate::ScheduledPublishRequest;
-use broker_storage::JsonlJournal;
+use broker_storage::{FileLock, JsonlJournal};
 use chrono::{DateTime, Utc};
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,8 @@ pub enum CronError {
     NotFound(Uuid),
     #[error(transparent)]
     MetadataLoad(#[from] MetadataLoadError),
+    #[error("cron journal {0} is in use by another process; every broker needs its own data dir")]
+    Locked(PathBuf),
 }
 
 /// Either a cron pattern or a fixed interval between runs.
@@ -127,6 +130,8 @@ pub struct CronRegistry {
     path: PathBuf,
     journal: JsonlJournal,
     inner: Arc<parking_lot::Mutex<CronState>>,
+    /// Exclusive ownership of the journal for the life of the registry.
+    _lock: Arc<FileLock>,
 }
 
 struct CronState {
@@ -174,19 +179,15 @@ fn apply_command(file: &mut CronFile, command: CronCommand) {
     }
 }
 
-fn meta_file_path(data_dir: &Path, name: &str) -> PathBuf {
-    if let Ok(shared) = std::env::var("BETTERMQ_SHARED_META_DIR") {
-        let dir = PathBuf::from(shared);
-        let _ = std::fs::create_dir_all(&dir);
-        return dir.join(name);
-    }
-    data_dir.join(name)
-}
-
 impl CronRegistry {
+    /// Open the node-local cron registry in `data_dir`. Never shared between
+    /// processes: the journal is locked exclusively for the registry's lifetime.
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, CronError> {
-        let path = meta_file_path(data_dir.as_ref(), "crons.json");
-        let journal = JsonlJournal::new(path.with_extension("journal"));
+        let path = data_dir.as_ref().join("crons.json");
+        let journal_path = path.with_extension("journal");
+        let lock = crate::lock_journal(&journal_path)?
+            .ok_or_else(|| CronError::Locked(journal_path.clone()))?;
+        let journal = JsonlJournal::new(journal_path);
         let mut loaded = load_json_with_recovery(&path, || CronFile {
             version: CRON_JOURNAL_VERSION,
             sequence: 0,
@@ -237,7 +238,82 @@ impl CronRegistry {
                 journal_ops,
                 retries: HashMap::new(),
             })),
+            _lock: Arc::new(lock),
         })
+    }
+
+    /// Import cron jobs that older releases stored under the shared meta dir.
+    ///
+    /// Every node runs this, so whichever node holds the scheduler lease has
+    /// the crons. Shared files are only read, never renamed, truncated or
+    /// rewritten (other nodes import from them too). Jobs already local or
+    /// recorded in this node's import ledger are skipped, so re-scans never
+    /// resurrect a cron deleted here.
+    pub fn import_legacy_shared(&self, shared_dir: &Path) -> Result<LegacyImport, CronError> {
+        let mut report = LegacyImport::default();
+        if !shared_dir.is_dir() || legacy::is_same_dir(shared_dir, &self.path) {
+            return Ok(report);
+        }
+        let snapshot = shared_dir.join("crons.json");
+        let journal = shared_dir.join("crons.journal");
+        let mut found = CronFile {
+            version: CRON_JOURNAL_VERSION,
+            sequence: 0,
+            jobs: Vec::new(),
+        };
+        if snapshot.exists() {
+            found = serde_json::from_slice(&std::fs::read(&snapshot)?)?;
+            report.sources.push(snapshot);
+        }
+        if journal.exists() {
+            // Several writers shared this journal with colliding sequence
+            // numbers: apply in file order instead of filtering by sequence.
+            for line in JsonlJournal::new(&journal).read_lines_readonly()? {
+                let record = serde_json::from_slice::<CronJournalRecord>(&line)?;
+                if record.version != CRON_JOURNAL_VERSION {
+                    return Err(CronError::InvalidSchedule(format!(
+                        "unsupported cron journal version {}",
+                        record.version
+                    )));
+                }
+                apply_command(&mut found, record.command);
+            }
+            report.sources.push(journal);
+        }
+        if found.jobs.is_empty() {
+            return Ok(report);
+        }
+        let mut ledger = legacy::Ledger::load(self.path.with_extension("imported.json"))?;
+        let mut ledger_changed = false;
+        {
+            let mut state = self.inner.lock();
+            for job in found.jobs {
+                let local = state.file.jobs.iter().any(|existing| existing.id == job.id);
+                if local || ledger.contains(&job.id) {
+                    ledger_changed |= ledger.insert(job.id);
+                    report.skipped += 1;
+                    continue;
+                }
+                self.append_command(&mut state, CronCommand::Upsert { job: job.clone() })?;
+                ledger_changed |= ledger.insert(job.id);
+                apply_command(&mut state.file, CronCommand::Upsert { job });
+                report.imported += 1;
+            }
+            self.maybe_compact(&mut state);
+        }
+        if ledger_changed {
+            ledger.save()?;
+        }
+        legacy::record_imported_crons(report.imported);
+        if report.imported > 0 {
+            info!(
+                shared_dir = %shared_dir.display(),
+                imported = report.imported,
+                skipped = report.skipped,
+                "imported legacy shared cron jobs"
+            );
+        }
+        Ok(report)
     }
 
     pub fn create(
@@ -982,6 +1058,56 @@ mod tests {
         let reopened = CronRegistry::open(&dir).unwrap();
         assert!(reopened.get(first.id).is_ok());
         assert!(reopened.get(second.id).is_ok());
+    }
+
+    #[test]
+    fn second_open_of_same_cron_journal_is_refused() {
+        let dir = temp_dir().join(format!("bettermq-cron-lock-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        assert!(matches!(
+            CronRegistry::open(&dir),
+            Err(CronError::Locked(_))
+        ));
+        drop(reg);
+        CronRegistry::open(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_shared_crons_import_on_every_node_without_resurrection() {
+        let base = temp_dir().join(format!("bettermq-cron-legacy-{}", Uuid::new_v4()));
+        let shared = base.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let writer = CronRegistry::open(&shared).unwrap();
+        let kept = writer.create("0 9 * * *", sample_request()).unwrap();
+        let gone = writer.create("0 10 * * *", sample_request()).unwrap();
+        writer.delete(gone.id).unwrap();
+        drop(writer);
+        let shared_bytes = std::fs::read(shared.join("crons.journal")).unwrap();
+
+        for node in ["n1", "n2"] {
+            let dir = base.join(node);
+            std::fs::create_dir_all(&dir).unwrap();
+            let reg = CronRegistry::open(&dir).unwrap();
+            let report = reg.import_legacy_shared(&shared).unwrap();
+            assert_eq!(report.imported, 1);
+            let imported = reg.get(kept.id).unwrap();
+            assert_eq!(imported.next_run_at_ms, kept.next_run_at_ms);
+            assert!(reg.get(gone.id).is_err());
+
+            // Deleted locally: a re-scan or restart must not bring it back.
+            reg.delete(kept.id).unwrap();
+            assert_eq!(reg.import_legacy_shared(&shared).unwrap().imported, 0);
+            drop(reg);
+            let reopened = CronRegistry::open(&dir).unwrap();
+            assert_eq!(reopened.import_legacy_shared(&shared).unwrap().imported, 0);
+            assert!(reopened.get(kept.id).is_err());
+        }
+        assert_eq!(
+            std::fs::read(shared.join("crons.journal")).unwrap(),
+            shared_bytes,
+            "shared files are read-only"
+        );
     }
 
     #[test]

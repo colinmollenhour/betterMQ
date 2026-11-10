@@ -336,12 +336,13 @@ Background loops export these `/metrics` series: `bettermq_scheduler_failures_to
 | Env | Used for |
 |-----|----------|
 | `BETTERMQ_CLUSTER_SECRET` | Internal `/internal/v1/*` (replication, lease, catalog). Also an admin credential for `/admin/v1`, and the **only** one on a standalone `bettermq panel` (required there) |
-| `BETTERMQ_SHARED_META_DIR` | Local-WAL HA: one shared filesystem for leases, cursors, catalogs, host breaker. Each node has its own `--data-dir`. Slate is single-broker only, not a shared-disk-free HA alternative |
+| `BETTERMQ_SHARED_META_DIR` | Local-WAL HA: one shared filesystem for leases, cursors, catalogs, host breaker. Each node has its own `--data-dir`. Slate is single-broker only, not a shared-disk-free HA alternative. Delayed-job and cron journals are never stored here; older releases' shared `schedule.*` / `crons.*` files are imported once (see [Scheduling in a cell](#scheduling-in-a-cell)) |
 | `BETTERMQ_DEDUP_RETENTION_SECS` | Idempotency-key retention in seconds; default and minimum `604800` (seven days). Overrides config `dedupRetention` (alias `dedup_retention`) |
 | `BETTERMQ_SHARED_META_LOCK_TIMEOUT_MS` | Shared metadata lock deadline per local/cross-process lock; default `2000` ms, maximum `60000` ms. Timeout returns HTTP `503` |
 | `BETTERMQ_SHARED_META_MAX_ENTRIES` | Shared dedup/cursor/completion entry cap; default `1000000`. New writes beyond capacity fail closed |
 | `BETTERMQ_SHARED_META_MAX_BYTES` | Estimated live shared metadata byte cap; default and maximum `268435456` (256 MiB). Serialized snapshots are also capped at 256 MiB |
 | `BETTERMQ_SHARED_META_COMPACT_BYTES` | Journal compaction threshold; default `33554432` (32 MiB), maximum `268435456` (256 MiB), or four times the estimated live set if smaller |
+| `BETTERMQ_LEGACY_SCHEDULE_IMPORT_SECS` | How long after start a node re-scans `BETTERMQ_SHARED_META_DIR` for schedule state from older releases (default `3600`, every 30 s) |
 | `BETTERMQ_BROKER_URLS` | Fleet/gateway: comma-separated broker base URLs |
 | `BETTERMQ_FLEET_CONCURRENCY` | Fleet in-flight jobs (default `1`) |
 | `BETTERMQ_FLEET_HOLDER` | Optional fleet worker id |
@@ -636,6 +637,18 @@ Local WAL HA requires `BETTERMQ_SHARED_META_DIR` (shared volume). Slate + S3 is 
 
 See [BACKUP.md](BACKUP.md) for backup/restore and host-breaker cold-start notes.
 
+#### Scheduling in a cell
+
+Delayed jobs and crons are stored in each node's own data dir and are not replicated, so a configured cluster (any `cluster.json`, even with one member) does not accept new scheduling work in this release:
+
+- `delay` on enqueue/publish (including `delay: 0`), on every ingest path, returns **501** `delayed delivery is not supported in multi-node cells in this release`. A batch with any delayed record is refused as a whole (501, one rejected result per record, nothing committed).
+- Creating, pausing or resuming crons returns **501**; deleting a cron still works. Crons that already exist keep firing on the scheduler-lease holder through the normal quorum publish path.
+- Delayed jobs accepted before the upgrade stay on the node that accepted them, with that node's local durability, until they fire. Every node fires its own (not just the scheduler holder), deduplicated by the job's idempotency key. `GET /v1/ops/aggregate` (`delayed_legacy_pending`) and `bettermq_schedule_legacy_delayed_pending` show what is left.
+- With `BETTERMQ_SHARED_META_DIR`, older releases kept `schedule.json` / `schedule.journal` / `crons.json` / `crons.journal` there. The scheduler holder imports the shared delayed jobs into its own queue (ids and deadlines kept) and renames the files to `*.imported-<ts>`; every node imports the shared crons it does not have yet, reading but never changing those files. Import ledgers (`schedule.imported.json`, `crons.imported.json` in the data dir) prevent double imports. Shared files are never truncated or compacted. `bettermq_schedule_legacy_imported_total` counts imported jobs.
+- Each journal is locked exclusively; a second process on the same data dir refuses to start.
+
+Replicated delayed delivery is planned as a follow-up.
+
 ### Shared metadata and retry retention
 
 Idempotency keys remain **tenant-wide**, including retries with a different topic or no routing key. Keys are guaranteed for `dedupRetention` seconds after insertion, default seven days. This guarantee survives WAL retention: a known mapping below the safely reclaimed log base still counts as a duplicate. After expiry, the same key can enqueue a new message. Local RocksDB periodically sweeps expired mappings; shared metadata removes them during compaction. All brokers in a cell must use the same retention setting. Existing mappings receive a persisted migration grace window when upgraded, rather than expiring immediately.
@@ -655,6 +668,7 @@ Upgrading the legacy `indexes.json` format requires a coordinated restart of eve
 | Delivery | **At-least-once** — use message / idempotency keys in handlers |
 | HA model | Local WAL: fenced shard leaders + quorum + shared metadata; Slate: single broker only |
 | Shared metadata capacity | Incremental indexed journal, but one cell-wide lock/fsync and bounded memory; not a qualified high-throughput HA backend |
+| Scheduling in a cell | `delay` and cron create/update return 501; see [Scheduling in a cell](#scheduling-in-a-cell) |
 | MinIO single-node | Dev only; not object-store HA |
 | Host breaker | Shared via `BETTERMQ_SHARED_META_DIR/host_breaker.json` when set; otherwise in-memory (lost on restart) |
 | Fleet | Not in `cluster.nodes`; claims via internal lease API |

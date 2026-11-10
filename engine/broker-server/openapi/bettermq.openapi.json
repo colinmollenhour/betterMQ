@@ -2658,6 +2658,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: the request sets delay (including 0), which multi-node cells do not support in this release. Nothing was accepted."
           }
         },
         "description": "Provide either url+secret (1:1) or group_id (fan-out). Shared options: delay, retries, idempotency, priority, outbound HTTP fields."
@@ -2834,6 +2837,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: the request sets delay (including 0), which multi-node cells do not support in this release. Nothing was accepted."
           }
         }
       }
@@ -2937,6 +2943,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: the request sets delay (including 0), which multi-node cells do not support in this release. Nothing was accepted."
           }
         }
       }
@@ -3050,6 +3059,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: the request sets delay (including 0), which multi-node cells do not support in this release. Nothing was accepted."
           }
         }
       }
@@ -3765,6 +3777,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: creating or changing crons is not supported in multi-node cells in this release (deleting still works)."
           }
         }
       }
@@ -3854,6 +3869,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: creating or changing crons is not supported in multi-node cells in this release (deleting still works)."
           }
         }
       }
@@ -3885,6 +3903,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: creating or changing crons is not supported in multi-node cells in this release (deleting still works)."
           }
         }
       }
@@ -4110,6 +4131,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: a record sets delay. The whole batch is refused (one rejected result per record) and nothing is committed."
           }
         }
       }
@@ -4164,6 +4188,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: a record sets delay. The whole batch is refused (one rejected result per record) and nothing is committed."
           }
         }
       }
@@ -4222,6 +4249,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: a record sets delay. The whole batch is refused (one rejected result per record) and nothing is committed."
           }
         }
       }
@@ -4254,6 +4284,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: a record sets delay. The whole batch is refused (one rejected result per record) and nothing is committed."
           }
         }
       }

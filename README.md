@@ -24,7 +24,7 @@ Windows: `powershell -ExecutionPolicy Bypass -c "irm https://raw.githubuserconte
 ## Features
 
 - **Push queues** — named destinations with retries and parallelism; 1:1 publish; groups (fan-out)
-- **Scheduling** — delay, cron, intervals
+- **Scheduling** — delay, cron, intervals (single node; multi-node cells return 501 for new delayed jobs and cron changes in this release)
 - **Ordering** — omit `key` for standard (high throughput); set `key` for FIFO per entity
 - **Flow control** — per-key parallelism and rate on publish
 - **Retries & DLQ** — backoff, dead-letter, idempotency keys

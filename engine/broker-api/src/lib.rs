@@ -27,6 +27,8 @@ mod rate_limit;
 pub mod request_id;
 mod retention;
 mod routes;
+#[cfg(test)]
+mod test_support;
 
 use axum::{extract::DefaultBodyLimit, routing::get, Json, Router};
 use broker_dispatch::{DispatchEngine, LeaseTable};
