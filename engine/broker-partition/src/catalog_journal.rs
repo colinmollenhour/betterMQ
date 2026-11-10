@@ -1,7 +1,6 @@
+use broker_storage::JsonlJournal;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -43,20 +42,20 @@ struct JournalRecord<C> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CatalogJournal {
-    path: PathBuf,
+    journal: JsonlJournal,
     version: u16,
 }
 
 impl CatalogJournal {
     pub(crate) fn new(snapshot_path: &Path, version: u16) -> Self {
         Self {
-            path: snapshot_path.with_extension("journal"),
+            journal: JsonlJournal::new(snapshot_path.with_extension("journal")),
             version,
         }
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.path
+        self.journal.path()
     }
 
     pub(crate) fn replay<C>(
@@ -67,25 +66,10 @@ impl CatalogJournal {
     where
         C: DeserializeOwned,
     {
-        if !self.path.exists() {
-            return Ok((snapshot_sequence, 0));
-        }
-        let bytes = std::fs::read(&self.path)?;
-        let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
         let mut sequence = snapshot_sequence;
         let mut operations = 0usize;
-        for (index, line) in lines.iter().enumerate() {
-            if line.iter().all(|byte| byte.is_ascii_whitespace()) {
-                continue;
-            }
-            let record = match serde_json::from_slice::<JournalRecord<C>>(line) {
-                Ok(record) => record,
-                Err(error) if index + 1 == lines.len() => {
-                    tracing::warn!(%error, path = %self.path.display(), "ignoring torn catalog journal tail");
-                    break;
-                }
-                Err(error) => return Err(error.into()),
-            };
+        for line in self.journal.read_lines()? {
+            let record = serde_json::from_slice::<JournalRecord<C>>(&line)?;
             if record.version != self.version {
                 return Err(CatalogJournalError::UnsupportedVersion {
                     saw: record.version,
@@ -103,81 +87,19 @@ impl CatalogJournal {
     }
 
     /// Append one record. Callers must hold the catalog's exclusive writer
-    /// lock: the journal tail is repaired to a record boundary first, so a
-    /// fragment left by a crash (or a failed earlier append) is never glued
-    /// onto the new record.
+    /// lock: [`JsonlJournal::append`] repairs the tail to a record boundary
+    /// first, so a fragment left by a crash (or a failed earlier append) is
+    /// never glued onto the new record.
     pub(crate) fn append<C>(&self, sequence: u64, command: &C) -> Result<(), CatalogJournalError>
     where
-        C: Serialize + DeserializeOwned,
+        C: Serialize,
     {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut line = serde_json::to_vec(&JournalRecord {
+        self.journal.append(&JournalRecord {
             version: self.version,
             sequence,
             command,
         })?;
-        line.push(b'\n');
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&self.path)?;
-        let end = self.repair_tail::<C>(&mut file)?;
-        file.seek(SeekFrom::Start(end))?;
-        if let Err(error) = file.write_all(&line).and_then(|()| file.sync_data()) {
-            // Roll a partial write back so the journal still ends on a boundary.
-            let _ = file.set_len(end).and_then(|()| file.sync_data());
-            return Err(error.into());
-        }
-        broker_storage::set_secret_file_mode(&self.path);
         Ok(())
-    }
-
-    /// Make the journal end on a newline-terminated record boundary and return
-    /// the resulting length. A final line that is a complete record (newline
-    /// lost) is kept, because `replay` already applies it; anything else after
-    /// the last newline is a torn write and is truncated durably.
-    fn repair_tail<C>(&self, file: &mut File) -> Result<u64, CatalogJournalError>
-    where
-        C: DeserializeOwned,
-    {
-        let len = file.metadata()?.len();
-        if len == 0 {
-            return Ok(0);
-        }
-        let mut last = [0u8; 1];
-        file.seek(SeekFrom::Start(len - 1))?;
-        file.read_exact(&mut last)?;
-        if last[0] == b'\n' {
-            return Ok(len);
-        }
-        let mut bytes = Vec::with_capacity(len as usize);
-        file.seek(SeekFrom::Start(0))?;
-        file.read_to_end(&mut bytes)?;
-        let tail_start = bytes
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |index| index + 1);
-        let tail = &bytes[tail_start..];
-        let complete = !tail.iter().all(|byte| byte.is_ascii_whitespace())
-            && serde_json::from_slice::<JournalRecord<C>>(tail).is_ok();
-        if complete {
-            file.seek(SeekFrom::Start(len))?;
-            file.write_all(b"\n")?;
-            file.sync_data()?;
-            return Ok(len + 1);
-        }
-        tracing::warn!(
-            path = %self.path.display(),
-            discarded_bytes = tail.len(),
-            "truncating torn catalog journal tail before append"
-        );
-        file.set_len(tail_start as u64)?;
-        file.sync_data()?;
-        Ok(tail_start as u64)
     }
 
     pub(crate) fn compact<T>(
@@ -191,12 +113,7 @@ impl CatalogJournal {
         let bytes = serde_json::to_vec_pretty(snapshot)?;
         broker_storage::atomic_write_file(snapshot_path, &bytes)?;
         broker_storage::set_secret_file_mode(snapshot_path);
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        file.sync_data()?;
+        self.journal.reset()?;
         Ok(())
     }
 }
@@ -204,6 +121,8 @@ impl CatalogJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
+    use std::io::Write;
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     struct Command(u64);
@@ -293,5 +212,29 @@ mod tests {
         assert!(replay_all(&journal).is_empty());
         journal.append(1, &Command(1)).unwrap();
         assert_eq!(replay_all(&CatalogJournal::new(&snapshot, 1)), vec![1]);
+    }
+
+    #[test]
+    fn append_after_torn_tail_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("catalog.json");
+        let journal = CatalogJournal::new(&snapshot, 1);
+        journal.append(1, &Command(1)).unwrap();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(snapshot.with_extension("journal"))
+            .unwrap();
+        file.write_all(br#"{"version":1,"seq"#).unwrap();
+        drop(file);
+
+        journal.replay(0, |_: Command| {}).unwrap();
+        journal.append(2, &Command(2)).unwrap();
+
+        let mut applied = Vec::new();
+        let (sequence, _) = CatalogJournal::new(&snapshot, 1)
+            .replay(0, |command: Command| applied.push(command.0))
+            .unwrap();
+        assert_eq!(sequence, 2);
+        assert_eq!(applied, vec![1, 2]);
     }
 }

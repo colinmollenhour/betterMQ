@@ -4,6 +4,7 @@ mod cron;
 mod persist;
 mod retry;
 
+use broker_storage::JsonlJournal;
 use chrono::Utc;
 pub use cron::{normalize_cron, CronError, CronJob, CronRegistry, ScheduleKind};
 use parking_lot::Mutex;
@@ -16,8 +17,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -159,7 +158,7 @@ impl Ord for HeapItem {
 #[derive(Clone)]
 pub struct ScheduleQueue {
     path: PathBuf,
-    journal_path: PathBuf,
+    journal: JsonlJournal,
     state: Arc<Mutex<ScheduleState>>,
 }
 
@@ -218,7 +217,7 @@ fn meta_file_path(data_dir: &std::path::Path, name: &str) -> std::path::PathBuf 
 impl ScheduleQueue {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, ScheduleError> {
         let path = meta_file_path(data_dir.as_ref(), "schedule.json");
-        let journal_path = path.with_extension("journal");
+        let journal = JsonlJournal::new(path.with_extension("journal"));
         let loaded = load_json_with_recovery(&path, || ScheduleSnapshotCompat::Legacy(Vec::new()))?;
         let (items, mut sequence) = match loaded.value {
             ScheduleSnapshotCompat::Current(snapshot) => {
@@ -242,46 +241,35 @@ impl ScheduleQueue {
         }
         let mut heap: BinaryHeap<HeapItem> = items.into_iter().collect();
         let mut journal_ops = 0usize;
-        if journal_path.exists() {
-            let bytes = std::fs::read(&journal_path)?;
-            let lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
-            for (index, line) in lines.iter().enumerate() {
-                if line.iter().all(|b| b.is_ascii_whitespace()) {
-                    continue;
-                }
-                let record = match serde_json::from_slice::<JournalRecord>(line) {
-                    Ok(record) => record,
-                    Err(record_error) => match serde_json::from_slice::<JournalOp>(line) {
-                        Ok(op) => JournalRecord {
-                            version: SCHEDULE_STATE_VERSION,
-                            sequence: sequence.saturating_add(1),
-                            op,
-                        },
-                        Err(_) if index + 1 == lines.len() => {
-                            tracing::warn!(%record_error, "ignoring torn schedule journal tail");
-                            break;
-                        }
-                        Err(_) => return Err(ScheduleError::Serde(record_error)),
+        for line in journal.read_lines()? {
+            let record = match serde_json::from_slice::<JournalRecord>(&line) {
+                Ok(record) => record,
+                Err(record_error) => match serde_json::from_slice::<JournalOp>(&line) {
+                    Ok(op) => JournalRecord {
+                        version: SCHEDULE_STATE_VERSION,
+                        sequence: sequence.saturating_add(1),
+                        op,
                     },
-                };
-                if record.version != SCHEDULE_STATE_VERSION {
-                    return Err(ScheduleError::UnsupportedVersion(record.version));
+                    Err(_) => return Err(ScheduleError::Serde(record_error)),
+                },
+            };
+            if record.version != SCHEDULE_STATE_VERSION {
+                return Err(ScheduleError::UnsupportedVersion(record.version));
+            }
+            if record.sequence <= sequence {
+                continue;
+            }
+            sequence = record.sequence;
+            journal_ops += 1;
+            match record.op {
+                JournalOp::Add { item } => {
+                    let mut items: Vec<_> = heap.drain().filter(|i| i.id != item.id).collect();
+                    items.push(item);
+                    heap.extend(items);
                 }
-                if record.sequence <= sequence {
-                    continue;
-                }
-                sequence = record.sequence;
-                journal_ops += 1;
-                match record.op {
-                    JournalOp::Add { item } => {
-                        let mut items: Vec<_> = heap.drain().filter(|i| i.id != item.id).collect();
-                        items.push(item);
-                        heap.extend(items);
-                    }
-                    JournalOp::Remove { id } => {
-                        let items: Vec<_> = heap.drain().filter(|i| i.id != id).collect();
-                        heap.extend(items);
-                    }
+                JournalOp::Remove { id } => {
+                    let items: Vec<_> = heap.drain().filter(|i| i.id != id).collect();
+                    heap.extend(items);
                 }
             }
         }
@@ -292,7 +280,7 @@ impl ScheduleQueue {
             .collect();
         Ok(Self {
             path,
-            journal_path,
+            journal,
             state: Arc::new(Mutex::new(ScheduleState {
                 heap,
                 in_flight: HashMap::new(),
@@ -510,34 +498,25 @@ impl ScheduleQueue {
     }
 
     /// Append records in one write followed by one fsync. A crash can tear
-    /// only the final line, which `open` ignores.
+    /// only the final line, which the next append or `open` cuts off.
     fn append_ops(
         &self,
         state: &mut ScheduleState,
         ops: Vec<JournalOp>,
     ) -> Result<(), ScheduleError> {
-        if let Some(parent) = self.journal_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let mut sequence = state.sequence;
-        let mut buffer = Vec::new();
-        for op in ops {
-            sequence = sequence.saturating_add(1);
-            let record = JournalRecord {
-                version: SCHEDULE_STATE_VERSION,
-                sequence,
-                op,
-            };
-            serde_json::to_writer(&mut buffer, &record)?;
-            buffer.push(b'\n');
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.journal_path)?;
-        file.write_all(&buffer)?;
-        file.sync_data()?;
-        broker_storage::set_secret_file_mode(&self.journal_path);
+        let records: Vec<_> = ops
+            .into_iter()
+            .map(|op| {
+                sequence = sequence.saturating_add(1);
+                JournalRecord {
+                    version: SCHEDULE_STATE_VERSION,
+                    sequence,
+                    op,
+                }
+            })
+            .collect();
+        self.journal.append_all(&records)?;
         state.sequence = sequence;
         Ok(())
     }
@@ -569,13 +548,7 @@ impl ScheduleQueue {
             return;
         }
         broker_storage::set_secret_file_mode(&self.path);
-        match OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.journal_path)
-            .and_then(|file| file.sync_data())
-        {
+        match self.journal.reset() {
             Ok(()) => state.journal_ops = 0,
             Err(error) => tracing::warn!(%error, "schedule journal compaction truncate failed"),
         }
@@ -797,6 +770,33 @@ mod schedule_tests {
         queue.cancel(pending.id).unwrap();
         queue.fail(pending, FireFailure::Transient, 0).unwrap();
         assert!(queue.list().is_empty());
+    }
+
+    #[test]
+    fn append_after_torn_journal_tail_survives_restart() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        let first = queue.schedule(request(), 60_000).unwrap();
+        drop(queue);
+        let journal = dir.path().join("schedule.journal");
+        let mut bytes = std::fs::read(&journal).unwrap();
+        bytes.extend_from_slice(br#"{"version":1,"sequence":2,"op":{"op":"ad"#);
+        std::fs::write(&journal, bytes).unwrap();
+
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        let second = queue.schedule(request(), 60_000).unwrap();
+        drop(queue);
+
+        let mut ids: Vec<_> = ScheduleQueue::open(dir.path())
+            .unwrap()
+            .list()
+            .into_iter()
+            .map(|job| job.id)
+            .collect();
+        ids.sort();
+        let mut expected = vec![first.id, second.id];
+        expected.sort();
+        assert_eq!(ids, expected);
     }
 
     #[test]

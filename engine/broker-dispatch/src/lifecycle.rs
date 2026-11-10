@@ -1,8 +1,7 @@
 use crate::retry_state::RetryKey;
+use broker_storage::JsonlJournal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -63,7 +62,7 @@ struct Record {
 #[derive(Clone)]
 pub(crate) struct LifecycleStore {
     snapshot_path: PathBuf,
-    journal_path: PathBuf,
+    journal: JsonlJournal,
     state: Arc<parking_lot::Mutex<Snapshot>>,
     io_lock: Arc<parking_lot::Mutex<()>>,
 }
@@ -79,35 +78,22 @@ impl LifecycleStore {
         } else {
             Snapshot::default()
         };
-        if journal_path.exists() {
-            let bytes = std::fs::read(&journal_path)?;
-            let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
-            for (index, line) in lines.iter().enumerate() {
-                if line.iter().all(|byte| byte.is_ascii_whitespace()) {
-                    continue;
-                }
-                let record = match serde_json::from_slice::<Record>(line) {
-                    Ok(record) => record,
-                    Err(error) if index + 1 == lines.len() => {
-                        tracing::warn!(%error, "ignoring torn lifecycle journal tail");
-                        break;
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                if record.version != LIFECYCLE_VERSION {
-                    return Err(LifecycleError::UnsupportedVersion(record.version));
-                }
-                if record.sequence <= state.sequence {
-                    continue;
-                }
-                state.sequence = record.sequence;
-                apply(&mut state, record.event);
-                state.journal_ops += 1;
+        let journal = JsonlJournal::new(journal_path);
+        for line in journal.read_lines()? {
+            let record = serde_json::from_slice::<Record>(&line)?;
+            if record.version != LIFECYCLE_VERSION {
+                return Err(LifecycleError::UnsupportedVersion(record.version));
             }
+            if record.sequence <= state.sequence {
+                continue;
+            }
+            state.sequence = record.sequence;
+            apply(&mut state, record.event);
+            state.journal_ops += 1;
         }
         Ok(Self {
             snapshot_path,
-            journal_path,
+            journal,
             state: Arc::new(parking_lot::Mutex::new(state)),
             io_lock: Arc::new(parking_lot::Mutex::new(())),
         })
@@ -161,21 +147,11 @@ impl LifecycleStore {
 
     fn write(&self, event: Event) -> Result<(), LifecycleError> {
         let sequence = self.state.lock().sequence.saturating_add(1);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.journal_path)?;
-        serde_json::to_writer(
-            &mut file,
-            &Record {
-                version: LIFECYCLE_VERSION,
-                sequence,
-                event,
-            },
-        )?;
-        file.write_all(b"\n")?;
-        file.sync_data()?;
-        broker_storage::set_secret_file_mode(&self.journal_path);
+        self.journal.append(&Record {
+            version: LIFECYCLE_VERSION,
+            sequence,
+            event,
+        })?;
         let mut state = self.state.lock();
         state.sequence = sequence;
         state.journal_ops += 1;
@@ -189,12 +165,7 @@ impl LifecycleStore {
         }
         broker_storage::atomic_write_file(&self.snapshot_path, &serde_json::to_vec(&*state)?)?;
         broker_storage::set_secret_file_mode(&self.snapshot_path);
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.journal_path)?;
-        file.sync_data()?;
+        self.journal.reset()?;
         state.journal_ops = 0;
         Ok(())
     }
@@ -304,5 +275,34 @@ mod tests {
             LifecycleStore::open(dir.path()).unwrap().pending().len(),
             1032
         );
+    }
+
+    #[test]
+    fn append_after_torn_tail_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = transition();
+        let store = LifecycleStore::open(dir.path()).unwrap();
+        store.prepare(first.clone()).unwrap();
+        drop(store);
+        let journal = dir.path().join("dispatch-lifecycle.journal");
+        let mut bytes = std::fs::read(&journal).unwrap();
+        bytes.extend_from_slice(br#"{"version":1,"sequ"#);
+        std::fs::write(&journal, bytes).unwrap();
+
+        let store = LifecycleStore::open(dir.path()).unwrap();
+        let second = transition();
+        store.prepare(second.clone()).unwrap();
+        drop(store);
+
+        let reopened = LifecycleStore::open(dir.path()).unwrap();
+        let mut sources: Vec<_> = reopened
+            .pending()
+            .into_iter()
+            .map(|transition| transition.source.message_id)
+            .collect();
+        sources.sort();
+        let mut expected = vec![first.source.message_id, second.source.message_id];
+        expected.sort();
+        assert_eq!(sources, expected);
     }
 }

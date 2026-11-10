@@ -5,12 +5,11 @@ use crate::persist::{
 };
 use crate::retry::{self, FireFailure, FireRetry};
 use crate::ScheduledPublishRequest;
+use broker_storage::JsonlJournal;
 use chrono::{DateTime, Utc};
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -123,7 +122,7 @@ struct CronFile {
 #[derive(Clone)]
 pub struct CronRegistry {
     path: PathBuf,
-    journal_path: PathBuf,
+    journal: JsonlJournal,
     inner: Arc<parking_lot::Mutex<CronState>>,
 }
 
@@ -184,7 +183,7 @@ fn meta_file_path(data_dir: &Path, name: &str) -> PathBuf {
 impl CronRegistry {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, CronError> {
         let path = meta_file_path(data_dir.as_ref(), "crons.json");
-        let journal_path = path.with_extension("journal");
+        let journal = JsonlJournal::new(path.with_extension("journal"));
         let mut loaded = load_json_with_recovery(&path, || CronFile {
             version: CRON_JOURNAL_VERSION,
             sequence: 0,
@@ -210,39 +209,25 @@ impl CronRegistry {
         loaded.value.version = CRON_JOURNAL_VERSION;
         let mut sequence = loaded.value.sequence;
         let mut journal_ops = 0usize;
-        if journal_path.exists() {
-            let bytes = std::fs::read(&journal_path)?;
-            let lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
-            for (index, line) in lines.iter().enumerate() {
-                if line.iter().all(|b| b.is_ascii_whitespace()) {
-                    continue;
-                }
-                let record = match serde_json::from_slice::<CronJournalRecord>(line) {
-                    Ok(record) => record,
-                    Err(error) if index + 1 == lines.len() => {
-                        tracing::warn!(%error, "ignoring torn cron journal tail");
-                        break;
-                    }
-                    Err(error) => return Err(CronError::Serde(error)),
-                };
-                if record.version != CRON_JOURNAL_VERSION {
-                    return Err(CronError::InvalidSchedule(format!(
-                        "unsupported cron journal version {}",
-                        record.version
-                    )));
-                }
-                if record.sequence <= sequence {
-                    continue;
-                }
-                sequence = sequence.max(record.sequence);
-                journal_ops += 1;
-                apply_command(&mut loaded.value, record.command);
+        for line in journal.read_lines()? {
+            let record = serde_json::from_slice::<CronJournalRecord>(&line)?;
+            if record.version != CRON_JOURNAL_VERSION {
+                return Err(CronError::InvalidSchedule(format!(
+                    "unsupported cron journal version {}",
+                    record.version
+                )));
             }
+            if record.sequence <= sequence {
+                continue;
+            }
+            sequence = sequence.max(record.sequence);
+            journal_ops += 1;
+            apply_command(&mut loaded.value, record.command);
         }
         loaded.value.sequence = sequence;
         Ok(Self {
             path,
-            journal_path,
+            journal,
             inner: Arc::new(parking_lot::Mutex::new(CronState {
                 file: loaded.value,
                 sequence,
@@ -554,14 +539,7 @@ impl CronRegistry {
             sequence,
             command,
         };
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.journal_path)?;
-        serde_json::to_writer(&mut file, &record)?;
-        file.write_all(b"\n")?;
-        file.sync_data()?;
-        broker_storage::set_secret_file_mode(&self.journal_path);
+        self.journal.append(&record)?;
         state.sequence = sequence;
         state.file.sequence = sequence;
         state.journal_ops += 1;
@@ -579,13 +557,7 @@ impl CronRegistry {
             return;
         }
         broker_storage::set_secret_file_mode(&self.path);
-        match OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.journal_path)
-            .and_then(|file| file.sync_data())
-        {
+        match self.journal.reset() {
             Ok(()) => state.journal_ops = 0,
             Err(error) => tracing::warn!(%error, "cron journal compaction failed"),
         }
@@ -919,6 +891,27 @@ mod tests {
         assert_eq!(restored.next_run_at_ms, job.created_at_ms + 20_000);
         assert_eq!(restored.last_run_at_ms, Some(job.created_at_ms + 10_000));
         assert!(dir.join("crons.journal").exists());
+    }
+
+    #[test]
+    fn append_after_torn_journal_tail_survives_restart() {
+        let dir = temp_dir().join(format!("bettermq-cron-torn-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        let first = reg.create("0 9 * * *", sample_request()).unwrap();
+        drop(reg);
+        let journal = dir.join("crons.journal");
+        let mut bytes = std::fs::read(&journal).unwrap();
+        bytes.extend_from_slice(br#"{"version":1,"sequence":2,"comm"#);
+        std::fs::write(&journal, bytes).unwrap();
+
+        let reg = CronRegistry::open(&dir).unwrap();
+        let second = reg.create("0 10 * * *", sample_request()).unwrap();
+        drop(reg);
+
+        let reopened = CronRegistry::open(&dir).unwrap();
+        assert!(reopened.get(first.id).is_ok());
+        assert!(reopened.get(second.id).is_ok());
     }
 
     #[test]

@@ -1,7 +1,6 @@
+use broker_storage::JsonlJournal;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -98,7 +97,7 @@ struct RetryJournalRecord {
 #[derive(Clone)]
 pub(crate) struct RetryState {
     snapshot_path: PathBuf,
-    journal_path: PathBuf,
+    journal: JsonlJournal,
     state: Arc<parking_lot::Mutex<RetrySnapshot>>,
     io_lock: Arc<parking_lot::Mutex<()>>,
 }
@@ -115,35 +114,22 @@ impl RetryState {
             RetrySnapshot::default()
         };
         rebuild_index(&mut state);
-        if journal_path.exists() {
-            let bytes = std::fs::read(&journal_path)?;
-            let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
-            for (index, line) in lines.iter().enumerate() {
-                if line.iter().all(|byte| byte.is_ascii_whitespace()) {
-                    continue;
-                }
-                let record = match serde_json::from_slice::<RetryJournalRecord>(line) {
-                    Ok(record) => record,
-                    Err(error) if index + 1 == lines.len() => {
-                        tracing::warn!(%error, "ignoring torn retry journal tail");
-                        break;
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                if record.version != RETRY_STATE_VERSION {
-                    return Err(RetryStateError::UnsupportedVersion(record.version));
-                }
-                if record.sequence <= state.sequence {
-                    continue;
-                }
-                state.sequence = record.sequence;
-                apply_event(&mut state, record.event);
-                state.journal_ops += 1;
+        let journal = JsonlJournal::new(journal_path);
+        for line in journal.read_lines()? {
+            let record = serde_json::from_slice::<RetryJournalRecord>(&line)?;
+            if record.version != RETRY_STATE_VERSION {
+                return Err(RetryStateError::UnsupportedVersion(record.version));
             }
+            if record.sequence <= state.sequence {
+                continue;
+            }
+            state.sequence = record.sequence;
+            apply_event(&mut state, record.event);
+            state.journal_ops += 1;
         }
         Ok(Self {
             snapshot_path,
-            journal_path,
+            journal,
             state: Arc::new(parking_lot::Mutex::new(state)),
             io_lock: Arc::new(parking_lot::Mutex::new(())),
         })
@@ -197,21 +183,11 @@ impl RetryState {
 
     fn append(&self, event: RetryEvent) -> Result<(), RetryStateError> {
         let sequence = self.state.lock().sequence.saturating_add(1);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.journal_path)?;
-        serde_json::to_writer(
-            &mut file,
-            &RetryJournalRecord {
-                version: RETRY_STATE_VERSION,
-                sequence,
-                event,
-            },
-        )?;
-        file.write_all(b"\n")?;
-        file.sync_data()?;
-        broker_storage::set_secret_file_mode(&self.journal_path);
+        self.journal.append(&RetryJournalRecord {
+            version: RETRY_STATE_VERSION,
+            sequence,
+            event,
+        })?;
         let mut state = self.state.lock();
         state.sequence = sequence;
         state.journal_ops += 1;
@@ -226,12 +202,7 @@ impl RetryState {
         let bytes = serde_json::to_vec(&*state)?;
         broker_storage::atomic_write_file(&self.snapshot_path, &bytes)?;
         broker_storage::set_secret_file_mode(&self.snapshot_path);
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.journal_path)?;
-        file.sync_data()?;
+        self.journal.reset()?;
         state.journal_ops = 0;
         Ok(())
     }
@@ -359,5 +330,40 @@ mod tests {
         let snapshot: RetrySnapshot =
             serde_json::from_str(r#"{"sequence":1,"records":{}}"#).unwrap();
         assert!(snapshot.records.is_empty());
+    }
+
+    #[test]
+    fn append_after_torn_tail_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |offset| RetryRecord {
+            key: RetryKey {
+                topic: "orders".into(),
+                partition: 0,
+                offset,
+                message_id: Uuid::new_v4(),
+            },
+            cursor_key: "lane".into(),
+            fifo_key: None,
+            attempts: 1,
+            due_at_ms: 1,
+            last_error: "HTTP 503".into(),
+        };
+        let first = record(1);
+        let state = RetryState::open(dir.path()).unwrap();
+        state.schedule(first.clone()).unwrap();
+        drop(state);
+        let journal = dir.path().join("dispatch-retries.journal");
+        let mut bytes = std::fs::read(&journal).unwrap();
+        bytes.extend_from_slice(br#"{"version":1,"seq"#);
+        std::fs::write(&journal, bytes).unwrap();
+
+        let state = RetryState::open(dir.path()).unwrap();
+        let second = record(2);
+        state.schedule(second.clone()).unwrap();
+        drop(state);
+
+        let reopened = RetryState::open(dir.path()).unwrap();
+        assert!(reopened.get(&first.key).is_some());
+        assert!(reopened.get(&second.key).is_some());
     }
 }
