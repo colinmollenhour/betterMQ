@@ -32,7 +32,7 @@ pub use archive::{restore_object_archive, restore_object_archive_until, scrub_ob
 pub use backend::{PartitionBackend, StorageMode};
 pub use flock::FileLock;
 pub use indexes::{DedupEntry, IndexError, MetadataStore, MetadataWriteBatch};
-pub use log::{FsyncMode, LogError, PartitionLog, PartitionLogConfig};
+pub use log::{storage_faults, FsyncMode, LogError, PartitionLog, PartitionLogConfig};
 pub use manifest::{WalManifest, WAL_FORMAT_V1, WAL_FORMAT_V2};
 pub use message_store::{MessageStore, StoreError};
 pub use meta::{atomic_write_file, set_secret_file_mode, LogMeta};
@@ -50,8 +50,8 @@ pub use state_index::{
     RocksStateIndex, StateIndex, StateIndexError, StateWriteBatch, WriteDurability,
 };
 pub use telemetry::{
-    storage_telemetry_snapshot, StorageShardTelemetrySnapshot, StorageTelemetrySnapshot,
-    FSYNC_BUCKET_US, MAX_TELEMETRY_SHARDS,
+    storage_telemetry_snapshot, StorageFault, StorageFaultKind, StorageShardTelemetrySnapshot,
+    StorageTelemetrySnapshot, FSYNC_BUCKET_US, MAX_TELEMETRY_SHARDS,
 };
 
 pub use broker_proto::{LogRecord, StoredMessage};

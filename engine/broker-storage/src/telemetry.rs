@@ -1,6 +1,7 @@
 //! Bounded, lock-free-per-shard WAL telemetry.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -25,6 +26,7 @@ struct ShardCounters {
     fsync_latency_sum_us: AtomicU64,
     fsync_buckets: [AtomicU64; 10],
     fence_events: AtomicU64,
+    quarantine_events: AtomicU64,
 }
 
 #[derive(Default)]
@@ -106,6 +108,13 @@ impl StorageTelemetryHandle {
     pub(crate) fn record_fence(&self) {
         self.counters.fence_events.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// WAL corruption was found, or an open was refused because of it.
+    pub(crate) fn record_quarantine(&self) {
+        self.counters
+            .quarantine_events
+            .fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +136,8 @@ pub struct StorageShardTelemetrySnapshot {
     /// Times a partition log on this shard was fenced (writes refused until
     /// reopen). Any non-zero value needs operator attention.
     pub fence_events: u64,
+    /// WAL corruption detections plus opens refused by a quarantine marker.
+    pub quarantine_events: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,10 +170,63 @@ pub fn storage_telemetry_snapshot() -> StorageTelemetrySnapshot {
                 counters.fsync_buckets[index].load(Ordering::Relaxed)
             }),
             fence_events: counters.fence_events.load(Ordering::Relaxed),
+            quarantine_events: counters.quarantine_events.load(Ordering::Relaxed),
         })
         .collect();
     StorageTelemetrySnapshot {
         shards,
         dropped_shards: registry.dropped_shards,
     }
+}
+
+/// Why a partition log cannot serve: readiness reports these per shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFaultKind {
+    /// WAL corruption was found; the log refuses to open until repaired.
+    Quarantined,
+    /// A WAL write could not be rolled back or an fsync failed; the log
+    /// refuses writes until the broker restarts.
+    Fenced,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageFault {
+    pub shard: u32,
+    pub dir: PathBuf,
+    pub kind: StorageFaultKind,
+    pub reason: String,
+}
+
+/// Current faults keyed by log directory. Unlike the event counters these
+/// clear: when a fenced log is dropped or a directory opens cleanly again.
+static FAULTS: OnceLock<Mutex<BTreeMap<PathBuf, StorageFault>>> = OnceLock::new();
+
+fn faults() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, StorageFault>> {
+    FAULTS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(crate) fn set_fault(dir: &Path, shard: u32, kind: StorageFaultKind, reason: String) {
+    faults().insert(
+        dir.to_path_buf(),
+        StorageFault {
+            shard,
+            dir: dir.to_path_buf(),
+            kind,
+            reason,
+        },
+    );
+}
+
+pub(crate) fn clear_fault(dir: &Path) {
+    faults().remove(dir);
+}
+
+/// Current faults, after dropping entries `still_applies` rejects.
+pub(crate) fn current_faults(still_applies: impl Fn(&StorageFault) -> bool) -> Vec<StorageFault> {
+    let mut faults = faults();
+    faults.retain(|_, fault| still_applies(fault));
+    faults.values().cloned().collect()
 }

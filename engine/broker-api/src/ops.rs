@@ -13,6 +13,37 @@ pub struct ReadyResponse {
     pub ready: bool,
     pub cluster_healthy: bool,
     pub auth_configured: bool,
+    /// False while any local partition log is quarantined or fenced.
+    pub storage_healthy: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub storage_faults: Vec<ShardStorageFault>,
+}
+
+/// One unavailable local shard. Paths and topic names stay in the logs and
+/// `quarantine.json`: `/readyz` is unauthenticated.
+#[derive(Debug, Serialize)]
+pub struct ShardStorageFault {
+    pub shard: u32,
+    pub state: &'static str,
+    pub reason: &'static str,
+}
+
+fn shard_storage_faults(faults: Vec<broker_storage::StorageFault>) -> Vec<ShardStorageFault> {
+    faults
+        .into_iter()
+        .map(|fault| match fault.kind {
+            broker_storage::StorageFaultKind::Quarantined => ShardStorageFault {
+                shard: fault.shard,
+                state: "quarantined",
+                reason: "WAL corruption detected; repair the WAL and remove quarantine.json",
+            },
+            broker_storage::StorageFaultKind::Fenced => ShardStorageFault {
+                shard: fault.shard,
+                state: "fenced",
+                reason: "WAL write or fsync failed; restart the broker to recover from disk",
+            },
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -116,10 +147,14 @@ pub fn ready_snapshot(state: &AppState) -> ReadyResponse {
             alive >= cfg.quorum_size()
         }
     };
+    let storage_faults = shard_storage_faults(broker_storage::storage_faults());
+    let storage_healthy = storage_faults.is_empty();
     ReadyResponse {
-        ready: auth_configured && cluster_healthy,
+        ready: auth_configured && cluster_healthy && storage_healthy,
         cluster_healthy,
         auth_configured,
+        storage_healthy,
+        storage_faults,
     }
 }
 

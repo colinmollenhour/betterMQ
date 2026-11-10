@@ -37,3 +37,24 @@ not a launch result.
   bounded archive lag, no readiness false positives, and stable p99 latency.
 - Save metrics, load-generator settings, logs, and a redacted
   `bettermq support-bundle` with the release evidence.
+
+## WAL corruption and fenced shards
+
+Recovery never discards records it cannot prove were unacknowledged:
+
+- Only an incomplete or zero-filled record at the very end of `active.wal`,
+  above the last fsynced offset, is a torn tail and is truncated on open.
+- Any other decode failure, a short sealed segment, a missing segment, or fewer
+  records than were last fsynced (`durable_offset` in `meta.json`) quarantines
+  the shard. The broker writes `quarantine.json` in the shard directory and
+  leaves the WAL files untouched. The shard refuses to open, through lazy
+  reopens and restarts, until an operator acts.
+- To recover, restore the named file from a replica or archive, or knowingly
+  truncate it at the reported offset. Then delete `quarantine.json`. A file
+  named `active.corrupt.<ts>` (left by older versions) also blocks open; move
+  it out of the shard directory once its records are restored or written off.
+- `bettermq_wal_quarantine_events_total` counts detections and refused opens.
+  `bettermq_wal_fence_events_total` counts shards that stopped accepting writes
+  after a WAL write could not be rolled back. A fenced shard recovers when the
+  broker restarts and the log is rebuilt from disk. Alert on any increase of
+  either counter.

@@ -62,6 +62,11 @@ pub struct LogMeta {
     /// lower number are deletion leftovers and are removed on open.
     #[serde(default)]
     pub base_segment: u64,
+    /// Exclusive offset known to be fsynced to the WAL. Advanced only after a
+    /// successful sync, so it is a lower bound of what recovery must find;
+    /// opening with fewer records fails instead of reusing their offsets.
+    #[serde(default)]
+    pub durable_offset: u64,
 }
 
 impl LogMeta {

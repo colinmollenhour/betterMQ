@@ -2026,4 +2026,90 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
+
+    #[tokio::test]
+    async fn readyz_reports_a_quarantined_shard_until_it_is_repaired() {
+        const SHARD: u32 = 40_123;
+        let dir = tempdir().unwrap();
+        let store = broker_local_auth::LocalAuthStore::open(dir.path()).unwrap();
+        store.setup("password1234").unwrap();
+        let mut state = test_state(&dir);
+        state.local_auth = Some(Arc::new(store));
+        let state = Arc::new(state);
+        assert!(ops::ready_snapshot(&state).ready);
+
+        let shard_dir = dir.path().join("quarantined-shard");
+        let open = || {
+            broker_storage::PartitionLog::open_for_shard(
+                &shard_dir,
+                broker_storage::PartitionLogConfig::default(),
+                SHARD,
+                broker_storage::WAL_FORMAT_V2,
+            )
+        };
+        {
+            let mut log = open().unwrap();
+            for body in [b"one".to_vec(), b"two".to_vec()] {
+                log.append(SHARD, record_for_ready(), body).unwrap();
+            }
+            log.sync().unwrap();
+        }
+        let wal = shard_dir.join("active.wal");
+        let good = std::fs::read(&wal).unwrap();
+        let mut bad = good.clone();
+        bad[broker_proto::epoch::EPOCH_HEADER_BYTES + 16] ^= 0xff;
+        std::fs::write(&wal, bad).unwrap();
+        assert!(open().is_err());
+
+        let snapshot = ops::ready_snapshot(&state);
+        assert!(!snapshot.ready && !snapshot.storage_healthy);
+        let fault = snapshot
+            .storage_faults
+            .iter()
+            .find(|fault| fault.shard == SHARD)
+            .expect("quarantined shard listed");
+        assert_eq!(fault.state, "quarantined");
+        let body = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            !body.contains("quarantined-shard"),
+            "no paths on /readyz: {body}"
+        );
+        let (status, _) = ops::readyz(axum::extract::State(state.clone())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        // Operator repair: restore the WAL and remove the marker.
+        std::fs::write(&wal, good).unwrap();
+        std::fs::remove_file(shard_dir.join("quarantine.json")).unwrap();
+        assert!(ops::ready_snapshot(&state).ready);
+        drop(open().unwrap());
+        assert!(ops::ready_snapshot(&state).ready);
+    }
+
+    fn record_for_ready() -> broker_proto::LogRecord {
+        broker_proto::LogRecord {
+            id: uuid::Uuid::new_v4(),
+            tenant_id: "default".into(),
+            topic: "orders".into(),
+            routing_key: "rk".into(),
+            idempotency_key: None,
+            published_at_ms: 1,
+            priority: 5,
+            flow_parallelism: None,
+            flow_key: None,
+            flow_rate: None,
+            flow_period_secs: None,
+            queue_id: None,
+            group_id: None,
+            group_member_id: None,
+            flow_profile_id: None,
+            destination_url: None,
+            destination_secret: None,
+            max_retries: 0,
+            retry_backoff: None,
+            http_method: None,
+            http_headers_json: None,
+            http_sign: None,
+            payload_ref_json: None,
+        }
+    }
 }

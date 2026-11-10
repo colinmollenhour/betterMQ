@@ -181,6 +181,8 @@ pub enum LogError {
     Slate(String),
     #[error("partition log fenced until reopened from disk: {0}")]
     Fenced(String),
+    #[error("partition log quarantined: {0}")]
+    Quarantined(String),
 }
 
 #[cfg(test)]
@@ -235,6 +237,16 @@ impl PartitionLog {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
         std::fs::create_dir_all(dir.join(SEGMENTS_DIR))?;
+        if let Some(reason) = quarantine_reason(&dir)? {
+            crate::telemetry::register_shard(shard_id).record_quarantine();
+            crate::telemetry::set_fault(
+                &dir,
+                shard_id,
+                crate::telemetry::StorageFaultKind::Quarantined,
+                reason.clone(),
+            );
+            return Err(LogError::Quarantined(reason));
+        }
         let manifest = WalManifest::load_or_create(&dir, requested_format, shard_id)?;
 
         let meta = match LogMeta::load(&dir) {
@@ -280,6 +292,7 @@ impl PartitionLog {
 
         log.rebuild_from_disk()?;
         log.committed_hwm = log.meta.next_offset;
+        crate::telemetry::clear_fault(&dir);
 
         info!(
             dir = %dir.display(),
@@ -320,6 +333,9 @@ impl PartitionLog {
                 self.recover_missing_base(&segment_files, lowest)?;
             }
         }
+        if segment_files.is_empty() {
+            self.adopt_legacy_active_base()?;
+        }
 
         // Offsets are absolute: a GC'd prefix must not renumber survivors.
         let mut next = self.meta.base_offset;
@@ -338,10 +354,77 @@ impl PartitionLog {
         let wal_path = self.dir.join(WAL_FILE);
         next = self.scan_file(&wal_path, next, true)?;
 
+        if next < self.meta.durable_offset {
+            // An earlier run fsynced records up to durable_offset; whatever
+            // removed them (a deleted or replaced active.wal, lost segments),
+            // continuing would hand their offsets to new records.
+            let error = LogError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "recovered next offset {next} is below the durable offset {}: \
+                     acknowledged records are missing",
+                    self.meta.durable_offset
+                ),
+            ));
+            return Err(self.quarantine(&wal_path, next, error));
+        }
+
         self.wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
         self.meta.next_offset = next;
+        if self.config.fsync != FsyncMode::Os {
+            // Recovered bytes may still be only in the page cache (a process
+            // crash, not a power loss); make them durable before recording
+            // them as such.
+            self.wal.sync_data()?;
+            self.meta.durable_offset = next;
+        }
         self.meta.save(&self.dir)?;
         Ok(())
+    }
+
+    /// Record that `path` is corrupt at `offset`: write a sticky marker that
+    /// makes every later open fail until an operator repairs the log, and
+    /// return `error`. The file itself is left in place for inspection.
+    fn quarantine(&mut self, path: &Path, offset: u64, error: LogError) -> LogError {
+        let marker = QuarantineMarker {
+            file: path.display().to_string(),
+            offset,
+            error: error.to_string(),
+            detected_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
+        self.telemetry.record_quarantine();
+        crate::telemetry::set_fault(
+            &self.dir,
+            self.manifest.shard_id,
+            crate::telemetry::StorageFaultKind::Quarantined,
+            error.to_string(),
+        );
+        let written = serde_json::to_vec_pretty(&marker)
+            .map_err(io::Error::other)
+            .and_then(|bytes| {
+                crate::meta::atomic_write_file(&self.dir.join(QUARANTINE_FILE), &bytes)
+            });
+        match written {
+            Ok(()) => tracing::error!(
+                file = %path.display(),
+                offset,
+                %error,
+                marker = %self.dir.join(QUARANTINE_FILE).display(),
+                "partition log quarantined; it stays closed until the WAL is repaired \
+                 and the marker removed"
+            ),
+            Err(marker_error) => tracing::error!(
+                file = %path.display(),
+                offset,
+                %error,
+                %marker_error,
+                "partition log corrupt; could not write the quarantine marker"
+            ),
+        }
+        error
     }
 
     /// Sealed segments in roll order. Only canonical `segment-NNNNNN.log`
@@ -432,6 +515,39 @@ impl PartitionLog {
         );
         self.meta.base_offset = epoch.first_offset;
         self.meta.base_segment = lowest;
+        Ok(())
+    }
+
+    /// Builds before `base_offset` existed could GC every sealed segment and
+    /// record only `gc_watermark`; the active WAL then starts above the
+    /// stored base and used to be quarantined. A V2 epoch at or below that
+    /// watermark is exactly the retained start such a GC leaves behind.
+    fn adopt_legacy_active_base(&mut self) -> Result<(), LogError> {
+        if self.manifest.wal_format_version != WAL_FORMAT_V2
+            || self.meta.gc_watermark <= self.meta.base_offset
+        {
+            return Ok(());
+        }
+        let wal_path = self.dir.join(WAL_FILE);
+        if std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0) == 0 {
+            return Ok(());
+        }
+        let Ok((epoch, _)) = decode_epoch(&mut BufReader::new(File::open(&wal_path)?)) else {
+            // Let the full scan report the damage.
+            return Ok(());
+        };
+        if epoch.first_offset > self.meta.base_offset
+            && epoch.first_offset <= self.meta.gc_watermark
+        {
+            tracing::warn!(
+                dir = %self.dir.display(),
+                base_offset = epoch.first_offset,
+                gc_watermark = self.meta.gc_watermark,
+                "adopting the retained base left by a GC from an older version"
+            );
+            self.meta.base_offset = epoch.first_offset;
+            self.meta.base_segment = self.meta.base_segment.max(self.meta.segment_roll_count);
+        }
         Ok(())
     }
 
@@ -538,6 +654,29 @@ impl PartitionLog {
         }
     }
 
+    /// Whether an undecodable record at `start` of the active WAL is a torn
+    /// tail: what is left of a write that never completed (incomplete, cut
+    /// off exactly at EOF, or zero-filled by the filesystem after a power
+    /// loss). Records below the durable offset were fsynced and acknowledged,
+    /// so damage there is corruption, never a tail to discard.
+    fn is_torn_tail(
+        &self,
+        path: &Path,
+        start: u64,
+        error_end: u64,
+        len: u64,
+        next_offset: u64,
+        incomplete: bool,
+    ) -> io::Result<bool> {
+        if next_offset < self.meta.durable_offset {
+            return Ok(false);
+        }
+        if incomplete || error_end >= len {
+            return Ok(true);
+        }
+        tail_is_zeroed(path, start)
+    }
+
     fn scan_v1_file(
         &mut self,
         path: &Path,
@@ -569,23 +708,31 @@ impl PartitionLog {
                     next_offset += 1;
                     byte_pos = reader.stream_position()?;
                 }
-                Err(RecordError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    if truncate_torn_tail {
-                        truncate_file(path, frame_start)?;
-                    }
-                    break;
-                }
                 Err(e) => {
-                    let pos = reader.stream_position().unwrap_or(byte_pos);
-                    if pos < len {
-                        quarantine_corrupt_file(path);
-                        return Err(LogError::CorruptSegment {
-                            path: path.display().to_string(),
-                            offset: next_offset,
-                            source: e,
-                        });
+                    let incomplete = matches!(
+                        &e,
+                        RecordError::Io(io) if io.kind() == io::ErrorKind::UnexpectedEof
+                    );
+                    let error_end = reader.stream_position().unwrap_or(len);
+                    if truncate_torn_tail
+                        && self.is_torn_tail(
+                            path,
+                            frame_start,
+                            error_end,
+                            len,
+                            next_offset,
+                            incomplete,
+                        )?
+                    {
+                        truncate_file(path, frame_start)?;
+                        break;
                     }
-                    break;
+                    let error = LogError::CorruptSegment {
+                        path: path.display().to_string(),
+                        offset: next_offset,
+                        source: e,
+                    };
+                    return Err(self.quarantine(path, next_offset, error));
                 }
             }
         }
@@ -610,22 +757,27 @@ impl PartitionLog {
             let epoch_start = byte_pos;
             let (epoch, body) = match decode_epoch(&mut reader) {
                 Ok(decoded) => decoded,
-                Err(EpochError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    if truncate_torn_tail {
-                        truncate_file(path, epoch_start)?;
-                        break;
-                    }
-                    return Err(LogError::Epoch(EpochError::Io(e)));
-                }
                 Err(e) => {
+                    let incomplete = matches!(
+                        &e,
+                        EpochError::Io(io) if io.kind() == io::ErrorKind::UnexpectedEof
+                    ) || len.saturating_sub(epoch_start)
+                        < EPOCH_HEADER_BYTES as u64;
+                    let error_end = reader.stream_position().unwrap_or(len);
                     if truncate_torn_tail
-                        && len.saturating_sub(epoch_start) < EPOCH_HEADER_BYTES as u64
+                        && self.is_torn_tail(
+                            path,
+                            epoch_start,
+                            error_end,
+                            len,
+                            next_offset,
+                            incomplete,
+                        )?
                     {
                         truncate_file(path, epoch_start)?;
                         break;
                     }
-                    quarantine_corrupt_file(path);
-                    return Err(LogError::Epoch(e));
+                    return Err(self.quarantine(path, next_offset, LogError::Epoch(e)));
                 }
             };
             if epoch.shard_id != self.manifest.shard_id
@@ -633,24 +785,27 @@ impl PartitionLog {
                 || epoch.committed_hwm
                     != epoch.first_offset.saturating_add(epoch.record_count as u64)
             {
-                quarantine_corrupt_file(path);
-                return Err(LogError::Io(io::Error::new(
+                let error = LogError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "invalid epoch: shard={} first={} count={} hwm={}",
+                        "invalid epoch: shard={} first={} count={} hwm={} (expected first={next_offset})",
                         epoch.shard_id, epoch.first_offset, epoch.record_count, epoch.committed_hwm
                     ),
-                )));
+                ));
+                return Err(self.quarantine(path, next_offset, error));
             }
 
             let mut frames = Cursor::new(body.as_slice());
             for _ in 0..epoch.record_count {
                 let frame_start = frames.position();
-                decode_frame(&mut frames).map_err(|source| LogError::CorruptSegment {
-                    path: path.display().to_string(),
-                    offset: next_offset,
-                    source,
-                })?;
+                if let Err(source) = decode_frame(&mut frames) {
+                    let error = LogError::CorruptSegment {
+                        path: path.display().to_string(),
+                        offset: next_offset,
+                        source,
+                    };
+                    return Err(self.quarantine(path, next_offset, error));
+                }
                 if !self.meta.purged_offsets.contains(&next_offset) {
                     self.index.insert(
                         next_offset,
@@ -663,11 +818,11 @@ impl PartitionLog {
                 next_offset += 1;
             }
             if frames.position() != body.len() as u64 || next_offset != epoch.committed_hwm {
-                quarantine_corrupt_file(path);
-                return Err(LogError::Io(io::Error::new(
+                let error = LogError::Io(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "epoch record count/length mismatch",
-                )));
+                ));
+                return Err(self.quarantine(path, next_offset, error));
             }
             byte_pos = reader.stream_position()?;
         }
@@ -713,6 +868,12 @@ impl PartitionLog {
             "partition log fenced; writes refused until it is reopened from disk"
         );
         self.telemetry.record_fence();
+        crate::telemetry::set_fault(
+            &self.dir,
+            self.manifest.shard_id,
+            crate::telemetry::StorageFaultKind::Fenced,
+            reason.clone(),
+        );
         self.fenced = Some(reason);
     }
 
@@ -1046,6 +1207,7 @@ impl PartitionLog {
             }
             self.telemetry
                 .record_fsync(pending_records, started.elapsed(), true);
+            self.meta.durable_offset = self.meta.next_offset;
         }
 
         // Close the WAL handle before rename. Do not truncate active.wal first.
@@ -1332,6 +1494,7 @@ impl PartitionLog {
         self.set_base(base, roll);
         self.meta.next_offset = base;
         self.meta.gc_watermark = self.meta.gc_watermark.max(base);
+        self.meta.durable_offset = self.meta.durable_offset.max(base);
         if let Err(error) = self.meta.save_with(&self.dir, true) {
             self.meta = previous;
             return Err(error.into());
@@ -1429,6 +1592,9 @@ impl PartitionLog {
             }
         }
         self.committed_hwm = self.meta.next_offset;
+        if persist_sync {
+            self.meta.durable_offset = self.committed_hwm;
+        }
         self.flush_count = self.flush_count.saturating_add(1);
         let checkpoint = self.config.fsync == FsyncMode::Always || self.flush_count % 32 == 0;
         if checkpoint {
@@ -1467,6 +1633,10 @@ impl PartitionLog {
 
 impl Drop for PartitionLog {
     fn drop(&mut self) {
+        if self.fenced.is_some() {
+            // Nothing serves from this instance any more; a reopen rebuilds.
+            crate::telemetry::clear_fault(&self.dir);
+        }
         if let Err(e) = self.flush_durable() {
             tracing::warn!(error = %e, "wal flush on drop failed");
         }
@@ -1477,23 +1647,85 @@ impl Drop for PartitionLog {
     }
 }
 
-fn quarantine_corrupt_file(path: &Path) {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let dest = path.with_extension(format!("corrupt.{ts}"));
-    match std::fs::rename(path, &dest) {
-        Ok(()) => tracing::error!(
-            from = %path.display(),
-            to = %dest.display(),
-            "quarantined corrupt WAL/segment; refusing to skip later frames"
-        ),
-        Err(e) => tracing::error!(
-            file = %path.display(),
-            error = %e,
-            "could not quarantine corrupt WAL/segment"
-        ),
+const QUARANTINE_FILE: &str = "quarantine.json";
+
+/// Partition logs in this process that are quarantined or fenced now, for
+/// readiness. A quarantine whose marker an operator has removed is dropped
+/// here, so readiness recovers without waiting for traffic to reopen the
+/// shard (the next open re-checks the WAL and re-quarantines if needed).
+pub fn storage_faults() -> Vec<crate::telemetry::StorageFault> {
+    crate::telemetry::current_faults(|fault| {
+        fault.kind == crate::telemetry::StorageFaultKind::Fenced
+            || !matches!(quarantine_reason(&fault.dir), Ok(None))
+    })
+}
+
+/// Sticky record of detected WAL corruption. While it exists the log refuses
+/// to open; an operator repairs or restores the named file and removes it.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct QuarantineMarker {
+    file: String,
+    offset: u64,
+    error: String,
+    detected_at_unix_ms: u64,
+}
+
+/// Why `dir` must not be opened: a quarantine marker, or an `active.wal`
+/// that an older build renamed to `active.corrupt.<ts>` (opening would start
+/// an empty WAL and reuse the offsets of its records).
+fn quarantine_reason(dir: &Path) -> Result<Option<String>, LogError> {
+    let marker_path = dir.join(QUARANTINE_FILE);
+    match std::fs::read(&marker_path) {
+        Ok(bytes) => {
+            let detail = serde_json::from_slice::<QuarantineMarker>(&bytes)
+                .map(|marker| {
+                    format!(
+                        "{} is corrupt at offset {}: {}",
+                        marker.file, marker.offset, marker.error
+                    )
+                })
+                .unwrap_or_else(|_| "unreadable quarantine marker".into());
+            return Ok(Some(format!(
+                "{detail}; repair or restore the WAL, then remove {}",
+                marker_path.display()
+            )));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let legacy = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("active.corrupt."));
+        if legacy {
+            return Ok(Some(format!(
+                "{} was quarantined by an earlier version and its records are not in \
+                 active.wal; repair or restore it, then move it out of {}",
+                path.display(),
+                dir.display()
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether everything from `start` to the end of `path` is zero bytes: an
+/// extended-but-unwritten tail some filesystems expose after a power loss.
+fn tail_is_zeroed(path: &Path, start: u64) -> io::Result<bool> {
+    use std::io::Read;
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            return Ok(true);
+        }
+        if buf[..read].iter().any(|byte| *byte != 0) {
+            return Ok(false);
+        }
     }
 }
 
@@ -1939,6 +2171,263 @@ mod tests {
             Err(e) => panic!("expected epoch checksum failure, got {e}"),
             Ok(_) => panic!("expected epoch checksum failure, log opened"),
         }
+        // Quarantine is sticky: the WAL stays where it is, untouched, and a
+        // second open (lazy shard reopen, container restart) still refuses
+        // instead of starting an empty WAL and reusing offsets 0 and 1.
+        assert_eq!(std::fs::read(&wal).unwrap(), bytes);
+        for _ in 0..2 {
+            match PartitionLog::open(dir.path(), PartitionLogConfig::default()) {
+                Err(LogError::Quarantined(reason)) => {
+                    assert!(reason.contains("active.wal"), "{reason}")
+                }
+                Err(e) => panic!("expected quarantine, got {e}"),
+                Ok(_) => panic!("quarantined log opened"),
+            }
+        }
+        assert_eq!(std::fs::read(&wal).unwrap(), bytes);
+    }
+
+    fn fault_for(dir: &Path) -> Option<crate::telemetry::StorageFaultKind> {
+        storage_faults()
+            .into_iter()
+            .find(|fault| fault.dir == dir)
+            .map(|fault| fault.kind)
+    }
+
+    #[test]
+    fn storage_faults_track_quarantined_and_fenced_logs() {
+        use crate::telemetry::StorageFaultKind;
+        let dir = tempdir().unwrap();
+        let mut log = PartitionLog::open(dir.path(), group_cfg(Duration::from_secs(60))).unwrap();
+        log.append(0, sample_record("t"), b"one".to_vec()).unwrap();
+        log.append(0, sample_record("t"), b"two".to_vec()).unwrap();
+        assert_eq!(fault_for(dir.path()), None);
+        log.inject_fsync_failure();
+        assert!(log.sync().is_err());
+        assert_eq!(fault_for(dir.path()), Some(StorageFaultKind::Fenced));
+        drop(log);
+        assert_eq!(
+            fault_for(dir.path()),
+            None,
+            "cleared once the instance is gone"
+        );
+
+        let wal = dir.path().join(WAL_FILE);
+        let good = std::fs::read(&wal).unwrap();
+        let mut bad = good.clone();
+        bad[EPOCH_HEADER_BYTES + 16] ^= 0xff;
+        std::fs::write(&wal, bad).unwrap();
+        let cfg = || group_cfg(Duration::from_secs(60));
+        assert!(PartitionLog::open(dir.path(), cfg()).is_err());
+        assert_eq!(fault_for(dir.path()), Some(StorageFaultKind::Quarantined));
+        assert!(PartitionLog::open(dir.path(), cfg()).is_err());
+        assert_eq!(fault_for(dir.path()), Some(StorageFaultKind::Quarantined));
+
+        std::fs::write(&wal, good).unwrap();
+        std::fs::remove_file(dir.path().join(QUARANTINE_FILE)).unwrap();
+        assert_eq!(
+            fault_for(dir.path()),
+            None,
+            "marker removal clears readiness"
+        );
+        drop(PartitionLog::open(dir.path(), cfg()).unwrap());
+        assert_eq!(fault_for(dir.path()), None);
+    }
+
+    #[test]
+    fn repaired_quarantined_log_opens_after_marker_removal() {
+        let dir = tempdir().unwrap();
+        {
+            let mut log = PartitionLog::open(dir.path(), PartitionLogConfig::default()).unwrap();
+            log.append(0, sample_record("t"), b"one".to_vec()).unwrap();
+            log.append(0, sample_record("t"), b"two".to_vec()).unwrap();
+            log.sync().unwrap();
+        }
+        let wal = dir.path().join(WAL_FILE);
+        let good = std::fs::read(&wal).unwrap();
+        let mut bad = good.clone();
+        bad[EPOCH_HEADER_BYTES + 16] ^= 0xff;
+        std::fs::write(&wal, &bad).unwrap();
+        assert!(PartitionLog::open(dir.path(), PartitionLogConfig::default()).is_err());
+
+        // Operator restores the file; the marker alone still blocks open.
+        std::fs::write(&wal, &good).unwrap();
+        assert!(matches!(
+            PartitionLog::open(dir.path(), PartitionLogConfig::default()),
+            Err(LogError::Quarantined(_))
+        ));
+        std::fs::remove_file(dir.path().join(QUARANTINE_FILE)).unwrap();
+        let log = PartitionLog::open(dir.path(), PartitionLogConfig::default()).unwrap();
+        assert_payload_sequence(&log, &[b"one", b"two"]);
+    }
+
+    #[test]
+    fn missing_active_wal_below_durable_offset_refuses_open() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            {
+                let mut log = PartitionLog::open_for_shard(
+                    dir.path(),
+                    group_cfg(Duration::from_secs(60)),
+                    0,
+                    format,
+                )
+                .unwrap();
+                log.append(0, sample_record("t"), b"acked".to_vec())
+                    .unwrap();
+                log.sync().unwrap();
+            }
+            std::fs::remove_file(dir.path().join(WAL_FILE)).unwrap();
+            for _ in 0..2 {
+                let err = PartitionLog::open_for_shard(
+                    dir.path(),
+                    group_cfg(Duration::from_secs(60)),
+                    0,
+                    format,
+                )
+                .err()
+                .expect("must not reopen empty over acknowledged records");
+                assert!(
+                    err.to_string().contains("durable offset")
+                        || matches!(err, LogError::Quarantined(_)),
+                    "{err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_renamed_active_wal_refuses_open() {
+        let dir = tempdir().unwrap();
+        drop(PartitionLog::open(dir.path(), PartitionLogConfig::default()).unwrap());
+        std::fs::write(dir.path().join("active.corrupt.1700000000000"), b"x").unwrap();
+        let err = PartitionLog::open(dir.path(), PartitionLogConfig::default())
+            .err()
+            .expect("legacy quarantine must block open");
+        assert!(matches!(err, LogError::Quarantined(_)), "{err}");
+    }
+
+    #[test]
+    fn torn_record_below_durable_offset_is_corruption_not_a_tail() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            {
+                let mut log = PartitionLog::open_for_shard(
+                    dir.path(),
+                    group_cfg(Duration::from_secs(60)),
+                    0,
+                    format,
+                )
+                .unwrap();
+                log.append(0, sample_record("t"), b"one".to_vec()).unwrap();
+                log.append(0, sample_record("t"), b"two".to_vec()).unwrap();
+                log.sync().unwrap();
+            }
+            let wal = dir.path().join(WAL_FILE);
+            let len = std::fs::metadata(&wal).unwrap().len();
+            OpenOptions::new()
+                .write(true)
+                .open(&wal)
+                .unwrap()
+                .set_len(len - 3)
+                .unwrap();
+            assert!(PartitionLog::open_for_shard(
+                dir.path(),
+                group_cfg(Duration::from_secs(60)),
+                0,
+                format
+            )
+            .is_err());
+            assert_eq!(
+                std::fs::metadata(&wal).unwrap().len(),
+                len - 3,
+                "evidence kept"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_filled_tail_above_durable_offset_is_truncated() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            {
+                let mut log = PartitionLog::open_for_shard(
+                    dir.path(),
+                    group_cfg(Duration::from_secs(60)),
+                    0,
+                    format,
+                )
+                .unwrap();
+                log.append(0, sample_record("t"), b"one".to_vec()).unwrap();
+                log.sync().unwrap();
+            }
+            let wal = dir.path().join(WAL_FILE);
+            let len = std::fs::metadata(&wal).unwrap().len();
+            use std::io::Write;
+            OpenOptions::new()
+                .append(true)
+                .open(&wal)
+                .unwrap()
+                .write_all(&[0u8; 4096])
+                .unwrap();
+            let log = PartitionLog::open_for_shard(
+                dir.path(),
+                group_cfg(Duration::from_secs(60)),
+                0,
+                format,
+            )
+            .unwrap();
+            assert_payload_sequence(&log, &[b"one"]);
+            assert_eq!(std::fs::metadata(&wal).unwrap().len(), len);
+        }
+    }
+
+    #[test]
+    fn torn_sealed_segment_is_corruption() {
+        let dir = tempdir().unwrap();
+        {
+            let mut log =
+                PartitionLog::open_for_shard(dir.path(), small_segment_cfg(), 0, WAL_FORMAT_V1)
+                    .unwrap();
+            append_until_roll(&mut log, 1);
+            append_until_roll(&mut log, 2);
+        }
+        let first = dir.path().join(SEGMENTS_DIR).join("segment-000000.log");
+        let len = std::fs::metadata(&first).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&first)
+            .unwrap()
+            .set_len(len - 3)
+            .unwrap();
+        assert!(
+            PartitionLog::open_for_shard(dir.path(), small_segment_cfg(), 0, WAL_FORMAT_V1)
+                .is_err(),
+            "a short sealed segment must not silently renumber the next one"
+        );
+    }
+
+    #[test]
+    fn legacy_full_prefix_gc_adopts_active_wal_base() {
+        let dir = tempdir().unwrap();
+        let (base, next) = {
+            let mut log = open_gc_log(dir.path(), WAL_FORMAT_V2);
+            fill_gc_log(&mut log, 2, 2);
+            (log.active_base_offset, log.high_watermark())
+        };
+        // What an older build left: segments gone, only gc_watermark saved.
+        for name in segment_names(dir.path()) {
+            std::fs::remove_file(dir.path().join(SEGMENTS_DIR).join(name)).unwrap();
+        }
+        let mut meta = LogMeta::load(dir.path()).unwrap();
+        meta.base_offset = 0;
+        meta.base_segment = 0;
+        meta.durable_offset = 0;
+        meta.gc_watermark = base;
+        meta.save(dir.path()).unwrap();
+
+        let log = open_gc_log(dir.path(), WAL_FORMAT_V2);
+        assert_retained(&log, base, next);
     }
 
     fn group_cfg(interval: Duration) -> PartitionLogConfig {
