@@ -454,6 +454,20 @@ To collect sooner than the next retention pass, send `POST /admin/v1/gc/{shard}`
 
 **One admin principal.** The `sk_local_…` API token that publishes messages is also a full admin credential: whoever holds it can call `/admin/v1/gc`, drain nodes and change the cluster. There are no producer-scoped tokens yet, so do not give the token to a producer you would not trust with admin access; put untrusted producers behind your own gateway that holds the token.
 
+**Follower repair.** A shard leader repairs a follower that missed a
+replication batch (timeout, restart, out-of-order delivery) without a
+leadership change: it finds the follower's log end, checks that both logs
+agree below it, and resends the missing records in order. Until the repair
+finishes, that follower's acknowledgements do not count toward minISR. If the
+follower holds a tail the leader does not (records from a deposed leader),
+the tail is cut and the cut bytes are kept as `truncated.<epoch>.<unix-ms>`
+in the partition directory; delete them once you no longer need them. A
+follower refuses to cut records it acknowledged unless the request comes from
+a newer leader epoch. Repair fails closed, leaving the follower out of sync
+and logging an error, when the missing records were purged or
+garbage-collected on the leader, or when a V2 shard's cut would fall inside a
+commit epoch; reseed that follower.
+
 S3/R2 credentials for Slate and archive are **not** `BETTERMQ_*`: `S3_ENDPOINT` or `R2_ENDPOINT`, plus `S3_ACCESS_KEY` / `R2_ACCESS_KEY` / `AWS_ACCESS_KEY_ID`, matching secret and region vars, and `S3_BUCKET` / `R2_BUCKET` (payload blobs: `S3_PAYLOAD_BUCKET` / `R2_PAYLOAD_BUCKET`). See [`engine/broker-storage/ARCHIVE.md`](../engine/broker-storage/ARCHIVE.md).
 
 #### Gateway-only profile

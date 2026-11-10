@@ -187,6 +187,17 @@ impl PartitionBackend {
         }
     }
 
+    /// Follower reconciliation; see [`PartitionLog::truncate_to`].
+    pub fn truncate_to(&mut self, offset: u64, generation: u64) -> Result<u64, LogError> {
+        match self {
+            Self::Local(log) => log.truncate_to(offset, generation),
+            #[cfg(feature = "slate")]
+            Self::Slate(_) => Err(LogError::TruncateUnsupported(
+                "slate logs are not replicated".into(),
+            )),
+        }
+    }
+
     pub fn gc_sealed_below(&mut self, watermark: u64) -> Result<usize, LogError> {
         match self {
             Self::Local(log) => log.gc_sealed_below(watermark),

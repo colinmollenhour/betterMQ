@@ -200,6 +200,7 @@ mod tests {
             last_success_ms: Some(1),
             consecutive_failures: u64::from(!in_sync),
             last_update_ms: 1,
+            log_end: None,
         }
     }
 

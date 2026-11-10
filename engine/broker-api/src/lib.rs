@@ -24,6 +24,7 @@ mod ops;
 mod payload_repair;
 mod publish_path;
 mod rate_limit;
+mod replica_source;
 pub mod request_id;
 mod retention;
 mod routes;
@@ -322,6 +323,10 @@ fn internal_cluster_route_table() -> Router<Arc<AppState>> {
         .route(
             "/internal/v1/payload-blob/{tenant}/{message_id}",
             axum::routing::get(payload_repair::internal_payload_blob),
+        )
+        .route(
+            "/internal/v1/replicate/truncate",
+            axum::routing::post(cluster::internal_replicate_truncate),
         )
         .route(
             "/internal/v1/cluster",

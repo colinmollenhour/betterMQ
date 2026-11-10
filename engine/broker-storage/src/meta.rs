@@ -158,6 +158,16 @@ impl OffsetRanges {
         self.ranges = kept;
     }
 
+    /// Drop every offset at or above `end`.
+    pub fn remove_from(&mut self, end: u64) {
+        self.ranges.split_off(&end);
+        if let Some((&start, &range_end)) = self.ranges.iter().next_back() {
+            if range_end > end {
+                self.ranges.insert(start, end);
+            }
+        }
+    }
+
     /// End of the range containing `offset`, if any.
     pub fn run_end_from(&self, offset: u64) -> Option<u64> {
         self.ranges
@@ -218,6 +228,11 @@ mod tests {
         assert_eq!(set.len(), 6);
         assert!(set.contains(6) && !set.contains(7) && !set.contains(2));
         assert_eq!(set.run_end_from(4), Some(7));
+        let mut cut = set.clone();
+        cut.remove_from(5);
+        assert_eq!(cut.ranges().collect::<Vec<_>>(), vec![(3, 5)]);
+        cut.remove_from(3);
+        assert!(cut.is_empty());
         assert_eq!(set.run_end_from(7), None);
         set.remove_below(6);
         assert_eq!(set.ranges().collect::<Vec<_>>(), vec![(6, 7), (10, 12)]);

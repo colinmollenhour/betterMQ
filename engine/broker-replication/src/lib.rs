@@ -1,6 +1,7 @@
 //! Replicate encoded log frames to peer brokers (quorum ack).
 
 mod append;
+mod repair;
 mod telemetry;
 
 pub use append::{
@@ -9,6 +10,10 @@ pub use append::{
     ReplicateBatchAck, ReplicateBatchRequest, ReplicateCatchUpRange, ReplicateCatchUpRequest,
     ReplicateCatchUpResponse, ReplicateError, ReplicateOutcome, ReplicationClient,
     DLQ_ENVELOPE_ALLOWANCE,
+};
+pub use repair::{
+    FollowerFence, RepairObserver, ReplicaLogSource, ReplicaPositionConflict,
+    ReplicateTruncateRequest, ReplicateTruncateResponse,
 };
 pub use telemetry::{
     ReplicationShardTelemetrySnapshot, ReplicationTelemetrySnapshot,

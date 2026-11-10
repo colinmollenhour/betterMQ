@@ -510,6 +510,8 @@ pub struct ReplicaProgress {
     pub consecutive_failures: u64,
     /// Last time this stream was updated (success or failure).
     pub last_update_ms: u64,
+    /// Follower log end reported by its last position conflict.
+    pub log_end: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -698,14 +700,16 @@ impl ReplicateCatchUpRange {
 
 #[derive(Clone)]
 pub struct ReplicationClient {
-    http: reqwest::Client,
-    cluster: ClusterConfig,
-    in_flight: Arc<Semaphore>,
-    max_epoch_bytes: usize,
-    progress: SharedReplicaProgress,
+    pub(crate) http: reqwest::Client,
+    pub(crate) cluster: ClusterConfig,
+    pub(crate) in_flight: Arc<Semaphore>,
+    pub(crate) max_epoch_bytes: usize,
+    pub(crate) progress: SharedReplicaProgress,
     telemetry: Arc<crate::telemetry::ReplicationTelemetry>,
-    runtime: Option<broker_raft_meta::ClusterRuntime>,
+    pub(crate) runtime: Option<broker_raft_meta::ClusterRuntime>,
     physical_shards: bool,
+    pub(crate) repair: Arc<crate::repair::RepairRegistry>,
+    fence: Arc<crate::repair::FollowerFence>,
 }
 
 impl ReplicationClient {
@@ -726,7 +730,14 @@ impl ReplicationClient {
             telemetry: Arc::new(crate::telemetry::ReplicationTelemetry::default()),
             runtime: None,
             physical_shards: false,
+            repair: Arc::default(),
+            fence: Arc::default(),
         }
+    }
+
+    /// Follower-side truncation fence for this node's replicas.
+    pub fn follower_fence(&self) -> &crate::repair::FollowerFence {
+        &self.fence
     }
 
     /// V2 layouts keep one log per physical shard, so progress is tracked per
@@ -755,7 +766,10 @@ impl ReplicationClient {
         self
     }
 
-    fn targets_for_shard(&self, shard: u32) -> (Vec<broker_raft_meta::NodeConfig>, usize) {
+    pub(crate) fn targets_for_shard(
+        &self,
+        shard: u32,
+    ) -> (Vec<broker_raft_meta::NodeConfig>, usize) {
         if let Some(runtime) = &self.runtime {
             return runtime.replication_targets(shard);
         }
@@ -794,7 +808,7 @@ impl ReplicationClient {
             .map(|_| ())
     }
 
-    fn apply_cluster_secret(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    pub(crate) fn apply_cluster_secret(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Ok(secret) = std::env::var("BETTERMQ_CLUSTER_SECRET") {
             if !secret.trim().is_empty() {
                 return req.header("x-bettermq-cluster-secret", secret);
@@ -864,6 +878,7 @@ impl ReplicationClient {
         );
         let encoded = bytes::Bytes::from(req.encode_binary()?);
         let (peers, quorum) = self.targets_for_shard(req.partition);
+        let stream = self.progress_stream(&req.topic);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(peers.len().max(1));
         for peer in peers {
             let url = format!("{}/internal/v1/replicate/batch", peer.internal_base());
@@ -871,18 +886,21 @@ impl ReplicationClient {
             let body = encoded.clone();
             let tx = tx.clone();
             let epoch_permit = Arc::clone(&epoch_permit);
-            let progress = Arc::clone(&self.progress);
-            let topic = self.progress_stream(&req.topic);
+            let client = self.clone();
+            let stream = stream.clone();
             let partition = req.partition;
             let leader_epoch = req.leader_epoch;
-            let peer_id = peer.id;
+            // A peer that is out of sync or under repair still receives the
+            // push, but only a completed repair makes it count again.
+            let counted = self.counts_toward_quorum(&stream, partition, peer.id);
             tokio::spawn(async move {
+                let peer_id = peer.id;
                 let builder = Self::apply_cluster_secret(
                     http.post(&url)
                         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
                         .body(body),
                 );
-                let ok = match builder.send().await {
+                let outcome = match builder.send().await {
                     Ok(resp) if resp.status().is_success() => {
                         match resp.json::<ReplicateBatchAck>().await {
                             Ok(response)
@@ -891,16 +909,7 @@ impl ReplicationClient {
                                     && response.leader_epoch == leader_epoch
                                     && response.durable_hwm >= required_hwm =>
                             {
-                                update_progress(
-                                    &progress,
-                                    &topic,
-                                    partition,
-                                    peer_id,
-                                    required_hwm,
-                                    response.durable_hwm,
-                                    true,
-                                );
-                                true
+                                PushOutcome::Durable(response.durable_hwm)
                             }
                             Ok(response) => {
                                 warn!(
@@ -910,61 +919,61 @@ impl ReplicationClient {
                                     actual_hwm = response.durable_hwm,
                                     "replicate peer returned non-durable or mismatched ack"
                                 );
-                                update_progress(
-                                    &progress,
-                                    &topic,
-                                    partition,
-                                    peer_id,
-                                    required_hwm,
-                                    response.durable_hwm,
-                                    false,
-                                );
-                                false
+                                PushOutcome::Short(response.durable_hwm)
                             }
                             Err(e) => {
                                 warn!(error = %e, url = %url, "replicate peer returned invalid ack");
-                                update_progress(
-                                    &progress,
-                                    &topic,
-                                    partition,
-                                    peer_id,
-                                    required_hwm,
-                                    0,
-                                    false,
-                                );
-                                false
+                                PushOutcome::Failed
                             }
+                        }
+                    }
+                    Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                        match resp.json::<crate::repair::ReplicaPositionConflict>().await {
+                            Ok(conflict) if conflict.node_id == peer_id => {
+                                debug!(
+                                    url = %url,
+                                    log_end = conflict.log_end,
+                                    want = conflict.want,
+                                    "replicate peer is at a different position; scheduling repair"
+                                );
+                                PushOutcome::Conflict(conflict.log_end)
+                            }
+                            _ => PushOutcome::Failed,
                         }
                     }
                     Ok(resp) => {
                         warn!(status = %resp.status(), url = %url, "replicate batch peer rejected");
-                        update_progress(
-                            &progress,
-                            &topic,
-                            partition,
-                            peer_id,
-                            required_hwm,
-                            0,
-                            false,
-                        );
-                        false
+                        PushOutcome::Failed
                     }
                     Err(e) => {
                         warn!(error = %e, url = %url, "replicate batch peer failed");
-                        update_progress(
-                            &progress,
-                            &topic,
-                            partition,
-                            peer_id,
-                            required_hwm,
-                            0,
-                            false,
-                        );
-                        false
+                        PushOutcome::Failed
                     }
                 };
+                let durable = matches!(outcome, PushOutcome::Durable(_));
+                let (durable_hwm, log_end) = match outcome {
+                    PushOutcome::Durable(hwm) | PushOutcome::Short(hwm) => (hwm, None),
+                    PushOutcome::Conflict(log_end) => (0, Some(log_end)),
+                    PushOutcome::Failed => (0, None),
+                };
+                update_progress(
+                    &client.progress,
+                    ProgressUpdate {
+                        stream: &stream,
+                        partition,
+                        peer_id,
+                        leader_hwm: required_hwm,
+                        durable_hwm,
+                        success: durable,
+                        may_mark_in_sync: counted,
+                        log_end,
+                    },
+                );
+                if !durable {
+                    client.schedule_repair(&stream, partition, peer);
+                }
                 drop(epoch_permit);
-                let _ = tx.send(ok).await;
+                let _ = tx.send(durable && counted).await;
             });
         }
         drop(tx);
@@ -1123,31 +1132,59 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn update_progress(
+enum PushOutcome {
+    Durable(u64),
+    Short(u64),
+    Conflict(u64),
+    Failed,
+}
+
+pub(crate) struct ProgressUpdate<'a> {
+    pub stream: &'a str,
+    pub partition: u32,
+    pub peer_id: Uuid,
+    pub leader_hwm: u64,
+    pub durable_hwm: u64,
+    pub success: bool,
+    /// A hot-path ack only keeps an in-sync peer in sync; turning an
+    /// out-of-sync peer back in sync is reserved for a completed repair.
+    pub may_mark_in_sync: bool,
+    pub log_end: Option<u64>,
+}
+
+pub(crate) fn update_progress(
     progress: &Mutex<HashMap<(String, u32, Uuid), ReplicaProgress>>,
-    topic: &str,
-    partition: u32,
-    peer_id: Uuid,
-    leader_hwm: u64,
-    durable_hwm: u64,
-    success: bool,
-) {
-    let key = (topic.to_string(), partition, peer_id);
+    update: ProgressUpdate<'_>,
+) -> bool {
+    let ProgressUpdate {
+        stream,
+        partition,
+        peer_id,
+        leader_hwm,
+        durable_hwm,
+        success,
+        may_mark_in_sync,
+        log_end,
+    } = update;
+    let key = (stream.to_string(), partition, peer_id);
     let mut all = progress
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let entry = all.entry(key).or_insert_with(|| ReplicaProgress {
         peer_id,
-        topic: topic.to_string(),
+        topic: stream.to_string(),
         partition,
         durable_hwm: 0,
         leader_hwm,
         lag: leader_hwm,
-        in_sync: false,
+        // A peer is presumed in sync until the first failed push.
+        in_sync: true,
         last_success_ms: None,
         consecutive_failures: 0,
         last_update_ms: 0,
+        log_end: None,
     });
+    let was_in_sync = entry.in_sync;
     entry.last_update_ms = now_ms();
     // Concurrent epochs can complete out of order; an older epoch's ack must
     // not hide a failure of a newer one, so the leader frontier only grows.
@@ -1156,11 +1193,99 @@ fn update_progress(
         entry.durable_hwm = entry.durable_hwm.max(durable_hwm);
         entry.last_success_ms = Some(now_ms());
         entry.consecutive_failures = 0;
+        entry.log_end = None;
     } else {
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        if log_end.is_some() {
+            entry.log_end = log_end;
+        }
     }
     entry.lag = entry.leader_hwm.saturating_sub(entry.durable_hwm);
-    entry.in_sync = success && entry.durable_hwm >= entry.leader_hwm;
+    entry.in_sync =
+        success && may_mark_in_sync && was_in_sync && entry.durable_hwm >= entry.leader_hwm;
+    entry.in_sync
+}
+
+impl ReplicationClient {
+    /// Whether a durable ack from `peer` counts toward quorum right now.
+    pub(crate) fn counts_toward_quorum(&self, stream: &str, partition: u32, peer: Uuid) -> bool {
+        let key = (stream.to_string(), partition, peer);
+        if self.repair.is_active(&key) {
+            return false;
+        }
+        self.progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .is_none_or(|entry| entry.in_sync)
+    }
+
+    pub(crate) fn record_repair_progress(
+        &self,
+        stream: &str,
+        partition: u32,
+        peer_id: Uuid,
+        leader_hwm: u64,
+        durable_hwm: u64,
+    ) {
+        update_progress(
+            &self.progress,
+            ProgressUpdate {
+                stream,
+                partition,
+                peer_id,
+                leader_hwm,
+                durable_hwm,
+                success: true,
+                may_mark_in_sync: false,
+                log_end: None,
+            },
+        );
+    }
+
+    /// Mark a peer in sync after repair verified it holds the leader's log
+    /// through `leader_end`. Returns false if pushes have moved the leader
+    /// frontier beyond what was verified, so repair must continue.
+    pub(crate) fn mark_repaired(
+        &self,
+        stream: &str,
+        partition: u32,
+        peer_id: Uuid,
+        leader_end: u64,
+        durable_hwm: u64,
+    ) -> bool {
+        let mut all = self
+            .progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = all
+            .entry((stream.to_string(), partition, peer_id))
+            .or_insert_with(|| ReplicaProgress {
+                peer_id,
+                topic: stream.to_string(),
+                partition,
+                durable_hwm: 0,
+                leader_hwm: leader_end,
+                lag: leader_end,
+                in_sync: false,
+                last_success_ms: None,
+                consecutive_failures: 0,
+                last_update_ms: 0,
+                log_end: None,
+            });
+        let now = now_ms();
+        entry.last_update_ms = now;
+        entry.last_success_ms = Some(now);
+        entry.consecutive_failures = 0;
+        entry.log_end = None;
+        // Repair may have truncated the follower, so its durable HWM is set,
+        // not maxed.
+        entry.durable_hwm = durable_hwm;
+        entry.leader_hwm = entry.leader_hwm.max(leader_end);
+        entry.lag = entry.leader_hwm.saturating_sub(entry.durable_hwm);
+        entry.in_sync = entry.durable_hwm >= entry.leader_hwm;
+        entry.in_sync
+    }
 }
 
 #[cfg(test)]
@@ -1422,21 +1547,39 @@ mod tests {
         })
         .with_physical_shards(true);
         // Two logical topics routed to physical shard 4 share one stream.
+        let push = |stream: &str, leader_hwm: u64, durable_hwm: u64, success: bool| {
+            update_progress(
+                &client.progress,
+                ProgressUpdate {
+                    stream,
+                    partition: 4,
+                    peer_id: peer,
+                    leader_hwm,
+                    durable_hwm,
+                    success,
+                    may_mark_in_sync: true,
+                    log_end: None,
+                },
+            )
+        };
         for topic in ["orders", "billing"] {
-            let stream = client.progress_stream(topic);
-            update_progress(&client.progress, &stream, 4, peer, 10, 10, true);
+            push(&client.progress_stream(topic), 10, 10, true);
         }
         assert_eq!(client.replica_progress().len(), 1);
         assert_eq!(client.telemetry_snapshot().shards[0].isr_members, 2);
 
         // Epoch ending at 20 fails, then the older epoch ending at 15 acks.
         let stream = client.progress_stream("orders");
-        update_progress(&client.progress, &stream, 4, peer, 20, 0, false);
-        update_progress(&client.progress, &stream, 4, peer, 15, 15, true);
+        push(&stream, 20, 0, false);
+        push(&stream, 15, 15, true);
         let progress = client.replica_progress();
         assert!(!progress[0].in_sync);
         assert_eq!(progress[0].lag, 5);
         assert_eq!(client.telemetry_snapshot().shards[0].isr_members, 1);
+        // Even a full ack does not restore it: only a completed repair does.
+        assert!(!push(&stream, 20, 20, true));
+        assert!(client.mark_repaired(&stream, 4, peer, 20, 20));
+        assert_eq!(client.telemetry_snapshot().shards[0].isr_members, 2);
 
         let v1 = ReplicationClient::new(client.cluster.clone());
         assert_eq!(v1.progress_stream("orders"), "orders");

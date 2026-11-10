@@ -72,7 +72,7 @@ async fn recover_gained_shard(
     shard: u32,
 ) -> Result<(), CatchUpError> {
     match ShardRecovery::for_storage(state.broker.config().storage) {
-        ShardRecovery::ReplicaCatchUp => catch_up_shard(cluster, state, shard).await,
+        ShardRecovery::ReplicaCatchUp => catch_up_reconciling_tail(cluster, state, shard).await,
         ShardRecovery::SharedStorage => {
             let broker = state.broker.clone();
             let topics = discover_topics(state);
@@ -80,6 +80,69 @@ async fn recover_gained_shard(
                 .await
                 .map_err(|e| format!("shard {shard}: shared-storage reopen task failed: {e}"))?
                 .map_err(CatchUpError::Retryable)
+        }
+    }
+}
+
+/// Tail truncations one recovery attempt may make before the shard stays
+/// fenced until the next monitor cycle.
+const MAX_TAIL_RECONCILIATIONS: usize = 3;
+
+/// Catch up `shard`, cutting this node's own log tail where the replicas'
+/// read quorum proves it was never acknowledged (decision D5, fenced
+/// truncation), then retrying. A tail that cannot be cut (sealed segment,
+/// inside a V2 epoch) keeps the shard fenced.
+async fn catch_up_reconciling_tail(
+    cluster: &Cluster,
+    state: &AppState,
+    shard: u32,
+) -> Result<(), CatchUpError> {
+    let mut reconciled = 0;
+    loop {
+        let error = match catch_up_shard(cluster, state, shard).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let Some((topic, to_offset)) = error.reconcile_target() else {
+            return Err(error);
+        };
+        if reconciled >= MAX_TAIL_RECONCILIATIONS {
+            return Err(error);
+        }
+        reconciled += 1;
+        // V2 shards keep one physical log for every topic.
+        let stream = if state.broker.layout().is_physical() {
+            ""
+        } else {
+            topic
+        };
+        match cluster.reconcile_local_tail(&state.broker, stream, shard, to_offset) {
+            Ok(log_end) => warn!(
+                shard,
+                %topic,
+                to_offset,
+                log_end,
+                %error,
+                "cut this node's unacknowledged log tail; retrying catch-up"
+            ),
+            Err(broker_partition::BrokerError::Storage(
+                broker_storage::LogError::TruncateUnsupported(reason),
+            )) => {
+                tracing::error!(
+                    shard,
+                    %topic,
+                    to_offset,
+                    %reason,
+                    %error,
+                    "cannot cut the unverified log tail; shard stays fenced"
+                );
+                return Err(error);
+            }
+            Err(other) => {
+                return Err(CatchUpError::Retryable(format!(
+                    "{topic}/{shard}: truncate local tail to {to_offset}: {other}"
+                )))
+            }
         }
     }
 }
@@ -162,11 +225,14 @@ enum CatchUpError {
         local_leo: u64,
         replica_hwm: u64,
     },
-    /// Two logs hold different records at the same offset.
+    /// Two logs hold different records at the same offset. `local` when this
+    /// node's log disagrees with the replicas (which agree with each other);
+    /// otherwise the replicas disagree among themselves.
     Divergent {
         topic: String,
         offset: u64,
         detail: String,
+        local: bool,
     },
 }
 
@@ -177,6 +243,26 @@ impl CatchUpError {
     /// authoritative log.
     fn needs_tail_reconciliation(&self) -> bool {
         matches!(self, Self::LocalTailAhead { .. } | Self::Divergent { .. })
+    }
+
+    /// `(topic, offset)` to cut this node's log back to, when the catch-up
+    /// read quorum proves everything from there on was never acknowledged:
+    /// past every answering replica's committed HWM, or a local record the
+    /// agreeing replicas do not hold. Replicas that disagree among themselves
+    /// give no such proof.
+    fn reconcile_target(&self) -> Option<(&str, u64)> {
+        match self {
+            Self::LocalTailAhead {
+                topic, replica_hwm, ..
+            } => Some((topic, *replica_hwm)),
+            Self::Divergent {
+                topic,
+                offset,
+                local: true,
+                ..
+            } => Some((topic, *offset)),
+            _ => None,
+        }
     }
 }
 
@@ -197,6 +283,7 @@ impl std::fmt::Display for CatchUpError {
                 topic,
                 offset,
                 detail,
+                ..
             } => write!(f, "{topic}: divergent record at offset {offset}: {detail}"),
         }
     }
@@ -238,6 +325,7 @@ fn verify_answers_agree(
                     topic: topic.to_string(),
                     offset: frame.offset,
                     detail: "replicas disagree on the record at this offset".into(),
+                    local: false,
                 });
             }
         }
@@ -358,6 +446,7 @@ async fn catch_up_shard(
                             topic: topic.clone(),
                             offset: frame.offset,
                             detail: e.to_string(),
+                            local: true,
                         },
                         other => CatchUpError::Retryable(format!(
                             "{topic}/{shard}: apply catch-up frame at offset {}: {other}",
@@ -575,6 +664,8 @@ pub fn spawn_cluster_health_monitor(
             if !runtime.has_controller_lease() {
                 continue;
             }
+            // Backstop for followers that missed pushes without a failed RPC.
+            cluster.replication.wake_repairs();
 
             repair_ticks = repair_ticks.wrapping_add(1);
             if repair_ticks % LEGACY_REPAIR_RETRY_TICKS == 0 {
@@ -952,6 +1043,77 @@ mod tests {
             "{error}"
         );
         assert!(error.needs_tail_reconciliation());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_cuts_an_unacknowledged_local_tail_and_catches_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = catch_up_body(0, 0, Vec::new());
+        let (a, b) = (
+            catch_up_peer(empty.clone()).await,
+            catch_up_peer(empty).await,
+        );
+        let (state, cluster, _) = three_node_state(&dir, [&a.uri(), &b.uri()]);
+        let (shard, _) = committed_publish(&state.broker, "local-only").await;
+        let topic = broker_partition::DIRECT_TOPIC;
+
+        recover_gained_shard(&cluster, &state, shard).await.unwrap();
+        assert_eq!(
+            state.broker.partition_high_watermark(topic, shard).unwrap(),
+            0,
+            "no answering replica held the record, so it was never acknowledged"
+        );
+        assert_eq!(state.broker.committed_hwm(topic, shard).unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_replaces_a_divergent_local_record_with_the_replicas_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let other =
+            Broker::open(broker_partition::BrokerConfig::new(other_dir.path().into())).unwrap();
+        let (shard, foreign) = committed_publish(&other, "replica").await;
+        let peer = catch_up_peer(catch_up_body(shard, 1, vec![(0, foreign)])).await;
+        let (state, cluster, _) = three_node_state(&dir, [&peer.uri(), UNREACHABLE]);
+        committed_publish(&state.broker, "local").await;
+
+        recover_gained_shard(&cluster, &state, shard).await.unwrap();
+        let topic = broker_partition::DIRECT_TOPIC;
+        assert_eq!(
+            state.broker.read_message(topic, shard, 0).unwrap().payload,
+            b"replica"
+        );
+        assert_eq!(state.broker.committed_hwm(topic, shard).unwrap(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_does_not_cut_the_tail_when_replicas_disagree() {
+        let dir = tempfile::tempdir().unwrap();
+        let (x_dir, y_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let x = Broker::open(broker_partition::BrokerConfig::new(x_dir.path().into())).unwrap();
+        let y = Broker::open(broker_partition::BrokerConfig::new(y_dir.path().into())).unwrap();
+        let (shard, x_frame) = committed_publish(&x, "x").await;
+        let (_, y_frame) = committed_publish(&y, "y").await;
+        let a = catch_up_peer(catch_up_body(shard, 1, vec![(0, x_frame)])).await;
+        let b = catch_up_peer(catch_up_body(shard, 1, vec![(0, y_frame)])).await;
+        let (state, cluster, _) = three_node_state(&dir, [&a.uri(), &b.uri()]);
+        committed_publish(&state.broker, "local").await;
+
+        let error = recover_gained_shard(&cluster, &state, shard)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, CatchUpError::Divergent { local: false, .. }),
+            "{error}"
+        );
+        assert_eq!(
+            state
+                .broker
+                .read_message(broker_partition::DIRECT_TOPIC, shard, 0)
+                .unwrap()
+                .payload,
+            b"local"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

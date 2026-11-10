@@ -9,7 +9,7 @@ use broker_proto::record::{decode_frame, encode_frame, RecordError};
 use broker_proto::{LogRecord, StoredMessage};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, Cursor, Seek, SeekFrom};
+use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -183,6 +183,8 @@ pub enum LogError {
     Fenced(String),
     #[error("partition log quarantined: {0}")]
     Quarantined(String),
+    #[error("log truncation unsupported: {0}")]
+    TruncateUnsupported(String),
 }
 
 #[cfg(test)]
@@ -1706,6 +1708,114 @@ impl PartitionLog {
         Ok(())
     }
 
+    /// Follower log reconciliation: drop every record at or above `offset`.
+    ///
+    /// The cut bytes are first copied to `truncated.<generation>.<unix_ms>` in
+    /// the log directory and fsynced, so the only destructive step is
+    /// reversible. Only the active WAL can be cut; offsets in sealed segments,
+    /// and V2 cuts that do not fall on an epoch boundary, are refused with
+    /// [`LogError::TruncateUnsupported`]. Returns the number of records removed.
+    pub fn truncate_to(&mut self, offset: u64, generation: u64) -> Result<u64, LogError> {
+        let next = self.meta.next_offset;
+        if offset >= next {
+            return Ok(0);
+        }
+        if offset < self.active_base_offset {
+            return Err(LogError::TruncateUnsupported(format!(
+                "offset {offset} is in a sealed segment (active WAL starts at {})",
+                self.active_base_offset
+            )));
+        }
+        self.dirty = true;
+        self.flush_durable()?;
+        let wal_path = self.dir.join(WAL_FILE);
+        let cut = self.wal_byte_position(&wal_path, offset)?;
+        let wal_len = std::fs::metadata(&wal_path)?.len();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let sidecar = self.dir.join(format!("truncated.{generation}.{ts}"));
+        {
+            let mut source = File::open(&wal_path)?;
+            source.seek(SeekFrom::Start(cut))?;
+            let mut tail = Vec::with_capacity(wal_len.saturating_sub(cut) as usize);
+            source.read_to_end(&mut tail)?;
+            let mut out = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&sidecar)?;
+            out.write_all(&tail)?;
+            out.sync_all()?;
+        }
+        File::open(&self.dir)?.sync_all()?;
+        // Lower the durable mark before cutting, or the reopen after a crash
+        // (and the rebuild below) would treat the cut records as lost
+        // acknowledged data and quarantine the log.
+        self.meta.durable_offset = self.meta.durable_offset.min(offset);
+        self.meta.purged_offsets.remove_from(offset);
+        self.meta
+            .save_with(&self.dir, self.config.fsync != FsyncMode::Os)?;
+        truncate_file(&wal_path, cut)?;
+        if let Ok(mut cache) = self.reader_cache.lock() {
+            cache.remove(&wal_path);
+        }
+        self.rebuild_from_disk()?;
+        self.committed_hwm = self.meta.next_offset;
+        self.dirty = false;
+        self.meta
+            .save_with(&self.dir, self.config.fsync != FsyncMode::Os)?;
+        let removed = next.saturating_sub(self.meta.next_offset);
+        tracing::warn!(
+            dir = %self.dir.display(),
+            offset,
+            removed,
+            sidecar = %sidecar.display(),
+            "truncated divergent log tail; cut bytes kept in sidecar"
+        );
+        Ok(removed)
+    }
+
+    /// Byte position in the active WAL where record `offset` starts.
+    fn wal_byte_position(&self, wal_path: &Path, offset: u64) -> Result<u64, LogError> {
+        let len = std::fs::metadata(wal_path)?.len();
+        let mut reader = BufReader::new(File::open(wal_path)?);
+        let mut current = self.active_base_offset;
+        let mut position = 0u64;
+        while position < len {
+            if current == offset {
+                return Ok(position);
+            }
+            match self.manifest.wal_format_version {
+                WAL_FORMAT_V1 => {
+                    decode_frame(&mut reader)?;
+                    current += 1;
+                }
+                WAL_FORMAT_V2 => {
+                    let (epoch, _) = decode_epoch(&mut reader)?;
+                    if offset > epoch.first_offset && offset < epoch.committed_hwm {
+                        return Err(LogError::TruncateUnsupported(format!(
+                            "offset {offset} is inside epoch {}..{}",
+                            epoch.first_offset, epoch.committed_hwm
+                        )));
+                    }
+                    current = epoch.committed_hwm;
+                }
+                version => {
+                    return Err(LogError::Io(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unsupported WAL format {version}"),
+                    )))
+                }
+            }
+            position = reader.stream_position()?;
+        }
+        if current == offset {
+            return Ok(position);
+        }
+        Err(LogError::OffsetNotFound(offset))
+    }
+
     fn read_at(&self, pos: &LogPosition) -> Result<(LogRecord, Vec<u8>), LogError> {
         let mut file = self.cached_reader(&pos.path)?;
         file.seek(SeekFrom::Start(pos.byte_offset))?;
@@ -2074,6 +2184,79 @@ mod tests {
         let msgs = log.read_range(0, 0, 10).unwrap();
         assert_eq!(msgs.len(), 5);
         assert_eq!(log.high_watermark(), 5);
+    }
+
+    fn sidecars(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("truncated.7."))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn truncate_to_quarantines_tail_and_accepts_new_appends() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            {
+                let mut log = PartitionLog::open_for_shard(
+                    dir.path(),
+                    PartitionLogConfig::default(),
+                    0,
+                    format,
+                )
+                .unwrap();
+                for i in 0..10u8 {
+                    log.append(0, sample_record("t"), vec![i]).unwrap();
+                }
+                log.purge_offset(8).unwrap();
+                assert_eq!(log.truncate_to(6, 7).unwrap(), 4);
+                assert_eq!(log.high_watermark(), 6);
+                assert_eq!(log.committed_hwm(), 6);
+                assert_eq!(log.read_range(0, 0, 20).unwrap().len(), 6);
+                let sidecar = sidecars(dir.path());
+                assert_eq!(sidecar.len(), 1, "format {format}");
+                assert!(std::fs::metadata(&sidecar[0]).unwrap().len() > 0);
+                let stored = log
+                    .append(0, sample_record("t"), b"replacement".to_vec())
+                    .unwrap();
+                assert_eq!(stored.0.offset, 6);
+                assert_eq!(log.truncate_to(20, 7).unwrap(), 0);
+                log.sync().unwrap();
+            }
+            let log =
+                PartitionLog::open_for_shard(dir.path(), PartitionLogConfig::default(), 0, format)
+                    .unwrap();
+            assert_eq!(log.high_watermark(), 7);
+            assert_eq!(log.read_range(0, 6, 1).unwrap()[0].payload, b"replacement");
+        }
+    }
+
+    #[test]
+    fn truncate_inside_a_v2_epoch_fails_closed() {
+        let dir = tempdir().unwrap();
+        let mut log = PartitionLog::open_for_shard(
+            dir.path(),
+            PartitionLogConfig::default(),
+            0,
+            WAL_FORMAT_V2,
+        )
+        .unwrap();
+        let batch = (0..4u8)
+            .map(|i| (sample_record("t"), vec![i]))
+            .collect::<Vec<_>>();
+        log.append_batch(0, batch, None).unwrap();
+        assert!(matches!(
+            log.truncate_to(2, 7),
+            Err(LogError::TruncateUnsupported(_))
+        ));
+        assert_eq!(log.high_watermark(), 4);
+        assert!(sidecars(dir.path()).is_empty());
+        assert_eq!(log.truncate_to(0, 7).unwrap(), 4);
     }
 
     #[test]

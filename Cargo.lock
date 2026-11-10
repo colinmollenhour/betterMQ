@@ -582,6 +582,7 @@ dependencies = [
 name = "broker-replication"
 version = "0.6.2"
 dependencies = [
+ "axum",
  "base64",
  "broker-proto",
  "broker-raft-meta",
@@ -591,6 +592,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

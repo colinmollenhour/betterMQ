@@ -64,6 +64,11 @@ enum ShardCommand {
         base: u64,
         reply: Reply<()>,
     },
+    Truncate {
+        offset: u64,
+        generation: u64,
+        reply: Reply<u64>,
+    },
     Commit {
         offset: u64,
         reply: oneshot::Sender<Result<u64, String>>,
@@ -265,6 +270,16 @@ impl ShardHandle {
     /// catch-up behind a leader that already collected the prefix).
     pub fn reset_base(&self, base: u64) -> Result<(), LogError> {
         self.call(|reply| ShardCommand::ResetBase { base, reply })
+    }
+
+    /// Drop records at or above `offset` (follower reconciliation). Serialized
+    /// with appends by the shard actor.
+    pub fn truncate_to(&self, offset: u64, generation: u64) -> Result<u64, LogError> {
+        self.call(|reply| ShardCommand::Truncate {
+            offset,
+            generation,
+            reply,
+        })
     }
 
     pub fn flush_durable(&self) -> Result<u64, LogError> {
@@ -490,6 +505,15 @@ fn process_non_commit(
         }
         ShardCommand::ResetBase { base, reply } => {
             let result = backend.reset_base(base);
+            publish_backend_hwm(backend, committed_hwm);
+            let _ = reply.send(result);
+        }
+        ShardCommand::Truncate {
+            offset,
+            generation,
+            reply,
+        } => {
+            let result = backend.truncate_to(offset, generation);
             publish_backend_hwm(backend, committed_hwm);
             let _ = reply.send(result);
         }

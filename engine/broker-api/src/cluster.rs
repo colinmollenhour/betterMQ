@@ -6,7 +6,7 @@ use axum::{
     body::{Body, Bytes},
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     Json,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -17,8 +17,9 @@ use broker_partition::{
 };
 use broker_raft_meta::ClusterRuntime;
 use broker_replication::{
-    CatchUpFrame, ReplicaProgress, ReplicateAppendRequest, ReplicateBatchAck,
-    ReplicateBatchRequest, ReplicateCatchUpRange, ReplicateCatchUpRequest, ReplicationClient,
+    CatchUpFrame, ReplicaPositionConflict, ReplicaProgress, ReplicateAppendRequest,
+    ReplicateBatchAck, ReplicateBatchRequest, ReplicateCatchUpRange, ReplicateCatchUpRequest,
+    ReplicateTruncateRequest, ReplicateTruncateResponse, ReplicationClient,
 };
 use broker_schedule::CronJob;
 use broker_storage::StorageMode;
@@ -198,6 +199,38 @@ impl ClusterHandle {
         self.runtime
             .controller()
             .is_none_or(|controller| self.catalog_apply.ready(controller.catalog_revision()))
+    }
+
+    /// Let the leader repair lagging followers from the local log, and persist
+    /// this node's follower truncation fence under `data_dir`.
+    pub fn attach_local_log(
+        &self,
+        broker: broker_partition::Broker,
+        data_dir: &std::path::Path,
+    ) -> std::io::Result<()> {
+        self.replication
+            .set_log_source(Arc::new(crate::replica_source::BrokerLogSource::new(
+                broker,
+            )));
+        self.replication.follower_fence().open_dir(data_dir)
+    }
+
+    /// Leader recovery: cut this node's own uncommitted tail of `stream` on
+    /// `shard` back to `to_offset` (the committed prefix proven by the
+    /// replicas). The cut bytes are kept in a `truncated.<generation>.<ts>`
+    /// sidecar. `stream` is the V1 topic, or empty for a V2 physical shard.
+    /// Returns the new local log end. Fails with
+    /// `LogError::TruncateUnsupported` (and changes nothing) when the cut lies
+    /// in a sealed segment or inside a V2 epoch; the shard must stay fenced.
+    pub fn reconcile_local_tail(
+        &self,
+        broker: &broker_partition::Broker,
+        stream: &str,
+        shard: u32,
+        to_offset: u64,
+    ) -> Result<u64, broker_partition::BrokerError> {
+        let generation = self.runtime.shard_generation(shard);
+        broker.truncate_replica_log(stream, shard, to_offset, generation)
     }
 
     /// Track replication progress per physical shard (V2 layouts).
@@ -1643,34 +1676,45 @@ fn validate_replication_epoch(
     runtime: &ClusterRuntime,
     body: &ReplicateBatchRequest,
 ) -> Result<(), ApiError> {
-    let elected = runtime.elect_leader_for_shard(body.partition);
-    if elected != Some(body.leader_id) {
+    validate_leader_epoch(runtime, body.partition, body.leader_id, body.leader_epoch)
+}
+
+/// Reject requests from a node that is not the committed shard leader, or
+/// from an older leader epoch; adopt the next epoch when it is newer by one.
+fn validate_leader_epoch(
+    runtime: &ClusterRuntime,
+    partition: u32,
+    leader_id: Uuid,
+    leader_epoch: u64,
+) -> Result<(), ApiError> {
+    let elected = runtime.elect_leader_for_shard(partition);
+    if elected != Some(leader_id) {
         return Err(ApiError::BadRequest(format!(
             "replication leader {} is not elected for shard {}",
-            body.leader_id, body.partition
+            leader_id, partition
         )));
     }
-    let expected = runtime.shard_generation(body.partition);
-    if body.leader_epoch < expected {
+    let expected = runtime.shard_generation(partition);
+    if leader_epoch < expected {
         return Err(ApiError::BadRequest(format!(
             "stale leader_epoch {} < {}",
-            body.leader_epoch, expected
+            leader_epoch, expected
         )));
     }
-    if body.leader_epoch > expected {
-        if body.leader_epoch != expected.saturating_add(1) {
+    if leader_epoch > expected {
+        if leader_epoch != expected.saturating_add(1) {
             return Err(ApiError::BadRequest(format!(
                 "leader_epoch jump {} -> {} is not allowed",
-                expected, body.leader_epoch
+                expected, leader_epoch
             )));
         }
         let observed = runtime
-            .try_observe_shard_generation(body.partition, body.leader_epoch)
+            .try_observe_shard_generation(partition, leader_epoch)
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        if observed != body.leader_epoch {
+        if observed != leader_epoch {
             return Err(ApiError::BadRequest(format!(
                 "failed to durably adopt leader_epoch {}",
-                body.leader_epoch
+                leader_epoch
             )));
         }
     }
@@ -1681,7 +1725,7 @@ pub async fn internal_replicate_batch(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<ReplicateBatchAck>, ApiError> {
+) -> Result<Response, ApiError> {
     if state.broker.config().storage == StorageMode::Slate {
         return Err(ApiError::BadRequest(
             "slate mode: frame replication disabled".into(),
@@ -1727,30 +1771,145 @@ pub async fn internal_replicate_batch(
         frame_topics.push(header.topic);
     }
 
-    let mut last_offset = body.first_offset;
-    for (i, (frame, topic)) in body.frames.iter().zip(&frame_topics).enumerate() {
-        let offset = body.first_offset + i as u64;
-        last_offset = offset;
-        state
-            .broker
-            .append_replicated_frame(topic, body.partition, frame, Some(offset))?;
-    }
-    let commit_topic = frame_topics.first().cloned().unwrap_or_default();
-    let durable_hwm = state
-        .broker
-        .wait_committed(&commit_topic, body.partition, last_offset)
-        .await?;
     let node_id = state
         .cluster
         .as_ref()
         .map(|cluster| cluster.runtime.config().node_id)
         .ok_or_else(|| ApiError::BadRequest("cluster mode not enabled".into()))?;
+    let commit_topic = frame_topics.first().cloned().unwrap_or_default();
+    // Concurrent leader pushes can arrive out of order. Give an earlier epoch a
+    // moment to land before rejecting this one as a gap.
+    let deadline = std::time::Instant::now() + REORDER_WAIT;
+    while state
+        .broker
+        .partition_high_watermark(&commit_topic, body.partition)?
+        < body.first_offset
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let mut last_offset = body.first_offset;
+    for (i, (frame, topic)) in body.frames.iter().zip(&frame_topics).enumerate() {
+        let offset = body.first_offset + i as u64;
+        last_offset = offset;
+        match state
+            .broker
+            .append_replicated_frame(topic, body.partition, frame, Some(offset))
+        {
+            Ok(_) => {}
+            Err(broker_partition::BrokerError::Storage(
+                broker_storage::LogError::OffsetMismatch { have, want },
+            )) => {
+                // Structured position so the leader can repair from our log end.
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(ReplicaPositionConflict {
+                        node_id,
+                        partition: body.partition,
+                        leader_epoch: body.leader_epoch,
+                        log_end: have,
+                        want,
+                    }),
+                )
+                    .into_response());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let durable_hwm = state
+        .broker
+        .wait_committed(&commit_topic, body.partition, last_offset)
+        .await?;
+    if let Some(cluster) = &state.cluster {
+        let stream = cluster.replication.progress_stream(&body.topic);
+        if let Err(error) = cluster.replication.follower_fence().record_ack(
+            &stream,
+            body.partition,
+            body.leader_epoch,
+            durable_hwm,
+        ) {
+            return Err(ApiError::Unavailable(format!(
+                "could not persist replica fence: {error}"
+            )));
+        }
+    }
     Ok(Json(ReplicateBatchAck {
         node_id,
         partition: body.partition,
         leader_epoch: body.leader_epoch,
         durable_hwm,
-    }))
+    })
+    .into_response())
+}
+
+/// How long a follower holds an epoch that starts beyond its log end.
+const REORDER_WAIT: Duration = Duration::from_millis(500);
+
+/// Leader-requested truncation of a divergent follower tail. Fenced by the
+/// leader epoch and by what this follower has already acknowledged; the cut
+/// bytes are kept in a sidecar file next to the log.
+pub async fn internal_replicate_truncate(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ReplicateTruncateRequest>,
+) -> Result<Response, ApiError> {
+    if state.broker.config().storage == StorageMode::Slate {
+        return Err(ApiError::BadRequest(
+            "slate mode: frame replication disabled".into(),
+        ));
+    }
+    let cluster = state
+        .cluster
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("cluster mode not enabled".into()))?;
+    if !body.tenant_id.is_empty() && body.tenant_id != state.broker.tenant() {
+        return Err(ApiError::BadRequest("truncate tenant mismatch".into()));
+    }
+    validate_leader_epoch(
+        &cluster.runtime,
+        body.partition,
+        body.leader_id,
+        body.leader_epoch,
+    )?;
+    let local_end = state.broker.committed_hwm(&body.topic, body.partition)?;
+    let stream = cluster.replication.progress_stream(&body.topic);
+    cluster
+        .replication
+        .follower_fence()
+        .check_truncate(
+            &stream,
+            body.partition,
+            body.leader_epoch,
+            body.to_offset,
+            local_end,
+        )
+        .map_err(ApiError::Conflict)?;
+    let log_end = match state.broker.truncate_replica_log(
+        &body.topic,
+        body.partition,
+        body.to_offset,
+        body.leader_epoch,
+    ) {
+        Ok(end) => end,
+        Err(broker_partition::BrokerError::Storage(
+            broker_storage::LogError::TruncateUnsupported(reason),
+        )) => {
+            tracing::error!(
+                partition = body.partition,
+                topic = %body.topic,
+                to_offset = body.to_offset,
+                %reason,
+                "divergent replica tail cannot be truncated; replica stays out of sync"
+            );
+            return Ok((StatusCode::NOT_IMPLEMENTED, reason).into_response());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Json(ReplicateTruncateResponse {
+        node_id: cluster.runtime.config().node_id,
+        partition: body.partition,
+        log_end,
+    })
+    .into_response())
 }
 
 pub async fn internal_replicate_catch_up(

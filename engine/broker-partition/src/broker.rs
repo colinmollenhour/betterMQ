@@ -2199,6 +2199,9 @@ impl Broker {
             return Ok(Vec::new());
         }
         let handle = self.shard_handle(topic, partition)?;
+        // An empty topic on a physical (V2) shard reads the whole shard log,
+        // which is what replica repair needs.
+        let whole_shard = topic.is_empty() && self.inner.layout.is_physical();
         let mut cursor = from_offset;
         let mut out = Vec::with_capacity(max_messages.min(256));
         while out.len() < max_messages {
@@ -2212,7 +2215,7 @@ impl Broker {
             out.extend(
                 batch
                     .into_iter()
-                    .filter(|message| message.topic == topic)
+                    .filter(|message| whole_shard || message.topic == topic)
                     .take(remaining),
             );
             if cursor >= handle.high_watermark()? {
@@ -2297,6 +2300,28 @@ impl Broker {
         };
         broker_proto::encode_frame_vec(&header, &msg.payload)
             .map_err(|e| BrokerError::Storage(broker_storage::LogError::Record(e)))
+    }
+
+    /// Follower reconciliation: drop this replica's records at or above
+    /// `offset`, keeping the cut bytes in a sidecar (see
+    /// `PartitionLog::truncate_to`). Returns the new log end.
+    pub fn truncate_replica_log(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        generation: u64,
+    ) -> Result<u64, BrokerError> {
+        if self.inner.config.storage == StorageMode::Slate {
+            return Err(BrokerError::Storage(
+                broker_storage::LogError::TruncateUnsupported(
+                    "slate mode: frame replication disabled".into(),
+                ),
+            ));
+        }
+        let handle = self.shard_handle(topic, partition)?;
+        handle.truncate_to(offset, generation)?;
+        Ok(handle.high_watermark()?)
     }
 
     /// Drop a primary-queue record from the partition log (not used for `*. __dlq` topics).

@@ -655,6 +655,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         None
     };
     if let Some(ref c) = cluster {
+        c.attach_local_log(broker.clone(), &settings.data_dir)
+            .context("open replica fence")?;
         if c.runtime.config().node_count() > 1 && storage == StorageMode::Local {
             // Blobs would exist only on the accepting node: keep bodies inline
             // in the replicated WAL frame, bounded by the epoch cap (D3).
