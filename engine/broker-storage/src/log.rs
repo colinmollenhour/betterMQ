@@ -929,7 +929,15 @@ impl PartitionLog {
         self.ensure_writable()?;
         let (header, payload) = {
             let mut cursor = std::io::Cursor::new(frame);
-            decode_frame(&mut cursor)?
+            let decoded = decode_frame(&mut cursor)?;
+            if cursor.position() != frame.len() as u64 {
+                // Stored as is, so trailing bytes would corrupt the WAL.
+                return Err(LogError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "replicated frame has trailing bytes",
+                )));
+            }
+            decoded
         };
 
         if let Some(want) = expected_offset {
@@ -949,7 +957,11 @@ impl PartitionLog {
         }
 
         if self.manifest.wal_format_version == WAL_FORMAT_V2 {
-            let mut appended = self.append_batch(partition, vec![(header, payload)], None)?;
+            let mut appended = self.append_items(
+                partition,
+                vec![(header, payload, Some(frame.to_vec()))],
+                None,
+            )?;
             return appended.pop().map(|(stored, _)| stored).ok_or_else(|| {
                 LogError::Io(io::Error::other(
                     "empty result from single-record epoch append",
@@ -1095,6 +1107,22 @@ impl PartitionLog {
         items: Vec<(LogRecord, Vec<u8>)>,
         fence_generation: Option<u64>,
     ) -> Result<Vec<(StoredMessage, Vec<u8>)>, LogError> {
+        let items = items
+            .into_iter()
+            .map(|(header, payload)| (header, payload, None))
+            .collect();
+        self.append_items(partition, items, fence_generation)
+    }
+
+    /// Append records, each with its already-encoded frame when it has one
+    /// (replication: the frame was validated by decoding and is stored as
+    /// is, so the local ingest limit does not apply to it).
+    fn append_items(
+        &mut self,
+        partition: u32,
+        items: Vec<(LogRecord, Vec<u8>, Option<Vec<u8>>)>,
+        fence_generation: Option<u64>,
+    ) -> Result<Vec<(StoredMessage, Vec<u8>)>, LogError> {
         if items.is_empty() {
             return Ok(Vec::new());
         }
@@ -1113,9 +1141,12 @@ impl PartitionLog {
         };
         let mut byte_offset = self.wal_size + epoch_prefix;
         let mut offset = first_offset;
-        for (header, payload) in items {
+        for (header, payload, encoded) in items {
             let frame_start = buf.len();
-            encode_frame(&header, &payload, &mut buf)?;
+            match encoded {
+                Some(frame) => buf.extend_from_slice(&frame),
+                None => encode_frame(&header, &payload, &mut buf)?,
+            }
             let frame = buf[frame_start..].to_vec();
             positions.push((
                 offset,
@@ -2760,6 +2791,26 @@ mod tests {
         )
         .unwrap();
         assert_payload_sequence(&log, &[b"one", b"two"]);
+    }
+
+    #[test]
+    fn raw_frame_with_trailing_bytes_is_rejected() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            let mut log = PartitionLog::open_for_shard(
+                dir.path(),
+                group_cfg(Duration::from_secs(60)),
+                0,
+                format,
+            )
+            .unwrap();
+            let mut frame = Vec::new();
+            encode_frame(&sample_record("t"), b"one", &mut frame).unwrap();
+            frame.extend_from_slice(b"junk");
+            assert!(log.append_raw_frame(0, &frame, Some(0)).is_err());
+            assert_eq!(log.high_watermark(), 0);
+            assert_eq!(wal_len(dir.path()), 0);
+        }
     }
 
     #[test]

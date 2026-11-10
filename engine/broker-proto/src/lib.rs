@@ -23,7 +23,8 @@ pub use paths::{
     PathSegmentError,
 };
 pub use record::{
-    batch_crc, decode_frame, encode_frame, encode_frame_vec, LogRecord, RecordError, StoredMessage,
+    batch_crc, decode_frame, encode_frame, encode_frame_vec, max_frame_decode_payload_bytes,
+    LogRecord, RecordError, StoredMessage,
 };
 pub use recover::allow_empty_metadata_recovery;
 pub use retry::{RetryBackoff, RetryBackoffKind, RetryDefaults};

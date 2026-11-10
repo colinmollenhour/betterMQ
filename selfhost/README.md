@@ -354,7 +354,7 @@ Background loops export these `/metrics` series: `bettermq_scheduler_failures_to
 | `BETTERMQ_INGEST_MAX_QUEUED_BYTES` | Process queued-byte cap (default 64 MiB) |
 | `BETTERMQ_INGEST_MAX_TENANT_RECORDS` | Per-tenant queued-record cap; excess gets `429` |
 | `BETTERMQ_INGEST_MAX_TENANT_BYTES` | Per-tenant queued-byte cap; excess gets `429` |
-| `BETTERMQ_MAX_HTTP_BODY_BYTES` | HTTP body cap (default 64 MiB) |
+| `BETTERMQ_MAX_HTTP_BODY_BYTES` | HTTP ingest body cap (default 64 MiB). Limits only new public requests: records already stored stay readable after it is lowered, and `/internal/v1` replication accepts frames up to at least 64 MiB regardless |
 | `BETTERMQ_INLINE_MAX_BYTES` | Inline payload threshold before blob store (default 256 KiB) |
 | `BETTERMQ_MAX_PAYLOAD_BLOB_BYTES` | Hard cap for blob payloads (default 256 MiB) |
 | `BETTERMQ_CORS_ORIGINS` | CORS allowlist (`*` or comma-separated origins) |

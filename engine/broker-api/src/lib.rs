@@ -183,6 +183,24 @@ fn data_plane_routes(shared: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(protected)
 }
 
+/// Headroom over the frame decode cap for replication envelopes.
+const INTERNAL_BODY_SLACK_BYTES: usize = 1024 * 1024;
+
+/// Body cap for `/internal/v1`. Replication carries frames that were
+/// accepted under whatever ingest limit applied when they were written, so a
+/// follower whose public `BETTERMQ_MAX_HTTP_BODY_BYTES` is lower must still
+/// accept anything the frame codec can decode.
+fn internal_body_limit_bytes() -> usize {
+    internal_body_limit(
+        http_body_limit_bytes(),
+        broker_proto::max_frame_decode_payload_bytes(),
+    )
+}
+
+fn internal_body_limit(http_limit: usize, decode_cap: usize) -> usize {
+    http_limit.max(decode_cap.saturating_add(INTERNAL_BODY_SLACK_BYTES))
+}
+
 fn finish_router(routes: Router<Arc<AppState>>, shared: Arc<AppState>) -> Router {
     routes
         .layer(DefaultBodyLimit::max(http_body_limit_bytes()))
@@ -225,6 +243,12 @@ pub fn internal_router(state: AppState) -> Router {
 }
 
 fn internal_cluster_routes() -> Router<Arc<AppState>> {
+    // Innermost DefaultBodyLimit wins, so this overrides finish_router's
+    // public limit for these routes on the collapsed listener too.
+    internal_cluster_route_table().layer(DefaultBodyLimit::max(internal_body_limit_bytes()))
+}
+
+fn internal_cluster_route_table() -> Router<Arc<AppState>> {
     Router::new()
         .route(
             "/internal/v1/lease/claim",
@@ -1996,6 +2020,53 @@ mod tests {
         .await;
         std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
         assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn internal_body_limit_ignores_a_lower_public_limit() {
+        let decode_cap = 64 * 1024 * 1024;
+        assert_eq!(
+            internal_body_limit(128 * 1024, decode_cap),
+            decode_cap + INTERNAL_BODY_SLACK_BYTES
+        );
+        assert_eq!(
+            internal_body_limit(512 * 1024 * 1024, decode_cap),
+            512 * 1024 * 1024
+        );
+        assert!(internal_body_limit_bytes() > broker_proto::max_frame_decode_payload_bytes());
+    }
+
+    #[tokio::test]
+    async fn inner_internal_body_limit_overrides_the_public_one() {
+        // Same layering as router(): internal routes carry their own limit
+        // inside finish_router's public limit.
+        async fn echo(body: axum::body::Bytes) -> String {
+            body.len().to_string()
+        }
+        let internal = Router::new()
+            .route("/internal/v1/x", axum::routing::post(echo))
+            .layer(DefaultBodyLimit::max(64 * 1024));
+        let app: Router = Router::new()
+            .route("/v1/x", axum::routing::post(echo))
+            .merge(internal)
+            .layer(DefaultBodyLimit::max(1024));
+        let send = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .body(Body::from(vec![0u8; 8 * 1024]))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        assert_eq!(send("/internal/v1/x").await, StatusCode::OK);
+        assert_eq!(send("/v1/x").await, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
