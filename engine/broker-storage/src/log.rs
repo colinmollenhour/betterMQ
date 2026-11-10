@@ -214,6 +214,7 @@ pub struct PartitionLog {
     committed_hwm: u64,
     flush_count: u64,
     fail_next_sync: bool,
+    wal_syncs: u64,
     /// Set once the WAL on disk may no longer match the in-memory state.
     /// Every later write or durability barrier fails until a reopen rebuilds
     /// the log from disk.
@@ -284,6 +285,7 @@ impl PartitionLog {
             committed_hwm: 0,
             flush_count: 0,
             fail_next_sync: false,
+            wal_syncs: 0,
             fenced: None,
             telemetry: crate::telemetry::register_shard(shard_id),
             #[cfg(test)]
@@ -375,7 +377,7 @@ impl PartitionLog {
             // Recovered bytes may still be only in the page cache (a process
             // crash, not a power loss); make them durable before recording
             // them as such.
-            self.wal.sync_data()?;
+            self.sync_wal(false)?;
             self.meta.durable_offset = next;
         }
         self.meta.save(&self.dir)?;
@@ -914,7 +916,7 @@ impl PartitionLog {
         self.wal.set_len(self.wal_size)?;
         // Always durable, even in `os` mode: a torn record that reappears
         // after a crash would hide every record written after it.
-        self.wal.sync_data()
+        self.sync_wal(false)
     }
 
     /// Append a pre-encoded broker-proto frame (follower replication).
@@ -1231,7 +1233,7 @@ impl PartitionLog {
         if self.config.fsync != FsyncMode::Os {
             let started = Instant::now();
             let pending_records = self.meta.next_offset.saturating_sub(self.committed_hwm);
-            if let Err(error) = self.wal.sync_all() {
+            if let Err(error) = self.sync_wal(true) {
                 self.telemetry
                     .record_fsync(pending_records, started.elapsed(), false);
                 self.fence(format!("WAL fsync before segment roll failed: {error}"));
@@ -1455,9 +1457,33 @@ impl PartitionLog {
                 .sum::<usize>()
     }
 
-    /// Fail the next durability barrier before advancing the committed HWM.
+    /// Make the next WAL fsync report failure, as a kernel does when
+    /// writeback failed: the syscall still runs, then its result is replaced
+    /// with an error. Exercises the same path as a real fsync error.
     pub fn inject_fsync_failure(&mut self) {
         self.fail_next_sync = true;
+    }
+
+    /// WAL fsync syscalls that returned success on this log. Every durability
+    /// barrier goes through [`Self::sync_wal`], so tests can prove that an
+    /// acknowledgement followed a real barrier.
+    pub fn wal_sync_count(&self) -> u64 {
+        self.wal_syncs
+    }
+
+    /// The only place the WAL is fsynced (`sync_all` when the file length
+    /// must be durable too).
+    fn sync_wal(&mut self, all: bool) -> io::Result<()> {
+        if all {
+            self.wal.sync_all()?;
+        } else {
+            self.wal.sync_data()?;
+        }
+        if std::mem::take(&mut self.fail_next_sync) {
+            return Err(io::Error::other("injected fsync failure"));
+        }
+        self.wal_syncs += 1;
+        Ok(())
     }
 
     /// First offset still retained (everything below was collected).
@@ -1667,17 +1693,9 @@ impl PartitionLog {
         }
         let started = Instant::now();
         let pending_records = self.meta.next_offset.saturating_sub(self.committed_hwm);
-        if self.fail_next_sync {
-            self.fail_next_sync = false;
-            self.telemetry
-                .record_fsync(pending_records, started.elapsed(), false);
-            let error = io::Error::other("injected fsync failure");
-            self.fence(format!("WAL fsync failed: {error}"));
-            return Err(LogError::Io(error));
-        }
         let persist_sync = self.config.fsync != FsyncMode::Os;
         if persist_sync {
-            if let Err(error) = self.wal.sync_data() {
+            if let Err(error) = self.sync_wal(false) {
                 self.telemetry
                     .record_fsync(pending_records, started.elapsed(), false);
                 self.fence(format!("WAL fsync failed: {error}"));
@@ -2887,6 +2905,33 @@ mod tests {
         )
         .unwrap();
         assert_payload_sequence(&log, &[b"one", b"two"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_fsync_error_from_the_kernel_fences_the_log() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        let dir = tempdir().unwrap();
+        let mut log = PartitionLog::open(dir.path(), group_cfg(Duration::from_secs(60))).unwrap();
+        log.append(0, sample_record("t"), b"one".to_vec()).unwrap();
+        log.sync().unwrap();
+        let syncs = log.wal_sync_count();
+
+        // fdatasync(2) on a socket fails with EINVAL: a genuine syscall error,
+        // not the injection flag.
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        log.wal = File::from(OwnedFd::from(socket));
+        log.append(0, sample_record("t"), b"two".to_vec()).unwrap();
+        let err = log.sync().unwrap_err();
+        assert!(
+            matches!(&err, LogError::Io(e) if e.raw_os_error() == Some(22)),
+            "{err:?}"
+        );
+        assert_eq!(log.wal_sync_count(), syncs);
+        assert_eq!(log.committed_hwm(), 1);
+        assert!(log.fenced_reason().is_some());
+        assert!(matches!(log.sync(), Err(LogError::Fenced(_))));
     }
 
     #[test]
