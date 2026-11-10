@@ -974,13 +974,25 @@ impl ClusterRuntime {
         }
     }
 
+    /// Acquire or renew the scheduler lease. In OpenRaft mode a renewal is a
+    /// quorum-replicated controller write, so the holder only renews once less
+    /// than half of `ttl_ms` remains; callers may poll this every tick.
     pub async fn acquire_scheduler_leader(&self, ttl_ms: i64) -> Result<bool, ClusterError> {
         if let Some(controller) = &self.controller {
             let now_ms = Utc::now().timestamp_millis();
-            if controller.state().scheduler.is_some_and(|lease| {
-                lease.holder != self.config.node_id && lease.expires_at_ms > now_ms
-            }) {
-                return Ok(false);
+            match controller.state().scheduler {
+                Some(lease)
+                    if lease.holder != self.config.node_id && lease.expires_at_ms > now_ms =>
+                {
+                    return Ok(false);
+                }
+                Some(lease)
+                    if lease.holder == self.config.node_id
+                        && lease.expires_at_ms.saturating_sub(now_ms) > ttl_ms.max(1) / 2 =>
+                {
+                    return Ok(true);
+                }
+                _ => {}
             }
             let state = controller
                 .submit(ControllerCommand::AcquireScheduler {
@@ -1067,6 +1079,55 @@ mod tests {
     use super::*;
     use crate::election::elect_shard_leader;
 
+    /// `BETTERMQ_SHARED_META_DIR` is process-wide: a test that sets it would
+    /// move a concurrent test's `cluster.json` (and its scheduler lease) into
+    /// the shared dir.
+    static SHARED_META_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scheduler_holder_renews_only_after_half_the_lease() {
+        let _env = SHARED_META_ENV.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let node = Uuid::new_v4();
+        let config = ClusterConfig {
+            cluster_id: Uuid::new_v4(),
+            nodes: vec![NodeConfig {
+                id: node,
+                addr: "http://127.0.0.1:1".into(),
+                internal_url: None,
+            }],
+            node_id: node,
+            generation: 1,
+            hash_version: 1,
+        };
+        let rt = ClusterRuntime::open_with_raft(dir.path(), config, 4)
+            .await
+            .unwrap();
+        let controller = rt.controller().unwrap().clone();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !(controller.is_ready() && controller.is_leader_with_quorum()) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("single-node controller becomes ready");
+        let last_log = || controller.raft().metrics().borrow().last_log_index;
+
+        assert!(rt.acquire_scheduler_leader(5_000).await.unwrap());
+        let acquired_at = last_log();
+        for _ in 0..10 {
+            assert!(rt.acquire_scheduler_leader(5_000).await.unwrap());
+        }
+        assert_eq!(last_log(), acquired_at, "fresh lease is not re-submitted");
+        assert!(rt.is_scheduler_leader());
+
+        // Less than half of a longer TTL remains, so this call renews.
+        let before = controller.state().scheduler.unwrap().expires_at_ms;
+        assert!(rt.acquire_scheduler_leader(60_000).await.unwrap());
+        assert!(last_log() > acquired_at);
+        assert!(controller.state().scheduler.unwrap().expires_at_ms > before);
+    }
+
     #[test]
     fn shard_leader_round_robin_when_all_healthy() {
         let n1 = Uuid::new_v4();
@@ -1141,6 +1202,7 @@ mod tests {
 
     #[test]
     fn scheduler_lease_cas_under_shared_file() {
+        let _env = SHARED_META_ENV.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("BETTERMQ_SHARED_META_DIR", dir.path());
         let n1 = Uuid::new_v4();
