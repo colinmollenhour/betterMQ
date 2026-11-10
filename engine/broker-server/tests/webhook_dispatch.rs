@@ -2,11 +2,26 @@
 
 use broker_dispatch::{DispatchConfig, DispatchEngine};
 use broker_partition::{Broker, BrokerConfig, CreateSubscriptionRequest, PublishRequest};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::sync::Once;
 use std::time::Duration;
 use tempfile::tempdir;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Recompute the signature the receiver would check, independently of
+/// `broker_dispatch::sign_payload`.
+fn expected_signature(secret: &str, timestamp_ms: &str, body: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(timestamp_ms.as_bytes());
+    mac.update(b".");
+    mac.update(body);
+    format!(
+        "t={timestamp_ms},v1={}",
+        hex::encode(mac.finalize().into_bytes())
+    )
+}
 
 fn allow_wiremock_localhost() {
     static ONCE: Once = Once::new();
@@ -38,6 +53,7 @@ async fn publish_triggers_webhook_with_signature() {
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/hook"))
+        .and(header_exists("bettermq-signature"))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
         .mount(&mock)
@@ -92,6 +108,27 @@ async fn publish_triggers_webhook_with_signature() {
         resp.message_id.unwrap(),
     ));
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let request = loop {
+        if let Some(request) = mock.received_requests().await.unwrap().into_iter().next() {
+            break request;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "webhook was not delivered"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(request.body, b"ping");
+    let signature = request.headers["bettermq-signature"].to_str().unwrap();
+    let timestamp = request.headers["bettermq-timestamp"].to_str().unwrap();
+    assert_eq!(
+        signature,
+        expected_signature("whsec_test", timestamp, &request.body)
+    );
+    assert_ne!(
+        signature,
+        expected_signature("wrong-secret", timestamp, &request.body)
+    );
     mock.verify().await;
 }
