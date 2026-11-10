@@ -26,6 +26,12 @@ Record hardware, filesystem, fsync mode, payload distribution, batch size, and
 open-loop offered load with every result. A saturated closed-loop benchmark is
 not a launch result.
 
+The repeatable harness for these gates lives in
+[`tools/bettermq-bench`](../tools/bettermq-bench/README.md): open-loop step ramps
+to find the sustained ceiling and where it breaks, a realistic mixed workload,
+outage/burst/crash scenarios, and CPU, memory-release and disk accounting, with a
+`compare` command for before/after runs.
+
 ## Soak and fault gates
 
 - Pull requests that change durability, admission, replication, archive, or

@@ -1,0 +1,28 @@
+[package]
+name = "bettermq-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Repeatable load, scale, and resource benchmark suite for BetterMQ"
+
+[[bin]]
+name = "bettermq-bench"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+hdrhistogram = { version = "7.6.0", default-features = false }
+hex = { workspace = true }
+libc = "0.2"
+parking_lot = { workspace = true }
+reqwest = { workspace = true, features = ["http2"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
