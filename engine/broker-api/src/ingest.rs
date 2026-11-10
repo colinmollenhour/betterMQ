@@ -187,6 +187,96 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn cell_batch_rejects_only_oversize_items_before_append() {
+        use axum::response::IntoResponse as _;
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        broker.set_payload_policy(broker_partition::PayloadPolicy::InlineOnly { max_body: 1_000 });
+        let state = Arc::new(AppState {
+            broker: broker.clone(),
+            schedule: ScheduleQueue::open(dir.path()).unwrap(),
+            crons: CronRegistry::open(dir.path()).unwrap(),
+            dispatch: DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default()),
+            leases: LeaseTable::new(),
+            cluster: None,
+            local_auth: None,
+            fair_queue: Arc::new(broker_dispatch::TenantFairQueue::new()),
+            catalog_tombstones: crate::catalog_tombstones::CatalogTombstones::open(dir.path())
+                .unwrap(),
+            dispatch_fleet: false,
+            broker_only: true,
+            #[cfg(feature = "cloud")]
+            auth: None,
+            #[cfg(feature = "cloud")]
+            control_plane: None,
+        });
+        let body = |len: usize, key: &str| {
+            let mut request = sample(None);
+            request.url = Some("https://example.com/hook".into());
+            request.payload = "p".repeat(len);
+            request.idempotency_key = Some(key.into());
+            request
+        };
+        let delayed = {
+            let mut request = body(1_001, "delayed-big");
+            request.delay_ms = Some(60_000);
+            request
+        };
+        let outcomes = submit_batch(
+            &state,
+            None,
+            IngestBatch::from_requests(vec![
+                body(1_000, "ok-1"),
+                body(1_001, "big"),
+                body(10, "ok-2"),
+                delayed,
+            ])
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(outcomes.len(), 4);
+        assert!(outcomes[0].result.is_ok());
+        assert!(outcomes[2].result.is_ok());
+        for rejected in [&outcomes[1], &outcomes[3]] {
+            let response = rejected.result.as_ref().unwrap_err();
+            assert!(matches!(
+                response,
+                ApiError::Broker(broker_partition::BrokerError::Payload(
+                    broker_partition::PayloadError::TooLargeForCell { limit: 1_000, .. }
+                ))
+            ));
+        }
+        let partition = outcomes[0].result.as_ref().unwrap().partition.unwrap();
+        assert_eq!(
+            outcomes[2].result.as_ref().unwrap().partition,
+            Some(partition)
+        );
+        let stored = broker
+            .list_topic_messages_from(broker_partition::DIRECT_TOPIC, partition, 0, 100)
+            .unwrap();
+        assert_eq!(stored.len(), 2, "only the fitting items were appended");
+        assert!(stored
+            .iter()
+            .all(|message| message.payload_ref_json.is_none()));
+        assert!(!dir.path().join("payload-blobs").join("payloads").exists());
+        assert!(state.schedule.list().is_empty());
+        let response = ApiError::Broker(broker_partition::BrokerError::Payload(
+            broker_partition::PayloadError::TooLargeForCell {
+                size: 1_001,
+                limit: 1_000,
+            },
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["error"], "payload_too_large_for_cell");
+        assert_eq!(json["limit"], 1_000);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn local_api_batch_uses_one_shard_commit_epoch() {
         let dir = tempfile::tempdir().unwrap();
         let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
@@ -270,6 +360,9 @@ pub(crate) async fn ingest_one_validated(
 ) -> Result<PublishResponse, ApiError> {
     let _permit =
         crate::admission::check_admission(state, meter.map(|m| m.tenant_id), req.payload.len())?;
+    // Local-WAL cells keep bodies inline: refuse an oversize body here,
+    // before scheduling, forwarding or any append.
+    state.broker.check_publish_body(&req)?;
     if let Some(delay_ms) = req.delay_ms.take() {
         if req.idempotency_key.is_none() {
             req.idempotency_key = Some(format!("delay:{}", uuid::Uuid::new_v4()));
@@ -476,61 +569,98 @@ async fn submit_local_leader_batch(
             .map(|record| (record.topic.to_string(), record.partition))
             .collect();
         let broker = state.broker.clone();
-        let local = async move {
-            broker
-                .wait_committed(&topic, partition, last_offset)
-                .await
-                .map_err(|error| {
-                    broker_replication::ReplicateError::InvalidEpoch(error.to_string())
-                })
-        };
         if replicate {
             let cluster = state.cluster.as_ref().expect("cluster checked above");
             let records: Vec<_> = appended.records().collect();
-            let Some(first_rec) = records.first() else {
+            if records.is_empty() {
                 continue;
-            };
-            let epoch_topic = if records.iter().all(|record| record.topic == first_rec.topic) {
-                first_rec.topic.to_string()
-            } else {
-                String::new()
-            };
-            let frames = records
+            }
+            // Cut the shard group into epochs that each fit the replication
+            // byte cap; they replicate in offset order below.
+            let tenant = state.broker.tenant();
+            let frame_lens: Vec<usize> = records
                 .iter()
-                .map(|record| record.replication_frame.to_vec())
+                .map(|record| record.replication_frame.len())
                 .collect();
-            let request = match ReplicateBatchRequest::new(
-                state.broker.tenant(),
-                epoch_topic,
-                first_rec.partition,
-                cluster.runtime.config().node_id,
-                cluster.runtime.shard_generation(first_rec.partition),
-                first_rec.offset,
-                frames,
+            let longest_topic = records
+                .iter()
+                .map(|record| record.topic.len())
+                .max()
+                .unwrap_or(0);
+            let mut requests = Vec::new();
+            for range in broker_replication::epoch_frame_ranges(
+                &frame_lens,
+                tenant.len(),
+                longest_topic,
+                cluster.replication.max_epoch_bytes(),
             ) {
-                Ok(request) => request,
-                Err(error) => {
-                    rejected.extend(failed_outcomes(
-                        &admitted,
-                        ApiError::ReplicationFailed(format!(
-                            "batch replication encoding failed: {error}"
-                        )),
-                    ));
-                    return rejected;
+                let chunk = &records[range];
+                let first_rec = &chunk[0];
+                let epoch_topic = if chunk.iter().all(|record| record.topic == first_rec.topic) {
+                    first_rec.topic.to_string()
+                } else {
+                    String::new()
+                };
+                match ReplicateBatchRequest::new(
+                    tenant.clone(),
+                    epoch_topic,
+                    first_rec.partition,
+                    cluster.runtime.config().node_id,
+                    cluster.runtime.shard_generation(first_rec.partition),
+                    first_rec.offset,
+                    chunk
+                        .iter()
+                        .map(|record| record.replication_frame.to_vec())
+                        .collect(),
+                ) {
+                    Ok(request) => requests.push(request),
+                    Err(error) => {
+                        rejected.extend(failed_outcomes(
+                            &admitted,
+                            ApiError::ReplicationFailed(format!(
+                                "batch replication encoding failed: {error}"
+                            )),
+                        ));
+                        return rejected;
+                    }
                 }
-            };
+            }
             let replication = cluster.replication.clone();
+            let wait_topic = topic;
             commit_tasks.spawn(async move {
-                let outcome = replication
-                    .replicate_batch_with_local(request, local)
-                    .await?;
+                let mut committed_hwm = 0;
+                for request in requests {
+                    let epoch_last = request.last_offset()?;
+                    let broker = broker.clone();
+                    let wait_topic = wait_topic.clone();
+                    let local = async move {
+                        broker
+                            .wait_committed(&wait_topic, partition, epoch_last)
+                            .await
+                            .map_err(|error| {
+                                broker_replication::ReplicateError::InvalidEpoch(error.to_string())
+                            })
+                    };
+                    committed_hwm = replication
+                        .replicate_batch_with_local(request, local)
+                        .await?
+                        .committed_hwm;
+                }
                 Ok::<_, broker_replication::ReplicateError>((
                     appended,
                     response_keys,
-                    outcome.committed_hwm,
+                    committed_hwm,
                 ))
             });
         } else {
+            let local = async move {
+                broker
+                    .wait_committed(&topic, partition, last_offset)
+                    .await
+                    .map_err(|error| {
+                        broker_replication::ReplicateError::InvalidEpoch(error.to_string())
+                    })
+            };
             commit_tasks.spawn(async move {
                 let epoch = local.await?;
                 Ok::<_, broker_replication::ReplicateError>((appended, response_keys, epoch))
@@ -621,6 +751,16 @@ pub async fn submit_batch(
     let mut immediate = Vec::new();
     let mut out = Vec::with_capacity(batch.records.len());
     for (index, env) in batch.records.into_iter().enumerate() {
+        // Reject only the oversize items, before anything is appended.
+        if let Err(error) = state.broker.check_publish_body(&env.req) {
+            record_rejected();
+            out.push(IngestOutcome {
+                index,
+                topic: env.req.topic,
+                result: Err(error.into()),
+            });
+            continue;
+        }
         if env.req.delay_ms.is_none() {
             immediate.push((index, env));
             continue;

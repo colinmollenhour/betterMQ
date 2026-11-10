@@ -360,7 +360,7 @@ Background loops export these `/metrics` series: `bettermq_scheduler_failures_to
 | `BETTERMQ_INGEST_MAX_TENANT_RECORDS` | Per-tenant queued-record cap; excess gets `429` |
 | `BETTERMQ_INGEST_MAX_TENANT_BYTES` | Per-tenant queued-byte cap; excess gets `429` |
 | `BETTERMQ_MAX_HTTP_BODY_BYTES` | HTTP ingest body cap (default 64 MiB). Limits only new public requests: records already stored stay readable after it is lowered, and `/internal/v1` replication accepts frames up to at least 64 MiB regardless |
-| `BETTERMQ_INLINE_MAX_BYTES` | Inline payload threshold before blob store (default 256 KiB) |
+| `BETTERMQ_INLINE_MAX_BYTES` | Inline payload threshold before blob store (default 256 KiB). Ignored in local-WAL cells, which keep every body inline |
 | `BETTERMQ_MAX_PAYLOAD_BLOB_BYTES` | Hard cap for blob payloads (default 256 MiB) |
 | `BETTERMQ_CORS_ORIGINS` | CORS allowlist (`*` or comma-separated origins) |
 | `BETTERMQ_SHUTDOWN_TIMEOUT_SECS` | Per-phase HTTP, dispatch and WAL drain bound (default 30 seconds each, maximum 300); see Shutdown grace |
@@ -422,7 +422,7 @@ Fan-out vars are **group bookkeeping**, not DLQ TTL.
 | `BETTERMQ_SHARD_QUEUE_CAPACITY` | Per-shard I/O queue (default `1024`, clamp 1–65536) |
 | `BETTERMQ_SEGMENT_READER_CACHE` | Open WAL segment file cache (default `64`, clamp 1–4096) |
 | `BETTERMQ_METADATA_RECOVER` | `empty` allows replacing corrupt JSON meta with defaults |
-| `BETTERMQ_MAX_REPLICATION_EPOCH_BYTES` | Replication epoch size (default 16 MiB) |
+| `BETTERMQ_MAX_REPLICATION_EPOCH_BYTES` | Replication epoch size (default 16 MiB, max 64 MiB). Also sets the local-WAL cell body limit (`cell_max_inline_body`: the cap minus about 1.2 MiB of framing and a 64 KiB dead-letter allowance) |
 | `BETTERMQ_MAX_REPLICATION_IN_FLIGHT_BYTES` | Replication in-flight bytes (default 64 MiB) |
 | `BETTERMQ_ARCHIVE_DIR` | Directory for async copies of sealed WAL segments |
 | `BETTERMQ_ARCHIVE_QUEUE_CAPACITY` | Bounded sealed-segment archive queue (default 128) |
@@ -629,6 +629,10 @@ Standalone panel: `BETTERMQ_CLUSTER_SECRET=… docker compose -f docker-compose.
 `/admin/v1` fails closed. Every route except `/admin/v1/health` needs `Authorization: Bearer <token>`: the local `sk_local_…` API token (embedded panel) or `BETTERMQ_CLUSTER_SECRET`. Before a panel password is set, admin calls return `401` (`auth_not_configured`); a standalone panel without a cluster secret rejects every admin call. Registering a remote cell (`POST /admin/v1/cells`) requires `adminToken`, that cell's own `sk_local_…` token; leave it blank on update to keep the saved one. Federated cell queries authenticate to each cell with only that token (never the caller's bearer or the cluster secret); a cell without one is reported as `cell credential not configured`. Responses show `adminTokenConfigured` instead of the token, and `cell-registry.json` is written with mode `0600`.
 
 Local WAL HA requires `BETTERMQ_SHARED_META_DIR` (shared volume). Slate + S3 is not a supported multi-broker alternative.
+
+**Message size in local-WAL cells.** With `BETTERMQ_STORAGE=local` and more than one node, every message body is stored inline in its WAL record and replicated with it, so a body survives the loss of the node (and disk) that accepted it. `BETTERMQ_INLINE_MAX_BYTES` does not apply in this mode. The largest accepted body is the replication epoch cap minus framing overhead and a 64 KiB allowance that keeps every accepted message small enough to move to the DLQ: about 14.8 MiB with the default `BETTERMQ_MAX_REPLICATION_EPOCH_BYTES` of 16 MiB. Each node logs the exact value as `cell_max_inline_body` at startup. Larger bodies are rejected before anything is written, with `413 {"error":"payload_too_large_for_cell","limit":N}`; in a batch only those items fail. Raise `BETTERMQ_MAX_REPLICATION_EPOCH_BYTES` (up to 64 MiB) for larger bodies; `BETTERMQ_MAX_HTTP_BODY_BYTES` still caps each public request. A node refuses to start if the epoch cap exceeds 64 MiB or the internal `/internal/v1` body limit. Single-node brokers and Slate/S3 cells keep the HTTP body cap and the external blob store.
+
+*Upgrading a cell.* Large messages accepted by earlier versions may reference a blob that exists only on the node that accepted them. When a node takes over a shard, it copies any such blob it is missing from a live peer, verifying the size and the sha256 when one was recorded, before the shard serves. If no live peer has a blob, its message is held, not dropped or sent empty. `/readyz` then reports `legacy_payloads_unresolved`, `/metrics` reports `bettermq_legacy_payload_unresolved{shard}`, and the copy is retried every minute. Bytes lost together with the only node that had them cannot be reconstructed.
 
 See [BACKUP.md](BACKUP.md) for backup/restore and host-breaker cold-start notes.
 

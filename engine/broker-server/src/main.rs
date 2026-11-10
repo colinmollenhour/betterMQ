@@ -654,6 +654,26 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         None
     };
     if let Some(ref c) = cluster {
+        if c.runtime.config().node_count() > 1 && storage == StorageMode::Local {
+            // Blobs would exist only on the accepting node: keep bodies inline
+            // in the replicated WAL frame, bounded by the epoch cap (D3).
+            let limits = broker_replication::cell_body_limits(
+                broker_api::internal_body_limit_bytes(),
+                broker_proto::record::max_frame_payload_bytes(),
+            )
+            .map_err(|reason| {
+                anyhow::anyhow!("refusing to start a local-WAL cell node: {reason}")
+            })?;
+            broker.set_payload_policy(broker_partition::PayloadPolicy::InlineOnly {
+                max_body: limits.max_inline_body,
+            });
+            info!(
+                cell_max_inline_body = limits.max_inline_body,
+                dlq_envelope_allowance = broker_replication::DLQ_ENVELOPE_ALLOWANCE,
+                max_replication_epoch_bytes = limits.max_epoch_bytes,
+                "local-WAL cell: message bodies stay inline in the replicated WAL; larger bodies get 413"
+            );
+        }
         let cluster = c.clone();
         broker.set_shard_leader_check(Arc::new(move |p| {
             if cluster.catalog_ready() && cluster.runtime.is_leader_for_shard(p) {

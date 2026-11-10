@@ -353,6 +353,21 @@ impl IntoResponse for ApiError {
                 }
                 resp
             }
+            ApiError::Broker(BrokerError::Payload(
+                broker_partition::PayloadError::TooLargeForCell { size, limit },
+            )) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({
+                    "error": "payload_too_large_for_cell",
+                    "code": "payload_too_large_for_cell",
+                    "message": format!(
+                        "message body is {size} bytes; this replicated cell stores bodies inline and accepts at most {limit} bytes"
+                    ),
+                    "limit": limit,
+                    "size": size,
+                })),
+            )
+                .into_response(),
             ApiError::Broker(BrokerError::IdempotencyInFlight(key)) => {
                 let mut resp = (
                     StatusCode::CONFLICT,
@@ -460,6 +475,18 @@ mod tests {
         )))
         .into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn oversize_cell_body_is_413_with_the_limit() {
+        let response = ApiError::Broker(BrokerError::Payload(
+            broker_partition::PayloadError::TooLargeForCell {
+                size: 20,
+                limit: 10,
+            },
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]

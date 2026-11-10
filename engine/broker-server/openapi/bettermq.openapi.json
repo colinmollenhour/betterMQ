@@ -2626,6 +2626,37 @@
                 }
               }
             }
+          },
+          "413": {
+            "description": "Local-WAL multi-node cell only: the message body is larger than the cell's inline body limit (`cell_max_inline_body`, about 14.8 MiB by default). Nothing was written. In a batch, only the oversize items fail with this error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "payload_too_large_for_cell"
+                      ]
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "limit": {
+                      "type": "integer",
+                      "description": "Largest accepted body in bytes"
+                    },
+                    "size": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
           }
         },
         "description": "Provide either url+secret (1:1) or group_id (fan-out). Shared options: delay, retries, idempotency, priority, outbound HTTP fields."
@@ -2771,6 +2802,37 @@
                 }
               }
             }
+          },
+          "413": {
+            "description": "Local-WAL multi-node cell only: the message body is larger than the cell's inline body limit (`cell_max_inline_body`, about 14.8 MiB by default). Nothing was written. In a batch, only the oversize items fail with this error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "payload_too_large_for_cell"
+                      ]
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "limit": {
+                      "type": "integer",
+                      "description": "Largest accepted body in bytes"
+                    },
+                    "size": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -2838,6 +2900,37 @@
                       "enum": [
                         "idempotency_in_flight"
                       ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Local-WAL multi-node cell only: the message body is larger than the cell's inline body limit (`cell_max_inline_body`, about 14.8 MiB by default). Nothing was written. In a batch, only the oversize items fail with this error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "payload_too_large_for_cell"
+                      ]
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "limit": {
+                      "type": "integer",
+                      "description": "Largest accepted body in bytes"
+                    },
+                    "size": {
+                      "type": "integer"
                     }
                   }
                 }
@@ -2920,6 +3013,37 @@
                       "enum": [
                         "idempotency_in_flight"
                       ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Local-WAL multi-node cell only: the message body is larger than the cell's inline body limit (`cell_max_inline_body`, about 14.8 MiB by default). Nothing was written. In a batch, only the oversize items fail with this error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "payload_too_large_for_cell"
+                      ]
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "limit": {
+                      "type": "integer",
+                      "description": "Largest accepted body in bytes"
+                    },
+                    "size": {
+                      "type": "integer"
                     }
                   }
                 }

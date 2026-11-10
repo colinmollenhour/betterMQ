@@ -624,6 +624,8 @@ async fn publish_to_group(
         .unwrap_or_else(|| state.broker.tenant());
     #[cfg(not(feature = "cloud"))]
     let fanout_tenant = state.broker.tenant();
+    // Each member copy carries the body inline in a local-WAL cell.
+    state.broker.check_publish_body(&base)?;
     let fanout_id = match base.idempotency_key.as_deref() {
         Some(key) => Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
@@ -2350,6 +2352,11 @@ async fn create_cron(
     let mutation = crate::catalog_applier::begin(&state)?;
     let schedule = parse_schedule_kind(&req)?;
     let scheduled = build_cron_scheduled_request(&state, &req).await?;
+    // Every fire must fit the cell's inline body limit; refuse up front.
+    state
+        .broker
+        .check_body(&scheduled.payload, scheduled.payload_encoding.as_deref())
+        .map_err(ApiError::from)?;
     let job = if state.cluster.is_some() {
         let mut job = broker_schedule::CronRegistry::prepare_with_kind(schedule, scheduled)?;
         job.id = mutation.id("default", CatalogKind::Cron);

@@ -9,7 +9,7 @@ use crate::priority::normalize_priority;
 use crate::shard::ShardHandle;
 use crate::subscriptions::{Subscription, SubscriptionRegistry};
 use crate::topic::{group_topic, is_dlq_topic, partition_dir, DIRECT_TOPIC};
-use broker_payload::{hydrate_payload, prepare_for_log, BlobStore};
+use broker_payload::{hydrate_payload, prepare_for_log_with, BlobStore, PayloadPolicy};
 use broker_proto::{LogRecord, RetryBackoff, RetryDefaults};
 #[cfg(feature = "slate")]
 use broker_storage::{open_object_store_from_env, slate_db_path};
@@ -537,6 +537,7 @@ struct BrokerInner {
     flows: FlowProfileRegistry,
     groups: GroupRegistry,
     blob_store: BlobStore,
+    payload_policy: RwLock<PayloadPolicy>,
     retention: crate::retention::RetentionStore,
     layout: ShardLayout,
     shards: RwLock<HashMap<String, HashMap<u32, Arc<ShardHandle>>>>,
@@ -780,6 +781,7 @@ impl Broker {
                 flows,
                 groups,
                 blob_store,
+                payload_policy: RwLock::new(PayloadPolicy::External),
                 retention,
                 layout,
                 shards: RwLock::new(HashMap::new()),
@@ -852,6 +854,31 @@ impl Broker {
             }
         }
         (counts, ready)
+    }
+
+    /// Where message bodies live. Local-WAL multi-node cells must use
+    /// [`PayloadPolicy::InlineOnly`] (set once at startup, before writes):
+    /// a node-local blob would exist only on the accepting node.
+    pub fn set_payload_policy(&self, policy: PayloadPolicy) {
+        *self.inner.payload_policy.write() = policy;
+    }
+
+    pub fn payload_policy(&self) -> PayloadPolicy {
+        *self.inner.payload_policy.read()
+    }
+
+    /// Reject a body the payload policy cannot store, before any append,
+    /// blob write or idempotency reservation.
+    pub fn check_publish_body(&self, req: &PublishRequest) -> Result<(), BrokerError> {
+        self.check_body(&req.payload, req.payload_encoding.as_deref())
+    }
+
+    /// [`Broker::check_publish_body`] for a body that is not yet a request
+    /// (schedules, crons, fan-out commands).
+    pub fn check_body(&self, payload: &str, encoding: Option<&str>) -> Result<(), BrokerError> {
+        Ok(self
+            .payload_policy()
+            .check(decoded_body_len(payload, encoding))?)
     }
 
     /// Slate + cluster: only the elected shard leader may append; generation is the fence token.
@@ -1716,8 +1743,13 @@ impl Broker {
         // Large payloads write their blob before the append. Retention deletes
         // blobs of collected or purged records; a blob orphaned by a failed
         // append or a crash before it is not reclaimed.
-        let (log_payload, payload_ref_json) =
-            prepare_for_log(&self.inner.blob_store, &tenant_id, message_id, payload)?;
+        let (log_payload, payload_ref_json) = prepare_for_log_with(
+            &self.inner.blob_store,
+            self.payload_policy(),
+            &tenant_id,
+            message_id,
+            payload,
+        )?;
 
         let _ = req.delay_ms.take();
 
@@ -2198,39 +2230,73 @@ impl Broker {
         from_offset: u64,
         max_messages: usize,
     ) -> Result<Vec<(u64, Vec<u8>)>, BrokerError> {
-        let msgs = self.list_topic_messages_from(topic, partition, from_offset, max_messages)?;
-        let mut out = Vec::with_capacity(msgs.len());
-        for msg in msgs {
-            let header = LogRecord {
-                id: msg.id,
-                tenant_id: msg.tenant_id.clone(),
-                topic: msg.topic.clone(),
-                routing_key: msg.routing_key.clone(),
-                idempotency_key: None,
-                published_at_ms: msg.published_at_ms,
-                priority: msg.priority,
-                flow_parallelism: msg.flow_parallelism,
-                flow_key: msg.flow_key.clone(),
-                flow_rate: msg.flow_rate,
-                flow_period_secs: msg.flow_period_secs,
-                queue_id: msg.queue_id,
-                group_id: msg.group_id,
-                group_member_id: msg.group_member_id,
-                flow_profile_id: msg.flow_profile_id,
-                destination_url: msg.destination_url.clone(),
-                destination_secret: msg.destination_secret.clone(),
-                max_retries: msg.max_retries,
-                retry_backoff: msg.retry_backoff.clone(),
-                http_method: msg.http_method.clone(),
-                http_headers_json: msg.http_headers_json.clone(),
-                http_sign: msg.http_sign,
-                payload_ref_json: msg.payload_ref_json.clone(),
+        self.replication_frames_bounded(topic, partition, from_offset, max_messages, usize::MAX)
+    }
+
+    /// [`Broker::replication_frames`] that also stops before `max_bytes` of
+    /// frames, always returning at least one frame when any is available, so
+    /// catch-up of large inline bodies advances page by page.
+    pub fn replication_frames_bounded(
+        &self,
+        topic: &str,
+        partition: u32,
+        from_offset: u64,
+        max_messages: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>, BrokerError> {
+        let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut bytes = 0usize;
+        let mut cursor = from_offset;
+        while out.len() < max_messages {
+            let page = (max_messages - out.len()).min(64);
+            let msgs = self.list_topic_messages_from(topic, partition, cursor, page)?;
+            let Some(last) = msgs.last().map(|message| message.offset) else {
+                break;
             };
-            let frame = broker_proto::encode_frame_vec(&header, &msg.payload)
-                .map_err(|e| BrokerError::Storage(broker_storage::LogError::Record(e)))?;
-            out.push((msg.offset, frame));
+            cursor = last.saturating_add(1);
+            for msg in msgs {
+                let frame = Self::replication_frame(&msg)?;
+                if !out.is_empty() && bytes.saturating_add(frame.len()) > max_bytes {
+                    return Ok(out);
+                }
+                bytes = bytes.saturating_add(frame.len());
+                out.push((msg.offset, frame));
+                if out.len() >= max_messages {
+                    break;
+                }
+            }
         }
         Ok(out)
+    }
+
+    fn replication_frame(msg: &StoredMessage) -> Result<Vec<u8>, BrokerError> {
+        let header = LogRecord {
+            id: msg.id,
+            tenant_id: msg.tenant_id.clone(),
+            topic: msg.topic.clone(),
+            routing_key: msg.routing_key.clone(),
+            idempotency_key: None,
+            published_at_ms: msg.published_at_ms,
+            priority: msg.priority,
+            flow_parallelism: msg.flow_parallelism,
+            flow_key: msg.flow_key.clone(),
+            flow_rate: msg.flow_rate,
+            flow_period_secs: msg.flow_period_secs,
+            queue_id: msg.queue_id,
+            group_id: msg.group_id,
+            group_member_id: msg.group_member_id,
+            flow_profile_id: msg.flow_profile_id,
+            destination_url: msg.destination_url.clone(),
+            destination_secret: msg.destination_secret.clone(),
+            max_retries: msg.max_retries,
+            retry_backoff: msg.retry_backoff.clone(),
+            http_method: msg.http_method.clone(),
+            http_headers_json: msg.http_headers_json.clone(),
+            http_sign: msg.http_sign,
+            payload_ref_json: msg.payload_ref_json.clone(),
+        };
+        broker_proto::encode_frame_vec(&header, &msg.payload)
+            .map_err(|e| BrokerError::Storage(broker_storage::LogError::Record(e)))
     }
 
     /// Drop a primary-queue record from the partition log (not used for `*. __dlq` topics).
@@ -2667,6 +2733,27 @@ impl Broker {
 
     pub fn assign_shard(&self, topic: &str, routing_key: &str) -> u32 {
         self.inner.layout.assign(&self.tenant(), topic, routing_key)
+    }
+}
+
+/// Body size after `payload_encoding` is applied, without decoding.
+pub fn decoded_payload_len(req: &PublishRequest) -> usize {
+    decoded_body_len(&req.payload, req.payload_encoding.as_deref())
+}
+
+/// Decoded length of a (possibly base64) body, without decoding it.
+pub fn decoded_body_len(payload: &str, encoding: Option<&str>) -> usize {
+    match encoding {
+        Some("base64") => {
+            let encoded = payload.trim_end();
+            let padding = encoded
+                .bytes()
+                .rev()
+                .take_while(|byte| *byte == b'=')
+                .count();
+            (encoded.len() / 4 * 3 + encoded.len() % 4 * 3 / 4).saturating_sub(padding)
+        }
+        _ => payload.len(),
     }
 }
 
@@ -3726,6 +3813,113 @@ mod tests {
             .unwrap();
         assert!(!retry.duplicate);
         assert_ne!(retry.message_id, first.message_id);
+    }
+
+    #[test]
+    fn inline_only_cell_policy_keeps_bodies_in_the_frame_and_rejects_before_append() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let limit = broker_payload::inline_max_bytes() * 2;
+        broker.set_payload_policy(PayloadPolicy::InlineOnly { max_body: limit });
+        let at_limit = "a".repeat(limit);
+        let published = broker
+            .publish(direct_request(at_limit.clone(), Some("fits".into())))
+            .unwrap();
+        let message = broker
+            .read_message(
+                DIRECT_TOPIC,
+                published.partition.unwrap(),
+                published.offset.unwrap(),
+            )
+            .unwrap();
+        assert!(message.payload_ref_json.is_none());
+        assert_eq!(message.payload, at_limit.as_bytes());
+        // The replicated frame carries the whole body.
+        let frame = published.replication_frame.unwrap();
+        let (_, payload) = broker_proto::decode_frame(std::io::Cursor::new(&frame)).unwrap();
+        assert_eq!(payload.len(), limit);
+
+        let partition = published.partition.unwrap();
+        let hwm = broker
+            .partition_high_watermark(DIRECT_TOPIC, partition)
+            .unwrap();
+        let error = broker
+            .publish(direct_request(
+                "b".repeat(limit + 1),
+                Some("too-big".into()),
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerError::Payload(broker_payload::PayloadError::TooLargeForCell { size, limit: l })
+                if size == limit as u64 + 1 && l == limit as u64
+        ));
+        assert!(broker
+            .check_publish_body(&direct_request("c".repeat(limit + 1), None))
+            .is_err());
+        // Base64 bodies are measured decoded.
+        let mut encoded = direct_request(
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, vec![0u8; limit]),
+            None,
+        );
+        encoded.payload_encoding = Some("base64".into());
+        assert_eq!(decoded_payload_len(&encoded), limit);
+        broker.check_publish_body(&encoded).unwrap();
+        // Nothing appended, nothing written, and the key is not reserved.
+        assert_eq!(
+            broker
+                .partition_high_watermark(DIRECT_TOPIC, partition)
+                .unwrap(),
+            hwm
+        );
+        let blobs = dir.path().join("payload-blobs");
+        assert!(std::fs::read_dir(&blobs).map_or(true, |mut entries| entries.next().is_none()));
+        assert!(
+            !broker
+                .publish(direct_request("small", Some("too-big".into())))
+                .unwrap()
+                .duplicate
+        );
+    }
+
+    #[test]
+    fn catch_up_frames_are_byte_bounded_but_always_advance() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        broker.set_payload_policy(PayloadPolicy::InlineOnly {
+            max_body: 2 * 1024 * 1024,
+        });
+        let body = "m".repeat(1024 * 1024);
+        let mut partition = 0;
+        for _ in 0..6 {
+            partition = broker
+                .publish(direct_request(body.clone(), None))
+                .unwrap()
+                .partition
+                .unwrap();
+        }
+        let page = broker
+            .replication_frames_bounded(DIRECT_TOPIC, partition, 0, 4096, 3 * 1024 * 1024 + 1024)
+            .unwrap();
+        assert_eq!(page.len(), 3);
+        assert!(page.iter().map(|(_, frame)| frame.len()).sum::<usize>() <= 3 * 1024 * 1024 + 1024);
+        // A single frame larger than the budget still comes back alone.
+        let tiny = broker
+            .replication_frames_bounded(DIRECT_TOPIC, partition, page[2].0 + 1, 4096, 10)
+            .unwrap();
+        assert_eq!(tiny.len(), 1);
+        // Paging converges on every record.
+        let mut from = 0;
+        let mut seen = 0;
+        loop {
+            let page = broker
+                .replication_frames_bounded(DIRECT_TOPIC, partition, from, 4096, 2 * 1024 * 1024)
+                .unwrap();
+            let Some((last, _)) = page.last() else { break };
+            from = last + 1;
+            seen += page.len();
+        }
+        assert_eq!(seen, 6);
     }
 
     #[test]

@@ -16,6 +16,9 @@ use std::time::Duration;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// Health ticks (2 s) between retries of unrepaired legacy payloads.
+const LEGACY_REPAIR_RETRY_TICKS: u64 = 30;
+
 fn discover_topics(state: &AppState) -> HashSet<String> {
     let mut topics = HashSet::from([broker_partition::DIRECT_TOPIC.to_string()]);
     if let Ok(queues) = state.broker.list_queues() {
@@ -546,6 +549,7 @@ pub fn spawn_cluster_health_monitor(
         let _health = AbortOnDrop(tokio::spawn(peer_health_loop(runtime.clone(), client)));
 
         let mut prev_leaders: HashMap<u32, Uuid> = HashMap::new();
+        let mut repair_ticks = 0u64;
         let mut prev_peer_alive: HashMap<Uuid, bool> = HashMap::new();
         let mut interval = tokio::time::interval(HEALTH_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -570,6 +574,16 @@ pub fn spawn_cluster_health_monitor(
 
             if !runtime.has_controller_lease() {
                 continue;
+            }
+
+            repair_ticks = repair_ticks.wrapping_add(1);
+            if repair_ticks % LEGACY_REPAIR_RETRY_TICKS == 0 {
+                let unresolved = broker_partition::payload_repair_snapshot().unresolved_by_shard;
+                for shard in unresolved.into_keys() {
+                    if runtime.is_leader_for_shard(shard) {
+                        broker_api::repair_legacy_payloads(&state, shard).await;
+                    }
+                }
             }
 
             let mut gained_shards = Vec::new();
@@ -617,6 +631,16 @@ pub fn spawn_cluster_health_monitor(
                 for shard in gained_shards {
                     match recover_gained_shard(&cluster, &state, shard).await {
                         Ok(()) => {
+                            // Legacy blob references must be repaired before
+                            // the shard serves; unrepairable ones stay deferred.
+                            let repair = broker_api::repair_legacy_payloads(&state, shard).await;
+                            if repair.unresolved > 0 {
+                                warn!(
+                                    shard,
+                                    unresolved = repair.unresolved,
+                                    "shard serving with unrepaired legacy payloads; retrying periodically"
+                                );
+                            }
                             runtime.set_shard_ready(shard, true);
                             caught_up.push(shard);
                         }

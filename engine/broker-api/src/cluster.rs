@@ -184,7 +184,7 @@ pub struct ClusterHandle {
     pub(crate) catalog_apply: Arc<crate::catalog_applier::ApplyState>,
     pub runtime: ClusterRuntime,
     pub replication: ReplicationClient,
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
     catalog_peers: Arc<parking_lot::Mutex<Option<CatalogPeerCache>>>,
 }
 
@@ -1740,11 +1740,12 @@ pub async fn internal_replicate_catch_up(
     let frames = if max_records == 0 {
         Vec::new()
     } else {
-        state.broker.replication_frames(
+        state.broker.replication_frames_bounded(
             &body.topic,
             body.partition,
             body.from_offset,
             max_records,
+            broker_replication::max_catchup_page_bytes(),
         )?
     };
     let leader_generation = state

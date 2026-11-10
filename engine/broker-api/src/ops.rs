@@ -24,6 +24,10 @@ pub struct ReadyResponse {
     pub storage_healthy: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub storage_faults: Vec<ShardStorageFault>,
+    /// Legacy payload-blob references this node could not repair from any
+    /// peer (local-WAL cells). Their messages stay deferred, not dropped.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub legacy_payloads_unresolved: u64,
 }
 
 /// One unavailable local shard. Paths and topic names stay in the logs and
@@ -51,6 +55,10 @@ fn shard_storage_faults(faults: Vec<broker_storage::StorageFault>) -> Vec<ShardS
             },
         })
         .collect()
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Serialize)]
@@ -193,6 +201,7 @@ pub fn ready_snapshot(state: &AppState) -> ReadyResponse {
         controller_ready,
         local_shards_ready,
         catalog_ready,
+        legacy_payloads_unresolved: broker_partition::payload_repair_snapshot().unresolved(),
     }
 }
 

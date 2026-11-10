@@ -142,7 +142,58 @@ impl FsBlobStore {
     }
 }
 
+/// Verify fetched bytes against a reference: size always, sha256 when set.
+pub(crate) fn verify_bytes(reference: &PayloadRef, data: &[u8]) -> Result<(), PayloadError> {
+    if data.len() as u64 != reference.size {
+        return Err(PayloadError::Mismatch(format!(
+            "{}: {} bytes, reference says {}",
+            reference.bucket_key,
+            data.len(),
+            reference.size
+        )));
+    }
+    if let Some(expected) = &reference.sha256 {
+        if sha256_hex(data) != *expected {
+            return Err(PayloadError::ChecksumMismatch);
+        }
+    }
+    Ok(())
+}
+
 impl FsBlobStore {
+    pub(crate) fn read_key(&self, bucket_key: &str) -> Result<Vec<u8>, PayloadError> {
+        std::fs::read(self.path_for(bucket_key)?).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                PayloadError::NotFound(bucket_key.to_string())
+            } else {
+                PayloadError::Io(error)
+            }
+        })
+    }
+
+    /// Write `data` at the reference's key: temp file, fsync, rename, then
+    /// fsync the directory.
+    pub(crate) fn install(&self, reference: &PayloadRef, data: &[u8]) -> Result<(), PayloadError> {
+        let path = self.path_for(&reference.bucket_key)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| PayloadError::Store(format!("no parent for {}", path.display())))?;
+        std::fs::create_dir_all(parent)?;
+        let tmp = path.with_extension("repair.tmp");
+        let written = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(data)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
+            std::fs::File::open(parent)?.sync_all()
+        })();
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(PayloadError::Io(error));
+        }
+        Ok(())
+    }
+
     /// Remove a blob. Idempotent: a missing blob is not an error.
     pub fn delete_blob(&self, reference: &PayloadRef) -> Result<bool, PayloadError> {
         let path = self.path_for(&reference.bucket_key)?;

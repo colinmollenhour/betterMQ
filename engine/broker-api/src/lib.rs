@@ -21,6 +21,7 @@ mod local_auth;
 mod metering;
 mod metrics;
 mod ops;
+mod payload_repair;
 mod publish_path;
 mod rate_limit;
 pub mod request_id;
@@ -71,6 +72,7 @@ pub use metrics::{
     record_fleet_claim_failure, record_scheduler_failure, record_shard_recovery_failure,
     set_fenced_shards, SchedulerFailure, ShardRecoveryFailure,
 };
+pub use payload_repair::{repair_legacy_payloads, PayloadRepairReport};
 pub use retention::{compute_safe_watermark, run_retention_tick, spawn_retention_loop};
 
 /// Reject new ingest while allowing already-admitted requests to drain.
@@ -196,11 +198,13 @@ fn data_plane_routes(shared: Arc<AppState>) -> Router<Arc<AppState>> {
 /// Headroom over the frame decode cap for replication envelopes.
 const INTERNAL_BODY_SLACK_BYTES: usize = 1024 * 1024;
 
-/// Body cap for `/internal/v1`. Replication carries frames that were
-/// accepted under whatever ingest limit applied when they were written, so a
-/// follower whose public `BETTERMQ_MAX_HTTP_BODY_BYTES` is lower must still
-/// accept anything the frame codec can decode.
-fn internal_body_limit_bytes() -> usize {
+/// Body cap for `/internal/v1` (replication epochs, catch-up, forwarded
+/// publishes). Replication carries frames that were accepted under whatever
+/// ingest limit applied when they were written, so a follower whose public
+/// `BETTERMQ_MAX_HTTP_BODY_BYTES` is lower must still accept anything the
+/// frame codec can decode. Cell startup checks the replication epoch cap
+/// against this same value.
+pub fn internal_body_limit_bytes() -> usize {
     internal_body_limit(
         http_body_limit_bytes(),
         broker_proto::max_frame_decode_payload_bytes(),
@@ -311,6 +315,10 @@ fn internal_cluster_route_table() -> Router<Arc<AppState>> {
         .route(
             "/internal/v1/replicate/catch-up",
             axum::routing::post(cluster::internal_replicate_catch_up),
+        )
+        .route(
+            "/internal/v1/payload-blob/{tenant}/{message_id}",
+            axum::routing::get(payload_repair::internal_payload_blob),
         )
         .route(
             "/internal/v1/cluster",

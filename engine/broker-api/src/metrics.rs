@@ -325,6 +325,7 @@ pub struct NativeTelemetrySnapshot {
     pub dispatch: broker_dispatch::DispatchTelemetrySnapshot,
     pub fairness: broker_dispatch::TenantFairnessSnapshot,
     pub retention: broker_partition::RetentionTelemetrySnapshot,
+    pub payload_repair: broker_partition::PayloadRepairSnapshot,
 }
 
 pub fn native_snapshot(state: &crate::AppState) -> NativeTelemetrySnapshot {
@@ -343,6 +344,7 @@ pub fn native_snapshot(state: &crate::AppState) -> NativeTelemetrySnapshot {
         dispatch: state.dispatch.telemetry_snapshot(),
         fairness: state.fair_queue.telemetry_snapshot(),
         retention: broker_partition::retention_telemetry_snapshot(),
+        payload_repair: broker_partition::payload_repair_snapshot(),
     }
 }
 
@@ -360,7 +362,37 @@ pub fn prometheus_text_with_native(native: &NativeTelemetrySnapshot) -> String {
     append_shared_metadata_metrics(&mut out, &broker_storage::shared_metadata_telemetry());
     append_dispatch_metrics(&mut out, &native.dispatch, &native.fairness);
     append_retention_metrics(&mut out, &native.retention);
+    append_payload_repair_metrics(&mut out, &native.payload_repair);
     out
+}
+
+fn append_payload_repair_metrics(
+    out: &mut String,
+    snapshot: &broker_partition::PayloadRepairSnapshot,
+) {
+    out.push_str(
+        "# HELP bettermq_legacy_payload_unresolved Legacy payload blobs no peer could supply\n",
+    );
+    out.push_str("# TYPE bettermq_legacy_payload_unresolved gauge\n");
+    for (shard, unresolved) in &snapshot.unresolved_by_shard {
+        out.push_str(&format!(
+            "bettermq_legacy_payload_unresolved{{shard=\"{shard}\"}} {unresolved}\n"
+        ));
+    }
+    out.push_str(
+        "# HELP bettermq_legacy_payload_repaired_total Legacy payload blobs repaired from peers\n",
+    );
+    out.push_str("# TYPE bettermq_legacy_payload_repaired_total counter\n");
+    out.push_str(&format!(
+        "bettermq_legacy_payload_repaired_total {}\n",
+        snapshot.repaired_total
+    ));
+    out.push_str("# HELP bettermq_legacy_payload_unhashed_total Repaired legacy blobs verified by size only (no sha256)\n");
+    out.push_str("# TYPE bettermq_legacy_payload_unhashed_total counter\n");
+    out.push_str(&format!(
+        "bettermq_legacy_payload_unhashed_total {}\n",
+        snapshot.unhashed_total
+    ));
 }
 
 /// Per-log retention gauges are capped so V1 topic counts cannot explode
@@ -1360,6 +1392,12 @@ mod tests {
                 blob_tombstones_pending: 1,
                 errors_total: 0,
             },
+            payload_repair: broker_partition::PayloadRepairSnapshot {
+                unresolved_by_shard: [(7u32, 2u64)].into_iter().collect(),
+                repaired_total: 3,
+                unhashed_total: 1,
+                failures_total: 2,
+            },
         };
         let output = prometheus_text_with_native(&native);
         assert!(output.contains("bettermq_dispatch_delivery_outcomes_total{outcome=\"5xx\"} 3"));
@@ -1374,6 +1412,8 @@ mod tests {
             output.contains("bettermq_retention_frontier{log=\"__physical\",partition=\"7\"} 140")
         );
         assert!(output.contains("bettermq_wal_retained_bytes_total 4096"));
+        assert!(output.contains("bettermq_legacy_payload_unresolved{shard=\"7\"} 2"));
+        assert!(output.contains("bettermq_legacy_payload_repaired_total 3"));
         assert!(output.contains("bettermq_wal_epoch_total{shard=\"7\"} 3"));
         assert!(output.contains("bettermq_wal_records_per_fsync{shard=\"7\"} 6"));
         assert!(output.contains("bettermq_wal_fence_events_total{shard=\"7\"} 1"));

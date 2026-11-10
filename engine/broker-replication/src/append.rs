@@ -30,6 +30,143 @@ const CATCHUP_VERSION_BASE: u16 = 2;
 const CATCHUP_HEADER_LEN_BASE: usize = 40;
 const MAX_CATCHUP_RECORDS: usize = 4096;
 
+/// Bytes an epoch header may spend on its tenant and topic (both are
+/// length-prefixed with a u16).
+const EPOCH_NAME_BUDGET: usize = 2 * u16::MAX as usize;
+/// Fixed bytes of one broker-proto frame around its header and payload:
+/// magic, header length, payload length and CRC.
+const FRAME_FIXED_BYTES: usize = 16;
+/// Per-frame length prefix inside an epoch.
+const EPOCH_FRAME_PREFIX: usize = 4;
+
+/// Replication epoch cap (`BETTERMQ_MAX_REPLICATION_EPOCH_BYTES`, 16 MiB).
+pub fn configured_max_epoch_bytes() -> usize {
+    env_bytes(
+        "BETTERMQ_MAX_REPLICATION_EPOCH_BYTES",
+        DEFAULT_MAX_EPOCH_BYTES,
+    )
+    .min(Semaphore::MAX_PERMITS)
+}
+
+/// Replication in-flight cap (`BETTERMQ_MAX_REPLICATION_IN_FLIGHT_BYTES`).
+fn configured_max_in_flight_bytes() -> usize {
+    env_bytes(
+        "BETTERMQ_MAX_REPLICATION_IN_FLIGHT_BYTES",
+        DEFAULT_MAX_IN_FLIGHT_BYTES,
+    )
+    .min(Semaphore::MAX_PERMITS)
+}
+
+/// Bytes of every cell body budget reserved for the dead-letter envelope.
+/// A DLQ record wraps the original body with metadata (source queue, message
+/// id, destination, reason, headers), and it must still fit one replication
+/// epoch, so any body accepted at ingest stays dead-letterable. The DLQ
+/// writer must keep its envelope overhead within this allowance.
+pub const DLQ_ENVELOPE_ALLOWANCE: usize = 64 * 1024;
+
+/// Body-size policy of a local-WAL multi-node cell. Bodies travel inline in
+/// their WAL frame, so a worst-case frame (largest header) must fit one
+/// replication epoch, which must fit the receiver's decode cap and the
+/// internal HTTP body limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellBodyLimits {
+    pub max_epoch_bytes: usize,
+    /// Largest frame payload one epoch can carry with a worst-case header
+    /// (what a DLQ record may use).
+    pub max_frame_body: usize,
+    /// Largest message body (decoded bytes) the cell accepts at ingest:
+    /// `max_frame_body - DLQ_ENVELOPE_ALLOWANCE`.
+    pub max_inline_body: usize,
+}
+
+/// The single source of the cell body limit (`cell_max_inline_body`).
+/// Errors when the configuration cannot replicate safely; cell nodes must
+/// refuse to start then.
+pub fn cell_body_limits(
+    internal_body_limit: usize,
+    frame_payload_limit: usize,
+) -> Result<CellBodyLimits, String> {
+    cell_body_limits_for(
+        configured_max_epoch_bytes(),
+        internal_body_limit,
+        frame_payload_limit,
+    )
+}
+
+pub fn cell_body_limits_for(
+    max_epoch_bytes: usize,
+    internal_body_limit: usize,
+    frame_payload_limit: usize,
+) -> Result<CellBodyLimits, String> {
+    if max_epoch_bytes > MAX_DECODE_EPOCH_BYTES {
+        return Err(format!(
+            "BETTERMQ_MAX_REPLICATION_EPOCH_BYTES={max_epoch_bytes} exceeds the replication decode cap of {MAX_DECODE_EPOCH_BYTES} bytes"
+        ));
+    }
+    if max_epoch_bytes > internal_body_limit {
+        return Err(format!(
+            "BETTERMQ_MAX_REPLICATION_EPOCH_BYTES={max_epoch_bytes} exceeds the internal HTTP body limit of {internal_body_limit} bytes (BETTERMQ_MAX_HTTP_BODY_BYTES)"
+        ));
+    }
+    let overhead = FIXED_HEADER_LEN
+        + EPOCH_NAME_BUDGET
+        + EPOCH_FRAME_PREFIX
+        + FRAME_FIXED_BYTES
+        + broker_proto::record::MAX_FRAME_HEADER_BYTES;
+    let max_frame_body = max_epoch_bytes
+        .saturating_sub(overhead)
+        .min(frame_payload_limit);
+    let max_inline_body = max_frame_body
+        .checked_sub(DLQ_ENVELOPE_ALLOWANCE)
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| {
+            format!(
+                "BETTERMQ_MAX_REPLICATION_EPOCH_BYTES={max_epoch_bytes} leaves no room for a message body (needs more than {} bytes of frame, epoch and DLQ-envelope overhead)",
+                overhead + DLQ_ENVELOPE_ALLOWANCE
+            )
+        })?;
+    Ok(CellBodyLimits {
+        max_epoch_bytes,
+        max_frame_body,
+        max_inline_body,
+    })
+}
+
+/// Split consecutive frames into epochs that each encode within
+/// `max_epoch_bytes` and [`MAX_EPOCH_RECORDS`]. Every range holds at least one
+/// frame; a single frame larger than the budget gets a range of its own (and
+/// is rejected by the sender), which pre-append body checks prevent.
+pub fn epoch_frame_ranges(
+    frame_lens: &[usize],
+    tenant_len: usize,
+    topic_len: usize,
+    max_epoch_bytes: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let header = FIXED_HEADER_LEN + tenant_len + topic_len;
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = header;
+    for (index, len) in frame_lens.iter().enumerate() {
+        let cost = EPOCH_FRAME_PREFIX + len;
+        let count = index - start;
+        if count > 0 && (bytes + cost > max_epoch_bytes || count >= MAX_EPOCH_RECORDS) {
+            ranges.push(start..index);
+            start = index;
+            bytes = header;
+        }
+        bytes += cost;
+    }
+    if start < frame_lens.len() {
+        ranges.push(start..frame_lens.len());
+    }
+    ranges
+}
+
+/// Byte budget for frames in one catch-up page (stays below the decoder cap).
+pub fn max_catchup_page_bytes() -> usize {
+    MAX_DECODE_EPOCH_BYTES - CATCHUP_HEADER_LEN_BASE - MAX_CATCHUP_RECORDS * 12
+}
+
 #[derive(Debug, Error)]
 pub enum ReplicateError {
     #[error("http error: {0}")]
@@ -564,17 +701,10 @@ pub struct ReplicationClient {
 
 impl ReplicationClient {
     pub fn new(cluster: ClusterConfig) -> Self {
-        let max_epoch_bytes = env_bytes(
-            "BETTERMQ_MAX_REPLICATION_EPOCH_BYTES",
-            DEFAULT_MAX_EPOCH_BYTES,
-        )
-        .min(Semaphore::MAX_PERMITS);
-        let max_in_flight = env_bytes(
-            "BETTERMQ_MAX_REPLICATION_IN_FLIGHT_BYTES",
-            DEFAULT_MAX_IN_FLIGHT_BYTES,
-        )
-        .max(max_epoch_bytes)
-        .min(Semaphore::MAX_PERMITS);
+        let max_epoch_bytes = configured_max_epoch_bytes();
+        let max_in_flight = configured_max_in_flight_bytes()
+            .max(max_epoch_bytes)
+            .min(Semaphore::MAX_PERMITS);
         Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
@@ -587,6 +717,11 @@ impl ReplicationClient {
             telemetry: Arc::new(crate::telemetry::ReplicationTelemetry::default()),
             runtime: None,
         }
+    }
+
+    /// Encoded-size cap of one replication epoch.
+    pub fn max_epoch_bytes(&self) -> usize {
+        self.max_epoch_bytes
     }
 
     pub fn with_runtime(mut self, runtime: broker_raft_meta::ClusterRuntime) -> Self {
@@ -1047,6 +1182,120 @@ mod tests {
             ReplicateCatchUpRange::decode_binary(&encoded).unwrap(),
             range
         );
+    }
+
+    #[test]
+    fn cell_inline_limit_leaves_room_for_a_worst_case_frame() {
+        let limits = cell_body_limits_for(16 * 1024 * 1024, 64 * 1024 * 1024, usize::MAX).unwrap();
+        // Worst case: largest header and longest tenant/topic names.
+        let epoch = FIXED_HEADER_LEN
+            + EPOCH_NAME_BUDGET
+            + EPOCH_FRAME_PREFIX
+            + FRAME_FIXED_BYTES
+            + broker_proto::record::MAX_FRAME_HEADER_BYTES
+            + limits.max_frame_body;
+        assert_eq!(epoch, limits.max_epoch_bytes);
+        assert!(limits.max_inline_body > 14 * 1024 * 1024);
+        // The frame payload cap also binds, and the DLQ allowance still holds.
+        let capped = cell_body_limits_for(16 * 1024 * 1024, 64 * 1024 * 1024, 100_000).unwrap();
+        assert_eq!(capped.max_frame_body, 100_000);
+        assert_eq!(capped.max_inline_body, 100_000 - DLQ_ENVELOPE_ALLOWANCE);
+        assert!(cell_body_limits_for(16 * 1024 * 1024, 64 * 1024 * 1024, 1_000).is_err());
+        // Unsafe configurations refuse.
+        assert!(cell_body_limits_for(MAX_DECODE_EPOCH_BYTES + 1, usize::MAX, usize::MAX).is_err());
+        assert!(cell_body_limits_for(16 * 1024 * 1024, 8 * 1024 * 1024, usize::MAX).is_err());
+        assert!(cell_body_limits_for(1024 * 1024, usize::MAX, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn every_accepted_body_stays_dead_letterable() {
+        for epoch in [2 * 1024 * 1024, 16 * 1024 * 1024, MAX_DECODE_EPOCH_BYTES] {
+            for frame_cap in [usize::MAX, 4 * 1024 * 1024] {
+                let Ok(limits) = cell_body_limits_for(epoch, usize::MAX, frame_cap) else {
+                    continue;
+                };
+                // A body at the ingest limit, wrapped in a DLQ envelope of up
+                // to the allowance, still fits the epoch-derived frame limit.
+                assert!(
+                    limits.max_inline_body + DLQ_ENVELOPE_ALLOWANCE <= limits.max_frame_body,
+                    "{limits:?}"
+                );
+                let dlq_frame = FIXED_HEADER_LEN
+                    + EPOCH_NAME_BUDGET
+                    + EPOCH_FRAME_PREFIX
+                    + FRAME_FIXED_BYTES
+                    + broker_proto::record::MAX_FRAME_HEADER_BYTES
+                    + limits.max_inline_body
+                    + DLQ_ENVELOPE_ALLOWANCE;
+                assert!(dlq_frame <= limits.max_epoch_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn epoch_ranges_respect_byte_budget_and_keep_order() {
+        let lens = vec![400, 400, 400, 900, 10, 10];
+        let budget = FIXED_HEADER_LEN + 3 + 4 + (EPOCH_FRAME_PREFIX + 400) * 2;
+        let ranges = epoch_frame_ranges(&lens, 3, 4, budget);
+        assert_eq!(ranges, vec![0..2, 2..3, 3..4, 4..6]);
+        for range in &ranges {
+            let bytes: usize = FIXED_HEADER_LEN
+                + 7
+                + lens[range.clone()]
+                    .iter()
+                    .map(|len| EPOCH_FRAME_PREFIX + len)
+                    .sum::<usize>();
+            assert!(bytes <= budget || range.len() == 1);
+        }
+        assert!(epoch_frame_ranges(&[], 0, 0, budget).is_empty());
+        let many = vec![1usize; MAX_EPOCH_RECORDS + 5];
+        let ranges = epoch_frame_ranges(&many, 0, 0, usize::MAX);
+        assert_eq!(
+            ranges,
+            vec![
+                0..MAX_EPOCH_RECORDS,
+                MAX_EPOCH_RECORDS..MAX_EPOCH_RECORDS + 5
+            ]
+        );
+    }
+
+    #[test]
+    fn split_epochs_of_large_inline_frames_always_encode_within_the_cap() {
+        let max_epoch = 16 * 1024 * 1024;
+        let limits = cell_body_limits_for(max_epoch, usize::MAX, usize::MAX).unwrap();
+        // Bodies from 200 KiB up to the cell limit, in a mixed order.
+        let sizes: Vec<usize> = (0..40)
+            .map(|index| {
+                let span = limits.max_inline_body - 200 * 1024;
+                200 * 1024 + (index * 7_919 * 4_099) % span
+            })
+            .chain([limits.max_inline_body, 200 * 1024, limits.max_inline_body])
+            .collect();
+        let frames: Vec<Vec<u8>> = sizes
+            .iter()
+            .map(|size| vec![0u8; FRAME_FIXED_BYTES + 2048 + size])
+            .collect();
+        let lens: Vec<usize> = frames.iter().map(Vec::len).collect();
+        let tenant = "default".to_string();
+        let topic = "jobs".to_string();
+        let ranges = epoch_frame_ranges(&lens, tenant.len(), topic.len(), max_epoch);
+        let mut next = 0usize;
+        for range in ranges {
+            assert_eq!(range.start, next, "ranges keep offset order");
+            next = range.end;
+            let request = ReplicateBatchRequest::new(
+                tenant.clone(),
+                topic.clone(),
+                0,
+                Uuid::nil(),
+                1,
+                range.start as u64,
+                frames[range].to_vec(),
+            )
+            .unwrap();
+            assert!(request.binary_len().unwrap() <= max_epoch);
+        }
+        assert_eq!(next, frames.len());
     }
 
     #[test]
