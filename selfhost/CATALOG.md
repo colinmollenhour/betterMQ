@@ -4,6 +4,9 @@ Cell queue, flow, group, member, and cron definitions use the OpenRaft controlle
 as their authority. Local registries are serving caches. Single-node deployments
 without a cluster keep their local-only behavior.
 
+The [catalog mutation API reference](CATALOG_API.md) defines operation IDs,
+revision/version headers, replay receipts, and retryable outcomes.
+
 Catalog writes require controller quorum. A committed change reaches other
 nodes within about one 100 ms apply interval; commit does not mean simultaneous
 application everywhere. A node whose cache is dirty or behind the committed
@@ -59,3 +62,5 @@ Each catalog mutation pays a controller commit and local materialization. The
 controller stores its state as one JSON value, so write volume grows with catalog
 size. Ingest and dispatch still read local caches and add no catalog RPC. Repeated
 unchanged inline flows do not submit a catalog mutation.
+Operation receipts are retained with controller state for durable retries; this
+release does not garbage-collect them, so state also grows with mutation count.

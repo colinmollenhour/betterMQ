@@ -25,7 +25,7 @@ use broker_storage::StorageMode;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
 use uuid::Uuid;
@@ -824,105 +824,15 @@ pub async fn push_catalog_to_recovered_peer(peer_base: &str, state: &AppState) -
     push_catalog_to_peer(peer_base, &snap).await
 }
 
-async fn propagate_catalog_to_peers<T: Serialize>(
-    peer_bases: &[String],
-    path: &str,
-    body: &T,
-) -> usize {
-    if peer_bases.is_empty() {
-        return 0;
-    }
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    let client = CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(8))
-            .build()
-            .expect("catalog HTTP client")
-    });
-    let mut notified = 0usize;
-    for peer in peer_bases {
-        let mut delivered = false;
-        for base in peer_fanout_urls(peer) {
-            let url = format!("{}{}", base.trim_end_matches('/'), path);
-            match crate::cluster_auth::apply_cluster_secret(client.post(&url))
-                .json(body)
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    notified += 1;
-                    delivered = true;
-                    break;
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let detail = resp.text().await.unwrap_or_default();
-                    warn!(peer = %peer, base = %base, %status, body = %detail, "catalog fan-out rejected");
-                }
-                Err(e) => warn!(peer = %peer, base = %base, error = %e, "catalog fan-out failed"),
-            }
-        }
-        if !delivered {
-            warn!(peer = %peer, "catalog fan-out exhausted peer URLs");
-        }
-    }
-    notified
-}
-
 fn persist_catalog_tombstone(
     state: &AppState,
     id: Uuid,
     kind: crate::catalog_tombstones::CatalogKind,
-) {
-    if let Err(e) = state.catalog_tombstones.record(id, kind) {
-        warn!(error = %e, %id, "catalog tombstone persist failed");
-    }
-}
-
-async fn fanout_catalog<T: Serialize>(state: &AppState, path: &str, body: &T, what: &'static str) {
-    let peers = catalog_peer_urls(state);
-    let notified = propagate_catalog_to_peers(&peers, path, body).await;
-    if !peers.is_empty() && notified == 0 {
-        warn!(
-            peers = peers.len(),
-            what, "catalog propagate did not reach any peer"
-        );
-    }
-}
-
-async fn advance_catalog_controller(state: &AppState) {
-    if let Some(cluster) = &state.cluster {
-        if let Err(error) = cluster.runtime.advance_catalog_epoch().await {
-            warn!(%error, "catalog mutation rejected by OpenRaft controller");
-        }
-    }
-}
-
-async fn put_authoritative_catalog(
-    state: &AppState,
-    kind: &str,
-    key: &str,
-    payload: &impl serde::Serialize,
-    tombstone: bool,
-) {
-    let Some(cluster) = &state.cluster else {
-        return;
-    };
-    let payload_json = match serde_json::to_string(payload) {
-        Ok(json) => json,
-        Err(error) => {
-            warn!(%error, kind, key, "catalog record serialize failed");
-            return;
-        }
-    };
-    if let Err(error) = cluster
-        .runtime
-        .put_catalog_record(kind.into(), key.into(), payload_json, tombstone)
-        .await
-    {
-        warn!(%error, kind, key, "authoritative catalog write rejected");
-    }
+) -> Result<(), ApiError> {
+    state
+        .catalog_tombstones
+        .record(id, kind)
+        .map_err(crate::catalog_applier::unavailable)
 }
 
 pub fn catalog_snapshot(state: &AppState) -> Result<CatalogSnapshot, ApiError> {
@@ -1300,164 +1210,6 @@ pub async fn internal_catalog_apply(
     Ok(StatusCode::OK)
 }
 
-pub async fn replicate_flow_catalog(state: &AppState, profile: FlowProfile) {
-    advance_catalog_controller(state).await;
-    put_authoritative_catalog(state, "flow", &profile.id.to_string(), &profile, false).await;
-    let peers = catalog_peer_urls(state);
-    // Consensus acceptance stays on the request path; peer materialization does
-    // not. Unavailable peers need catalog reconciliation.
-    tokio::spawn(async move {
-        let notified = propagate_catalog_to_peers(
-            &peers,
-            "/internal/v1/cluster/catalog/flow",
-            &CatalogFlowUpsert { profile },
-        )
-        .await;
-        if !peers.is_empty() && notified == 0 {
-            warn!(
-                peers = peers.len(),
-                "flow catalog create did not reach any peer"
-            );
-        }
-    });
-}
-
-pub async fn replicate_queue_catalog(state: &AppState, subscription: Subscription) {
-    advance_catalog_controller(state).await;
-    put_authoritative_catalog(
-        state,
-        "queue",
-        &subscription.id.to_string(),
-        &subscription,
-        false,
-    )
-    .await;
-    let peers = catalog_peer_urls(state);
-    let notified = propagate_catalog_to_peers(
-        &peers,
-        "/internal/v1/cluster/catalog/queue",
-        &CatalogQueueUpsert { subscription },
-    )
-    .await;
-    if !peers.is_empty() && notified == 0 {
-        warn!(
-            peers = peers.len(),
-            "queue catalog create did not reach any peer"
-        );
-    }
-}
-
-pub async fn replicate_flow_delete(state: &AppState, flow_id: Uuid) {
-    advance_catalog_controller(state).await;
-    persist_catalog_tombstone(state, flow_id, crate::catalog_tombstones::CatalogKind::Flow);
-    fanout_catalog(
-        state,
-        "/internal/v1/cluster/catalog/flow/delete",
-        &CatalogFlowDelete { flow_id },
-        "flow delete",
-    )
-    .await;
-}
-
-pub async fn replicate_queue_delete(state: &AppState, queue_id: Uuid) {
-    advance_catalog_controller(state).await;
-    persist_catalog_tombstone(
-        state,
-        queue_id,
-        crate::catalog_tombstones::CatalogKind::Queue,
-    );
-    fanout_catalog(
-        state,
-        "/internal/v1/cluster/catalog/queue/delete",
-        &CatalogQueueDelete { queue_id },
-        "queue delete",
-    )
-    .await;
-}
-
-pub async fn replicate_group_catalog(state: &AppState, group: DispatchGroup) {
-    advance_catalog_controller(state).await;
-    let peers = catalog_peer_urls(state);
-    let notified = propagate_catalog_to_peers(
-        &peers,
-        "/internal/v1/cluster/catalog/group",
-        &CatalogGroupUpsert { group },
-    )
-    .await;
-    if !peers.is_empty() && notified == 0 {
-        warn!(
-            peers = peers.len(),
-            "group catalog create did not reach any peer"
-        );
-    }
-}
-
-pub async fn replicate_group_member_catalog(state: &AppState, member: GroupMember) {
-    advance_catalog_controller(state).await;
-    let peers = catalog_peer_urls(state);
-    let notified = propagate_catalog_to_peers(
-        &peers,
-        "/internal/v1/cluster/catalog/group-member",
-        &CatalogGroupMemberUpsert { member },
-    )
-    .await;
-    if !peers.is_empty() && notified == 0 {
-        warn!(
-            peers = peers.len(),
-            "group member catalog create did not reach any peer"
-        );
-    }
-}
-
-pub async fn replicate_group_delete(state: &AppState, group_id: Uuid) {
-    advance_catalog_controller(state).await;
-    persist_catalog_tombstone(
-        state,
-        group_id,
-        crate::catalog_tombstones::CatalogKind::Group,
-    );
-    fanout_catalog(
-        state,
-        "/internal/v1/cluster/catalog/group/delete",
-        &CatalogGroupDelete { group_id },
-        "group delete",
-    )
-    .await;
-}
-
-pub async fn replicate_group_member_delete(state: &AppState, member_id: Uuid) {
-    advance_catalog_controller(state).await;
-    persist_catalog_tombstone(
-        state,
-        member_id,
-        crate::catalog_tombstones::CatalogKind::GroupMember,
-    );
-    fanout_catalog(
-        state,
-        "/internal/v1/cluster/catalog/group-member/delete",
-        &CatalogGroupMemberDelete { member_id },
-        "group member delete",
-    )
-    .await;
-}
-
-pub async fn replicate_cron_catalog(state: &AppState, job: CronJob) {
-    advance_catalog_controller(state).await;
-    let peers = catalog_peer_urls(state);
-    let notified = propagate_catalog_to_peers(
-        &peers,
-        "/internal/v1/cluster/catalog/cron",
-        &CatalogCronUpsert { job },
-    )
-    .await;
-    if !peers.is_empty() && notified == 0 {
-        warn!(
-            peers = peers.len(),
-            "cron catalog create did not reach any peer"
-        );
-    }
-}
-
 /// Per-peer outcome of pushing local-auth credentials (setup or rotation).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AuthPropagation {
@@ -1611,18 +1363,6 @@ pub async fn internal_cluster_auth_apply(
     Ok(StatusCode::OK)
 }
 
-pub async fn replicate_cron_delete(state: &AppState, cron_id: Uuid) {
-    advance_catalog_controller(state).await;
-    persist_catalog_tombstone(state, cron_id, crate::catalog_tombstones::CatalogKind::Cron);
-    fanout_catalog(
-        state,
-        "/internal/v1/cluster/catalog/cron/delete",
-        &CatalogCronDelete { cron_id },
-        "cron delete",
-    )
-    .await;
-}
-
 pub async fn internal_catalog_flow(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogFlowUpsert>,
@@ -1660,7 +1400,7 @@ pub async fn internal_catalog_delete_flow(
         &state,
         body.flow_id,
         crate::catalog_tombstones::CatalogKind::Flow,
-    );
+    )?;
     if state
         .broker
         .get_flow_profile(body.flow_id)
@@ -1698,7 +1438,7 @@ pub async fn internal_catalog_delete_cron(
         &state,
         body.cron_id,
         crate::catalog_tombstones::CatalogKind::Cron,
-    );
+    )?;
     if state.crons.get(body.cron_id).is_ok() {
         state
             .crons
@@ -1717,7 +1457,7 @@ pub async fn internal_catalog_delete_queue(
         &state,
         body.queue_id,
         crate::catalog_tombstones::CatalogKind::Queue,
-    );
+    )?;
     if state
         .broker
         .get_queue_by_id(body.queue_id)
@@ -1755,7 +1495,7 @@ pub async fn internal_catalog_delete_group(
         &state,
         body.group_id,
         crate::catalog_tombstones::CatalogKind::Group,
-    );
+    )?;
     if state
         .broker
         .get_group(body.group_id)
@@ -1793,7 +1533,7 @@ pub async fn internal_catalog_delete_group_member(
         &state,
         body.member_id,
         crate::catalog_tombstones::CatalogKind::GroupMember,
-    );
+    )?;
     if state
         .broker
         .get_group_member(body.member_id)

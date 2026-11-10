@@ -78,6 +78,10 @@ pub fn committed_records(state: &ControllerState) -> Vec<CatalogRecord> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CatalogOperation {
+    #[serde(default)]
+    pub request_fingerprint: Option<String>,
+    #[serde(default)]
+    pub version: Option<u64>,
     pub fingerprint: String,
     pub revision: u64,
 }
@@ -150,7 +154,17 @@ pub fn mutate(
     let mut records = if seed {
         Default::default()
     } else {
-        state.catalog_records.clone()
+        let mut records = state.catalog_records.clone();
+        // An older leader can rewrite the state while discarding new fields.
+        // Recover typed keys before uniqueness/parent validation as well as
+        // before materialization; otherwise mixed-version writers lose indexes.
+        for record in committed_records(state) {
+            records.insert(
+                catalog_identity(&record.tenant_id, &record.kind, &record.key),
+                record,
+            );
+        }
+        records
     };
     let mut revision = state.catalog_epoch;
     let mut seen = std::collections::BTreeSet::new();
@@ -288,6 +302,10 @@ pub fn mutate(
             ));
         }
     }
+    let version = mutations
+        .first()
+        .and_then(|m| records.get(&m.key()))
+        .map(|r| r.version);
     state.catalog_records = records;
     // Empty bootstrap still needs a committed, observable revision.
     state.catalog_epoch = if seed && revision == state.catalog_epoch {
@@ -298,6 +316,8 @@ pub fn mutate(
     state.catalog_operations.insert(
         operation_id,
         CatalogOperation {
+            request_fingerprint: None,
+            version,
             fingerprint,
             revision: state.catalog_epoch,
         },
@@ -371,6 +391,25 @@ mod tests {
         queue.expected_version = Some(2);
         queue.tombstone = false;
         assert!(mutate(&mut state, Uuid::new_v4(), vec![queue], false).is_err());
+    }
+    #[test]
+    fn old_leader_field_loss_does_not_disable_typed_name_constraints() {
+        let mut state = state();
+        let first = item(CatalogKind::Queue, Uuid::new_v4(), "jobs");
+        mutate(&mut state, Uuid::new_v4(), vec![first.clone()], false).unwrap();
+        let record = state.catalog_records.get_mut(&first.key()).unwrap();
+        record.tenant_id.clear();
+        record.revision = 0;
+        record.operation_id = None;
+        let before = state.clone();
+        assert!(mutate(
+            &mut state,
+            Uuid::new_v4(),
+            vec![item(CatalogKind::Queue, Uuid::new_v4(), "jobs")],
+            false
+        )
+        .is_err());
+        assert_eq!(state, before);
     }
     #[test]
     fn group_delete_cascades_and_concurrent_member_add_cannot_revive_parent() {

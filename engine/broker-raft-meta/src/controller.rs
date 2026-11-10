@@ -222,6 +222,8 @@ impl ControllerState {
 pub enum ControllerCommand {
     MutateCatalog {
         operation_id: Uuid,
+        #[serde(default)]
+        request_fingerprint: Option<String>,
         mutations: Vec<crate::catalog::CatalogMutation>,
     },
     BeginCatalogActivation,
@@ -804,8 +806,23 @@ fn apply_command(
     match command {
         ControllerCommand::MutateCatalog {
             operation_id,
+            request_fingerprint,
             mutations,
-        } => crate::catalog::mutate(state, operation_id, mutations, false)?,
+        } => {
+            if let Some(previous) = state.catalog_operations.get(&operation_id) {
+                if previous.request_fingerprint != request_fingerprint {
+                    return Err(ControllerError::CatalogConflict(
+                        "operation id reused for a different request".into(),
+                    ));
+                }
+            }
+            crate::catalog::mutate(state, operation_id, mutations, false)?;
+            state
+                .catalog_operations
+                .get_mut(&operation_id)
+                .expect("committed operation")
+                .request_fingerprint = request_fingerprint;
+        }
         ControllerCommand::BeginCatalogActivation => {
             if !state.catalog_authoritative {
                 state.catalog_frozen = true;

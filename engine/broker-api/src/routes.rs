@@ -48,7 +48,25 @@ pub(crate) async fn create_subscription(
     Json(req): Json<CreateSubscriptionRequest>,
 ) -> Result<(StatusCode, Json<CreateSubscriptionResponse>), ApiError> {
     validate_destination_url_str(&req.url)?;
-    let resp = state.broker.create_subscription(req)?;
+    let resp = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let kind = broker_raft_meta::catalog::CatalogKind::Queue;
+        let sub = state
+            .broker
+            .prepare_subscription(req, mutation.id(&state.broker.tenant(), kind))?;
+        mutation
+            .commit(&state, sub.tenant_id.clone(), kind, sub.id, &sub, false)
+            .await?;
+        CreateSubscriptionResponse {
+            id: sub.id,
+            topic: sub.topic,
+            url: sub.url,
+            parallelism: sub.parallelism,
+            default_max_retries: sub.default_max_retries,
+        }
+    } else {
+        state.broker.create_subscription(req)?
+    };
     info!(queue_id = %resp.id, queue = %resp.topic, url = %resp.url, "queue ready");
     Ok((StatusCode::CREATED, Json(resp)))
 }

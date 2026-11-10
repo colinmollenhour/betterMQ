@@ -142,6 +142,7 @@ async fn catalog_cluster(node_count: usize) {
     };
     let committed = leader
         .submit(ControllerCommand::MutateCatalog {
+            request_fingerprint: None,
             operation_id: Uuid::new_v4(),
             mutations: vec![mutation.clone()],
         })
@@ -190,6 +191,7 @@ async fn catalog_cluster(node_count: usize) {
     updated.expected_version = Some(1);
     let updated_state = leader
         .submit(ControllerCommand::MutateCatalog {
+            request_fingerprint: None,
             operation_id: Uuid::new_v4(),
             mutations: vec![updated],
         })
@@ -200,6 +202,7 @@ async fn catalog_cluster(node_count: usize) {
     let stale = tokio::time::timeout(
         Duration::from_secs(3),
         controllers[old_index].submit_local(ControllerCommand::MutateCatalog {
+            request_fingerprint: None,
             operation_id: Uuid::new_v4(),
             mutations: vec![mutation.clone()],
         }),

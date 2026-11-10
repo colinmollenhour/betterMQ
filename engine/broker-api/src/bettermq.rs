@@ -16,6 +16,7 @@ use broker_partition::{
     CreateSubscriptionResponse, DestinationSnapshot, FlowSpec, PublishRequest, PublishResponse,
     ResolvedFlow, ScheduledInfo, StoredMessage, Subscription, DIRECT_TOPIC,
 };
+use broker_raft_meta::catalog::CatalogKind;
 use broker_schedule::{
     CronError, CronJob, ScheduleError, ScheduledPublish, ScheduledPublishRequest,
 };
@@ -1527,20 +1528,43 @@ async fn apply_inline_flow(
     req: &mut PublishRequest,
     flow: &FlowSpec,
 ) -> Result<(), ApiError> {
-    crate::catalog_applier::preflight(state)?;
     let key = flow.effective_key(&req.routing_key).to_string();
     let parallelism = flow.parallelism.unwrap_or(1).max(1);
     let rate = flow.rate.unwrap_or(0);
     let period_secs = flow.period_secs.unwrap_or(60).max(1);
-    let (profile, changed) = state.broker.ensure_flow_profile_by_key_with_change(
-        key.clone(),
-        parallelism,
-        rate,
-        period_secs,
-    )?;
-    if changed {
-        crate::cluster::replicate_flow_catalog(state, profile.clone()).await;
-    }
+    let existing = state.broker.get_flow_profile_by_key(&key)?;
+    let unchanged = existing.as_ref().is_some_and(|p| {
+        p.parallelism == parallelism && p.rate == rate && p.period_secs == period_secs
+    });
+    let profile = if unchanged {
+        existing.expect("unchanged profile")
+    } else if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(state)?;
+        let existing = state.broker.get_flow_profile_by_key(&key)?;
+        let id = existing.as_ref().map_or_else(
+            || mutation.id(&state.broker.tenant(), CatalogKind::Flow),
+            |p| p.id,
+        );
+        let profile = state
+            .broker
+            .prepare_flow(key.clone(), parallelism, rate, period_secs, id)?;
+        mutation
+            .commit(
+                state,
+                profile.tenant_id.clone(),
+                CatalogKind::Flow,
+                id,
+                &profile,
+                false,
+            )
+            .await?;
+        profile
+    } else {
+        state
+            .broker
+            .ensure_flow_profile_by_key_with_change(key.clone(), parallelism, rate, period_secs)?
+            .0
+    };
     req.flow_id = Some(profile.id);
     let mut spec = profile.to_spec();
     if spec.key.is_none() {
@@ -1755,22 +1779,6 @@ async fn create_queue(
         }),
     )
     .await?;
-    crate::cluster::replicate_queue_catalog(
-        &state,
-        Subscription {
-            id: inner.id,
-            tenant_id: state.broker.tenant(),
-            topic: inner.topic.clone(),
-            url: inner.url.clone(),
-            secret: req.secret,
-            paused: false,
-            parallelism: inner.parallelism,
-            default_max_retries: inner.default_max_retries,
-            retry_backoff: req.retry.retry_backoff.clone(),
-            updated_at_ms: chrono::Utc::now().timestamp_millis(),
-        },
-    )
-    .await;
     Ok((status, Json(to_queue_response(inner))))
 }
 
@@ -1778,11 +1786,31 @@ async fn create_flow(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateFlowRequest>,
 ) -> Result<(StatusCode, Json<FlowProfileResponse>), ApiError> {
-    let p =
+    let p = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let p = state.broker.prepare_flow(
+            req.key,
+            req.parallelism,
+            req.rate,
+            req.period_secs,
+            mutation.id(&state.broker.tenant(), CatalogKind::Flow),
+        )?;
+        mutation
+            .commit(
+                &state,
+                p.tenant_id.clone(),
+                CatalogKind::Flow,
+                p.id,
+                &p,
+                false,
+            )
+            .await?;
+        p
+    } else {
         state
             .broker
-            .create_flow_profile(req.key, req.parallelism, req.rate, req.period_secs)?;
-    crate::cluster::replicate_flow_catalog(&state, p.clone()).await;
+            .create_flow_profile(req.key, req.parallelism, req.rate, req.period_secs)?
+    };
     Ok((StatusCode::CREATED, Json(to_flow_response(p))))
 }
 
@@ -1803,8 +1831,26 @@ async fn delete_flow(
     State(state): State<Arc<AppState>>,
     Path(flow_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<FlowProfileResponse>), ApiError> {
-    let p = state.broker.delete_flow_profile(flow_id)?;
-    crate::cluster::replicate_flow_delete(&state, flow_id).await;
+    let p = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let p = state
+            .broker
+            .get_flow_profile(flow_id)?
+            .ok_or(broker_partition::BrokerError::FlowProfileNotFound(flow_id))?;
+        mutation
+            .commit(
+                &state,
+                p.tenant_id.clone(),
+                CatalogKind::Flow,
+                flow_id,
+                &p,
+                true,
+            )
+            .await?;
+        p
+    } else {
+        state.broker.delete_flow_profile(flow_id)?
+    };
     Ok((StatusCode::OK, Json(to_flow_response(p))))
 }
 
@@ -1824,8 +1870,26 @@ async fn delete_queue(
     State(state): State<Arc<AppState>>,
     Path(queue_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<QueueResponse>), ApiError> {
-    let s = state.broker.delete_endpoint(queue_id)?;
-    crate::cluster::replicate_queue_delete(&state, queue_id).await;
+    let s = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let s = state
+            .broker
+            .get_queue_by_id(queue_id)?
+            .ok_or_else(|| broker_partition::BrokerError::QueueNotFound(queue_id.to_string()))?;
+        mutation
+            .commit(
+                &state,
+                s.tenant_id.clone(),
+                CatalogKind::Queue,
+                queue_id,
+                &s,
+                true,
+            )
+            .await?;
+        s
+    } else {
+        state.broker.delete_endpoint(queue_id)?
+    };
     Ok((StatusCode::OK, Json(queue_response(&s))))
 }
 
@@ -1968,11 +2032,43 @@ async fn upsert_flow_control(
     Json(body): Json<UpsertFlowControlRequest>,
 ) -> Result<(StatusCode, Json<FlowProfileResponse>), FlowApiError> {
     let owner = flow_lane_owner(&q)?;
-    let profile = state
-        .broker
-        .upsert_flow_profile_by_key(key.clone(), body.parallelism, body.rate, body.period_secs)
-        .map_err(ApiError::Broker)?;
-    crate::cluster::replicate_flow_catalog(&state, profile.clone()).await;
+    let profile = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let existing = state
+            .broker
+            .get_flow_profile_by_key(&key)
+            .map_err(ApiError::Broker)?;
+        let id = existing.map_or_else(
+            || mutation.id(&state.broker.tenant(), CatalogKind::Flow),
+            |p| p.id,
+        );
+        let profile = state
+            .broker
+            .prepare_flow(
+                key.clone(),
+                body.parallelism,
+                body.rate,
+                body.period_secs,
+                id,
+            )
+            .map_err(ApiError::Broker)?;
+        mutation
+            .commit(
+                &state,
+                profile.tenant_id.clone(),
+                CatalogKind::Flow,
+                id,
+                &profile,
+                false,
+            )
+            .await?;
+        profile
+    } else {
+        state
+            .broker
+            .upsert_flow_profile_by_key(key.clone(), body.parallelism, body.rate, body.period_secs)
+            .map_err(ApiError::Broker)?
+    };
     let limits = resolved_flow_for_profile(&key, &profile);
     state.dispatch.flow.ensure_lane(owner, &key, limits).await;
     Ok((StatusCode::OK, Json(to_flow_response(profile))))
@@ -2219,18 +2315,7 @@ async fn build_cron_scheduled_request(
     let destination =
         crate::routes::resolve_destination_with_repair(state, req.queue_id, queue_name)
             .await
-            .map_err(|e| match e {
-                e @ ApiError::Upstream { .. } => CronApiError::BadRequest(e.to_string()),
-                ApiError::Broker(be) => CronApiError::BadRequest(be.to_string()),
-                ApiError::BadRequest(m)
-                | ApiError::Unauthorized(m)
-                | ApiError::NotFound(m)
-                | ApiError::Conflict(m)
-                | ApiError::Unavailable(m)
-                | ApiError::ReplicationFailed(m)
-                | ApiError::Overloaded { message: m, .. }
-                | ApiError::TooManyRequests { message: m, .. } => CronApiError::BadRequest(m),
-            })?;
+            .map_err(CronApiError::Api)?;
     let mut scheduled = ScheduledPublishRequest {
         topic: destination
             .queue_id
@@ -2262,10 +2347,26 @@ async fn create_cron(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateCronRequest>,
 ) -> Result<(StatusCode, Json<CronResponse>), CronApiError> {
+    let mutation = crate::catalog_applier::begin(&state)?;
     let schedule = parse_schedule_kind(&req)?;
     let scheduled = build_cron_scheduled_request(&state, &req).await?;
-    let job = state.crons.create_with_kind(schedule, scheduled)?;
-    crate::cluster::replicate_cron_catalog(&state, job.clone()).await;
+    let job = if state.cluster.is_some() {
+        let mut job = broker_schedule::CronRegistry::prepare_with_kind(schedule, scheduled)?;
+        job.id = mutation.id("default", CatalogKind::Cron);
+        mutation
+            .commit(
+                &state,
+                "default".into(),
+                CatalogKind::Cron,
+                job.id,
+                &job,
+                false,
+            )
+            .await?;
+        state.crons.get(job.id)?
+    } else {
+        state.crons.create_with_kind(schedule, scheduled)?
+    };
     Ok((StatusCode::CREATED, Json(to_cron_response(job))))
 }
 
@@ -2291,8 +2392,25 @@ async fn pause_cron(
     State(state): State<Arc<AppState>>,
     Path(cron_id): Path<Uuid>,
 ) -> Result<Json<CronResponse>, CronApiError> {
-    let job = state.crons.pause(cron_id)?;
-    crate::cluster::replicate_cron_catalog(&state, job.clone()).await;
+    let job = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let mut job = state.crons.get(cron_id)?;
+        job.paused = true;
+        job.updated_at_ms = chrono::Utc::now().timestamp_millis();
+        mutation
+            .commit(
+                &state,
+                "default".into(),
+                CatalogKind::Cron,
+                cron_id,
+                &job,
+                false,
+            )
+            .await?;
+        state.crons.get(cron_id)?
+    } else {
+        state.crons.pause(cron_id)?
+    };
     Ok(Json(to_cron_response(job)))
 }
 
@@ -2300,8 +2418,25 @@ async fn resume_cron(
     State(state): State<Arc<AppState>>,
     Path(cron_id): Path<Uuid>,
 ) -> Result<Json<CronResponse>, CronApiError> {
-    let job = state.crons.resume(cron_id)?;
-    crate::cluster::replicate_cron_catalog(&state, job.clone()).await;
+    let job = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let mut job = state.crons.get(cron_id)?;
+        job.paused = false;
+        job.updated_at_ms = chrono::Utc::now().timestamp_millis();
+        mutation
+            .commit(
+                &state,
+                "default".into(),
+                CatalogKind::Cron,
+                cron_id,
+                &job,
+                false,
+            )
+            .await?;
+        state.crons.get(cron_id)?
+    } else {
+        state.crons.resume(cron_id)?
+    };
     Ok(Json(to_cron_response(job)))
 }
 
@@ -2309,17 +2444,39 @@ async fn delete_cron(
     State(state): State<Arc<AppState>>,
     Path(cron_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<CronResponse>), CronApiError> {
-    let removed = state.crons.delete(cron_id)?;
-    crate::cluster::replicate_cron_delete(&state, cron_id).await;
+    let removed = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let job = state.crons.get(cron_id)?;
+        mutation
+            .commit(
+                &state,
+                "default".into(),
+                CatalogKind::Cron,
+                cron_id,
+                &job,
+                true,
+            )
+            .await?;
+        job
+    } else {
+        state.crons.delete(cron_id)?
+    };
     Ok((StatusCode::OK, Json(to_cron_response(removed))))
 }
 
 #[derive(Debug)]
 enum CronApiError {
+    Api(ApiError),
     InvalidCron(String),
     BadRequest(String),
     NotFound(Uuid),
     Internal(String),
+}
+
+impl From<ApiError> for CronApiError {
+    fn from(error: ApiError) -> Self {
+        Self::Api(error)
+    }
 }
 
 impl From<CronError> for CronApiError {
@@ -2339,6 +2496,7 @@ impl From<CronError> for CronApiError {
 impl IntoResponse for CronApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, msg) = match self {
+            CronApiError::Api(error) => return error.into_response(),
             CronApiError::InvalidCron(m) | CronApiError::BadRequest(m) => {
                 (StatusCode::BAD_REQUEST, m)
             }

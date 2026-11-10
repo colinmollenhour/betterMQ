@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "BetterMQ API",
-    "description": "HTTP message broker — publish, queues, enqueue, flow control, cron, and DLQ. Authenticate with a panel-generated `sk_local_…` Bearer token.",
+    "description": "HTTP message broker — publish, queues, enqueue, flow control, cron, and DLQ. Authenticate with a panel-generated `sk_local_…` Bearer token. Cell catalog mutations require controller quorum commit and requesting-node application. Send X-BetterMQ-Operation-Id (UUID) for safe retries; responses echo it and include X-BetterMQ-Catalog-Revision and X-BetterMQ-Catalog-Version after commit. Optional If-Match carries the identity version, not the global revision. A committed retry returns 200 with {operation_id,catalog_revision,catalog_version,replayed:true,resources:[{kind,id,deleted}]} rather than the original object. Reusing an operation UUID for a different method/path/tenant/body is 409. No quorum is 503; a timeout after submission means outcome unknown, retry the same UUID. A local apply failure remains committed and fences the node. Standalone behavior stays local-only.",
     "version": "0.6.2",
     "license": {
       "name": "MIT OR Apache-2.0"

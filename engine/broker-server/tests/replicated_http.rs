@@ -148,16 +148,54 @@ async fn replicated_http_ingest_survives_sigkill_and_refuses_missing_quorum() {
         .build()
         .unwrap();
     wait_ready(&client, &nodes, &[0, 1, 2]).await;
-
-    let (status, body) = post(
-        &client,
-        &nodes[0],
-        "/v1/queues",
-        &json!({
-            "queue":"http-test", "url":"https://example.com/hook", "secret":"delivery-secret"
-        }),
-    )
-    .await;
+    // Activation is automatic, but the legacy endpoint becomes read-only only
+    // after every configured node has advertised its writer capability.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut active = true;
+        for node in &nodes {
+            let response = client.post(format!("{}/internal/v1/cluster/catalog/apply", node.base))
+                .header("x-bettermq-cluster-secret", "http-integration-secret")
+                .json(&json!({"flows":[],"queues":[],"groups":[],"group_members":[],"crons":[],"tombstones":{}})).send().await.unwrap();
+            active &= response.status() == StatusCode::CONFLICT;
+        }
+        if active {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "catalog did not activate automatically"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    wait_ready(&client, &nodes, &[0, 1, 2]).await;
+    let catalog_op = Uuid::new_v4();
+    let queue_definition = json!({
+        "queue":"http-test", "url":"https://example.com/hook", "secret":"delivery-secret"
+    });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let response = loop {
+        let response = client
+            .post(format!("{}/v1/queues", nodes[0].base))
+            .header("x-bettermq-operation-id", catalog_op.to_string())
+            .json(&queue_definition)
+            .send()
+            .await
+            .unwrap();
+        if response.status().is_success() {
+            break response;
+        }
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            Instant::now() < deadline,
+            "catalog stayed frozen after capability activation: {}",
+            response.text().await.unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let status = response.status();
+    let catalog_revision = response.headers()["x-bettermq-catalog-revision"].clone();
+    let body: Value = response.json().await.unwrap();
     assert!(status.is_success(), "queue create: {status} {body}");
     // Wait for real catalog propagation before testing forwarding.
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -180,6 +218,20 @@ async fn replicated_http_ingest_survives_sigkill_and_refuses_missing_quorum() {
         assert!(Instant::now() < deadline, "queue catalog did not propagate");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    let response = client
+        .post(format!("{}/v1/queues", nodes[2].base))
+        .header("x-bettermq-operation-id", catalog_op.to_string())
+        .json(&queue_definition)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-bettermq-catalog-revision"],
+        catalog_revision
+    );
+    assert_eq!(response.json::<Value>().await.unwrap()["replayed"], true);
 
     let mut acknowledged = HashSet::new();
     let enqueue =
@@ -278,6 +330,38 @@ async fn replicated_http_ingest_survives_sigkill_and_refuses_missing_quorum() {
     assert_eq!(status, StatusCode::MULTI_STATUS, "{body}");
     assert_eq!(body["accepted"], 0);
     assert_eq!(body["results"][0]["retryable"], true);
+    let before: Value = client
+        .get(format!("{}/v1/queues", nodes[lone].base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let (status, body) = post(
+        &client,
+        &nodes[lone],
+        "/v1/queues",
+        &json!({"queue":"no-quorum-catalog","url":"https://example.com/hook","secret":"s"}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "catalog mutation without quorum: {body}"
+    );
+    let after: Value = client
+        .get(format!("{}/v1/queues", nodes[lone].base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        before, after,
+        "no-quorum mutation changed the serving cache"
+    );
     nodes[lone].crash();
 
     // With the old leader absent, the surviving replicas must contain every
@@ -305,4 +389,17 @@ async fn replicated_http_ingest_survives_sigkill_and_refuses_missing_quorum() {
     let (status, body) = post(&client, &nodes[2], "/v1/enqueue", &enqueue).await;
     assert_eq!(accepted_id(status, &body), enqueue_id);
     assert_eq!(body["duplicate"], true);
+    let response = client
+        .post(format!("{}/v1/queues", nodes[1].base))
+        .header("x-bettermq-operation-id", catalog_op.to_string())
+        .json(&queue_definition)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-bettermq-catalog-revision"],
+        catalog_revision,
+        "durable operation receipt survives all process restarts"
+    );
 }
