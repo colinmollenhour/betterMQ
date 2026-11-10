@@ -6,7 +6,15 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { isStandalone } from "@/lib/config";
 import { errText } from "@/lib/payload";
-import { handleAuthFailure, regenerateToken, session, startApp, submitGateToken, validateSessionToken } from "@/lib/session";
+import {
+  REGENERATE_WARNING,
+  handleAuthFailure,
+  regenerateToken,
+  session,
+  startApp,
+  submitGateToken,
+  validateSessionToken,
+} from "@/lib/session";
 
 const token = ref(session.token);
 const password = ref("");
@@ -33,6 +41,7 @@ async function continueWithToken() {
 
 async function regen() {
   error.value = "";
+  if (!window.confirm(REGENERATE_WARNING)) return;
   busy.value = true;
   try {
     await regenerateToken(password.value);
@@ -73,6 +82,9 @@ async function regen() {
         <Field label="Panel password">
           <Input v-model="password" type="password" autocomplete="current-password" />
         </Field>
+        <p class="text-xs text-destructive">
+          Regenerating revokes the current token for every API client in the cell.
+        </p>
         <Button class="w-full" variant="outline" :disabled="busy" @click="regen">Regenerate token</Button>
       </div>
     </div>

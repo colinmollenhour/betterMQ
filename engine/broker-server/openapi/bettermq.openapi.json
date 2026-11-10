@@ -1696,6 +1696,41 @@
           },
           "show_once": {
             "type": "boolean"
+          },
+          "propagation": {
+            "type": "object",
+            "description": "Present in a cluster. Peers in `failed` did not apply the new credentials: after a regenerate they still accept the previous token.",
+            "required": [
+              "peers",
+              "applied",
+              "failed"
+            ],
+            "properties": {
+              "peers": {
+                "type": "integer"
+              },
+              "applied": {
+                "type": "integer"
+              },
+              "failed": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "peer",
+                    "error"
+                  ],
+                  "properties": {
+                    "peer": {
+                      "type": "string"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       },
@@ -4493,7 +4528,8 @@
               }
             }
           }
-        }
+        },
+        "description": "Revokes the current API token (data plane and admin) and pushes the new versioned credentials to every cluster peer; configured peers accept a strictly newer version. Check `propagation.failed`."
       }
     },
     "/v1/infra/join/bootstrap": {

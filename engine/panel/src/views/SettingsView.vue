@@ -6,7 +6,7 @@ import { Input } from "@/components/ui/input";
 import Field from "@/components/form/Field.vue";
 import ActionMessage from "@/components/form/ActionMessage.vue";
 import { useActionStatus } from "@/composables/useActionStatus";
-import { regenerateToken } from "@/lib/session";
+import { REGENERATE_WARNING, regenerateToken } from "@/lib/session";
 
 const password = ref("");
 const busy = ref(false);
@@ -14,6 +14,7 @@ const status = useActionStatus();
 
 async function regen() {
   status.reset();
+  if (!window.confirm(REGENERATE_WARNING)) return;
   busy.value = true;
   try {
     await regenerateToken(password.value);
@@ -38,6 +39,7 @@ async function regen() {
         <CardTitle>Regenerate API token</CardTitle>
         <CardDescription>
           Enter your panel password. The new token is shown once — copy it immediately.
+          This revokes the current token for every API client on every broker in the cell.
         </CardDescription>
       </CardHeader>
       <CardContent>

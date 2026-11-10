@@ -45,6 +45,10 @@ pub enum LocalAuthError {
 struct Stored {
     password_hash: String,
     api_key_hash: String,
+    /// Bumped on every regenerate; peers accept a strictly newer version.
+    /// Files written before versioning read as 0.
+    #[serde(default)]
+    version: u64,
 }
 
 /// Password + API token hashes for cluster sync (never includes plaintext token).
@@ -52,6 +56,9 @@ struct Stored {
 pub struct AuthCredentials {
     pub password_hash: String,
     pub api_key_hash: String,
+    /// Credential generation; see [`LocalAuthStore::apply_credentials`].
+    #[serde(default)]
+    pub version: u64,
 }
 
 /// Identity of the credentials file, to notice replacement by another process.
@@ -177,6 +184,7 @@ impl LocalAuthStore {
         let stored = Stored {
             password_hash: hash_password(password)?,
             api_key_hash: hash_token(&token),
+            version: 1,
         };
         write_atomic(&self.path, &stored)?;
         self.remember(stored);
@@ -192,6 +200,7 @@ impl LocalAuthStore {
         let updated = Stored {
             password_hash: stored.password_hash,
             api_key_hash: hash_token(&token),
+            version: stored.version.saturating_add(1),
         };
         write_atomic(&self.path, &updated)?;
         self.remember(updated);
@@ -222,30 +231,39 @@ impl LocalAuthStore {
         Ok(Some(AuthCredentials {
             password_hash: stored.password_hash,
             api_key_hash: stored.api_key_hash,
+            version: stored.version,
         }))
     }
 
-    /// Apply credentials from cluster seed (same API token works on every node).
+    /// Apply credentials from a cluster peer (same API token works on every
+    /// node). Callers reach this only through cluster-secret-authenticated
+    /// internal routes or a seed that proved the secret.
     ///
     /// - Unconfigured node: write once (join path).
-    /// - Already configured with identical hashes: idempotent no-op.
-    /// - Already configured with different hashes: reject (blocks auth takeover).
+    /// - Identical hashes: no-op (adopts a newer version number).
+    /// - Different hashes with a strictly newer version: a rotation; replace.
+    /// - Different hashes with the same or an older version: reject, so a stale
+    ///   snapshot cannot restore a revoked token and peers cannot silently
+    ///   overwrite each other.
     pub fn apply_credentials(&self, creds: &AuthCredentials) -> Result<(), LocalAuthError> {
         if creds.password_hash.trim().is_empty() || creds.api_key_hash.trim().is_empty() {
             return Err(LocalAuthError::InvalidToken);
         }
-        if self.is_configured() {
+        if self.path.is_file() {
             let existing = self.load()?;
             let same_password = constant_time_eq(&existing.password_hash, &creds.password_hash);
             let same_api_key = constant_time_eq(&existing.api_key_hash, &creds.api_key_hash);
-            if same_password && same_api_key {
+            if same_password && same_api_key && creds.version <= existing.version {
                 return Ok(());
             }
-            return Err(LocalAuthError::AlreadyConfigured);
+            if !(same_password && same_api_key) && creds.version <= existing.version {
+                return Err(LocalAuthError::AlreadyConfigured);
+            }
         }
         let stored = Stored {
             password_hash: creds.password_hash.clone(),
             api_key_hash: creds.api_key_hash.clone(),
+            version: creds.version,
         };
         write_atomic(&self.path, &stored)?;
         self.remember(stored);
@@ -406,16 +424,66 @@ mod tests {
         let creds = AuthCredentials {
             password_hash: "argon2-hash".into(),
             api_key_hash: "sha256-hash".into(),
+            version: 1,
         };
         store.apply_credentials(&creds).unwrap();
         store.apply_credentials(&creds).unwrap(); // idempotent
         let takeover = AuthCredentials {
             password_hash: "evil-password-hash".into(),
             api_key_hash: "evil-api-hash".into(),
+            version: 1,
         };
         assert!(matches!(
             store.apply_credentials(&takeover),
             Err(LocalAuthError::AlreadyConfigured)
         ));
+    }
+
+    #[test]
+    fn rotation_propagates_to_a_configured_peer_and_stale_snapshots_are_refused() {
+        let origin_dir = tempdir().unwrap();
+        let peer_dir = tempdir().unwrap();
+        let origin = LocalAuthStore::open(origin_dir.path()).unwrap();
+        let peer = LocalAuthStore::open(peer_dir.path()).unwrap();
+        let t1 = origin.setup("password1234").unwrap();
+        let v1 = origin.export_credentials().unwrap().unwrap();
+        peer.apply_credentials(&v1).unwrap();
+        assert!(peer.verify_token(&t1).unwrap());
+
+        let t2 = origin.regenerate("password1234").unwrap();
+        let v2 = origin.export_credentials().unwrap().unwrap();
+        assert_eq!(v2.version, v1.version + 1);
+        peer.apply_credentials(&v2).unwrap();
+        assert!(
+            !peer.verify_token(&t1).unwrap(),
+            "old token revoked on peer"
+        );
+        assert!(peer.verify_token(&t2).unwrap());
+
+        assert!(matches!(
+            peer.apply_credentials(&v1),
+            Err(LocalAuthError::AlreadyConfigured)
+        ));
+        assert!(peer.verify_token(&t2).unwrap());
+    }
+
+    #[test]
+    fn unversioned_files_read_as_version_zero() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join(FILE_NAME),
+            br#"{"password_hash":"p","api_key_hash":"a"}"#,
+        )
+        .unwrap();
+        let store = LocalAuthStore::open(dir.path()).unwrap();
+        assert_eq!(store.export_credentials().unwrap().unwrap().version, 0);
+        store
+            .apply_credentials(&AuthCredentials {
+                password_hash: "p".into(),
+                api_key_hash: "b".into(),
+                version: 1,
+            })
+            .unwrap();
+        assert_eq!(store.export_credentials().unwrap().unwrap().version, 1);
     }
 }

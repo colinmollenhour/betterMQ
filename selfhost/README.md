@@ -570,6 +570,8 @@ Prefer compose profiles above, or run **one broker per server**. Two `all` nodes
 5. Later add broker 3 the same way for HA. Optional 4th = capacity, not RF=4.
 6. Dispatch / gateway / panel: same form, other profile. They are **not** replicas.
 
+Regenerating the API token (Settings) revokes it for every client and pushes the new credentials to every peer, which accept them because they carry a newer version; the response lists any peer that did not apply them (that peer still accepts the old token until **Re-sync**).
+
 Every broker in a cell needs the same `BETTERMQ_CLUSTER_SECRET`. **Add node** signs the enroll request with it (the secret itself is never sent to the new node's URL), and a joining node refuses a seed that cannot prove it holds the same secret. A node that already has a panel password needs its own API token to enroll, and a node that is already in a cluster refuses to join another one unless `force` is set on `/v1/infra/cluster/join`.
 
 `docker-compose.ha.yml` maps broker1→8081, broker2→8082, broker3→8083. Use the URL this panel process can call (compose DNS if the panel is in the compose network; `127.0.0.1` plus the published port if the panel is on the host).

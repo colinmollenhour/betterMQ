@@ -68,6 +68,7 @@ export const session = reactive({
   apiBase: loadSavedApiBase(),
   token: "",
   revealedToken: "",
+  revealWarning: "",
   auth: null as AuthConfig | null,
   health: "…",
   version: null as string | null,
@@ -207,15 +208,36 @@ export async function setupPassword(password: string, setupCode: string) {
   session.phase = "reveal";
 }
 
+export type AuthPropagation = {
+  peers: number;
+  applied: number;
+  failed: { peer: string; error: string }[];
+};
+
+export const REGENERATE_WARNING =
+  "Regenerating revokes the current API token for every producer, consumer and panel session " +
+  "on every broker in this cell. All API clients must be updated with the new token. Continue?";
+
+function propagationWarning(p: AuthPropagation | undefined): string {
+  if (!p || !p.failed?.length) return "";
+  const peers = p.failed.map((f) => `${f.peer} (${f.error})`).join("; ");
+  return `The new token reached ${p.applied} of ${p.peers} peer broker(s). These still accept the old token until fixed (Infrastructure → Re-sync on each): ${peers}`;
+}
+
 export async function regenerateToken(password: string) {
-  const res = await apiPost<{ token: string }>(publicUrl("/v1/local-auth/regenerate"), { password });
+  const res = await apiPost<{ token: string; propagation?: AuthPropagation }>(
+    publicUrl("/v1/local-auth/regenerate"),
+    { password },
+  );
   setToken(res.token);
   session.revealedToken = res.token;
+  session.revealWarning = propagationWarning(res.propagation);
   session.phase = "reveal";
 }
 
 export function finishReveal() {
   session.revealedToken = "";
+  session.revealWarning = "";
   startApp();
 }
 

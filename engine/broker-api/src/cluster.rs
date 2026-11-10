@@ -1241,17 +1241,87 @@ pub async fn replicate_cron_catalog(state: &AppState, job: CronJob) {
     }
 }
 
+/// Per-peer outcome of pushing local-auth credentials (setup or rotation).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AuthPropagation {
+    pub peers: usize,
+    pub applied: usize,
+    pub failed: Vec<AuthPropagationFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthPropagationFailure {
+    pub peer: String,
+    pub error: String,
+}
+
+/// Push credentials to every peer and report which ones applied them, so a
+/// rotation that left peers on the old token is visible to the caller.
 pub async fn replicate_auth_credentials(
     state: &AppState,
     creds: broker_local_auth::AuthCredentials,
-) {
-    fanout_catalog(
-        state,
-        "/internal/v1/cluster/auth/apply",
-        &ClusterAuthSnapshot { credentials: creds },
-        "auth credentials",
-    )
-    .await;
+) -> AuthPropagation {
+    let peers = catalog_peer_urls(state);
+    let mut report = AuthPropagation {
+        peers: peers.len(),
+        ..AuthPropagation::default()
+    };
+    if peers.is_empty() {
+        return report;
+    }
+    let body = ClusterAuthSnapshot { credentials: creds };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            report.failed = peers
+                .into_iter()
+                .map(|peer| AuthPropagationFailure {
+                    peer,
+                    error: format!("http client: {e}"),
+                })
+                .collect();
+            return report;
+        }
+    };
+    for peer in peers {
+        let mut last_error = String::from("no peer URL attempted");
+        let mut delivered = false;
+        for base in peer_fanout_urls(&peer) {
+            let url = format!(
+                "{}/internal/v1/cluster/auth/apply",
+                base.trim_end_matches('/')
+            );
+            match crate::cluster_auth::apply_cluster_secret(client.post(&url))
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    delivered = true;
+                    break;
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let detail = resp.text().await.unwrap_or_default();
+                    last_error = format!("HTTP {status}: {detail}");
+                }
+                Err(e) => last_error = e.to_string(),
+            }
+        }
+        if delivered {
+            report.applied += 1;
+        } else {
+            warn!(peer = %peer, error = %last_error, "auth credential propagation failed");
+            report.failed.push(AuthPropagationFailure {
+                peer,
+                error: last_error,
+            });
+        }
+    }
+    report
 }
 
 pub async fn pull_auth_from_seed(state: &Arc<AppState>, seed_base: &str) -> Result<(), ApiError> {
@@ -1315,7 +1385,12 @@ pub async fn internal_cluster_auth_apply(
     };
     local
         .apply_credentials(&body.credentials)
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        .map_err(|e| match e {
+            broker_local_auth::LocalAuthError::AlreadyConfigured => ApiError::Conflict(
+                "peer holds different credentials of the same or a newer version".into(),
+            ),
+            other => ApiError::BadRequest(other.to_string()),
+        })?;
     Ok(StatusCode::OK)
 }
 

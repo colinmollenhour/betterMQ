@@ -894,6 +894,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn regenerate_rotates_the_token_on_configured_peers() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BETTERMQ_CLUSTER_SECRET", "rotate-secret");
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let store_a = Arc::new(broker_local_auth::LocalAuthStore::open(dir_a.path()).unwrap());
+        let store_b = Arc::new(broker_local_auth::LocalAuthStore::open(dir_b.path()).unwrap());
+        let old = store_a.setup("password1234").unwrap();
+        store_b
+            .apply_credentials(&store_a.export_credentials().unwrap().unwrap())
+            .unwrap();
+
+        let mut state_b = test_state(&dir_b);
+        state_b.local_auth = Some(store_b.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener.local_addr().unwrap();
+        let app_b = router(state_b);
+        tokio::spawn(async move { axum::serve(listener, app_b).await.unwrap() });
+
+        let mut cfg = broker_config::BetterMqConfig::template_single_local();
+        cfg.data_dir = dir_a.path().to_path_buf();
+        cfg.node.name = "a".into();
+        cfg.node.public_url = "http://127.0.0.1:1".into();
+        cfg.cluster = Some(broker_config::ClusterConfigSection {
+            enabled: true,
+            id: Some(uuid::Uuid::new_v4().to_string()),
+            nodes: vec![
+                broker_config::ClusterNode {
+                    name: "a".into(),
+                    public_url: "http://127.0.0.1:1".into(),
+                    internal_url: None,
+                },
+                broker_config::ClusterNode {
+                    name: "b".into(),
+                    public_url: format!("http://{addr_b}"),
+                    internal_url: None,
+                },
+            ],
+            shared_meta_dir: None,
+        });
+        broker_config::save_managed_config(dir_a.path(), &cfg).unwrap();
+        let mut state_a = test_state(&dir_a);
+        state_a.local_auth = Some(store_a.clone());
+        let response = router(state_a)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/local-auth/regenerate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"password":"password1234"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let new = body["token"].as_str().unwrap();
+        assert_eq!(body["propagation"]["peers"], 1, "{body}");
+        assert_eq!(body["propagation"]["applied"], 1, "{body}");
+        assert!(
+            !store_b.verify_token(&old).unwrap(),
+            "old token revoked on peer"
+        );
+        assert!(
+            store_b.verify_token(new).unwrap(),
+            "new token works on peer"
+        );
+    }
+
+    #[tokio::test]
     async fn missing_local_auth_is_401_fail_closed() {
         let dir = tempdir().unwrap();
         let app = router(test_state(&dir));

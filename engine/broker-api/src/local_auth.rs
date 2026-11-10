@@ -188,6 +188,10 @@ struct TokenResponse {
     token: String,
     #[serde(rename = "show_once")]
     show_once: bool,
+    /// Cluster peers the new credentials were pushed to. Peers listed in
+    /// `failed` still accept the previous token (rotation) or none (setup).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    propagation: Option<crate::cluster::AuthPropagation>,
 }
 
 fn auth_config_body(mode: &'static str, configured: bool) -> AuthConfigResponse {
@@ -231,15 +235,22 @@ async fn local_status(
     }))
 }
 
-async fn propagate_local_auth(state: &AppState) {
-    let Some(local) = &state.local_auth else {
-        return;
-    };
+async fn propagate_local_auth(state: &AppState) -> Option<crate::cluster::AuthPropagation> {
+    let local = state.local_auth.as_ref()?;
     if crate::cluster::catalog_peer_urls(state).is_empty() {
-        return;
+        return None;
     }
-    if let Ok(Some(creds)) = local.export_credentials() {
-        crate::cluster::replicate_auth_credentials(state, creds).await;
+    match local.export_credentials() {
+        Ok(Some(creds)) => Some(crate::cluster::replicate_auth_credentials(state, creds).await),
+        Ok(None) => None,
+        Err(error) => Some(crate::cluster::AuthPropagation {
+            peers: crate::cluster::catalog_peer_urls(state).len(),
+            applied: 0,
+            failed: vec![crate::cluster::AuthPropagationFailure {
+                peer: "local".into(),
+                error: format!("could not read local credentials: {error}"),
+            }],
+        }),
     }
 }
 
@@ -264,10 +275,11 @@ async fn local_setup(
     let store = local_store(&state)?;
     let token = store.setup(&body.password).map_err(map_local_err)?;
     *SETUP_CODE.lock().unwrap() = None;
-    propagate_local_auth(&state).await;
+    let propagation = propagate_local_auth(&state).await;
     Ok(Json(TokenResponse {
         token,
         show_once: true,
+        propagation,
     }))
 }
 
@@ -279,10 +291,11 @@ async fn local_regenerate(
     enforce_auth_rate(&headers)?;
     let store = local_store(&state)?;
     let token = store.regenerate(&body.password).map_err(map_local_err)?;
-    propagate_local_auth(&state).await;
+    let propagation = propagate_local_auth(&state).await;
     Ok(Json(TokenResponse {
         token,
         show_once: true,
+        propagation,
     }))
 }
 
