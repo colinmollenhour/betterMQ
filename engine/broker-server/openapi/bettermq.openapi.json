@@ -69,17 +69,43 @@
     {
       "name": "Infra",
       "description": "Self-host config, storage, and HA cluster management"
+    },
+    {
+      "name": "Admin",
+      "description": "Management listener API. Supply an administrator session bearer token for embedded mode or the cluster-secret bearer for standalone mode. Dynamic controller snapshots may gain fields."
+    },
+    {
+      "name": "Infrastructure",
+      "description": "Fresh-node enrollment"
+    },
+    {
+      "name": "Observability",
+      "description": "Prometheus exposition and gateway-only status"
     }
   ],
   "components": {
+    "responses": {
+      "AdminUnauthorized": {"description": "Administrator authentication required", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AdminError"}}}},
+      "AdminFailure": {"description": "Invalid management request or rejected controller operation", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AdminError"}}}},
+      "AdminResult": {"description": "Management operation result; includes operation-specific fields and probe diagnostics", "content": {"application/json": {"schema": {"type": "object", "additionalProperties": true}}}}
+    },
     "securitySchemes": {
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "API token (`Authorization: Bearer sk_local_…`)"
+        "description": "API token for data-plane requests (`Authorization: Bearer sk_local_…`); administrator session token for embedded management or cluster-secret bearer for standalone management."
       }
     },
     "schemas": {
+      "AdminError": {"type": "object", "required": ["error", "code"], "properties": {"error": {"type": "string"}, "code": {"type": "string"}}},
+      "AdminClusterOverview": {
+        "type": "object",
+        "required": ["apiVersion", "ready", "clusterHealthy", "nodeCount", "replicationFactor", "minIsr", "catalogEpoch", "local"],
+        "properties": {"apiVersion": {"type": "string"}, "ready": {"type": "boolean"}, "clusterHealthy": {"type": "boolean"}, "nodeCount": {"type": "integer"}, "replicationFactor": {"type": "integer"}, "minIsr": {"type": "integer"}, "catalogEpoch": {"type": "integer"}, "local": {"type": "boolean"}}
+      },
+      "AdminCellRecord": {"type": "object", "required": ["id", "region", "controllerUrl"], "properties": {"id": {"type": "string"}, "region": {"type": "string"}, "controllerUrl": {"type": "string", "format": "uri"}, "label": {"type": "string", "nullable": true}}},
+      "AdminCellMember": {"type": "object", "required": ["profile", "reachUrl", "advertiseUrl", "name", "cellId"], "properties": {"profile": {"type": "string"}, "reachUrl": {"type": "string", "format": "uri"}, "advertiseUrl": {"type": "string", "format": "uri"}, "name": {"type": "string"}, "cellId": {"type": "string"}}},
+      "AdminCellRegistry": {"type": "object", "required": ["cells", "members"], "properties": {"cells": {"type": "array", "items": {"$ref": "#/components/schemas/AdminCellRecord"}}, "members": {"type": "array", "items": {"$ref": "#/components/schemas/AdminCellMember"}}}},
       "Error": {
         "type": "object",
         "properties": {
@@ -2266,6 +2292,73 @@
     }
   ],
   "paths": {
+    "/admin/v1/health": {
+      "get": {"tags": ["Admin"], "summary": "Management listener health", "security": [], "responses": {"200": {"description": "Listener health and mode", "content": {"application/json": {"schema": {"type": "object", "required": ["status", "apiVersion", "mode", "cells"], "properties": {"status": {"type": "string"}, "apiVersion": {"type": "string"}, "mode": {"type": "string", "enum": ["embedded", "standalone"]}, "cells": {"type": "integer"}}}}}}}}
+    },
+    "/admin/v1/cluster": {
+      "get": {"tags": ["Admin"], "summary": "Cluster overview", "responses": {"200": {"description": "Cluster health and replication policy", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AdminClusterOverview"}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/nodes": {
+      "get": {"tags": ["Admin"], "summary": "Controller data-node inventory", "responses": {"200": {"description": "Nodes (empty when no local controller)", "content": {"application/json": {"schema": {"type": "object", "properties": {"nodes": {"type": "array", "items": {"type": "object", "additionalProperties": true}}}}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/shards": {
+      "get": {"tags": ["Admin"], "summary": "Controller shard placements", "responses": {"200": {"description": "Shards (empty when no local controller)", "content": {"application/json": {"schema": {"type": "object", "properties": {"shards": {"type": "array", "items": {"type": "object", "additionalProperties": true}}}}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/catalog": {
+      "get": {"tags": ["Admin"], "summary": "Controller catalog snapshot", "responses": {"200": {"description": "Catalog epoch, records and authority flag", "content": {"application/json": {"schema": {"type": "object", "properties": {"epoch": {"type": "integer"}, "records": {"type": "object", "additionalProperties": true}, "authoritative": {"type": "boolean"}}}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/metrics": {
+      "get": {"tags": ["Admin"], "summary": "Management metrics snapshot", "responses": {"200": {"description": "Native broker metrics", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MetricsResponse"}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/readyz": {
+      "get": {"tags": ["Admin"], "summary": "Management readiness snapshot", "responses": {"200": {"description": "Readiness fields (inspect ready, not only HTTP status)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ReadyResponse"}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/audit": {
+      "get": {"tags": ["Admin"], "summary": "Management audit events", "description": "Currently returns an empty event list; limit is reserved and is not applied.", "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 0}}], "responses": {"200": {"description": "Audit event list", "content": {"application/json": {"schema": {"type": "object", "properties": {"events": {"type": "array", "items": {"type": "object"}}}}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/cells": {
+      "get": {"tags": ["Admin"], "summary": "List registered cells and members", "responses": {"200": {"description": "Cell registry", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AdminCellRegistry"}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}},
+      "post": {"tags": ["Admin"], "summary": "Upsert a registered cell", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AdminCellRecord"}}}}, "responses": {"200": {"description": "Updated registry", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AdminCellRegistry"}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/cells/{id}/members": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+      "get": {"tags": ["Admin"], "summary": "Cell brokers and attached members", "responses": {"200": {"description": "Cell inventory", "content": {"application/json": {"schema": {"type": "object", "properties": {"cellId": {"type": "string"}, "brokers": {"type": "array", "items": {"type": "object"}}, "members": {"type": "array", "items": {"$ref": "#/components/schemas/AdminCellMember"}}}}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/cells/query/{kind}": {
+      "parameters": [{"name": "kind", "in": "path", "required": true, "schema": {"type": "string", "enum": ["cluster", "nodes", "shards", "catalog"]}}],
+      "get": {"tags": ["Admin"], "summary": "Federated cell query with explicit per-cell failures", "responses": {"200": {"description": "Successful and failed cells", "content": {"application/json": {"schema": {"type": "object", "properties": {"ok": {"type": "array", "items": {"type": "object", "properties": {"cell": {"type": "string"}, "data": {"type": "object", "additionalProperties": true}}}}, "failed": {"type": "array", "items": {"type": "object", "properties": {"cell": {"type": "string"}, "error": {"type": "string"}}}}}}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/probe": {
+      "post": {"tags": ["Admin"], "summary": "Probe an attach target", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["reachUrl"], "properties": {"reachUrl": {"type": "string", "format": "uri"}}}}}}, "responses": {"200": {"$ref": "#/components/responses/AdminResult"}, "400": {"$ref": "#/components/responses/AdminFailure"}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/attach": {
+      "post": {"tags": ["Admin"], "summary": "Attach a broker or fleet process", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["profile", "reachUrl", "advertiseUrl", "nodeName"], "properties": {"profile": {"type": "string"}, "reachUrl": {"type": "string", "format": "uri"}, "advertiseUrl": {"type": "string", "format": "uri"}, "nodeName": {"type": "string"}, "joinToken": {"type": "string"}, "seedUrl": {"type": "string", "format": "uri"}, "cellId": {"type": "string"}}}}}}, "responses": {"200": {"$ref": "#/components/responses/AdminResult"}, "400": {"$ref": "#/components/responses/AdminFailure"}, "409": {"$ref": "#/components/responses/AdminFailure"}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/expand-rf": {
+      "post": {"tags": ["Admin"], "summary": "Expand the replication policy", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"nodeName": {"type": "string"}, "advertiseUrl": {"type": "string", "format": "uri"}}}}}}, "responses": {"200": {"$ref": "#/components/responses/AdminResult"}, "400": {"$ref": "#/components/responses/AdminFailure"}, "409": {"$ref": "#/components/responses/AdminFailure"}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/rebalance": {
+      "post": {"tags": ["Admin"], "summary": "Begin a shard rebalance", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["shard"], "properties": {"shard": {"type": "integer", "minimum": 0}, "add": {"type": "string", "format": "uuid"}, "remove": {"type": "string", "format": "uuid"}}}}}}, "responses": {"200": {"$ref": "#/components/responses/AdminResult"}, "400": {"$ref": "#/components/responses/AdminFailure"}, "409": {"$ref": "#/components/responses/AdminFailure"}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/nodes/drain": {
+      "post": {"tags": ["Admin"], "summary": "Drain a data node", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["nodeId"], "properties": {"nodeId": {"type": "string", "format": "uuid"}}}}}}, "responses": {"200": {"$ref": "#/components/responses/AdminResult"}, "400": {"$ref": "#/components/responses/AdminFailure"}, "409": {"$ref": "#/components/responses/AdminFailure"}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/controller/voters": {
+      "post": {"tags": ["Admin"], "summary": "Change controller voter membership", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["nodeId", "action"], "properties": {"nodeId": {"type": "string", "format": "uuid"}, "action": {"type": "string", "enum": ["add", "remove"]}}}}}}, "responses": {"200": {"$ref": "#/components/responses/AdminResult"}, "400": {"$ref": "#/components/responses/AdminFailure"}, "409": {"$ref": "#/components/responses/AdminFailure"}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/gc/{shard}": {
+      "parameters": [{"name": "shard", "in": "path", "required": true, "schema": {"type": "integer", "minimum": 0}}],
+      "post": {"tags": ["Admin"], "summary": "Advance a shard GC watermark and collect sealed segments", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["watermark"], "properties": {"watermark": {"type": "integer", "minimum": 0}}}}}}, "responses": {"200": {"$ref": "#/components/responses/AdminResult"}, "409": {"$ref": "#/components/responses/AdminFailure"}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/v1/infra/cluster/enroll": {
+      "post": {"tags": ["Infrastructure"], "summary": "Enroll a fresh broker using a seed join token", "description": "Uses the join token in the request body, not a local API token. Unsupported on dispatch fleets and WAL-less processes.", "security": [], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ClusterJoinRequest"}}}}, "responses": {"200": {"description": "Membership saved; restart required", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ClusterJoinResponse"}}}}, "400": {"description": "Invalid token, seed, configuration or unsupported process role"}}}
+    },
+    "/metrics/prometheus": {
+      "get": {"tags": ["Observability"], "summary": "Prometheus exposition", "security": [], "responses": {"200": {"description": "Prometheus text exposition format", "content": {"text/plain": {"schema": {"type": "string"}}}}}}
+    },
+    "/v1/gateway/status": {
+      "get": {"tags": ["Observability"], "summary": "Stateless gateway status", "description": "Mounted on gateway-only listeners.", "security": [], "responses": {"200": {"description": "Gateway configuration and broker probe counts", "content": {"application/json": {"schema": {"type": "object", "required": ["mode", "ready", "healthy_brokers", "configured_brokers", "shard_count", "layout_version"], "properties": {"mode": {"type": "string"}, "ready": {"type": "boolean"}, "healthy_brokers": {"type": "integer"}, "configured_brokers": {"type": "integer"}, "shard_count": {"type": "integer"}, "layout_version": {"type": "integer"}}}}}}}}
+    },
     "/healthz": {
       "get": {
         "tags": [
