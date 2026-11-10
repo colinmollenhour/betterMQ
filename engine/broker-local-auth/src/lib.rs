@@ -175,6 +175,21 @@ impl LocalAuthStore {
         !matches!(self.current(), Loaded::Missing)
     }
 
+    /// Exclusive advisory lock on `<file>.lock`, serialising every
+    /// check-then-write on the credentials file across threads and across
+    /// processes that share it. Blocks; call from a blocking context.
+    fn write_lock(&self) -> Result<fs::File, LocalAuthError> {
+        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
+        name.push(".lock");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.path.with_file_name(name))?;
+        lock.lock()?;
+        Ok(lock)
+    }
+
     pub fn setup(&self, password: &str) -> Result<String, LocalAuthError> {
         if self.is_configured() {
             return Err(LocalAuthError::AlreadyConfigured);
@@ -186,21 +201,33 @@ impl LocalAuthStore {
             api_key_hash: hash_token(&token),
             version: 1,
         };
+        // Concurrent first-boot claims: exactly one wins; the rest see the file.
+        let _lock = self.write_lock()?;
+        if self.path.is_file() {
+            return Err(LocalAuthError::AlreadyConfigured);
+        }
         write_atomic(&self.path, &stored)?;
         self.remember(stored);
         Ok(token)
     }
 
     pub fn regenerate(&self, password: &str) -> Result<String, LocalAuthError> {
-        let stored = self.load()?;
-        if !verify_password(password, &stored.password_hash)? {
+        let checked = self.load()?;
+        if !verify_password(password, &checked.password_hash)? {
             return Err(LocalAuthError::InvalidPassword);
         }
         let token = generate_token();
+        let _lock = self.write_lock()?;
+        // Re-read under the lock so a concurrent rotation or applied snapshot
+        // is not overwritten with a stale version.
+        let current = self.load()?;
+        if !constant_time_eq(&current.password_hash, &checked.password_hash) {
+            return Err(LocalAuthError::InvalidPassword);
+        }
         let updated = Stored {
-            password_hash: stored.password_hash,
+            password_hash: current.password_hash,
             api_key_hash: hash_token(&token),
-            version: stored.version.saturating_add(1),
+            version: current.version.saturating_add(1),
         };
         write_atomic(&self.path, &updated)?;
         self.remember(updated);
@@ -249,6 +276,7 @@ impl LocalAuthStore {
         if creds.password_hash.trim().is_empty() || creds.api_key_hash.trim().is_empty() {
             return Err(LocalAuthError::InvalidToken);
         }
+        let _lock = self.write_lock()?;
         if self.path.is_file() {
             let existing = self.load()?;
             let same_password = constant_time_eq(&existing.password_hash, &creds.password_hash);
@@ -323,33 +351,46 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
         == 0
 }
 
+/// Durable replace: unique temp file (mode 0600 from creation) → fsync →
+/// rename → directory fsync. A unique name keeps concurrent writers, including
+/// other processes sharing the file, from truncating each other's temp file.
 fn write_atomic(path: &Path, stored: &Stored) -> Result<(), LocalAuthError> {
     use std::io::Write;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
     let json = serde_json::to_string_pretty(stored)?;
-    {
-        let mut f = fs::File::create(&tmp)?;
+    let mut suffix = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut suffix);
+    let tmp = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id(),
+        hex::encode(suffix)
+    ));
+    let written = (|| -> Result<(), LocalAuthError> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut f = options.open(&tmp)?;
         f.write_all(json.as_bytes())?;
         f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+        return written;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-    }
-    fs::rename(&tmp, path)?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
     }
     Ok(())
 }
@@ -367,6 +408,50 @@ mod tests {
         assert!(token.starts_with(TOKEN_PREFIX));
         assert!(store.verify_token(&token).unwrap());
         assert!(!store.verify_token("sk_local_deadbeef").unwrap());
+    }
+
+    #[test]
+    fn concurrent_first_boot_setup_has_exactly_one_winner() {
+        let dir = tempdir().unwrap();
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..6)
+                .map(|_| {
+                    let path = dir.path();
+                    scope.spawn(move || {
+                        // Separate instances model separate processes sharing the file.
+                        let store = LocalAuthStore::open(path).unwrap();
+                        store.setup("password1234")
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let winners: Vec<&String> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(winners.len(), 1, "{results:?}");
+        assert!(results
+            .iter()
+            .all(|r| r.is_ok() || matches!(r, Err(LocalAuthError::AlreadyConfigured))));
+        let store = LocalAuthStore::open(dir.path()).unwrap();
+        assert!(
+            store.verify_token(winners[0]).unwrap(),
+            "the issued token works"
+        );
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.path().join(FILE_NAME))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
     }
 
     #[test]
