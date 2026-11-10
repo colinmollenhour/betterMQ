@@ -1210,7 +1210,11 @@ pub async fn infra_cluster_sync(
         .map(|n| n.internal_base().to_owned())
         .ok_or_else(|| ApiError::BadRequest("no seed node".into()))?;
     let seed_base = seed_url.trim().trim_end_matches('/');
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let mut nodes: Vec<ClusterNode> = match crate::cluster_auth::apply_cluster_secret(
         client.get(format!("{seed_base}/internal/v1/cluster/membership")),
     )

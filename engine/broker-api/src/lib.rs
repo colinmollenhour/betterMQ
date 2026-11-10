@@ -1424,6 +1424,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn federated_query_reports_a_hung_cell_without_hiding_healthy_ones() {
+        use axum::routing::get;
+        // Accepts connections and never answers.
+        let hung = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hung_addr = hung.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = hung.accept().await {
+                held.push(socket);
+            }
+        });
+        let healthy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthy_addr = healthy.local_addr().unwrap();
+        let app = Router::new().route(
+            "/admin/v1/nodes",
+            get(|| async { Json(serde_json::json!({ "nodes": [] })) }),
+        );
+        tokio::spawn(async move { axum::serve(healthy, app).await.unwrap() });
+
+        let mut registry = CellRegistry::default();
+        for (id, addr) in [("hung", hung_addr), ("healthy", healthy_addr)] {
+            registry.cells.push(CellRecord {
+                id: id.into(),
+                region: "r".into(),
+                controller_url: format!("http://{addr}"),
+                label: None,
+                admin_token: Some("sk_local_x".into()),
+            });
+        }
+        let mut admin = AdminState::remote("http://127.0.0.1:9".into(), registry);
+        admin.cluster_secret = Some("cluster-secret".into());
+        let started = std::time::Instant::now();
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            admin_json(
+                admin_router(admin),
+                "GET",
+                "/admin/v1/cells/query/nodes",
+                None,
+            ),
+        )
+        .await
+        .expect("federated query must not hang on one cell");
+        assert_eq!(status, StatusCode::OK);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(body["ok"][0]["cell"], "healthy", "{body}");
+        assert_eq!(body["failed"][0]["cell"], "hung", "{body}");
+        assert!(
+            body["failed"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("timed out"),
+            "{body}"
+        );
+    }
+
     async fn admin_json(
         app: Router,
         method: &str,

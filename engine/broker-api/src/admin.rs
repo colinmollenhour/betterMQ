@@ -13,9 +13,11 @@ use axum::{
 };
 use broker_config::stable_node_id;
 use broker_raft_meta::{replication_policy, ControllerCommand, DataNodeRecord};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 const ADMIN_API_VERSION: &str = "v1";
@@ -629,74 +631,116 @@ async fn federated_query(
             }));
         }
     }
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|err| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(AdminErrorBody {
-                    error: err.to_string(),
-                    code: "client",
-                }),
-            )
-        })?;
+    let client = federation_client().map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(AdminErrorBody {
+                error: err.to_string(),
+                code: "client",
+            }),
+        )
+    })?;
+    let path = match kind.as_str() {
+        "shards" => "shards",
+        "nodes" => "nodes",
+        "catalog" => "catalog",
+        _ => "cluster",
+    };
+    // Cells are queried concurrently (bounded) and each has its own deadline,
+    // so one slow or hung cell cannot hide the healthy ones.
+    let results: Vec<Result<CellOk<serde_json::Value>, CellFailure>> =
+        futures_util::stream::iter(cells.into_iter().map(|cell| {
+            let client = client.clone();
+            let state = state.clone();
+            let kind = kind.clone();
+            async move { query_cell(&client, &state, cell, &kind, path).await }
+        }))
+        .buffered(FEDERATION_CONCURRENCY)
+        .collect()
+        .await;
     let mut ok = Vec::new();
     let mut failed = Vec::new();
-    for cell in cells {
-        if let Some(local) = state
-            .local
-            .as_ref()
-            .filter(|_| is_local_cell(&state, &cell.id))
-        {
-            ok.push(CellOk {
-                cell: cell.id,
-                data: local_kind_data(local, &kind),
-            });
-            continue;
-        }
-        // Registry URLs are operator-supplied, not proven peers: authenticate with
-        // the cell's own credential only, never the caller's bearer or the
-        // cluster secret.
-        let Some(token) = cell.admin_token.clone() else {
-            failed.push(CellFailure {
-                cell: cell.id,
-                error: "cell credential not configured".into(),
-            });
-            continue;
-        };
-        let url = format!(
-            "{}/admin/v1/{}",
-            cell.controller_url.trim_end_matches('/'),
-            match kind.as_str() {
-                "shards" => "shards",
-                "nodes" => "nodes",
-                "catalog" => "catalog",
-                _ => "cluster",
-            }
-        );
-        match client.get(url).bearer_auth(token).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json().await {
-                Ok(data) => ok.push(CellOk {
-                    cell: cell.id,
-                    data,
-                }),
-                Err(err) => failed.push(CellFailure {
-                    cell: cell.id,
-                    error: err.to_string(),
-                }),
-            },
-            Ok(resp) => failed.push(CellFailure {
-                cell: cell.id,
-                error: format!("status {}", resp.status()),
-            }),
-            Err(err) => failed.push(CellFailure {
-                cell: cell.id,
-                error: err.to_string(),
-            }),
+    for result in results {
+        match result {
+            Ok(cell) => ok.push(cell),
+            Err(failure) => failed.push(failure),
         }
     }
     Ok(Json(PartialResult { ok, failed }))
+}
+
+const FEDERATION_CONCURRENCY: usize = 8;
+const FEDERATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(not(test))]
+const FEDERATION_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const FEDERATION_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// HTTP client for calls to registered cells: bounded connect and whole-request
+/// deadlines, and no redirects (a cell must not bounce the request elsewhere).
+fn federation_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(FEDERATION_CONNECT_TIMEOUT)
+        .timeout(FEDERATION_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+async fn query_cell(
+    client: &reqwest::Client,
+    state: &AdminState,
+    cell: CellRecord,
+    kind: &str,
+    path: &str,
+) -> Result<CellOk<serde_json::Value>, CellFailure> {
+    if let Some(local) = state
+        .local
+        .as_ref()
+        .filter(|_| is_local_cell(state, &cell.id))
+    {
+        return Ok(CellOk {
+            cell: cell.id,
+            data: local_kind_data(local, kind),
+        });
+    }
+    // Registry URLs are operator-supplied, not proven peers: authenticate with
+    // the cell's own credential only, never the caller's bearer or the
+    // cluster secret.
+    let Some(token) = cell.admin_token.as_deref() else {
+        return Err(CellFailure {
+            cell: cell.id,
+            error: "cell credential not configured".into(),
+        });
+    };
+    let url = format!(
+        "{}/admin/v1/{path}",
+        cell.controller_url.trim_end_matches('/')
+    );
+    let failure = |error: String| CellFailure {
+        cell: cell.id.clone(),
+        error,
+    };
+    let describe = |err: reqwest::Error| {
+        if err.is_timeout() {
+            format!("timed out after {}s", FEDERATION_TIMEOUT.as_secs_f32())
+        } else {
+            err.to_string()
+        }
+    };
+    let resp = client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| failure(describe(e)))?;
+    if !resp.status().is_success() {
+        return Err(failure(format!("status {}", resp.status())));
+    }
+    let data = resp.json().await.map_err(|e| failure(describe(e)))?;
+    Ok(CellOk {
+        cell: cell.id.clone(),
+        data,
+    })
 }
 
 fn cluster_from_local(local: &AppState) -> serde_json::Value {
