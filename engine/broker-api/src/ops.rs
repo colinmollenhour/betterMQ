@@ -127,62 +127,8 @@ pub async fn metrics(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
 ) -> Result<Json<MetricsResponse>, StatusCode> {
-    if let Some(expected) = std::env::var("BETTERMQ_METRICS_TOKEN")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        let presented = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .or_else(|| {
-                headers
-                    .get("x-bettermq-metrics-token")
-                    .and_then(|v| v.to_str().ok())
-            })
-            .unwrap_or("");
-        use subtle::ConstantTimeEq;
-        let a = presented.as_bytes();
-        let b = expected.as_bytes();
-        if a.len() != b.len() || !bool::from(a.ct_eq(b)) {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-    }
-    let blocked = state.dispatch.host_blocker().blocked_hosts();
-    let cluster_enabled = state.cluster.is_some();
-    let healthy_peers = state
-        .cluster
-        .as_ref()
-        .map(|c| {
-            let now = Utc::now().timestamp_millis();
-            c.runtime
-                .config()
-                .nodes
-                .iter()
-                .filter(|n| c.runtime.is_peer_alive(n.id, now))
-                .count()
-        })
-        .unwrap_or(1);
-    let guard = state.dispatch.memory_guard();
-    let resources = sample_process_resources();
-    let memory_limit_mb = guard.limit_mb();
-    let memory_percent = match (resources.rss_mb, memory_limit_mb) {
-        (Some(rss), Some(limit)) if limit > 0 => Some(((rss * 100) / limit).min(100) as u8),
-        _ => None,
-    };
-    let ingest = crate::metrics::snapshot();
-    Ok(Json(metrics_snapshot_from(
-        blocked.len(),
-        guard.is_critical(),
-        cluster_enabled,
-        healthy_peers,
-        ingest,
-        resources.rss_mb,
-        memory_limit_mb,
-        memory_percent,
-        resources.cpu_percent,
-    )))
+    metrics_authorized(&headers)?;
+    Ok(Json(metrics_snapshot(&state)))
 }
 
 pub fn metrics_snapshot(state: &AppState) -> MetricsResponse {
@@ -350,37 +296,42 @@ pub async fn block_host(
 }
 
 /// Aggregate DLQ/delayed/metrics/fleet across local + peer brokers (Phase D).
+/// A peer that cannot be queried is reported as unreachable (`active_leases:
+/// null`), and `fleet.complete` is false, rather than counted as zero leases.
 pub async fn aggregate_ops_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let local_leases = state.leases.active_count();
+    let local_leases = state.leases.active_count() as u64;
     let blocked = state.dispatch.host_blocker().blocked_hosts().len();
     let delayed = state.schedule.count();
-    let mut peers = Vec::new();
+    let targets = crate::cluster::catalog_peer_targets(&state);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .ok();
-    if let Some(http) = client {
-        for (_id, addr) in crate::cluster::catalog_peer_targets(&state) {
-            let lease_url = format!("{addr}/internal/v1/lease/status");
-            let mut lease_req = http.get(&lease_url);
-            if let Ok(secret) = std::env::var("BETTERMQ_CLUSTER_SECRET") {
-                if !secret.trim().is_empty() {
-                    lease_req = lease_req.header("x-bettermq-cluster-secret", secret);
-                }
+        .build();
+    let mut peers = Vec::with_capacity(targets.len());
+    let mut fleet_total = local_leases;
+    let mut unreachable = 0usize;
+    for (_id, addr) in targets {
+        let result = match &client {
+            Ok(http) => peer_active_leases(http, &addr).await,
+            Err(e) => Err(format!("http client: {e}")),
+        };
+        match result {
+            Ok(leases) => {
+                fleet_total += leases;
+                peers.push(serde_json::json!({
+                    "addr": addr,
+                    "reachable": true,
+                    "active_leases": leases,
+                }));
             }
-            let peer_leases = match lease_req.send().await {
-                Ok(r) if r.status().is_success() => r
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-                    .and_then(|v| v.get("active_leases").and_then(|n| n.as_u64()))
-                    .unwrap_or(0),
-                _ => 0,
-            };
-            peers.push(serde_json::json!({
-                "addr": addr,
-                "active_leases": peer_leases,
-            }));
+            Err(error) => {
+                unreachable += 1;
+                peers.push(serde_json::json!({
+                    "addr": addr,
+                    "reachable": false,
+                    "active_leases": null,
+                    "error": error,
+                }));
+            }
         }
     }
     Json(serde_json::json!({
@@ -393,11 +344,26 @@ pub async fn aggregate_ops_status(State(state): State<Arc<AppState>>) -> Json<se
         },
         "peers": peers,
         "fleet": {
-            "active_leases_total": local_leases
-                + peers
-                    .iter()
-                    .filter_map(|p| p.get("active_leases").and_then(|n| n.as_u64()))
-                    .sum::<u64>() as usize,
+            "active_leases_total": fleet_total,
+            "peers_unreachable": unreachable,
+            "complete": unreachable == 0,
         }
     }))
+}
+
+async fn peer_active_leases(http: &reqwest::Client, addr: &str) -> Result<u64, String> {
+    let url = format!("{}/internal/v1/lease/status", addr.trim_end_matches('/'));
+    let resp = crate::cluster_auth::apply_cluster_secret(http.get(&url))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("invalid lease status: {e}"))?
+        .get("active_leases")
+        .and_then(|n| n.as_u64())
+        .ok_or_else(|| "lease status has no active_leases".to_string())
 }

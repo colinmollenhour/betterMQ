@@ -2511,7 +2511,8 @@
               }
             }
           }
-        }
+        },
+        "description": "Peers are queried with the trimmed BETTERMQ_CLUSTER_SECRET. Each entry in `peers` has `reachable`; an unreachable peer has `active_leases: null` and an `error`, and `fleet.complete` is false with `fleet.peers_unreachable` counting them, so `fleet.active_leases_total` is a lower bound in that case."
       }
     },
     "/metrics": {

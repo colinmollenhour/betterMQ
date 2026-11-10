@@ -968,6 +968,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregate_ops_trims_the_secret_and_flags_unreachable_peers() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Env files and Docker secrets often end in a newline.
+        std::env::set_var("BETTERMQ_CLUSTER_SECRET", "agg-secret\n");
+        let dir_b = tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener.local_addr().unwrap();
+        let app_b = router(test_state(&dir_b));
+        tokio::spawn(async move { axum::serve(listener, app_b).await.unwrap() });
+
+        let dir_a = tempdir().unwrap();
+        let mut cfg = broker_config::BetterMqConfig::template_single_local();
+        cfg.data_dir = dir_a.path().to_path_buf();
+        cfg.node.name = "a".into();
+        cfg.node.public_url = "http://127.0.0.1:1".into();
+        cfg.cluster = Some(broker_config::ClusterConfigSection {
+            enabled: true,
+            id: Some(uuid::Uuid::new_v4().to_string()),
+            nodes: vec![
+                broker_config::ClusterNode {
+                    name: "a".into(),
+                    public_url: "http://127.0.0.1:1".into(),
+                    internal_url: None,
+                },
+                broker_config::ClusterNode {
+                    name: "b".into(),
+                    public_url: format!("http://{addr_b}"),
+                    internal_url: None,
+                },
+                broker_config::ClusterNode {
+                    name: "c".into(),
+                    public_url: "http://127.0.0.1:9".into(),
+                    internal_url: None,
+                },
+            ],
+            shared_meta_dir: None,
+        });
+        broker_config::save_managed_config(dir_a.path(), &cfg).unwrap();
+        let store = broker_local_auth::LocalAuthStore::open(dir_a.path()).unwrap();
+        let token = store.setup("password1234").unwrap();
+        let mut state_a = test_state(&dir_a);
+        state_a.local_auth = Some(Arc::new(store));
+        let response = router(state_a)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/ops/aggregate")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let peer = |port: u16| {
+            body["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["addr"].as_str().unwrap().ends_with(&format!(":{port}")))
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(peer(addr_b.port())["reachable"], true, "{body}");
+        assert_eq!(peer(addr_b.port())["active_leases"], 0);
+        assert_eq!(peer(9)["reachable"], false, "{body}");
+        assert!(peer(9)["active_leases"].is_null());
+        assert_eq!(body["fleet"]["complete"], false);
+        assert_eq!(body["fleet"]["peers_unreachable"], 1);
+    }
+
+    #[tokio::test]
     async fn missing_local_auth_is_401_fail_closed() {
         let dir = tempdir().unwrap();
         let app = router(test_state(&dir));
