@@ -31,6 +31,8 @@ use tower_http::{
 
 mod cluster_health;
 mod docs;
+#[cfg(test)]
+mod failover_tests;
 mod panel;
 mod security;
 mod startup_banner;

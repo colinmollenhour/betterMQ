@@ -1012,4 +1012,64 @@ mod tests {
         assert_eq!(gossip_requests(&blackholed[0]).await, 0);
         assert_eq!(gossip_requests(&blackholed[1]).await, 0);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lagging_leader_copies_the_committed_prefix_from_a_replica() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Broker::open(broker_partition::BrokerConfig::new(
+            source_dir.path().into(),
+        ))
+        .unwrap();
+        let (shard, first) = committed_publish(&source, "one").await;
+        let (_, second) = committed_publish(&source, "two").await;
+        let peer = catch_up_peer(catch_up_body(shard, 2, vec![(0, first), (1, second)])).await;
+        let (state, cluster, _) = three_node_state(&dir, [&peer.uri(), UNREACHABLE]);
+
+        catch_up_shard(&cluster, &state, shard).await.unwrap();
+        let topic = broker_partition::DIRECT_TOPIC;
+        assert_eq!(state.broker.committed_hwm(topic, shard).unwrap(), 2);
+        assert_eq!(
+            state.broker.read_message(topic, shard, 1).unwrap().payload,
+            b"two"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn short_catch_up_page_keeps_the_shard_fenced() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Broker::open(broker_partition::BrokerConfig::new(
+            source_dir.path().into(),
+        ))
+        .unwrap();
+        let (shard, first) = committed_publish(&source, "one").await;
+        let peer = wiremock::MockServer::start().await;
+        let octet = |body: Vec<u8>| {
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "application/octet-stream")
+                .set_body_bytes(body)
+        };
+        // The replica claims HWM 2 but stops returning frames after offset 0.
+        wiremock::Mock::given(wiremock::matchers::path("/internal/v1/replicate/catch-up"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"from_offset": 1}),
+            ))
+            .respond_with(octet(catch_up_body(shard, 2, Vec::new())))
+            .with_priority(1)
+            .mount(&peer)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::path("/internal/v1/replicate/catch-up"))
+            .respond_with(octet(catch_up_body(shard, 2, vec![(0, first)])))
+            .mount(&peer)
+            .await;
+        let (state, cluster, _) = three_node_state(&dir, [&peer.uri(), UNREACHABLE]);
+
+        let error = catch_up_shard(&cluster, &state, shard).await.unwrap_err();
+        assert!(!error.needs_tail_reconciliation());
+        assert!(
+            error.to_string().contains("returned no frame at 1"),
+            "{error}"
+        );
+    }
 }
