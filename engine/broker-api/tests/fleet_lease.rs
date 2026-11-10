@@ -1,9 +1,10 @@
-//! Broker lease API + dispatch fleet worker with separate data directories.
+//! Broker lease API + storage-free dispatch fleet worker.
 
 use axum::{extract::State, http::StatusCode, routing::post, Router};
 use broker_api::{AppState, CatalogTombstones};
 use broker_dispatch::{
-    deliver_claimed_job, DispatchConfig, DispatchEngine, LeaseClient, LeaseTable, TenantFairQueue,
+    deliver_claimed_job, DispatchConfig, DispatchEngine, FleetDelivery, LeaseClient, LeaseTable,
+    TenantFairQueue,
 };
 use broker_partition::{Broker, BrokerConfig, PublishRequest};
 use broker_schedule::{CronRegistry, ScheduleQueue};
@@ -24,12 +25,11 @@ fn test_env() {
 struct Harness {
     broker: Broker,
     broker_url: String,
-    fleet: DispatchEngine,
+    fleet: FleetDelivery,
     client: LeaseClient,
     received: mpsc::UnboundedReceiver<Vec<u8>>,
     hook_url: String,
     dir: tempfile::TempDir,
-    _fleet_dir: tempfile::TempDir,
 }
 
 async fn serve(app: Router) -> String {
@@ -87,10 +87,8 @@ async fn harness() -> Harness {
     };
     let broker_url = serve(broker_api::internal_router(state)).await;
 
-    // The fleet process has its own data directory, as in docker-compose.ha-fleet.yml.
-    let fleet_dir = tempfile::tempdir().unwrap();
-    let fleet_broker = Broker::open(BrokerConfig::new(fleet_dir.path().to_path_buf())).unwrap();
-    let fleet = DispatchEngine::new_broker_only(fleet_broker, DispatchConfig::default());
+    // The fleet side keeps no storage at all.
+    let fleet = FleetDelivery::new(DispatchConfig::default());
     let client = LeaseClient::new(vec![broker_url.clone()], "fleet-test".into());
     Harness {
         broker,
@@ -100,7 +98,6 @@ async fn harness() -> Harness {
         received,
         hook_url,
         dir: broker_dir,
-        _fleet_dir: fleet_dir,
     }
 }
 
@@ -295,14 +292,12 @@ async fn retry_budget_is_shared_across_fleet_restarts() {
         .unwrap();
     h.broker.flush_wal().unwrap();
 
-    // Each attempt runs on a fresh fleet process with its own empty data dir,
-    // as after a container restart; only the broker remembers the attempts.
+    // Each attempt runs on a fresh fleet worker, as after a container
+    // restart; only the broker remembers the attempts.
     let mut last_job = None;
     for _ in 0..2 {
         tokio::time::sleep(Duration::from_millis(30)).await;
-        let fleet_dir = tempfile::tempdir().unwrap();
-        let fleet_broker = Broker::open(BrokerConfig::new(fleet_dir.path().to_path_buf())).unwrap();
-        let fleet = DispatchEngine::new_broker_only(fleet_broker, DispatchConfig::default());
+        let fleet = FleetDelivery::new(DispatchConfig::default());
         let claimed = h.client.claim(&h.broker_url, 4).await.unwrap();
         assert_eq!(claimed.jobs.len(), 1);
         let job = claimed.jobs.into_iter().next().unwrap();

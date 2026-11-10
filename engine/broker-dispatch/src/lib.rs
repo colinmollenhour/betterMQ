@@ -19,7 +19,10 @@ pub use egress::{
     pin_destination_addr, validate_destination_url, validate_destination_url_resolved, EgressError,
 };
 pub use fairness::TenantFairQueue;
-pub use fleet::{deliver_claimed_job, spawn_fleet, FleetOptions, DEFAULT_HEARTBEAT_INTERVAL};
+pub use fleet::{
+    deliver_claimed_job, spawn_fleet, FleetDelivery, FleetHandle, FleetOptions, FleetStatus,
+    DEFAULT_HEARTBEAT_INTERVAL, FLEET_READY_WINDOW,
+};
 
 pub use flow_control::{FlowControlInfo, FlowController, FlowKey, GlobalParallelismInfo};
 pub use host_blocker::{HostBlocker, HostBlockerConfig};

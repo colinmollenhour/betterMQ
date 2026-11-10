@@ -580,6 +580,8 @@ Fleet delivery keeps the same semantics as local dispatch, because the broker de
 - The broker counts delivery attempts, so `max_retries` is shared by all fleet workers and survives fleet restarts. Fleet workers keep no retry state, so their `--data-dir` does not need a volume.
 - Limits are enforced per broker for the shards that broker leads, as with local dispatch on each node.
 
+A fleet process (`--dispatch-fleet` or `--profile dispatch`) opens no WAL, metadata or panel. It refuses to start without `BETTERMQ_BROKER_URLS`, serves only `/healthz` (the claim loop is running) and `/readyz` (ready once a broker answered a claim in the last 60 s; JSON with `running`, `draining`, `in_flight_jobs` and `last_claim_ok_ms`), and on SIGTERM stops claiming and waits up to `BETTERMQ_SHUTDOWN_TIMEOUT_SECS` for in-flight jobs to finish and report to their broker.
+
 ### Panel on its own port
 
 By default the panel is on the same listen address as the API (`http://localhost:8080/panel/`).

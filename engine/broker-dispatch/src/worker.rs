@@ -1656,130 +1656,12 @@ impl DispatchEngine {
         Ok(())
     }
 
-    /// Fleet push: HTTP only (no local cursor or retry state). Caller
-    /// completes/fails the lease on the broker, which owns the attempt count;
-    /// `prior_attempts` is the count the broker reported on the claim.
-    pub async fn push_http_only(
-        &self,
-        msg: &StoredMessage,
-        committed_hwm: u64,
-        prior_attempts: u32,
-    ) -> Result<(), DispatchError> {
-        let _permit = self
-            .in_flight
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| DispatchError::Failed("dispatch semaphore closed".into()))?;
-        let _active_http = self.active_http_guard();
-        self.memory_guard.wait_below_limit().await;
-        if msg.offset >= committed_hwm {
-            return Err(DispatchError::Uncommitted);
-        }
-        // Blob-backed bodies arrive from the claim with an empty inline payload;
-        // the caller must load them first or the destination gets an empty body.
-        if msg.payload_ref_json.is_some() && msg.payload.is_empty() {
-            return Err(DispatchError::PayloadUnresolved);
-        }
-        let url = msg
-            .destination_url
-            .as_deref()
-            .filter(|u| !u.is_empty())
-            .ok_or(DispatchError::NoDestination)?;
-        if self.host_blocker.is_blocked_async(url).await {
-            return Err(DispatchError::HostBlocked);
-        }
-        let outbound = build_outbound(msg);
-        let long = msg.payload.len() >= self.config.long_payload_threshold_bytes;
-        if prior_attempts > 0 {
-            self.telemetry.record_retry_due();
-        }
-        crate::egress::validate_destination_url(url).map_err(|error| {
-            self.telemetry.record_http_outcome(5, Duration::ZERO);
-            DispatchError::Egress(error.to_string())
-        })?;
-        let http = if long {
-            &self.long_client
-        } else {
-            &self.client
-        };
-        let started = Instant::now();
-        let response = apply_to_reqwest(http, url, outbound).send().await;
-        self.record_http_result(&response, started.elapsed());
-        let retry_after_ms;
-        let failure = match response {
-            Ok(response) if response.status().is_success() => {
-                self.host_blocker.record_success_async(url).await;
-                discard_body_capped(response).await;
-                return Ok(());
-            }
-            Ok(response) => {
-                let code = response.status().as_u16();
-                retry_after_ms = response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|secs| secs.saturating_mul(1000));
-                discard_body_capped(response).await;
-                if self.config.non_retry_status_codes.contains(&code) {
-                    return Err(DispatchError::NonRetryable(format!("HTTP {code}")));
-                }
-                self.host_blocker.record_transport_failure_async(url).await;
-                format!("HTTP {code}")
-            }
-            Err(error) if crate::egress::is_policy_failure(&error) => {
-                return Err(DispatchError::Egress(
-                    "destination blocked by egress policy".into(),
-                ));
-            }
-            Err(error) => {
-                let error = error.without_url();
-                retry_after_ms = None;
-                self.host_blocker.record_transport_failure_async(url).await;
-                format!("transport error: {error}")
-            }
-        };
-        let attempts = prior_attempts.saturating_add(1);
-        if attempts > msg.max_retries {
-            self.telemetry.record_retry_exhausted();
-            return Err(DispatchError::RetryExhausted(format!(
-                "{failure}; exhausted {} delivery attempt(s)",
-                msg.max_retries.saturating_add(1)
-            )));
-        }
-        let backoff_cfg = msg
-            .retry_backoff
-            .as_ref()
-            .unwrap_or(&self.config.retry_defaults.backoff);
-        let wait_ms = retry_after_ms
-            .unwrap_or_else(|| backoff_cfg.delay_ms(attempts))
-            .min(backoff_cfg.max_ms)
-            .max(1);
-        self.telemetry.record_retry_scheduled();
-        Err(DispatchError::RetryDeferred {
-            retry_after_ms: wait_ms,
-            reason: failure,
-        })
-    }
-
     fn record_http_result(
         &self,
         response: &Result<reqwest::Response, reqwest::Error>,
         elapsed: Duration,
     ) {
-        let class = match response {
-            Ok(response) => match response.status().as_u16() / 100 {
-                2 => 0,
-                3 => 1,
-                4 => 2,
-                5 => 3,
-                _ => 6,
-            },
-            Err(error) if crate::egress::is_policy_failure(error) => 5,
-            Err(_) => 4,
-        };
-        self.telemetry.record_http_outcome(class, elapsed);
+        record_http_result(&self.telemetry, response, elapsed);
     }
 
     pub(crate) fn record_flow_error(&self) {
@@ -1879,6 +1761,26 @@ pub const DLQ_RECORD_MAGIC: &[u8] = b"BMQDLQ1\n";
 /// the cell body limits it is carved out of.
 pub use broker_replication::DLQ_ENVELOPE_ALLOWANCE;
 
+/// Webhook outcome class for telemetry (2xx..5xx, transport, egress policy).
+pub(crate) fn record_http_result(
+    telemetry: &crate::telemetry::DispatchTelemetry,
+    response: &Result<reqwest::Response, reqwest::Error>,
+    elapsed: Duration,
+) {
+    let class = match response {
+        Ok(response) => match response.status().as_u16() / 100 {
+            2 => 0,
+            3 => 1,
+            4 => 2,
+            5 => 3,
+            _ => 6,
+        },
+        Err(error) if crate::egress::is_policy_failure(error) => 5,
+        Err(_) => 4,
+    };
+    telemetry.record_http_outcome(class, elapsed);
+}
+
 fn truncate_utf8(value: &str, max: usize) -> String {
     if value.len() <= max {
         return value.to_string();
@@ -1969,7 +1871,7 @@ fn dlq_record(msg: &StoredMessage, reason: &str) -> Vec<u8> {
     record
 }
 
-async fn discard_body_capped(resp: reqwest::Response) {
+pub(crate) async fn discard_body_capped(resp: reqwest::Response) {
     use futures_util::StreamExt;
     if let Some(len) = resp.content_length() {
         if len > WEBHOOK_RESPONSE_BODY_CAP as u64 {
@@ -2093,13 +1995,16 @@ mod tests {
             )
             .unwrap());
         engine.clear_retry(&msg).unwrap();
+        let fleet = crate::FleetDelivery::new(DispatchConfig::default());
         assert!(matches!(
-            engine.push_http_only(&msg, msg.offset + 1, 0).await,
+            fleet.push(&msg, msg.offset + 1, 0).await,
             Err(DispatchError::RetryDeferred { .. })
         ));
-        assert_eq!(engine.retry_state.get(&key).unwrap().attempts, 1);
+        // Fleet pushes keep no retry state; the broker counts lease failures.
+        assert!(engine.retry_state.get(&key).is_none());
+        fleet.shutdown();
         engine.shutdown_background().await;
-        assert_eq!(engine.telemetry_snapshot().delivery.outcomes[4], 2);
+        assert_eq!(engine.telemetry_snapshot().delivery.outcomes[4], 1);
     }
 
     #[tokio::test]
@@ -2190,7 +2095,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flow_and_fleet_delivery_wait_for_http_capacity() {
+    async fn flow_delivery_waits_for_http_capacity() {
         let dir = tempfile::tempdir().unwrap();
         let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
         let msg = publish_test_message(&broker, "https://example.com/hook");
@@ -2202,12 +2107,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(tokio::time::timeout(
-            Duration::from_millis(50),
-            engine.push_http_only(&msg, msg.offset + 1, 0)
-        )
-        .await
-        .is_err());
         assert_eq!(engine.active_http.load(Ordering::Acquire), 0);
         drop(permit);
         engine.shutdown_background().await;

@@ -194,10 +194,12 @@ async fn destroy_acceptor_then_deliver(len: usize, mode: Mode) {
                 .expect("claimed the surviving record");
             let message = job.message.expect("claim carries the message");
             assert_eq!(message.payload, body, "claim carries the inline body");
-            worker
-                .push_http_only(&message, job.committed_hwm, job.attempts)
+            let fleet = broker_dispatch::FleetDelivery::new(DispatchConfig::default());
+            fleet
+                .push(&message, job.committed_hwm, job.attempts)
                 .await
                 .unwrap();
+            fleet.shutdown();
         }
     }
 

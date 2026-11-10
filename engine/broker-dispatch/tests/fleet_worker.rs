@@ -1,10 +1,9 @@
 //! Fleet worker loop against a mocked broker lease API.
 
 use broker_dispatch::{
-    spawn_fleet, ClaimResponse, ClaimedJob, DispatchConfig, DispatchEngine, FleetOptions,
+    spawn_fleet, ClaimResponse, ClaimedJob, DispatchConfig, FleetDelivery, FleetOptions,
     LeaseClient,
 };
-use broker_partition::{Broker, BrokerConfig};
 use broker_storage::StoredMessage;
 use std::sync::Once;
 use std::sync::{Arc, Mutex};
@@ -63,13 +62,8 @@ fn job(offset: u64, url: &str) -> ClaimedJob {
     }
 }
 
-fn fleet_engine() -> (DispatchEngine, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
-    (
-        DispatchEngine::new_broker_only(broker, DispatchConfig::default()),
-        dir,
-    )
+fn fleet_delivery() -> FleetDelivery {
+    FleetDelivery::new(DispatchConfig::default())
 }
 
 async fn requests_to(server: &MockServer, route: &str) -> Vec<Request> {
@@ -120,7 +114,7 @@ async fn every_claimed_lease_is_heartbeated_while_deliveries_run() {
             .await;
     }
 
-    let (engine, _dir) = fleet_engine();
+    let engine = fleet_delivery();
     let client = LeaseClient::new(vec![broker.uri()], "fleet-test".into());
     let fleet = spawn_fleet(
         engine,
@@ -213,7 +207,7 @@ async fn fleet_keeps_claiming_while_brokers_return_work() {
             .await;
     }
 
-    let (engine, _dir) = fleet_engine();
+    let engine = fleet_delivery();
     let client = LeaseClient::new(vec![broker.uri()], "fleet-test".into());
     let started = std::time::Instant::now();
     let fleet = spawn_fleet(
@@ -224,6 +218,7 @@ async fn fleet_keeps_claiming_while_brokers_return_work() {
             claim_batch: 4,
             idle_poll: Duration::from_millis(250),
             heartbeat_interval: Duration::from_secs(10),
+            on_claim_failure: None,
         },
     );
     loop {
@@ -293,12 +288,16 @@ async fn stalled_broker_does_not_halt_claims_on_healthy_brokers() {
             .await;
     }
 
-    let (engine, _dir) = fleet_engine();
+    let engine = fleet_delivery();
     let client = LeaseClient::with_rpc_timeout(
         vec![stalled.uri(), healthy.uri()],
         "fleet-test".into(),
         Duration::from_millis(300),
     );
+    static CLAIM_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn count_claim_failure() {
+        CLAIM_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let started = std::time::Instant::now();
     let fleet = spawn_fleet(
         engine,
@@ -308,6 +307,7 @@ async fn stalled_broker_does_not_halt_claims_on_healthy_brokers() {
             claim_batch: 4,
             idle_poll: Duration::from_millis(50),
             heartbeat_interval: Duration::from_secs(10),
+            on_claim_failure: Some(count_claim_failure),
         },
     );
     loop {
@@ -329,6 +329,10 @@ async fn stalled_broker_does_not_halt_claims_on_healthy_brokers() {
     assert!(
         stalled_claims <= 3,
         "stalled broker should be backed off, got {stalled_claims} claims"
+    );
+    assert!(
+        CLAIM_FAILURES.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+        "failed claims reach the metrics hook"
     );
     fleet.abort();
 }

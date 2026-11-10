@@ -545,6 +545,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         return serve_gateway_only(&settings).await;
     }
 
+    // The dispatch profile delivers for remote brokers and opens no storage;
+    // it must be selected before the storage-free panel fallback.
+    if settings.dispatch_fleet && !settings.opens_local_storage {
+        return serve_dispatch_fleet(&settings).await;
+    }
+
     if !settings.opens_local_storage {
         return serve_panel_from_settings(&settings).await;
     }
@@ -691,13 +697,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let catalog_tombstones =
         CatalogTombstones::open(&settings.data_dir).context("open catalog tombstones")?;
 
-    let dispatch_cfg = DispatchConfig {
-        retry_defaults: settings.dispatch_retry.clone(),
-        http_timeout_secs: settings.dispatch_http_timeout_secs,
-        long_http_timeout_secs: settings.dispatch_long_http_timeout_secs,
-        long_payload_threshold_bytes: 256 * 1024,
-        ..DispatchConfig::default()
-    };
+    let dispatch_cfg = dispatch_config(&settings);
     let leases = broker_dispatch::LeaseTable::new();
     let broker_only = settings.broker_only || settings.dispatch_fleet;
     let mut dispatch = if broker_only {
@@ -765,11 +765,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     if let Some(task) = broker_api::spawn_retention_loop(app_state.clone()) {
         bg_tasks.push(task);
     }
-    if settings.dispatch_fleet {
-        if let Some(h) = spawn_fleet_workers(app_state.clone()) {
-            bg_tasks.push(h);
-        }
-    }
+    let fleet = if settings.dispatch_fleet {
+        Some(start_fleet(&settings)?)
+    } else {
+        None
+    };
 
     let cors = build_cors_layer();
 
@@ -855,11 +855,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         info!("cloud auth enabled (postgres)");
     }
 
-    let shutdown_deadline = std::env::var("BETTERMQ_SHUTDOWN_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(30u64)
-        .clamp(1, 300);
+    let shutdown_deadline = shutdown_deadline_secs();
     let drain_notice = Arc::new(tokio::sync::Notify::new());
     let signal_notice = drain_notice.clone();
     let shutdown = async move {
@@ -892,6 +888,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         }
     }
 
+    if let Some((fleet, delivery)) = &fleet {
+        stop_fleet(fleet, delivery, shutdown_deadline).await;
+    }
     if app_state
         .dispatch
         .drain(Duration::from_secs(shutdown_deadline))
@@ -1558,25 +1557,127 @@ async fn fire_scheduled_publish(
     }
 }
 
-fn spawn_fleet_workers(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
-    let Some(client) = broker_dispatch::LeaseClient::from_env() else {
-        tracing::error!(
-            "dispatch fleet requires BETTERMQ_BROKER_URLS (comma-separated broker base URLs)"
-        );
-        return None;
+fn dispatch_config(settings: &ResolvedServeSettings) -> DispatchConfig {
+    DispatchConfig {
+        retry_defaults: settings.dispatch_retry.clone(),
+        http_timeout_secs: settings.dispatch_http_timeout_secs,
+        long_http_timeout_secs: settings.dispatch_long_http_timeout_secs,
+        long_payload_threshold_bytes: 256 * 1024,
+        ..DispatchConfig::default()
+    }
+}
+
+fn shutdown_deadline_secs() -> u64 {
+    std::env::var("BETTERMQ_SHUTDOWN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30u64)
+        .clamp(1, 300)
+}
+
+/// Start the fleet claim loop; fails when no broker URLs are configured.
+fn start_fleet(
+    settings: &ResolvedServeSettings,
+) -> anyhow::Result<(broker_dispatch::FleetHandle, broker_dispatch::FleetDelivery)> {
+    let client = broker_dispatch::LeaseClient::from_env().context(
+        "dispatch fleet requires BETTERMQ_BROKER_URLS (comma-separated broker base URLs)",
+    )?;
+    let options = broker_dispatch::FleetOptions {
+        on_claim_failure: Some(broker_api::record_fleet_claim_failure),
+        ..broker_dispatch::FleetOptions::from_env()
     };
-    let options = broker_dispatch::FleetOptions::from_env();
     info!(
         holder = %client.holder(),
         brokers = ?client.broker_urls(),
         concurrency = options.concurrency,
+        claim_batch = options.claim_batch,
         "starting dispatch fleet workers"
     );
-    Some(broker_dispatch::spawn_fleet(
-        state.dispatch.clone(),
-        client,
-        options,
-    ))
+    let delivery = broker_dispatch::FleetDelivery::new(dispatch_config(settings));
+    let handle = broker_dispatch::spawn_fleet(delivery.clone(), client, options);
+    Ok((handle, delivery))
+}
+
+/// Stop claiming, let in-flight fleet jobs finish and report, then stop.
+async fn stop_fleet(
+    fleet: &broker_dispatch::FleetHandle,
+    delivery: &broker_dispatch::FleetDelivery,
+    deadline_secs: u64,
+) {
+    if fleet.shutdown(Duration::from_secs(deadline_secs)).await {
+        info!("fleet drain complete");
+    } else {
+        tracing::warn!(
+            in_flight = fleet.status().in_flight_jobs,
+            "fleet drain deadline exceeded; unfinished leases expire and are redelivered"
+        );
+    }
+    delivery.shutdown();
+}
+
+/// `--dispatch-fleet` / `--profile dispatch`: claim from remote brokers and
+/// push webhooks. Opens no WAL, metadata, archive or retry state.
+async fn serve_dispatch_fleet(settings: &ResolvedServeSettings) -> anyhow::Result<()> {
+    let (fleet, delivery) = start_fleet(settings)?;
+    let ready = fleet.clone();
+    let live = fleet.clone();
+    let app = axum::Router::new()
+        // Liveness: the claim loop is still running.
+        .route(
+            "/healthz",
+            get(move || {
+                let running = live.status().running;
+                async move {
+                    if running {
+                        (axum::http::StatusCode::OK, "ok")
+                    } else {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            "fleet loop stopped",
+                        )
+                    }
+                }
+            }),
+        )
+        // Readiness: claiming and a broker answered within FLEET_READY_WINDOW.
+        .route(
+            "/readyz",
+            get(move || {
+                let status = ready.status();
+                async move {
+                    let code = if status.ready {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    (code, axum::Json(status))
+                }
+            }),
+        )
+        .layer(axum::middleware::from_fn(security::api_security_headers))
+        .layer(TraceLayer::new_for_http());
+    let listener = tokio::net::TcpListener::bind(settings.listen)
+        .await
+        .with_context(|| format!("bind {}", settings.listen))?;
+    info!(
+        listen = %settings.listen,
+        "dispatch fleet mode: no broker WAL, RocksDB, archive, or retry state opened"
+    );
+    let deadline = shutdown_deadline_secs();
+    let draining = fleet.clone();
+    let shutdown = async move {
+        shutdown_signal().await;
+        begin_shutdown();
+        // Stop claiming at once so /readyz turns unready while jobs finish.
+        draining.begin_drain();
+        info!("fleet shutdown signal received; draining in-flight jobs");
+    };
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .context("fleet HTTP server exited");
+    stop_fleet(&fleet, &delivery, deadline).await;
+    served
 }
 
 #[cfg(test)]

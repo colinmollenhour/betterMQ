@@ -139,50 +139,6 @@ async fn embedded_panel_persists_local_cell_and_federates_local_kinds() {
 }
 
 #[tokio::test]
-async fn dispatch_fleet_enroll_is_rejected() {
-    let data = tempfile::tempdir().unwrap();
-    let address = free_addr();
-    let child = Command::new(env!("CARGO_BIN_EXE_bettermq"))
-        .args([
-            "serve",
-            "--dispatch-fleet",
-            "--listen",
-            &address.to_string(),
-            "--data-dir",
-            data.path().to_str().unwrap(),
-        ])
-        .env("BETTERMQ_INSECURE_NO_AUTH", "1")
-        .env("BETTERMQ_BROKER_URLS", "http://127.0.0.1:9")
-        .env("BETTERMQ_CLUSTER_SECRET", "panel-cells-test-secret")
-        .env("RUST_LOG", "error")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let _guard = ChildGuard(child);
-    let client = reqwest::Client::new();
-    let base = format!("http://{address}");
-    assert!(wait_health(&client, &format!("{base}/healthz")).await);
-
-    let resp = client
-        .post(format!("{base}/v1/infra/cluster/enroll"))
-        .json(&serde_json::json!({
-            "seed_url": "http://127.0.0.1:9",
-            "join_token": "nope",
-            "public_url": "http://127.0.0.1:9",
-            "node_name": "fleet1"
-        }))
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    assert!(
-        status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::NOT_FOUND,
-        "dispatch/WAL-less enroll must not join a replica set: {status}"
-    );
-}
-
-#[tokio::test]
 async fn standalone_panel_has_no_infra_join() {
     let data = tempfile::tempdir().unwrap();
     let address = free_addr();

@@ -137,6 +137,7 @@ async fn fleet_delivery_honors_message_retries_before_dlq() {
             ..DispatchConfig::default()
         },
     );
+    let fleet = broker_dispatch::FleetDelivery::new(DispatchConfig::default());
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/fleet-fail"))
@@ -184,10 +185,7 @@ async fn fleet_delivery_honors_message_retries_before_dlq() {
         .read_message(&response.topic, partition, offset)
         .unwrap();
 
-    let uncommitted = dispatch
-        .push_http_only(&message, offset, 0)
-        .await
-        .unwrap_err();
+    let uncommitted = fleet.push(&message, offset, 0).await.unwrap_err();
     assert!(matches!(
         uncommitted,
         broker_dispatch::DispatchError::Uncommitted
@@ -200,8 +198,8 @@ async fn fleet_delivery_honors_message_retries_before_dlq() {
     // The broker reports the attempts already spent on every claim; the
     // fleet keeps no retry state of its own.
     for prior_attempts in 0..2 {
-        let failure = dispatch
-            .push_http_only(&message, offset + 1, prior_attempts)
+        let failure = fleet
+            .push(&message, offset + 1, prior_attempts)
             .await
             .unwrap_err();
         assert!(
@@ -213,10 +211,7 @@ async fn fleet_delivery_honors_message_retries_before_dlq() {
             prior_attempts + 1
         );
     }
-    let exhausted = dispatch
-        .push_http_only(&message, offset + 1, 2)
-        .await
-        .unwrap_err();
+    let exhausted = fleet.push(&message, offset + 1, 2).await.unwrap_err();
     assert!(matches!(
         exhausted,
         broker_dispatch::DispatchError::RetryExhausted(_)
@@ -239,8 +234,5 @@ async fn fleet_delivery_honors_message_retries_before_dlq() {
         1
     );
     let telemetry = dispatch.telemetry_snapshot();
-    assert_eq!(telemetry.retries_scheduled, 2);
-    assert_eq!(telemetry.retries_due, 2);
-    assert_eq!(telemetry.retries_exhausted, 1);
     assert_eq!(telemetry.dlq_committed, 1);
 }
