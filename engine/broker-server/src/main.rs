@@ -1099,6 +1099,9 @@ async fn abort_and_join(tasks: Vec<JoinHandle<()>>, timeout: Duration) {
     }
 }
 
+/// Group-commit timer. Each flush walks every shard and fsyncs, so it runs on
+/// the blocking pool; awaiting it before the next tick keeps cycles from
+/// overlapping.
 fn spawn_wal_group_flusher(broker: Broker) -> tokio::task::JoinHandle<()> {
     let interval = broker.config().log.group_interval;
     tokio::spawn(async move {
@@ -1106,8 +1109,11 @@ fn spawn_wal_group_flusher(broker: Broker) -> tokio::task::JoinHandle<()> {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            if let Err(e) = broker.flush_wal_if_due() {
-                tracing::warn!(error = %e, "wal group flush failed");
+            let flushing = broker.clone();
+            match tokio::task::spawn_blocking(move || flushing.flush_wal_if_due()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "wal group flush failed"),
+                Err(e) => tracing::warn!(error = %e, "wal group flush task failed"),
             }
         }
     })
@@ -1396,5 +1402,57 @@ mod bootstrap_tests {
         assert!(validate_replication_policy(&policy, 3, 2).is_err());
         assert!(validate_replication_policy(&policy, 3, 3).is_ok());
         assert!(validate_replication_policy(&policy, 2, 2).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wal_group_flusher_commits_from_the_blocking_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = BrokerConfig::new(dir.path().to_path_buf());
+        cfg.log.fsync = broker_storage::FsyncMode::Group;
+        cfg.log.group_interval = Duration::from_millis(20);
+        let broker = Broker::open(cfg).unwrap();
+        let resp = broker
+            .publish(PublishRequest {
+                topic: broker_partition::DIRECT_TOPIC.into(),
+                routing_key: "k".into(),
+                payload: "x".into(),
+                payload_encoding: None,
+                idempotency_key: None,
+                delay_ms: None,
+                priority: None,
+                flow_id: None,
+                queue_id: None,
+                group_id: None,
+                group_member_id: None,
+                destination: None,
+                flow: None,
+                parallelism: None,
+                max_retries: None,
+                retry_backoff: None,
+                method: None,
+                headers: None,
+                sign: None,
+                request: None,
+                url: Some("http://example.invalid/hook".into()),
+                secret: Some("s".into()),
+            })
+            .unwrap();
+        let shard = resp.partition.unwrap();
+        assert_eq!(broker.committed_hwm(&resp.topic, shard).unwrap(), 0);
+
+        let flusher = spawn_wal_group_flusher(broker.clone());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while broker.committed_hwm(&resp.topic, shard).unwrap() < 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("group flusher advances the commit HWM");
+        flusher.abort();
     }
 }
