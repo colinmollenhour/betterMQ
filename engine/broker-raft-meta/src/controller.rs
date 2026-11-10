@@ -7,6 +7,7 @@
 
 use crate::cluster::{ClusterConfig, SchedulerLease};
 use crate::durable_store::DurableRocksStore;
+use crate::election::eligible_shard_leaders;
 use crate::network::HttpNetworkFactory;
 use crate::placement::{
     catalog_key, initial_controller_voters, min_isr_for, pick_leader, place_replicas,
@@ -887,13 +888,7 @@ impl OpenRaftController {
                     ControllerError::InvalidCommand(format!("unknown shard {shard}"))
                 })?;
             if placement.leader_id == node_id {
-                if let Some(next) = placement
-                    .isr
-                    .iter()
-                    .copied()
-                    .find(|id| *id != node_id)
-                    .or_else(|| placement.replicas.iter().copied().find(|id| *id != node_id))
-                {
+                if let Some(next) = placement.isr.iter().copied().find(|id| *id != node_id) {
                     self.submit(ControllerCommand::AcquireShardLeadership {
                         shard: *shard,
                         leader_id: next,
@@ -1053,6 +1048,12 @@ fn apply_command(
                 let placement = state.shards.get_mut(&shard).ok_or_else(|| {
                     ControllerError::InvalidCommand(format!("unknown shard {shard}"))
                 })?;
+                if !eligible_shard_leaders(placement).contains(&leader_id) {
+                    return Err(ControllerError::InvalidCommand(format!(
+                        "{leader_id} is not an in-sync replica of shard {shard} (isr {:?})",
+                        placement.isr
+                    )));
+                }
                 placement.leader_term = placement
                     .leader_term
                     .checked_add(1)
@@ -1363,7 +1364,9 @@ fn apply_command(
                             placement.isr.retain(|r| *r != id);
                             placement.learners.retain(|r| *r != id);
                             if placement.leader_id == id {
-                                if let Some(next) = pick_leader(&placement.replicas, shard) {
+                                if let Some(next) = pick_leader(&placement.isr, shard)
+                                    .or_else(|| pick_leader(&placement.replicas, shard))
+                                {
                                     placement.leader_id = next;
                                     placement.leader_term = placement.leader_term.saturating_add(1);
                                 }
@@ -1916,6 +1919,61 @@ mod tests {
             .await;
             assert_eq!(stored(&store).await.fanout_outbox[&id].authority_term, 7);
         }
+    }
+
+    #[test]
+    fn shard_leadership_is_restricted_to_the_isr() {
+        let ids: Vec<_> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let config = ClusterConfig {
+            cluster_id: Uuid::new_v4(),
+            nodes: ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| crate::cluster::NodeConfig {
+                    id: *id,
+                    addr: format!("http://n{index}"),
+                    internal_url: None,
+                })
+                .collect(),
+            node_id: ids[0],
+            generation: 1,
+            hash_version: 1,
+        };
+        let mut state = ControllerState::from_v1(&config, 1, &HashMap::new(), None).unwrap();
+        let drained = state.shards[&0].leader_id;
+        apply_command(
+            &mut state,
+            ControllerCommand::BeginRebalance {
+                shard: 0,
+                add: None,
+                remove: Some(drained),
+            },
+        )
+        .unwrap();
+        apply_command(
+            &mut state,
+            ControllerCommand::CompleteRebalance { shard: 0 },
+        )
+        .unwrap();
+        let placement = state.shards[&0].clone();
+        assert_ne!(placement.leader_id, drained);
+        assert!(placement.isr.contains(&placement.leader_id));
+        let before = state.clone();
+        let error = apply_command(
+            &mut state,
+            ControllerCommand::AcquireShardLeadership {
+                shard: 0,
+                leader_id: drained,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not an in-sync replica"));
+        assert_eq!(state, before);
+        // The health loop's recommendation never points at the drained node.
+        assert_eq!(
+            crate::election::choose_shard_leader(&placement, |_| true),
+            Some(placement.leader_id)
+        );
     }
 
     #[test]

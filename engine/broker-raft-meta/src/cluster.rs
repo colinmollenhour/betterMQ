@@ -1,6 +1,6 @@
 //! Cluster membership, peer health, and shard leader election (CP7b / HA M2).
 
-use crate::election::{elect_shard_leader, DEFAULT_PEER_TTL_MS};
+use crate::election::{choose_shard_leader, elect_shard_leader, DEFAULT_PEER_TTL_MS};
 use crate::epoch::{ControllerLeaderProof, ControllerVoteRequest, ControllerVoteResponse};
 use crate::{ControllerCommand, ControllerState, OpenRaftController};
 use broker_storage::FileLock;
@@ -458,7 +458,9 @@ impl ClusterRuntime {
     }
 
     /// Health-based placement recommendation. Only the current OpenRaft
-    /// leader may commit this recommendation as authoritative placement.
+    /// leader may commit this recommendation as authoritative placement. With
+    /// a controller the choice is limited to the shard's live in-sync
+    /// replicas; the static node ring is used only without one.
     pub fn desired_leader_for_shard(&self, shard: u32) -> Option<Uuid> {
         self.refresh_from_disk();
         let now = Utc::now().timestamp_millis();
@@ -473,6 +475,13 @@ impl ClusterRuntime {
             }
             Self::peer_alive_in_state(&state, id, now, ttl)
         };
+        if let Some(controller) = &self.controller {
+            let snapshot = controller.state();
+            return snapshot
+                .shards
+                .get(&shard)
+                .and_then(|placement| choose_shard_leader(placement, is_alive));
+        }
         elect_shard_leader(&config.nodes, shard, is_alive)
     }
 
