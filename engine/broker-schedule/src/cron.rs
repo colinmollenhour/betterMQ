@@ -96,13 +96,16 @@ impl CronJob {
     }
 
     /// Publish idempotency key for one firing of this job, as returned by
-    /// [`CronRegistry::pop_due`].
+    /// [`CronRegistry::pop_due`] (whose `next_run_at_ms` is the scheduled slot
+    /// being fired, before advancing).
     ///
-    /// Dedup entries never expire, so the key must differ per firing. A
-    /// user-supplied `idempotency_key` is kept only as a suffix: reusing it
-    /// verbatim would turn every firing after the first into a duplicate.
+    /// Keyed on the slot rather than the tick time, so a retry after a failed
+    /// publish, a replay after a crash, or a second scheduler firing the same
+    /// slot all dedupe to one message. Dedup entries never expire, so the key
+    /// must differ per slot: a user-supplied `idempotency_key` is kept only as
+    /// a suffix, since reusing it verbatim would suppress every later firing.
     pub fn fire_idempotency_key(&self) -> String {
-        let fire_ts = self.last_run_at_ms.unwrap_or(self.next_run_at_ms);
+        let fire_ts = self.next_run_at_ms;
         match self.request.idempotency_key.as_deref() {
             Some(user_key) => format!("cron:{}:{}:{}", self.id, fire_ts, user_key),
             None => format!("cron:{}:{}", self.id, fire_ts),
@@ -423,16 +426,23 @@ impl CronRegistry {
     }
 
     /// Persist advanced next_run after a successful cron publish.
+    ///
+    /// Bumps `updated_at_ms` so the advanced position wins catalog LWW merges
+    /// over stale peer copies that still hold the fired slot.
     pub fn commit_fire(&self, id: Uuid) -> Result<(), CronError> {
         let mut state = self.inner.lock();
-        let job = state
+        let mut job = state
             .file
             .jobs
             .iter()
             .find(|job| job.id == id)
             .cloned()
             .ok_or(CronError::NotFound(id))?;
-        self.append_command(&mut state, CronCommand::Upsert { job })?;
+        job.updated_at_ms = Utc::now()
+            .timestamp_millis()
+            .max(job.updated_at_ms.saturating_add(1));
+        self.append_command(&mut state, CronCommand::Upsert { job: job.clone() })?;
+        apply_command(&mut state.file, CronCommand::Upsert { job });
         state.retries.remove(&id);
         self.maybe_compact(&mut state);
         Ok(())
@@ -868,6 +878,66 @@ mod tests {
                 .unwrap(),
             FireRetry::Retry { attempt: 1, .. }
         ));
+    }
+
+    #[test]
+    fn retried_fire_reuses_the_slot_idempotency_key() {
+        let dir = temp_dir().join(format!("bettermq-cron-slot-key-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        let job = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        let slot = job.next_run_at_ms;
+
+        let first = reg.pop_due(slot + 7).pop().unwrap();
+        let retry_at = match reg.fail_fire(&first, FireFailure::Transient, slot + 7) {
+            Ok(FireRetry::Retry { retry_at_ms, .. }) => retry_at_ms,
+            other => panic!("unexpected {other:?}"),
+        };
+        let retried = reg.pop_due(retry_at + 123).pop().unwrap();
+        assert_eq!(first.fire_idempotency_key(), retried.fire_idempotency_key());
+        assert_eq!(
+            retried.fire_idempotency_key(),
+            format!("cron:{}:{}", job.id, slot)
+        );
+
+        // Crash between publish and commit: the reopened registry refires the
+        // same slot under the same key.
+        drop(reg);
+        let reopened = CronRegistry::open(&dir).unwrap();
+        let replayed = reopened.pop_due(retry_at + 999).pop().unwrap();
+        assert_eq!(
+            replayed.fire_idempotency_key(),
+            first.fire_idempotency_key()
+        );
+    }
+
+    #[test]
+    fn commit_fire_bumps_updated_at_so_stale_catalog_copies_lose() {
+        let dir = temp_dir().join(format!("bettermq-cron-bump-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        let job = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        let mut stale = job.clone();
+        stale.updated_at_ms -= 1;
+        reg.pop_due(job.next_run_at_ms).pop().unwrap();
+        reg.commit_fire(job.id).unwrap();
+        let advanced = reg.get(job.id).unwrap();
+        assert!(advanced.updated_at_ms > stale.updated_at_ms);
+
+        reg.upsert(stale.clone()).unwrap();
+        let after = reg.get(job.id).unwrap();
+        assert_eq!(after.next_run_at_ms, advanced.next_run_at_ms);
+        assert!(reg.pop_due(stale.next_run_at_ms).is_empty());
     }
 
     #[test]

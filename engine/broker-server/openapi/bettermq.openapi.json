@@ -1293,7 +1293,7 @@
           },
           "idempotency_key": {
             "type": "string",
-            "description": "Optional suffix for the per-run idempotency key. Each run publishes with its own key (cron:<id>:<run>[:<idempotency_key>]), so this value never suppresses later runs."
+            "description": "Optional suffix for the per-run idempotency key. Each run publishes with its own key, cron:<id>:<scheduled run time ms>[:<idempotency_key>]: retries of one run dedupe, and this value never suppresses later runs."
           },
           "body_encoding": {
             "type": "string",
