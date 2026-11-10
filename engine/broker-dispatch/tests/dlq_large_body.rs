@@ -109,7 +109,14 @@ async fn accepted_body_above_a_lowered_limit_still_moves_to_dlq() {
     );
     let mut message = dlq.remove(0);
     broker.hydrate_message_payload(&mut message).unwrap();
-    let envelope: serde_json::Value = serde_json::from_slice(&message.payload).unwrap();
-    assert_eq!(envelope["body"].as_str().unwrap().len(), BODY);
+    // DLQ record: magic, one JSON metadata line, then the original body bytes.
+    let rest = message
+        .payload
+        .strip_prefix(broker_dispatch::DLQ_RECORD_MAGIC)
+        .expect("DLQ record magic");
+    let newline = rest.iter().position(|byte| *byte == b'\n').unwrap();
+    let meta: serde_json::Value = serde_json::from_slice(&rest[..newline]).unwrap();
+    assert_eq!(meta["body_bytes"], BODY);
+    assert_eq!(rest[newline + 1..].len(), BODY);
     assert_eq!(dispatch.telemetry_snapshot().dlq_failures, 0);
 }

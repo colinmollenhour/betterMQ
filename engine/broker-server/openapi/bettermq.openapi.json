@@ -801,6 +801,11 @@
             "type": "string",
             "description": "Why the message was moved to the DLQ (HTTP status, transport error, retries exhausted, …)"
           },
+          "body_encoding": {
+            "type": "string",
+            "enum": ["utf8", "base64"],
+            "description": "How `body` is encoded. `base64` means the original payload was not valid UTF-8 and `body` holds its base64 encoding; `utf8` means `body` is the original text. Absent for records written before this field existed."
+          },
           "partition": {
             "type": "integer",
             "format": "uint32"

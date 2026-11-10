@@ -36,4 +36,7 @@ pub use telemetry::{
     HostPressureSnapshot, TenantFairnessSnapshot, DELIVERY_OUTCOME_CLASSES,
     MAX_DISPATCH_CURSOR_LANES, MAX_DISPATCH_TELEMETRY_SHARDS, WEBHOOK_DURATION_BUCKETS,
 };
-pub use worker::{DeliveryJob, DeliveryPriority, DispatchConfig, DispatchEngine, DispatchError};
+pub use worker::{
+    DeliveryJob, DeliveryPriority, DispatchConfig, DispatchEngine, DispatchError,
+    DLQ_ENVELOPE_ALLOWANCE, DLQ_RECORD_MAGIC,
+};

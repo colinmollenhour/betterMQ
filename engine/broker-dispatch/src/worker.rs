@@ -1598,20 +1598,16 @@ impl DispatchEngine {
             _ => dlq_topic(&msg.topic),
         };
         let reason = reason.into();
-        let payload = serde_json::json!({
-            "source_queue": msg.topic,
-            "message_id": msg.id,
-            "destination_url": msg.destination_url,
-            "method": msg.http_method,
-            "reason": reason,
-            "body": String::from_utf8_lossy(&msg.payload),
-        });
+        let record = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(dlq_record(&msg, &reason))
+        };
         let dlq_response = self.broker.publish_immediate(PublishRequest {
             routing_id: None,
             topic: dlq,
             routing_key: msg.id.to_string(),
-            payload: payload.to_string(),
-            payload_encoding: None,
+            payload: record,
+            payload_encoding: Some("base64".into()),
             idempotency_key: Some(format!(
                 "dlq:{}:{}:{}:{}",
                 msg.topic, msg.partition, msg.offset, msg.id
@@ -1818,6 +1814,107 @@ impl DispatchEngine {
         };
         self.finalize_dead_letter(&msg, reason).await
     }
+}
+
+/// Prefix of a DLQ record: `MAGIC`, one line of JSON metadata, then the
+/// original body bytes verbatim (binary-safe, never re-encoded or escaped).
+pub const DLQ_RECORD_MAGIC: &[u8] = b"BMQDLQ1\n";
+
+/// Bytes a DLQ record may add on top of the original body. Ingest limits
+/// reserve this much (decision D3), so a message accepted at the limit can
+/// always be dead-lettered and replicated. Oversized metadata (headers, URL,
+/// reason, keys) is truncated to fit; the body never is. Defined once, with
+/// the cell body limits it is carved out of.
+pub use broker_replication::DLQ_ENVELOPE_ALLOWANCE;
+
+fn truncate_utf8(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &value[..end])
+}
+
+/// Metadata needed to reproduce the original request (never the signing secret).
+fn dlq_metadata(msg: &StoredMessage, reason: &str, compact: bool) -> serde_json::Value {
+    let limit = |value: &str, max: usize| {
+        if compact {
+            truncate_utf8(value, max)
+        } else {
+            value.to_string()
+        }
+    };
+    let headers = if compact {
+        None
+    } else {
+        msg.http_headers_json.as_deref().map(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+        })
+    };
+    serde_json::json!({
+        "source_queue": limit(&msg.topic, 1024),
+        "source_partition": msg.partition,
+        "source_offset": msg.offset,
+        "message_id": msg.id,
+        "routing_key": limit(&msg.routing_key, 1024),
+        "published_at_ms": msg.published_at_ms,
+        "priority": msg.priority,
+        "queue_id": msg.queue_id,
+        "group_id": msg.group_id,
+        "group_member_id": msg.group_member_id,
+        "flow_profile_id": msg.flow_profile_id,
+        "flow": {
+            "key": msg.flow_key.as_deref().map(|key| limit(key, 1024)),
+            "parallelism": msg.flow_parallelism,
+            "rate": msg.flow_rate,
+            "period_secs": msg.flow_period_secs,
+        },
+        "destination_url": msg.destination_url.as_deref().map(|url| limit(url, 8 * 1024)),
+        "method": msg.http_method,
+        "headers": headers,
+        "headers_truncated": compact && msg.http_headers_json.is_some(),
+        "sign": msg.http_sign,
+        "max_retries": msg.max_retries,
+        "retry_backoff": msg.retry_backoff,
+        "reason": limit(reason, 8 * 1024),
+        "body_bytes": msg.payload.len(),
+    })
+}
+
+/// A DLQ record: everything needed to reproduce the original request, with
+/// the body stored byte for byte. Adds at most [`DLQ_ENVELOPE_ALLOWANCE`]
+/// bytes over the body.
+fn dlq_record(msg: &StoredMessage, reason: &str) -> Vec<u8> {
+    let fits = |meta: &serde_json::Value| {
+        let bytes = meta.to_string().into_bytes();
+        (DLQ_RECORD_MAGIC.len() + bytes.len() < DLQ_ENVELOPE_ALLOWANCE).then_some(bytes)
+    };
+    let meta = fits(&dlq_metadata(msg, reason, false))
+        .or_else(|| fits(&dlq_metadata(msg, reason, true)))
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "source_queue": truncate_utf8(&msg.topic, 1024),
+                "source_partition": msg.partition,
+                "source_offset": msg.offset,
+                "message_id": msg.id,
+                "reason": truncate_utf8(reason, 1024),
+                "metadata_truncated": true,
+                "body_bytes": msg.payload.len(),
+            })
+            .to_string()
+            .into_bytes()
+        });
+    let mut record =
+        Vec::with_capacity(DLQ_RECORD_MAGIC.len() + meta.len() + 1 + msg.payload.len());
+    record.extend_from_slice(DLQ_RECORD_MAGIC);
+    record.extend_from_slice(&meta);
+    record.push(b'\n');
+    record.extend_from_slice(&msg.payload);
+    record
 }
 
 async fn discard_body_capped(resp: reqwest::Response) {
@@ -2326,6 +2423,88 @@ mod tests {
         assert_eq!(shard.completions, 1);
         assert_eq!(shard.cursor_advanced_records, 2);
         assert_eq!(shard.completion_gap_records, 0);
+    }
+
+    fn sample_message(payload: Vec<u8>, headers: Option<String>) -> StoredMessage {
+        StoredMessage {
+            id: Uuid::new_v4(),
+            tenant_id: "t".into(),
+            topic: "orders".into(),
+            partition: 3,
+            offset: 9,
+            routing_key: "rk".into(),
+            payload,
+            published_at_ms: 1,
+            priority: 4,
+            flow_parallelism: Some(1),
+            flow_key: Some("rk".into()),
+            flow_rate: None,
+            flow_period_secs: None,
+            queue_id: None,
+            group_id: None,
+            group_member_id: None,
+            flow_profile_id: None,
+            destination_url: Some("https://example.com/hook".into()),
+            destination_secret: Some("secret".into()),
+            max_retries: 5,
+            retry_backoff: None,
+            http_method: Some("PUT".into()),
+            http_headers_json: headers,
+            http_sign: Some(false),
+            payload_ref_json: None,
+        }
+    }
+
+    fn split_record(record: &[u8]) -> (serde_json::Value, &[u8]) {
+        let rest = record.strip_prefix(DLQ_RECORD_MAGIC).unwrap();
+        let newline = rest.iter().position(|b| *b == b'\n').unwrap();
+        (
+            serde_json::from_slice(&rest[..newline]).unwrap(),
+            &rest[newline + 1..],
+        )
+    }
+
+    #[test]
+    fn dlq_record_keeps_binary_body_and_delivery_metadata() {
+        let body: Vec<u8> = vec![0xff, 0x00, 0xfe, b'a', 0x80, b'\n'];
+        let msg = sample_message(body.clone(), Some(r#"{"x-tenant":"acme"}"#.into()));
+        let record = dlq_record(&msg, "HTTP 400");
+        let (meta, stored_body) = split_record(&record);
+        assert_eq!(
+            stored_body,
+            body.as_slice(),
+            "the body is stored byte for byte"
+        );
+        assert_eq!(meta["headers"]["x-tenant"], "acme");
+        assert_eq!(meta["sign"], false);
+        assert_eq!(meta["method"], "PUT");
+        assert_eq!(meta["max_retries"], 5);
+        assert_eq!(meta["source_offset"], 9);
+        assert_eq!(meta["body_bytes"], body.len());
+        assert!(
+            meta.get("destination_secret").is_none(),
+            "the signing secret never lands in the DLQ"
+        );
+    }
+
+    #[test]
+    fn dlq_record_overhead_is_bounded_without_touching_the_body() {
+        // Control characters: JSON escaping would grow them 6x, base64 by a
+        // third; the record stores them raw, so only bounded metadata is added.
+        let body: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i % 0x20) as u8).collect();
+        let huge_headers = serde_json::json!({ "x-big": "h".repeat(512 * 1024) }).to_string();
+        let mut msg = sample_message(body.clone(), Some(huge_headers));
+        msg.destination_url = Some(format!("https://example.com/{}", "p".repeat(100 * 1024)));
+        let record = dlq_record(&msg, &"r".repeat(200 * 1024));
+        assert!(
+            record.len() - body.len() <= DLQ_ENVELOPE_ALLOWANCE,
+            "envelope added {} bytes",
+            record.len() - body.len()
+        );
+        let (meta, stored_body) = split_record(&record);
+        assert_eq!(stored_body, body.as_slice());
+        assert_eq!(meta["headers_truncated"], true);
+        assert_eq!(meta["message_id"], msg.id.to_string());
     }
 
     #[tokio::test]

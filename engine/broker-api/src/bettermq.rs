@@ -284,6 +284,9 @@ pub struct DlqMessage {
     /// Why the message was moved to the DLQ (HTTP status, transport error, retries exhausted, …).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// `base64` when `body` holds a base64-encoded binary payload; `utf8` for text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_encoding: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1332,19 +1335,25 @@ mod fanout_tests {
     }
 }
 
-fn parse_dlq_payload(body: &str) -> (Option<String>, Option<String>, Option<String>, String) {
+struct DlqEnvelope {
+    source_queue: Option<String>,
+    destination_url: Option<String>,
+    reason: Option<String>,
+    body: String,
+    body_encoding: Option<String>,
+}
+
+fn parse_dlq_payload(body: &str) -> DlqEnvelope {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return (None, None, None, body.to_string());
+        return DlqEnvelope {
+            source_queue: None,
+            destination_url: None,
+            reason: None,
+            body: body.to_string(),
+            body_encoding: None,
+        };
     };
-    let source_queue = v
-        .get("source_queue")
-        .and_then(|x| x.as_str())
-        .map(str::to_string);
-    let destination_url = v
-        .get("destination_url")
-        .and_then(|x| x.as_str())
-        .map(str::to_string);
-    let reason = v.get("reason").and_then(|x| x.as_str()).map(str::to_string);
+    let text = |field: &str| v.get(field).and_then(|x| x.as_str()).map(str::to_string);
     let display_body = v
         .get("body")
         .map(|b| match b {
@@ -1352,39 +1361,94 @@ fn parse_dlq_payload(body: &str) -> (Option<String>, Option<String>, Option<Stri
             other => other.to_string(),
         })
         .unwrap_or_else(|| body.to_string());
-    (source_queue, destination_url, reason, display_body)
+    DlqEnvelope {
+        source_queue: text("source_queue"),
+        destination_url: text("destination_url"),
+        reason: text("reason"),
+        body: display_body,
+        body_encoding: text("body_encoding"),
+    }
 }
 
-fn to_dlq_message(msg: StoredMessage, include_body: bool) -> DlqMessage {
-    #[derive(Deserialize, Default)]
-    struct Metadata {
-        source_queue: Option<String>,
-        destination_url: Option<String>,
-        reason: Option<String>,
-    }
-    let (source_queue, destination_url, reason, body) = if include_body {
-        let raw = String::from_utf8_lossy(&msg.payload);
-        let (source, destination, reason, body) = parse_dlq_payload(&raw);
-        (source, destination, reason, Some(body))
+/// Current DLQ records: magic, one JSON metadata line, then the original body
+/// bytes. Returns the metadata and the body.
+fn split_dlq_record(record: &[u8]) -> Option<(serde_json::Value, &[u8])> {
+    let rest = record.strip_prefix(broker_dispatch::DLQ_RECORD_MAGIC)?;
+    let newline = rest.iter().position(|byte| *byte == b'\n')?;
+    let meta: serde_json::Value = serde_json::from_slice(&rest[..newline]).ok()?;
+    Some((meta, &rest[newline + 1..]))
+}
+
+fn dlq_text(meta: &serde_json::Value, field: &str) -> Option<String> {
+    meta.get(field).and_then(|x| x.as_str()).map(str::to_string)
+}
+
+/// Text bodies are shown as text, binary ones base64-encoded.
+fn parse_dlq_record(record: &[u8]) -> Option<DlqEnvelope> {
+    let (meta, body) = split_dlq_record(record)?;
+    let (body, body_encoding) = match std::str::from_utf8(body) {
+        Ok(text) => (text.to_string(), "utf8"),
+        Err(_) => {
+            use base64::Engine;
+            (
+                base64::engine::general_purpose::STANDARD.encode(body),
+                "base64",
+            )
+        }
+    };
+    Some(DlqEnvelope {
+        source_queue: dlq_text(&meta, "source_queue"),
+        destination_url: dlq_text(&meta, "destination_url"),
+        reason: dlq_text(&meta, "reason"),
+        body,
+        body_encoding: Some(body_encoding.to_string()),
+    })
+}
+
+/// Listing rows: `include_body = false` reads only the metadata, never the body.
+fn to_dlq_message(mut msg: StoredMessage, include_body: bool) -> DlqMessage {
+    let envelope = if include_body {
+        match parse_dlq_record(&msg.payload) {
+            Some(envelope) => envelope,
+            None => {
+                let raw = String::from_utf8_lossy(&std::mem::take(&mut msg.payload)).into_owned();
+                parse_dlq_payload(&raw)
+            }
+        }
     } else {
-        let metadata: Metadata = serde_json::from_slice(&msg.payload).unwrap_or_default();
-        (
-            metadata.source_queue,
-            metadata.destination_url,
-            metadata.reason,
-            None,
-        )
+        #[derive(Deserialize, Default)]
+        struct Metadata {
+            source_queue: Option<String>,
+            destination_url: Option<String>,
+            reason: Option<String>,
+        }
+        let metadata = match split_dlq_record(&msg.payload) {
+            Some((meta, _)) => Metadata {
+                source_queue: dlq_text(&meta, "source_queue"),
+                destination_url: dlq_text(&meta, "destination_url"),
+                reason: dlq_text(&meta, "reason"),
+            },
+            None => serde_json::from_slice(&msg.payload).unwrap_or_default(),
+        };
+        DlqEnvelope {
+            source_queue: metadata.source_queue,
+            destination_url: metadata.destination_url,
+            reason: metadata.reason,
+            body: String::new(),
+            body_encoding: None,
+        }
     };
     DlqMessage {
         message_id: msg.id,
         key: msg.routing_key,
-        body,
+        body: include_body.then_some(envelope.body),
         published_at_ms: msg.published_at_ms,
         partition: msg.partition,
         offset: msg.offset,
-        source_queue,
-        destination_url,
-        reason,
+        source_queue: envelope.source_queue,
+        destination_url: envelope.destination_url,
+        reason: envelope.reason,
+        body_encoding: envelope.body_encoding,
     }
 }
 
@@ -2599,5 +2663,40 @@ mod cell_cron_tests {
             error.into_response().status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+}
+
+#[cfg(test)]
+mod dlq_envelope_tests {
+    use super::{parse_dlq_payload, parse_dlq_record};
+
+    #[test]
+    fn dlq_record_bodies_are_shown_as_text_or_base64() {
+        let mut record = broker_dispatch::DLQ_RECORD_MAGIC.to_vec();
+        record.extend_from_slice(br#"{"source_queue":"orders","reason":"HTTP 400"}"#);
+        record.push(b'\n');
+        let mut binary = record.clone();
+        record.extend_from_slice(b"plain\ntext");
+        binary.extend_from_slice(&[0xff, 0x00]);
+        let text = parse_dlq_record(&record).unwrap();
+        assert_eq!(text.body, "plain\ntext");
+        assert_eq!(text.body_encoding.as_deref(), Some("utf8"));
+        assert_eq!(text.reason.as_deref(), Some("HTTP 400"));
+        let binary = parse_dlq_record(&binary).unwrap();
+        assert_eq!(binary.body, "/wA=");
+        assert_eq!(binary.body_encoding.as_deref(), Some("base64"));
+        assert!(parse_dlq_record(br#"{"body":"legacy"}"#).is_none());
+    }
+
+    #[test]
+    fn dlq_listing_reports_body_encoding() {
+        let envelope = parse_dlq_payload(
+            r#"{"source_queue":"orders","reason":"HTTP 400","body":"/wA=","body_encoding":"base64"}"#,
+        );
+        assert_eq!(envelope.body, "/wA=");
+        assert_eq!(envelope.body_encoding.as_deref(), Some("base64"));
+        assert_eq!(envelope.source_queue.as_deref(), Some("orders"));
+        let legacy = parse_dlq_payload(r#"{"body":"text"}"#);
+        assert_eq!(legacy.body_encoding, None);
     }
 }

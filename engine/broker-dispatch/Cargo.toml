@@ -8,7 +8,9 @@ description = "Webhook push delivery with HMAC, retries, and DLQ (CP2)"
 [dependencies]
 broker-partition = { path = "../broker-partition" }
 broker-payload = { path = "../broker-payload" }
+base64 = { workspace = true }
 broker-proto = { workspace = true }
+broker-replication = { workspace = true }
 broker-storage = { path = "../broker-storage" }
 serde = { workspace = true }
 serde_json = { workspace = true }
