@@ -461,6 +461,134 @@ struct BrokerInner {
 }
 
 impl Broker {
+    /// Only the standalone server invokes this. Cells seed/adopt through Raft.
+    pub fn import_legacy_shared_catalog(&self) -> Result<(), BrokerError> {
+        crate::catalog_import::import(
+            &self.inner.config.data_dir,
+            &self.inner.flows,
+            &self.inner.subscriptions,
+            &self.inner.groups,
+        )
+    }
+    /// Pure preparation: reads existing identity but never publishes a catalog change.
+    pub fn prepare_subscription(
+        &self,
+        req: CreateSubscriptionRequest,
+        id: Uuid,
+    ) -> Result<Subscription, BrokerError> {
+        broker_proto::validate_queue_name(&req.topic)?;
+        let existing = self.get_queue(&req.topic)?;
+        Ok(Subscription {
+            id: existing.as_ref().map_or(id, |s| s.id),
+            tenant_id: self.tenant(),
+            topic: req.topic,
+            url: req.url,
+            secret: req.secret,
+            paused: existing.as_ref().is_some_and(|s| s.paused),
+            parallelism: req
+                .parallelism
+                .filter(|p| *p > 0)
+                .or(existing.as_ref().and_then(|s| s.parallelism)),
+            default_max_retries: req
+                .default_max_retries
+                .or(existing.as_ref().and_then(|s| s.default_max_retries)),
+            retry_backoff: req.retry_backoff.or(existing.and_then(|s| s.retry_backoff)),
+            updated_at_ms: Utc::now().timestamp_millis(),
+        })
+    }
+
+    pub fn prepare_flow(
+        &self,
+        key: String,
+        parallelism: u32,
+        rate: u32,
+        period_secs: u64,
+        id: Uuid,
+    ) -> Result<crate::FlowProfile, BrokerError> {
+        broker_proto::validate_flow_key(&key)?;
+        if parallelism == 0 || period_secs == 0 {
+            return Err(BrokerError::InvalidConfig(
+                "parallelism and period_secs must be positive".into(),
+            ));
+        }
+        Ok(crate::FlowProfile {
+            id,
+            tenant_id: self.tenant(),
+            key,
+            parallelism,
+            rate,
+            period_secs,
+            updated_at_ms: Utc::now().timestamp_millis(),
+        })
+    }
+
+    pub fn validate_catalog_group(&self, group: &crate::DispatchGroup) -> Result<(), BrokerError> {
+        if group.name.trim().is_empty() {
+            return Err(BrokerError::InvalidConfig("group name required".into()));
+        }
+        Ok(())
+    }
+    pub fn validate_catalog_member(&self, member: &crate::GroupMember) -> Result<(), BrokerError> {
+        if member.name.trim().is_empty() || member.parallelism == 0 || member.period_secs == 0 {
+            return Err(BrokerError::InvalidConfig(
+                "member name and positive limits required".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn catalog_flows(&self) -> Result<Vec<crate::FlowProfile>, BrokerError> {
+        Ok(self.inner.flows.catalog_all()?)
+    }
+    pub fn catalog_queues(&self) -> Result<Vec<Subscription>, BrokerError> {
+        Ok(self.inner.subscriptions.catalog_all()?)
+    }
+    pub fn catalog_groups(
+        &self,
+    ) -> Result<(Vec<crate::DispatchGroup>, Vec<crate::GroupMember>), BrokerError> {
+        Ok(self.inner.groups.catalog_all()?)
+    }
+    pub fn apply_flow_authoritative(
+        &self,
+        tenant: &str,
+        id: Uuid,
+        value: Option<crate::FlowProfile>,
+    ) -> Result<(), BrokerError> {
+        Ok(self.inner.flows.apply_authoritative(tenant, id, value)?)
+    }
+    pub fn apply_queue_authoritative(
+        &self,
+        tenant: &str,
+        id: Uuid,
+        value: Option<Subscription>,
+    ) -> Result<(), BrokerError> {
+        Ok(self
+            .inner
+            .subscriptions
+            .apply_authoritative(tenant, id, value)?)
+    }
+    pub fn apply_group_authoritative(
+        &self,
+        tenant: &str,
+        id: Uuid,
+        value: Option<crate::DispatchGroup>,
+    ) -> Result<(), BrokerError> {
+        Ok(self
+            .inner
+            .groups
+            .apply_group_authoritative(tenant, id, value)?)
+    }
+    pub fn apply_member_authoritative(
+        &self,
+        tenant: &str,
+        id: Uuid,
+        value: Option<crate::GroupMember>,
+    ) -> Result<(), BrokerError> {
+        Ok(self
+            .inner
+            .groups
+            .apply_member_authoritative(tenant, id, value)?)
+    }
     /// Active tenant for this call (request-scoped in cloud, else config default).
     pub fn tenant(&self) -> String {
         crate::tenant_scope::effective_tenant(&self.inner.config.tenant_id).into_owned()

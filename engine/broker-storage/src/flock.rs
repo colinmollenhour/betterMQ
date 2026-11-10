@@ -39,18 +39,29 @@ impl FileLock {
             }
         }
     }
-    pub fn exclusive(path: &Path) -> std::io::Result<Self> {
+
+    fn open(path: &Path) -> std::io::Result<File> {
         let lock_path = Path::new(&format!("{}.lock", path.display())).to_path_buf();
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
+        OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(&lock_path)?;
+            .open(&lock_path)
+    }
+
+    pub fn exclusive(path: &Path) -> std::io::Result<Self> {
+        let file = Self::open(path)?;
         file.lock_exclusive()?;
+        Ok(Self { file })
+    }
+
+    pub fn try_exclusive(path: &Path) -> std::io::Result<Self> {
+        let file = Self::open(path)?;
+        file.try_lock_exclusive()?;
         Ok(Self { file })
     }
 }

@@ -1010,7 +1010,10 @@ impl ClusterRuntime {
 
     pub async fn advance_catalog_epoch(&self) -> Result<u64, ClusterError> {
         let Some(controller) = &self.controller else {
-            return Ok(0);
+            return Err(crate::ControllerError::CatalogUnavailable(
+                "catalog mutations require an OpenRaft controller".into(),
+            )
+            .into());
         };
         let state = controller
             .submit(ControllerCommand::AdvanceCatalogEpoch)
@@ -1026,7 +1029,10 @@ impl ClusterRuntime {
         tombstone: bool,
     ) -> Result<u64, ClusterError> {
         let Some(controller) = &self.controller else {
-            return Ok(0);
+            return Err(crate::ControllerError::CatalogUnavailable(
+                "catalog mutations require an OpenRaft controller".into(),
+            )
+            .into());
         };
         let state = controller
             .submit(ControllerCommand::PutCatalogRecord {
@@ -1042,7 +1048,7 @@ impl ClusterRuntime {
     pub fn catalog_epoch(&self) -> u64 {
         self.controller
             .as_ref()
-            .map(|controller| controller.state().catalog_epoch)
+            .map(|controller| controller.catalog_revision())
             .unwrap_or(0)
     }
 

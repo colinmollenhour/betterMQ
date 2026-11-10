@@ -264,6 +264,11 @@ pub fn check_admission(
             ),
         });
     }
+    if state.cluster.as_ref().is_some_and(|c| !c.catalog_ready()) {
+        return Err(ApiError::Unavailable(
+            "catalog cache is dirty or behind the committed revision".into(),
+        ));
+    }
     if state.dispatch.memory_guard().is_critical() {
         return Err(ApiError::Overloaded {
             retry_after_ms: 1_000,

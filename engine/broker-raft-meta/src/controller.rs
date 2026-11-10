@@ -40,6 +40,10 @@ const QUORUM_ACK_MAX_AGE_MS: u64 = 2_000;
 
 #[derive(Debug, Error)]
 pub enum ControllerError {
+    #[error("catalog conflict: {0}")]
+    CatalogConflict(String),
+    #[error("catalog unavailable: {0}")]
+    CatalogUnavailable(String),
     #[error("openraft: {0}")]
     Raft(String),
     #[error("controller storage: {0}")]
@@ -93,6 +97,12 @@ pub struct FanoutOutboxEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ControllerState {
+    #[serde(default)]
+    pub catalog_authoritative: bool,
+    #[serde(default)]
+    pub catalog_frozen: bool,
+    #[serde(default)]
+    pub catalog_operations: BTreeMap<Uuid, crate::catalog::CatalogOperation>,
     pub version: u32,
     pub cluster_id: Uuid,
     pub membership_generation: u64,
@@ -186,6 +196,9 @@ impl ControllerState {
             );
         }
         Ok(Self {
+            catalog_authoritative: false,
+            catalog_frozen: false,
+            catalog_operations: BTreeMap::new(),
             version: 1,
             cluster_id: config.cluster_id,
             membership_generation: config.generation,
@@ -207,6 +220,15 @@ impl ControllerState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ControllerCommand {
+    MutateCatalog {
+        operation_id: Uuid,
+        mutations: Vec<crate::catalog::CatalogMutation>,
+    },
+    BeginCatalogActivation,
+    SeedCatalog {
+        operation_id: Uuid,
+        records: Vec<crate::catalog::CatalogMutation>,
+    },
     AcquireShardLeadership {
         shard: u32,
         leader_id: Uuid,
@@ -384,6 +406,11 @@ impl OpenRaftController {
         } else {
             state.controller_voters.iter().copied().collect()
         };
+        // A non-voter must wait for the elected leader to add it as a learner;
+        // OpenRaft refuses initialize() when the local ID is not a voter.
+        if !voter_ids.contains(&self.config.node_id) {
+            return Ok(());
+        }
         let members: BTreeMap<_, _> = self
             .config
             .nodes
@@ -407,8 +434,21 @@ impl OpenRaftController {
                     *controller.state.write() = state;
                     controller.state_committed.store(true, Ordering::Release);
                 } else if controller.is_leader_with_quorum() {
-                    let bootstrap = controller.state.read().clone();
-                    if let Err(error) = controller.write_state_local(bootstrap).await {
+                    let _guard = controller.command_lock.lock().await;
+                    let result = async {
+                        controller
+                            .raft
+                            .ensure_linearizable()
+                            .await
+                            .map_err(|error| ControllerError::Raft(error.to_string()))?;
+                        if controller.read_store_state().await?.is_none() {
+                            let bootstrap = controller.state.read().clone();
+                            controller.write_state_local(bootstrap).await?;
+                        }
+                        Ok::<_, ControllerError>(())
+                    }
+                    .await;
+                    if let Err(error) = result {
                         tracing::warn!(%error, "failed to commit migrated controller state");
                     }
                 }
@@ -438,10 +478,6 @@ impl OpenRaftController {
         &self,
         state: ControllerState,
     ) -> Result<ControllerState, ControllerError> {
-        self.raft
-            .ensure_linearizable()
-            .await
-            .map_err(|error| ControllerError::Raft(error.to_string()))?;
         let value = serde_json::to_string(&state)
             .map_err(|error| ControllerError::Storage(error.to_string()))?;
         self.raft
@@ -498,6 +534,11 @@ impl OpenRaftController {
             .await
             .map_err(|error| ControllerError::Transport(error.to_string()))?;
         if !response.status().is_success() {
+            if response.status() == reqwest::StatusCode::CONFLICT {
+                return Err(ControllerError::CatalogConflict(
+                    response.text().await.unwrap_or_default(),
+                ));
+            }
             return Err(ControllerError::Transport(format!(
                 "controller leader returned {}: {}",
                 response.status(),
@@ -517,6 +558,11 @@ impl OpenRaftController {
         mut command: ControllerCommand,
     ) -> Result<ControllerState, ControllerError> {
         let _guard = self.command_lock.lock().await;
+        // The barrier must precede the read, under the same command lock.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|error| ControllerError::Raft(error.to_string()))?;
         let now = chrono::Utc::now().timestamp_millis();
         let term = self.term();
         match &mut command {
@@ -580,9 +626,6 @@ impl OpenRaftController {
             .membership()
             .voter_ids()
             .collect();
-        if desired == current {
-            return Ok(());
-        }
         let mut node_by_raft: BTreeMap<NodeId, String> = BTreeMap::new();
         for node in &self.config.nodes {
             node_by_raft.insert(raft_id(node.id), node.internal_base().to_owned());
@@ -592,19 +635,29 @@ impl OpenRaftController {
                 .entry(raft_id(node.id))
                 .or_insert_with(|| node.addr.clone());
         }
-        for id in &desired {
-            if !current.contains(id) {
-                let addr = node_by_raft.get(id).cloned().unwrap_or_default();
+        let known: BTreeSet<_> = self
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, _)| *id)
+            .collect();
+        for (id, addr) in &node_by_raft {
+            if !known.contains(id) {
                 self.raft
-                    .add_learner(*id, BasicNode::new(&addr), true)
+                    .add_learner(*id, BasicNode::new(addr), false)
                     .await
                     .map_err(|error| ControllerError::Raft(error.to_string()))?;
             }
         }
-        self.raft
-            .change_membership(desired, false)
-            .await
-            .map_err(|error| ControllerError::Raft(error.to_string()))?;
+        if desired != current {
+            self.raft
+                .change_membership(desired, true)
+                .await
+                .map_err(|error| ControllerError::Raft(error.to_string()))?;
+        }
         Ok(())
     }
 
@@ -614,6 +667,14 @@ impl OpenRaftController {
 
     pub fn state(&self) -> ControllerState {
         self.state.read().clone()
+    }
+
+    pub fn catalog_revision(&self) -> u64 {
+        self.state.read().catalog_epoch
+    }
+
+    pub fn catalog_writes_frozen(&self) -> bool {
+        self.state.read().catalog_frozen
     }
 
     pub fn term(&self) -> u64 {
@@ -741,6 +802,19 @@ fn apply_command(
     command: ControllerCommand,
 ) -> Result<(), ControllerError> {
     match command {
+        ControllerCommand::MutateCatalog {
+            operation_id,
+            mutations,
+        } => crate::catalog::mutate(state, operation_id, mutations, false)?,
+        ControllerCommand::BeginCatalogActivation => {
+            if !state.catalog_authoritative {
+                state.catalog_frozen = true;
+            }
+        }
+        ControllerCommand::SeedCatalog {
+            operation_id,
+            records,
+        } => crate::catalog::mutate(state, operation_id, records, true)?,
         ControllerCommand::AcquireShardLeadership { shard, leader_id } => {
             if !state.nodes.values().any(|node| node.id == leader_id) {
                 return Err(ControllerError::UnknownNode(leader_id));
@@ -957,6 +1031,11 @@ fn apply_command(
             payload_json,
             tombstone,
         } => {
+            if state.catalog_authoritative || state.catalog_frozen {
+                return Err(ControllerError::CatalogConflict(
+                    "legacy catalog writes disabled; use MutateCatalog".into(),
+                ));
+            }
             upsert_catalog(
                 &mut state.catalog_records,
                 kind,

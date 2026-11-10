@@ -97,18 +97,52 @@ pub struct FlowProfileRegistry {
 }
 
 fn meta_file_path(data_dir: &Path, name: &str) -> PathBuf {
-    if let Ok(shared) = std::env::var("BETTERMQ_SHARED_META_DIR") {
-        let shared = shared.trim();
-        if !shared.is_empty() {
-            let dir = PathBuf::from(shared);
-            let _ = std::fs::create_dir_all(&dir);
-            return dir.join(name);
-        }
-    }
     data_dir.join(name)
 }
 
 impl FlowProfileRegistry {
+    pub fn import_snapshot(&self, profiles: Vec<FlowProfile>) -> Result<(), FlowProfileError> {
+        let _lock = broker_storage::FileLock::exclusive(&self.path)?;
+        let mut file = self.load()?;
+        file.profiles = profiles;
+        file.revision += 1;
+        self.journal
+            .compact(&self.path, &file)
+            .map_err(|e| FlowProfileError::Journal(e.to_string()))
+    }
+    /// Read-only migration input. Never creates or writes legacy shared files.
+    pub fn legacy_shared(data_dir: &Path) -> Result<Vec<FlowProfile>, FlowProfileError> {
+        let Some(path) = crate::catalog_journal::legacy_shared_path(data_dir, "flows.json")? else {
+            return Ok(Vec::new());
+        };
+        Self::read_snapshot_at(path)
+    }
+    pub fn read_snapshot_at(path: PathBuf) -> Result<Vec<FlowProfile>, FlowProfileError> {
+        Self {
+            journal: CatalogJournal::new(&path, FLOW_CATALOG_VERSION),
+            path,
+        }
+        .catalog_all()
+    }
+    pub fn catalog_all(&self) -> Result<Vec<FlowProfile>, FlowProfileError> {
+        Ok(self.load()?.profiles)
+    }
+
+    pub fn apply_authoritative(
+        &self,
+        tenant: &str,
+        id: Uuid,
+        profile: Option<FlowProfile>,
+    ) -> Result<(), FlowProfileError> {
+        self.mutate(|file| {
+            file.profiles
+                .retain(|p| p.id != id || (tenant != "*" && p.tenant_id != tenant));
+            if let Some(profile) = profile {
+                file.profiles.push(profile);
+            }
+            Ok(())
+        })
+    }
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, FlowProfileError> {
         let path = meta_file_path(data_dir.as_ref(), "flows.json");
         if !path.exists() {

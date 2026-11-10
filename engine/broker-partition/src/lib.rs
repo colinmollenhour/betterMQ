@@ -48,3 +48,4 @@ pub use telemetry::{
     partition_telemetry_snapshot, PartitionTelemetrySnapshot, ShardQueueTelemetrySnapshot,
     MAX_QUEUE_TELEMETRY_SHARDS,
 };
+mod catalog_import;

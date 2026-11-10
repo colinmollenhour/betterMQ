@@ -18,6 +18,7 @@ pub struct ReadyResponse {
     pub memory_critical: bool,
     pub controller_ready: bool,
     pub local_shards_ready: bool,
+    pub catalog_ready: bool,
     pub metadata_ready: bool,
     /// False while any local partition log is quarantined or fenced.
     pub storage_healthy: bool,
@@ -169,6 +170,7 @@ pub fn ready_snapshot(state: &AppState) -> ReadyResponse {
                 || c.runtime.shard_ready(shard)
         })
     });
+    let catalog_ready = state.cluster.as_ref().is_none_or(|c| c.catalog_ready());
     ReadyResponse {
         ready: auth_configured
             && cluster_healthy
@@ -178,7 +180,8 @@ pub fn ready_snapshot(state: &AppState) -> ReadyResponse {
             && !archive_blocked
             && !memory_critical
             && controller_ready
-            && local_shards_ready,
+            && local_shards_ready
+            && catalog_ready,
         cluster_healthy,
         auth_configured,
         storage_healthy,
@@ -189,6 +192,7 @@ pub fn ready_snapshot(state: &AppState) -> ReadyResponse {
         memory_critical,
         controller_ready,
         local_shards_ready,
+        catalog_ready,
     }
 }
 
@@ -297,7 +301,13 @@ pub async fn metrics_prometheus(
 ) -> Result<axum::response::Response, StatusCode> {
     metrics_authorized(&headers)?;
     let native = crate::metrics::native_snapshot(&state);
-    let body = crate::metrics::prometheus_text_with_native(&native);
+    let mut body = crate::metrics::prometheus_text_with_native(&native);
+    if let Some(cluster) = &state.cluster {
+        use std::fmt::Write;
+        let committed = cluster.runtime.catalog_epoch();
+        let applied = cluster.catalog_apply.revision();
+        let _ = writeln!(body, "# TYPE bettermq_catalog_apply_lag_revisions gauge\nbettermq_catalog_apply_lag_revisions {}\nbettermq_catalog_committed_revision {committed}\nbettermq_catalog_applied_revision {applied}\nbettermq_catalog_apply_errors_total {}", committed.saturating_sub(applied), cluster.catalog_apply.errors.load(std::sync::atomic::Ordering::Relaxed));
+    }
     Ok((
         StatusCode::OK,
         [("content-type", "text/plain; version=0.0.4")],

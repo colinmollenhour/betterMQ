@@ -1527,6 +1527,7 @@ async fn apply_inline_flow(
     req: &mut PublishRequest,
     flow: &FlowSpec,
 ) -> Result<(), ApiError> {
+    crate::catalog_applier::preflight(state)?;
     let key = flow.effective_key(&req.routing_key).to_string();
     let parallelism = flow.parallelism.unwrap_or(1).max(1);
     let rate = flow.rate.unwrap_or(0);

@@ -6,9 +6,23 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn corrupt_tombstones_are_not_an_empty_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CatalogTombstones::open(dir.path()).unwrap();
+        std::fs::write(dir.path().join("catalog-tombstones.json"), b"not json").unwrap();
+        assert!(store.snapshot().is_err());
+        assert!(CatalogTombstones::open(dir.path()).is_err());
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CatalogKind {
+    Unknown,
     Flow,
     Queue,
     Group,
@@ -35,25 +49,34 @@ pub struct CatalogTombstones {
 }
 
 fn meta_file_path(data_dir: &Path, name: &str) -> PathBuf {
-    if let Ok(shared) = std::env::var("BETTERMQ_SHARED_META_DIR") {
-        let shared = shared.trim();
-        if !shared.is_empty() {
-            let dir = PathBuf::from(shared);
-            let _ = std::fs::create_dir_all(&dir);
-            return dir.join(name);
-        }
-    }
     data_dir.join(name)
 }
 
 impl CatalogTombstones {
+    pub fn legacy_shared_snapshot(data_dir: &Path) -> std::io::Result<HashMap<Uuid, i64>> {
+        let Some(shared) = std::env::var("BETTERMQ_SHARED_META_DIR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return Ok(HashMap::new());
+        };
+        let path = PathBuf::from(shared).join("catalog-tombstones.json");
+        if path.parent().and_then(|p| p.canonicalize().ok()) == data_dir.canonicalize().ok()
+            || !path.try_exists()?
+        {
+            return Ok(HashMap::new());
+        }
+        Self { path }.snapshot()
+    }
     pub fn open(data_dir: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = meta_file_path(data_dir.as_ref(), "catalog-tombstones.json");
         if !path.exists() {
             let file = TombstoneFile::default();
             std::fs::write(&path, serde_json::to_vec_pretty(&file)?)?;
         }
-        Ok(Self { path })
+        let store = Self { path };
+        store.load()?;
+        Ok(store)
     }
 
     fn load(&self) -> std::io::Result<TombstoneFile> {
@@ -98,30 +121,26 @@ impl CatalogTombstones {
         })
     }
 
-    pub fn is_deleted(&self, id: Uuid) -> bool {
-        self.load()
-            .map(|f| f.tombstones.iter().any(|t| t.id == id))
-            .unwrap_or(false)
+    pub fn is_deleted(&self, id: Uuid) -> std::io::Result<bool> {
+        self.load().map(|f| f.tombstones.iter().any(|t| t.id == id))
     }
 
-    pub fn deleted_at(&self, id: Uuid) -> Option<i64> {
-        self.load()
-            .ok()?
+    pub fn deleted_at(&self, id: Uuid) -> std::io::Result<Option<i64>> {
+        Ok(self
+            .load()?
             .tombstones
             .iter()
             .find(|t| t.id == id)
-            .map(|t| t.deleted_at_ms)
+            .map(|t| t.deleted_at_ms))
     }
 
-    pub fn snapshot(&self) -> HashMap<Uuid, i64> {
-        self.load()
-            .map(|f| {
-                f.tombstones
-                    .into_iter()
-                    .map(|t| (t.id, t.deleted_at_ms))
-                    .collect()
-            })
-            .unwrap_or_default()
+    pub fn snapshot(&self) -> std::io::Result<HashMap<Uuid, i64>> {
+        self.load().map(|f| {
+            f.tombstones
+                .into_iter()
+                .map(|t| (t.id, t.deleted_at_ms))
+                .collect()
+        })
     }
 
     pub fn merge_remote(&self, remote: &HashMap<Uuid, i64>) -> std::io::Result<()> {
@@ -139,7 +158,7 @@ impl CatalogTombstones {
                 } else {
                     file.tombstones.push(CatalogTombstone {
                         id: *id,
-                        kind: CatalogKind::Queue,
+                        kind: CatalogKind::Unknown,
                         deleted_at_ms: *deleted_at_ms,
                     });
                     changed = true;

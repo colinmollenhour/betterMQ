@@ -70,6 +70,7 @@ pub struct CronJob {
     #[serde(default)]
     pub every_seconds: Option<u64>,
     pub paused: bool,
+    #[serde(default)]
     pub next_run_at_ms: i64,
     pub created_at_ms: i64,
     #[serde(default)]
@@ -239,6 +240,16 @@ impl CronRegistry {
         kind: ScheduleKind,
         request: ScheduledPublishRequest,
     ) -> Result<CronJob, CronError> {
+        let job = Self::prepare_with_kind(kind, request)?;
+        self.upsert(job.clone())?;
+        Ok(job)
+    }
+
+    /// Build and validate a definition without persisting or scheduling it.
+    pub fn prepare_with_kind(
+        kind: ScheduleKind,
+        request: ScheduledPublishRequest,
+    ) -> Result<CronJob, CronError> {
         let now = Utc::now().timestamp_millis();
         let (cron, every_seconds) = match &kind {
             ScheduleKind::Cron { cron } => {
@@ -265,11 +276,45 @@ impl CronRegistry {
             request,
         };
 
-        let mut state = self.inner.lock();
-        self.append_command(&mut state, CronCommand::Upsert { job: job.clone() })?;
-        apply_command(&mut state.file, CronCommand::Upsert { job: job.clone() });
-        self.maybe_compact(&mut state);
         Ok(job)
+    }
+
+    /// Controller definitions contain no execution progress. Replaying one must
+    /// not rewind a committed fire, even after an apply/checkpoint crash.
+    pub fn apply_authoritative(
+        &self,
+        id: Uuid,
+        definition: Option<CronJob>,
+    ) -> Result<(), CronError> {
+        let mut state = self.inner.lock();
+        if definition.is_none() && !state.file.jobs.iter().any(|job| job.id == id) {
+            return Ok(());
+        }
+        let command = if let Some(mut job) = definition {
+            next_run_for_job(&job.cron, job.every_seconds, Utc::now().timestamp_millis())?;
+            if let Some(existing) = state.file.jobs.iter().find(|j| j.id == id) {
+                job.last_run_at_ms = existing.last_run_at_ms;
+                job.next_run_at_ms = if existing.cron != job.cron
+                    || existing.every_seconds != job.every_seconds
+                    || (existing.paused && !job.paused)
+                {
+                    next_run_for_job(&job.cron, job.every_seconds, Utc::now().timestamp_millis())?
+                } else {
+                    existing.next_run_at_ms
+                };
+            } else {
+                job.last_run_at_ms = None;
+                job.next_run_at_ms =
+                    next_run_for_job(&job.cron, job.every_seconds, Utc::now().timestamp_millis())?;
+            }
+            CronCommand::Upsert { job }
+        } else {
+            CronCommand::Delete { id }
+        };
+        self.append_command(&mut state, command.clone())?;
+        apply_command(&mut state.file, command);
+        self.maybe_compact(&mut state);
+        Ok(())
     }
 
     pub fn get(&self, id: Uuid) -> Result<CronJob, CronError> {
@@ -567,6 +612,30 @@ fn next_run_after_cron(expr: &str, after_ms: i64) -> Result<i64, CronError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_definition_replay_preserves_execution_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = CronRegistry::open(dir.path()).unwrap();
+        let definition = CronRegistry::prepare_with_kind(
+            ScheduleKind::Interval { every_seconds: 1 },
+            sample_request(),
+        )
+        .unwrap();
+        assert!(registry.list().is_empty());
+        registry
+            .apply_authoritative(definition.id, Some(definition.clone()))
+            .unwrap();
+        registry.pop_due(definition.next_run_at_ms + 2000);
+        registry.commit_fire(definition.id).unwrap();
+        let before = registry.get(definition.id).unwrap();
+        registry
+            .apply_authoritative(definition.id, Some(definition.clone()))
+            .unwrap();
+        let after = registry.get(definition.id).unwrap();
+        assert_eq!(after.next_run_at_ms, before.next_run_at_ms);
+        assert_eq!(after.last_run_at_ms, before.last_run_at_ms);
+    }
     use std::env::temp_dir;
 
     fn sample_request() -> ScheduledPublishRequest {

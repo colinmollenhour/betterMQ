@@ -96,15 +96,58 @@ pub struct SubscriptionRegistry {
 }
 
 fn meta_file_path(data_dir: &std::path::Path, name: &str) -> std::path::PathBuf {
-    if let Ok(shared) = std::env::var("BETTERMQ_SHARED_META_DIR") {
-        let dir = std::path::PathBuf::from(shared);
-        let _ = std::fs::create_dir_all(&dir);
-        return dir.join(name);
-    }
     data_dir.join(name)
 }
 
 impl SubscriptionRegistry {
+    pub fn import_snapshot(
+        &self,
+        subscriptions: Vec<Subscription>,
+    ) -> Result<(), SubscriptionError> {
+        let _lock = broker_storage::FileLock::exclusive(&self.path)?;
+        let mut file = self.load()?;
+        file.subscriptions = subscriptions;
+        file.revision += 1;
+        self.journal
+            .compact(&self.path, &file)
+            .map_err(|e| SubscriptionError::Journal(e.to_string()))
+    }
+    pub fn legacy_shared(
+        data_dir: &std::path::Path,
+    ) -> Result<Vec<Subscription>, SubscriptionError> {
+        let Some(path) =
+            crate::catalog_journal::legacy_shared_path(data_dir, "subscriptions.json")?
+        else {
+            return Ok(Vec::new());
+        };
+        Self::read_snapshot_at(path)
+    }
+    pub fn read_snapshot_at(path: PathBuf) -> Result<Vec<Subscription>, SubscriptionError> {
+        Self {
+            journal: CatalogJournal::new(&path, SUBSCRIPTION_CATALOG_VERSION),
+            path,
+        }
+        .catalog_all()
+    }
+    pub fn catalog_all(&self) -> Result<Vec<Subscription>, SubscriptionError> {
+        Ok(self.load()?.subscriptions)
+    }
+
+    pub fn apply_authoritative(
+        &self,
+        tenant: &str,
+        id: Uuid,
+        subscription: Option<Subscription>,
+    ) -> Result<(), SubscriptionError> {
+        self.mutate(|file| {
+            file.subscriptions
+                .retain(|p| p.id != id || (tenant != "*" && p.tenant_id != tenant));
+            if let Some(subscription) = subscription {
+                file.subscriptions.push(subscription);
+            }
+            Ok(())
+        })
+    }
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, SubscriptionError> {
         let path = meta_file_path(data_dir.as_ref(), "subscriptions.json");
         if !path.exists() {

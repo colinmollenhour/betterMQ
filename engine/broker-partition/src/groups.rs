@@ -140,15 +140,78 @@ pub struct GroupRegistry {
 }
 
 fn meta_file_path(data_dir: &Path, name: &str) -> PathBuf {
-    if let Ok(shared) = std::env::var("BETTERMQ_SHARED_META_DIR") {
-        let dir = PathBuf::from(shared);
-        let _ = std::fs::create_dir_all(&dir);
-        return dir.join(name);
-    }
     data_dir.join(name)
 }
 
 impl GroupRegistry {
+    pub fn import_snapshot(
+        &self,
+        groups: Vec<DispatchGroup>,
+        members: Vec<GroupMember>,
+    ) -> Result<(), GroupError> {
+        let _lock = broker_storage::FileLock::exclusive(&self.path)?;
+        let mut file = self.load()?;
+        file.groups = groups;
+        file.members = members;
+        file.revision += 1;
+        self.journal
+            .compact(&self.path, &file)
+            .map_err(|e| GroupError::Journal(e.to_string()))
+    }
+    pub fn legacy_shared(
+        data_dir: &Path,
+    ) -> Result<(Vec<DispatchGroup>, Vec<GroupMember>), GroupError> {
+        let Some(path) = crate::catalog_journal::legacy_shared_path(data_dir, "groups.json")?
+        else {
+            return Ok(Default::default());
+        };
+        Self::read_snapshot_at(path)
+    }
+    pub fn read_snapshot_at(
+        path: PathBuf,
+    ) -> Result<(Vec<DispatchGroup>, Vec<GroupMember>), GroupError> {
+        Self {
+            journal: CatalogJournal::new(&path, GROUP_CATALOG_VERSION),
+            path,
+        }
+        .catalog_all()
+    }
+    pub fn catalog_all(&self) -> Result<(Vec<DispatchGroup>, Vec<GroupMember>), GroupError> {
+        let file = self.load()?;
+        Ok((file.groups, file.members))
+    }
+
+    pub fn apply_group_authoritative(
+        &self,
+        tenant: &str,
+        id: Uuid,
+        group: Option<DispatchGroup>,
+    ) -> Result<(), GroupError> {
+        self.mutate(|file| {
+            file.groups
+                .retain(|p| p.id != id || (tenant != "*" && p.tenant_id != tenant));
+            if let Some(group) = group {
+                file.groups.push(group);
+            }
+            Ok(())
+        })
+    }
+
+    pub fn apply_member_authoritative(
+        &self,
+        tenant: &str,
+        id: Uuid,
+        member: Option<GroupMember>,
+    ) -> Result<(), GroupError> {
+        self.mutate(|file| {
+            file.members
+                .retain(|p| p.id != id || (tenant != "*" && p.tenant_id != tenant));
+            if let Some(member) = member {
+                file.members.push(member);
+            }
+            Ok(())
+        })
+    }
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, GroupError> {
         let path = meta_file_path(data_dir.as_ref(), "groups.json");
         if !path.exists() {

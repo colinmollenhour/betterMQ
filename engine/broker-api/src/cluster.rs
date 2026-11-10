@@ -181,6 +181,7 @@ pub struct ClusterGossipResponse {
 
 #[derive(Clone)]
 pub struct ClusterHandle {
+    pub(crate) catalog_apply: Arc<crate::catalog_applier::ApplyState>,
     pub runtime: ClusterRuntime,
     pub replication: ReplicationClient,
     http: reqwest::Client,
@@ -193,6 +194,12 @@ struct CatalogPeerCache {
 }
 
 impl ClusterHandle {
+    pub fn catalog_ready(&self) -> bool {
+        self.runtime
+            .controller()
+            .is_none_or(|controller| self.catalog_apply.ready(controller.catalog_revision()))
+    }
+
     pub fn new(runtime: ClusterRuntime) -> Self {
         let replication =
             ReplicationClient::new(runtime.config().clone()).with_runtime(runtime.clone());
@@ -201,6 +208,7 @@ impl ClusterHandle {
             .build()
             .expect("cluster HTTP client");
         Self {
+            catalog_apply: Arc::new(crate::catalog_applier::ApplyState::default()),
             runtime,
             replication,
             http,
@@ -566,7 +574,7 @@ pub async fn publish_with_cluster(
     publish_on_leader(state, req, meter).await
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CatalogSnapshot {
     pub flows: Vec<FlowProfile>,
     pub queues: Vec<Subscription>,
@@ -763,6 +771,17 @@ pub fn catalog_peer_targets(state: &AppState) -> Vec<(Uuid, String)> {
 
 /// Union-merge catalog from all peers into this node (best-effort).
 pub async fn sync_catalog_from_peers(state: &Arc<AppState>) {
+    if state
+        .cluster
+        .as_ref()
+        .and_then(|c| c.runtime.controller())
+        .is_some()
+    {
+        if let Err(error) = crate::catalog_applier::materialize(state) {
+            warn!(%error, "catalog apply failed");
+        }
+        return;
+    }
     let peers = catalog_peer_urls(state);
     if peers.is_empty() {
         return;
@@ -791,10 +810,17 @@ pub fn spawn_cluster_catalog_sync(state: Arc<AppState>) -> Option<tokio::task::J
 
 /// Push local catalog to a peer that just came back online.
 pub async fn push_catalog_to_recovered_peer(peer_base: &str, state: &AppState) -> bool {
-    let snap = catalog_snapshot(state);
-    if snap.flows.is_empty() && snap.queues.is_empty() && snap.crons.is_empty() {
+    if state
+        .cluster
+        .as_ref()
+        .and_then(|c| c.runtime.controller())
+        .is_some()
+    {
         return true;
     }
+    let Ok(snap) = catalog_snapshot(state) else {
+        return false;
+    };
     push_catalog_to_peer(peer_base, &snap).await
 }
 
@@ -899,48 +925,61 @@ async fn put_authoritative_catalog(
     }
 }
 
-pub fn catalog_snapshot(state: &AppState) -> CatalogSnapshot {
-    let members = state
-        .broker
-        .list_groups()
-        .ok()
-        .map(|groups| {
-            groups
-                .iter()
-                .flat_map(|g| state.broker.list_group_members(g.id).unwrap_or_default())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+pub fn catalog_snapshot(state: &AppState) -> Result<CatalogSnapshot, ApiError> {
+    let (groups, members) = state.broker.catalog_groups()?;
     // Cluster catalog sync still needs secrets for followers to deliver webhooks.
     // Exposure is gated by BETTERMQ_CLUSTER_SECRET (fail-closed). Operators must
     // keep /internal/v1/* off the public internet.
-    CatalogSnapshot {
-        flows: state.broker.list_flow_profiles().unwrap_or_default(),
-        queues: state.broker.list_queues().unwrap_or_default(),
-        groups: state.broker.list_groups().unwrap_or_default(),
+    Ok(CatalogSnapshot {
+        flows: state.broker.catalog_flows()?,
+        queues: state.broker.catalog_queues()?,
+        groups,
         group_members: members,
         crons: state.crons.list(),
-        tombstones: state.catalog_tombstones.snapshot(),
-    }
+        tombstones: state
+            .catalog_tombstones
+            .snapshot()
+            .map_err(crate::catalog_applier::unavailable)?,
+    })
 }
 
-fn catalog_item_alive(id: Uuid, updated_at_ms: i64, tombstones: &HashMap<Uuid, i64>) -> bool {
-    tombstones
-        .get(&id)
-        .map(|deleted_at| updated_at_ms > *deleted_at)
-        .unwrap_or(true)
+fn catalog_item_alive(id: Uuid, _updated_at_ms: i64, tombstones: &HashMap<Uuid, i64>) -> bool {
+    !tombstones.contains_key(&id)
 }
 
 pub fn apply_catalog_snapshot(state: &AppState, snap: &CatalogSnapshot) -> Result<(), ApiError> {
+    crate::catalog_applier::legacy_write_allowed(state)?;
+    crate::catalog_applier::additive_no_overwrite(state, snap)?;
     state
         .catalog_tombstones
         .merge_remote(&snap.tombstones)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let tombstones = state.catalog_tombstones.snapshot();
+    let tombstones = state
+        .catalog_tombstones
+        .snapshot()
+        .map_err(crate::catalog_applier::unavailable)?;
+    // UUID tombstones apply to every local kind, including tombstone-only repair.
+    for id in tombstones.keys() {
+        state.broker.apply_flow_authoritative("*", *id, None)?;
+        state.broker.apply_queue_authoritative("*", *id, None)?;
+        state.broker.apply_group_authoritative("*", *id, None)?;
+        state.broker.apply_member_authoritative("*", *id, None)?;
+        state
+            .crons
+            .apply_authoritative(*id, None)
+            .map_err(crate::catalog_applier::unavailable)?;
+    }
     for profile in &snap.flows {
         if !catalog_item_alive(profile.id, profile.updated_at_ms, &tombstones) {
             continue;
         }
+        state.broker.prepare_flow(
+            profile.key.clone(),
+            profile.parallelism,
+            profile.rate,
+            profile.period_secs,
+            profile.id,
+        )?;
         state
             .broker
             .upsert_flow_profile(profile.clone())
@@ -960,6 +999,7 @@ pub fn apply_catalog_snapshot(state: &AppState, snap: &CatalogSnapshot) -> Resul
         if !catalog_item_alive(group.id, group.updated_at_ms, &tombstones) {
             continue;
         }
+        state.broker.validate_catalog_group(group)?;
         state
             .broker
             .upsert_group_catalog(group.clone())
@@ -969,6 +1009,7 @@ pub fn apply_catalog_snapshot(state: &AppState, snap: &CatalogSnapshot) -> Resul
         if !catalog_item_alive(member.id, member.updated_at_ms, &tombstones) {
             continue;
         }
+        state.broker.validate_catalog_member(member)?;
         crate::routes::validate_destination_url_str_pub(&member.url)?;
         state
             .broker
@@ -1132,10 +1173,13 @@ pub async fn merge_catalog_from_peers(
     let mut groups: HashMap<Uuid, DispatchGroup> = HashMap::new();
     let mut group_members: HashMap<Uuid, GroupMember> = HashMap::new();
     let mut crons: HashMap<Uuid, CronJob> = HashMap::new();
-    let mut tombstones: HashMap<Uuid, i64> = state.catalog_tombstones.snapshot();
+    let mut tombstones: HashMap<Uuid, i64> = state
+        .catalog_tombstones
+        .snapshot()
+        .map_err(crate::catalog_applier::unavailable)?;
     let mut fetched = 0usize;
 
-    let local = catalog_snapshot(state);
+    let local = catalog_snapshot(state)?;
     merge_tombstones_lww(&mut tombstones, &local.tombstones);
     for f in local.flows {
         merge_flow_lww(&mut flows, f);
@@ -1239,8 +1283,8 @@ pub async fn push_catalog_to_peer(peer_base: &str, snap: &CatalogSnapshot) -> bo
 
 pub async fn internal_catalog_snapshot(
     State(state): State<Arc<AppState>>,
-) -> Json<CatalogSnapshot> {
-    Json(catalog_snapshot(&state))
+) -> Result<Json<CatalogSnapshot>, ApiError> {
+    Ok(Json(catalog_snapshot(&state)?))
 }
 
 pub async fn internal_catalog_apply(
@@ -1583,10 +1627,13 @@ pub async fn internal_catalog_flow(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogFlowUpsert>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .broker
-        .upsert_flow_profile(body.profile)
-        .map_err(ApiError::Broker)?;
+    apply_catalog_snapshot(
+        &state,
+        &CatalogSnapshot {
+            flows: vec![body.profile],
+            ..Default::default()
+        },
+    )?;
     Ok(StatusCode::OK)
 }
 
@@ -1594,10 +1641,13 @@ pub async fn internal_catalog_queue(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogQueueUpsert>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .broker
-        .upsert_subscription_catalog(body.subscription)
-        .map_err(ApiError::Broker)?;
+    apply_catalog_snapshot(
+        &state,
+        &CatalogSnapshot {
+            queues: vec![body.subscription],
+            ..Default::default()
+        },
+    )?;
     Ok(StatusCode::OK)
 }
 
@@ -1605,6 +1655,7 @@ pub async fn internal_catalog_delete_flow(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogFlowDelete>,
 ) -> Result<StatusCode, ApiError> {
+    crate::catalog_applier::legacy_write_allowed(&state)?;
     persist_catalog_tombstone(
         &state,
         body.flow_id,
@@ -1628,10 +1679,13 @@ pub async fn internal_catalog_cron(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogCronUpsert>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .crons
-        .upsert(body.job)
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    apply_catalog_snapshot(
+        &state,
+        &CatalogSnapshot {
+            crons: vec![body.job],
+            ..Default::default()
+        },
+    )?;
     Ok(StatusCode::OK)
 }
 
@@ -1639,6 +1693,7 @@ pub async fn internal_catalog_delete_cron(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogCronDelete>,
 ) -> Result<StatusCode, ApiError> {
+    crate::catalog_applier::legacy_write_allowed(&state)?;
     persist_catalog_tombstone(
         &state,
         body.cron_id,
@@ -1657,6 +1712,7 @@ pub async fn internal_catalog_delete_queue(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogQueueDelete>,
 ) -> Result<StatusCode, ApiError> {
+    crate::catalog_applier::legacy_write_allowed(&state)?;
     persist_catalog_tombstone(
         &state,
         body.queue_id,
@@ -1680,10 +1736,13 @@ pub async fn internal_catalog_group(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogGroupUpsert>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .broker
-        .upsert_group_catalog(body.group)
-        .map_err(ApiError::Broker)?;
+    apply_catalog_snapshot(
+        &state,
+        &CatalogSnapshot {
+            groups: vec![body.group],
+            ..Default::default()
+        },
+    )?;
     Ok(StatusCode::OK)
 }
 
@@ -1691,6 +1750,7 @@ pub async fn internal_catalog_delete_group(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogGroupDelete>,
 ) -> Result<StatusCode, ApiError> {
+    crate::catalog_applier::legacy_write_allowed(&state)?;
     persist_catalog_tombstone(
         &state,
         body.group_id,
@@ -1714,10 +1774,13 @@ pub async fn internal_catalog_group_member(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogGroupMemberUpsert>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .broker
-        .upsert_group_member_catalog(body.member)
-        .map_err(ApiError::Broker)?;
+    apply_catalog_snapshot(
+        &state,
+        &CatalogSnapshot {
+            group_members: vec![body.member],
+            ..Default::default()
+        },
+    )?;
     Ok(StatusCode::OK)
 }
 
@@ -1725,6 +1788,7 @@ pub async fn internal_catalog_delete_group_member(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogGroupMemberDelete>,
 ) -> Result<StatusCode, ApiError> {
+    crate::catalog_applier::legacy_write_allowed(&state)?;
     persist_catalog_tombstone(
         &state,
         body.member_id,
@@ -2053,11 +2117,11 @@ pub async fn internal_controller_command(
         .cluster
         .as_ref()
         .and_then(|cluster| cluster.runtime.controller())
-        .ok_or_else(|| ApiError::BadRequest("OpenRaft controller is not enabled".into()))?;
+        .ok_or_else(|| ApiError::Unavailable("OpenRaft controller is not enabled".into()))?;
     let state = controller
-        .submit(command)
+        .submit_local(command)
         .await
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        .map_err(crate::catalog_applier::controller_error)?;
     Ok(Json(broker_raft_meta::ControllerCommandResponse { state }))
 }
 

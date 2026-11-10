@@ -627,6 +627,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     broker_cfg.retry_defaults = settings.dispatch_retry.clone();
     let storage = broker_cfg.storage;
     let broker = Broker::open(broker_cfg).context("open broker storage")?;
+    if !settings.cluster_enabled {
+        broker
+            .import_legacy_shared_catalog()
+            .context("import standalone legacy catalog")?;
+    }
 
     let cluster = if settings.cluster_enabled {
         let config =
@@ -649,10 +654,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         None
     };
     if let Some(ref c) = cluster {
-        let rt = c.runtime.clone();
+        let cluster = c.clone();
         broker.set_shard_leader_check(Arc::new(move |p| {
-            if rt.is_leader_for_shard(p) {
-                Some(rt.shard_generation(p))
+            if cluster.catalog_ready() && cluster.runtime.is_leader_for_shard(p) {
+                Some(cluster.runtime.shard_generation(p))
             } else {
                 None
             }
@@ -679,8 +684,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     };
     dispatch = dispatch.with_leases(leases.clone());
     if let Some(ref c) = cluster {
-        let rt = c.runtime.clone();
-        dispatch = dispatch.with_shard_leader_check(Arc::new(move |p| rt.is_leader_for_shard(p)));
+        let cluster = c.clone();
+        dispatch = dispatch.with_shard_leader_check(Arc::new(move |p| {
+            cluster.catalog_ready() && cluster.runtime.is_leader_for_shard(p)
+        }));
     }
     if !broker_only {
         dispatch.backfill_pending();
@@ -1201,6 +1208,9 @@ fn spawn_schedule_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
             let scheduler_leader = match &state.cluster {
                 None => true,
                 Some(c) => {
+                    if !c.catalog_ready() {
+                        continue;
+                    }
                     if let Err(error) = c.runtime.acquire_scheduler_leader(5_000).await {
                         broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Lease);
                         tracing::warn!(%error, "OpenRaft scheduler lease acquisition failed");

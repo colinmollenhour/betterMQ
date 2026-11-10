@@ -34,3 +34,4 @@ pub use placement::{
 };
 pub use rocks_store::RocksStore;
 pub use telemetry::{controller_telemetry_snapshot, ControllerTelemetrySnapshot};
+pub mod catalog;

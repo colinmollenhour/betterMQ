@@ -5,6 +5,25 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+pub(crate) fn legacy_shared_path(data_dir: &Path, name: &str) -> std::io::Result<Option<PathBuf>> {
+    let Ok(shared) = std::env::var("BETTERMQ_SHARED_META_DIR") else {
+        return Ok(None);
+    };
+    if shared.trim().is_empty() {
+        return Ok(None);
+    }
+    let dir = match PathBuf::from(shared).canonicalize() {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if dir.canonicalize().ok() == data_dir.canonicalize().ok() {
+        return Ok(None);
+    }
+    let path = dir.join(name);
+    Ok((path.try_exists()? || path.with_extension("journal").try_exists()?).then_some(path))
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum CatalogJournalError {
     #[error("catalog journal io: {0}")]

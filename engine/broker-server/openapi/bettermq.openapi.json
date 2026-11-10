@@ -1158,6 +1158,9 @@
           },
           "local_shards_ready": {
             "type": "boolean"
+          },
+          "catalog_ready": {
+            "type": "boolean"
           }
         }
       },

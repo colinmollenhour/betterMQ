@@ -5,6 +5,7 @@ mod admission;
 mod auth;
 mod batch;
 mod bettermq;
+mod catalog_applier;
 mod catalog_tombstones;
 mod cluster;
 pub mod cluster_auth;
@@ -118,6 +119,7 @@ pub struct HealthResponse {
 fn into_shared(state: AppState, spawn: bool) -> Arc<AppState> {
     let shared = Arc::new(state);
     if spawn {
+        catalog_applier::spawn(shared.clone());
         bettermq::spawn_fanout_replay(shared.clone());
         bettermq::spawn_dlq_retention(shared.clone());
     }
@@ -162,6 +164,10 @@ fn data_plane_routes(shared: Arc<AppState>) -> Router<Arc<AppState>> {
             .route_layer(axum::middleware::from_fn_with_state(
                 shared.clone(),
                 admission::buffer_ingest_body,
+            ))
+            .route_layer(axum::middleware::from_fn_with_state(
+                shared.clone(),
+                catalog_applier::mutation_preflight,
             ))
             .route_layer(axum::middleware::from_fn_with_state(
                 shared.clone(),
@@ -250,6 +256,14 @@ fn internal_cluster_routes() -> Router<Arc<AppState>> {
 
 fn internal_cluster_route_table() -> Router<Arc<AppState>> {
     Router::new()
+        .route(
+            "/internal/v1/cluster/catalog/activation-snapshot",
+            get(catalog_applier::activation_snapshot_endpoint),
+        )
+        .route(
+            "/internal/v1/cluster/catalog/capabilities",
+            get(catalog_applier::capabilities),
+        )
         .route(
             "/internal/v1/gateway/queue-topics",
             axum::routing::post(gateway::internal_gateway_queue_topics),

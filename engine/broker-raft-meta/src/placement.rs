@@ -29,6 +29,12 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogRecord {
+    #[serde(default)]
+    pub tenant_id: String,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub operation_id: Option<Uuid>,
     pub kind: String,
     pub key: String,
     pub version: u64,
@@ -143,6 +149,9 @@ pub fn upsert_catalog(
     records.insert(
         map_key,
         CatalogRecord {
+            tenant_id: String::new(),
+            revision: 0,
+            operation_id: None,
             kind,
             key,
             version,
