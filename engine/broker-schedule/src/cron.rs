@@ -140,6 +140,9 @@ struct CronState {
     journal_ops: usize,
     /// Failed-fire backoff per job (in memory only).
     retries: HashMap<Uuid, CronRetry>,
+    /// Tentative occurrences popped but not yet committed: job id → fire
+    /// time. Kept out of `file` so snapshots hold committed positions only.
+    firing: HashMap<Uuid, i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -237,6 +240,7 @@ impl CronRegistry {
                 sequence,
                 journal_ops,
                 retries: HashMap::new(),
+                firing: HashMap::new(),
             })),
             _lock: Arc::new(lock),
         })
@@ -448,6 +452,7 @@ impl CronRegistry {
         self.append_command(&mut state, CronCommand::Delete { id })?;
         apply_command(&mut state.file, CronCommand::Delete { id });
         state.retries.remove(&id);
+        state.firing.remove(&id);
         self.maybe_compact(&mut state);
         Ok(removed)
     }
@@ -469,15 +474,19 @@ impl CronRegistry {
         Ok(())
     }
 
-    /// Jobs due now — advances next_run only in memory. Call [`Self::commit_fire`]
-    /// after successful publish, or [`Self::fail_fire`] on failure. Jobs backing
-    /// off after a failed fire are not due until their retry time.
+    /// Jobs due now. Committed state is left untouched: the firing is held
+    /// as a tentative occurrence until [`Self::commit_fire`] (after a
+    /// successful publish) or [`Self::fail_fire`], so a compaction snapshot in
+    /// between only ever contains committed positions. Jobs already firing or
+    /// backing off after a failed fire are skipped. Each returned job is the
+    /// committed snapshot (its `next_run_at_ms` is the slot being fired)
+    /// stamped with `last_run_at_ms = now_ms`.
     pub fn pop_due(&self, now_ms: i64) -> Vec<CronJob> {
         let mut guard = self.inner.lock();
         let state = &mut *guard;
         let mut due = Vec::new();
-        for job in &mut state.file.jobs {
-            if job.paused || job.next_run_at_ms > now_ms {
+        for job in &state.file.jobs {
+            if job.paused || job.next_run_at_ms > now_ms || state.firing.contains_key(&job.id) {
                 continue;
             }
             if state
@@ -487,21 +496,16 @@ impl CronRegistry {
             {
                 continue;
             }
-            let previous = job.clone();
-            job.last_run_at_ms = Some(now_ms);
-            if let Ok(next) = next_run_for_job(&job.cron, job.every_seconds, now_ms) {
-                job.next_run_at_ms = next;
-            }
-            // Return the pre-advance snapshot stamped with fire time for idempotency.
-            let mut fired = previous;
+            state.firing.insert(job.id, now_ms);
+            let mut fired = job.clone();
             fired.last_run_at_ms = Some(now_ms);
             due.push(fired);
         }
-        // Do not persist here — commit_fire / revert_fire owns durability.
         due
     }
 
-    /// Persist advanced next_run after a successful cron publish.
+    /// Commit a successful firing: advance `next_run_at_ms` past the fire time
+    /// and persist it.
     ///
     /// Bumps `updated_at_ms` so the advanced position wins catalog LWW merges
     /// over stale peer copies that still hold the fired slot.
@@ -514,11 +518,26 @@ impl CronRegistry {
             .find(|job| job.id == id)
             .cloned()
             .ok_or(CronError::NotFound(id))?;
+        let fired_at_ms = state
+            .firing
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        match next_run_for_job(&job.cron, job.every_seconds, fired_at_ms) {
+            Ok(next) => job.next_run_at_ms = next,
+            Err(error) => {
+                // No later run exists: stop instead of refiring every tick.
+                tracing::warn!(cron_id = %id, %error, "cron has no upcoming run; pausing it");
+                job.paused = true;
+            }
+        }
+        job.last_run_at_ms = Some(fired_at_ms);
         job.updated_at_ms = Utc::now()
             .timestamp_millis()
             .max(job.updated_at_ms.saturating_add(1));
         self.append_command(&mut state, CronCommand::Upsert { job: job.clone() })?;
         apply_command(&mut state.file, CronCommand::Upsert { job });
+        state.firing.remove(&id);
         state.retries.remove(&id);
         self.maybe_compact(&mut state);
         Ok(())
@@ -526,29 +545,28 @@ impl CronRegistry {
 
     /// Record a failed publish of a job returned by [`Self::pop_due`].
     ///
-    /// On [`FireRetry::Retry`] the occurrence is reverted and retried after
-    /// an exponential backoff. On [`FireRetry::GiveUp`] (a permanent failure
-    /// that kept failing) the occurrence is skipped: the advanced next run is
-    /// committed and the job keeps its schedule.
+    /// On [`FireRetry::Retry`] the tentative occurrence is dropped (nothing
+    /// durable changed) and the slot is retried after an exponential backoff.
+    /// On [`FireRetry::GiveUp`] (a permanent failure that kept failing) the
+    /// occurrence is skipped: it is committed as fired and the job keeps its
+    /// schedule.
     pub fn fail_fire(
         &self,
         job: &CronJob,
         failure: FireFailure,
         now_ms: i64,
     ) -> Result<FireRetry, CronError> {
-        let attempt = {
-            let state = self.inner.lock();
-            state
+        let decision = {
+            let mut state = self.inner.lock();
+            let attempt = state
                 .retries
                 .get(&job.id)
                 .map_or(0, |retry| retry.attempts)
-                .saturating_add(1)
-        };
-        let decision = retry::decide(attempt, failure, now_ms);
-        match decision {
-            FireRetry::Retry { retry_at_ms, .. } => {
-                self.revert_fire(job)?;
-                self.inner.lock().retries.insert(
+                .saturating_add(1);
+            let decision = retry::decide(attempt, failure, now_ms);
+            if let FireRetry::Retry { retry_at_ms, .. } = decision {
+                state.firing.remove(&job.id);
+                state.retries.insert(
                     job.id,
                     CronRetry {
                         attempts: attempt,
@@ -556,32 +574,12 @@ impl CronRegistry {
                     },
                 );
             }
-            FireRetry::GiveUp { .. } => self.commit_fire(job.id)?,
+            decision
+        };
+        if let FireRetry::GiveUp { .. } = decision {
+            self.commit_fire(job.id)?;
         }
         Ok(decision)
-    }
-
-    /// Revert next_run after a failed publish so a later tick retries.
-    fn revert_fire(&self, job: &CronJob) -> Result<(), CronError> {
-        let mut state = self.inner.lock();
-        let mut restored = state
-            .file
-            .jobs
-            .iter()
-            .find(|existing| existing.id == job.id)
-            .cloned()
-            .ok_or(CronError::NotFound(job.id))?;
-        restored.next_run_at_ms = job.next_run_at_ms;
-        restored.last_run_at_ms = job.last_run_at_ms;
-        self.append_command(
-            &mut state,
-            CronCommand::Upsert {
-                job: restored.clone(),
-            },
-        )?;
-        apply_command(&mut state.file, CronCommand::Upsert { job: restored });
-        self.maybe_compact(&mut state);
-        Ok(())
     }
 
     fn set_paused(&self, id: Uuid, paused: bool) -> Result<CronJob, CronError> {
@@ -860,6 +858,13 @@ mod tests {
         let now = job.created_at_ms;
         let due = reg.pop_due(now + 10_000);
         assert_eq!(due.len(), 1);
+        assert_eq!(
+            reg.get(job.id).unwrap().next_run_at_ms,
+            now + 10_000,
+            "popping alone does not advance the committed position"
+        );
+        assert!(reg.pop_due(now + 10_000).is_empty(), "already firing");
+        reg.commit_fire(job.id).unwrap();
         let updated = reg.get(job.id).unwrap();
         assert_eq!(updated.next_run_at_ms, now + 20_000);
     }
@@ -1014,6 +1019,72 @@ mod tests {
         let after = reg.get(job.id).unwrap();
         assert_eq!(after.next_run_at_ms, advanced.next_run_at_ms);
         assert!(reg.pop_due(stale.next_run_at_ms).is_empty());
+    }
+
+    #[test]
+    fn compaction_mid_batch_does_not_persist_unpublished_advances() {
+        let dir = temp_dir().join(format!("bettermq-cron-m46-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        let first = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        let second = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        let now = first.next_run_at_ms.max(second.next_run_at_ms);
+        let due = reg.pop_due(now);
+        assert_eq!(due.len(), 2);
+
+        // Committing the first fire crosses the compaction threshold.
+        reg.inner.lock().journal_ops = CRON_COMPACT_OPS - 1;
+        reg.commit_fire(first.id).unwrap();
+        assert_eq!(reg.inner.lock().journal_ops, 0, "compacted");
+        let snapshot: CronFile =
+            serde_json::from_slice(&std::fs::read(dir.join("crons.json")).unwrap()).unwrap();
+        let persisted = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.id == second.id)
+            .unwrap();
+        assert_eq!(persisted.next_run_at_ms, second.next_run_at_ms);
+
+        // Crash before the second publish: it is still due, same slot.
+        drop(reg);
+        let reopened = CronRegistry::open(&dir).unwrap();
+        let refired = reopened.pop_due(now);
+        assert_eq!(refired.len(), 1);
+        assert_eq!(refired[0].id, second.id);
+        let original = due.iter().find(|job| job.id == second.id).unwrap();
+        assert_eq!(
+            refired[0].fire_idempotency_key(),
+            original.fire_idempotency_key()
+        );
+        assert!(reopened.get(first.id).unwrap().next_run_at_ms > now);
+    }
+
+    #[test]
+    fn failed_fire_writes_nothing_to_the_journal() {
+        let dir = temp_dir().join(format!("bettermq-cron-nofsync-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        let job = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        let before = std::fs::read(dir.join("crons.journal")).unwrap();
+        let fired = reg.pop_due(job.next_run_at_ms).pop().unwrap();
+        reg.fail_fire(&fired, FireFailure::Transient, job.next_run_at_ms)
+            .unwrap();
+        assert_eq!(std::fs::read(dir.join("crons.journal")).unwrap(), before);
     }
 
     #[test]
