@@ -169,11 +169,19 @@ impl PartitionBackend {
         }
     }
 
-    pub fn purge_offset(&mut self, offset: u64) -> bool {
+    pub fn purge_offset(&mut self, offset: u64) -> Result<bool, LogError> {
+        Ok(self.purge_offsets(&[offset])? == 1)
+    }
+
+    /// Tombstone records durably; returns how many live records were purged.
+    pub fn purge_offsets(&mut self, offsets: &[u64]) -> Result<usize, LogError> {
         match self {
-            Self::Local(log) => log.purge_offset(offset),
+            Self::Local(log) => log.purge_offsets(offsets),
             #[cfg(feature = "slate")]
-            Self::Slate(log) => log.purge_offset(offset),
+            Self::Slate(log) => Ok(offsets
+                .iter()
+                .filter(|offset| log.purge_offset(**offset))
+                .count()),
         }
     }
 

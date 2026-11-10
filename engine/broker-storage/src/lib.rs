@@ -35,7 +35,7 @@ pub use indexes::{DedupEntry, IndexError, MetadataStore, MetadataWriteBatch};
 pub use log::{storage_faults, FsyncMode, LogError, PartitionLog, PartitionLogConfig};
 pub use manifest::{WalManifest, WAL_FORMAT_V1, WAL_FORMAT_V2};
 pub use message_store::{MessageStore, StoreError};
-pub use meta::{atomic_write_file, set_secret_file_mode, LogMeta};
+pub use meta::{atomic_write_file, set_secret_file_mode, LogMeta, OffsetRanges};
 pub use migration::{
     inspect_wal, migrate_v1_to_v2, rollback_v1_to_v2, MigrationError, MigrationReport,
     WalInspection,

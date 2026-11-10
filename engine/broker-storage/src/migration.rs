@@ -1,7 +1,7 @@
 //! Offline, validated V1-to-V2 WAL migration.
 
 use crate::manifest::{WalManifest, WAL_FORMAT_V1, WAL_FORMAT_V2};
-use crate::meta::atomic_write_file;
+use crate::meta::{atomic_write_file, LogMeta};
 use crate::{FsyncMode, PartitionLog, PartitionLogConfig};
 use broker_proto::{decode_epoch, decode_frame, encode_frame_vec, LogRecord};
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,29 @@ pub struct WalInspection {
     pub total_bytes: u64,
     pub digest_hex: String,
     pub files: Vec<PathBuf>,
+    /// Records not tombstoned by purge, and their digest (offset + frame):
+    /// what consumers can actually read. Empty in reports from older builds.
+    #[serde(default)]
+    pub visible_record_count: u64,
+    #[serde(default)]
+    pub visible_digest_hex: String,
+}
+
+impl WalInspection {
+    /// Equal content. Logical fields are compared only when both sides have
+    /// them, so rollback metadata written by older builds stays valid.
+    fn matches(&self, other: &Self) -> bool {
+        let physical = self.format_version == other.format_version
+            && self.record_count == other.record_count
+            && self.total_bytes == other.total_bytes
+            && self.digest_hex == other.digest_hex
+            && self.files == other.files;
+        let logical = self.visible_digest_hex.is_empty()
+            || other.visible_digest_hex.is_empty()
+            || (self.visible_record_count == other.visible_record_count
+                && self.visible_digest_hex == other.visible_digest_hex);
+        physical && logical
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,12 +100,22 @@ pub fn inspect_wal(dir: impl AsRef<Path>) -> Result<WalInspection, MigrationErro
         .iter()
         .map(|path| path.strip_prefix(dir).unwrap_or(path).to_path_buf())
         .collect();
+    let meta = LogMeta::load(dir)?;
     let mut digest = Sha256::new();
+    let mut visible_digest = Sha256::new();
     let mut record_count = 0u64;
+    let mut visible_record_count = 0u64;
     scan_records(dir, format_version, |header, payload| {
+        let offset = record_count;
         let frame = encode_frame_vec(&header, &payload)?;
         digest.update((frame.len() as u64).to_be_bytes());
-        digest.update(frame);
+        digest.update(&frame);
+        if !meta.purged_offsets.contains(offset) {
+            visible_digest.update(offset.to_be_bytes());
+            visible_digest.update((frame.len() as u64).to_be_bytes());
+            visible_digest.update(&frame);
+            visible_record_count += 1;
+        }
         record_count = record_count.saturating_add(1);
         Ok(())
     })?;
@@ -92,6 +125,8 @@ pub fn inspect_wal(dir: impl AsRef<Path>) -> Result<WalInspection, MigrationErro
         total_bytes,
         digest_hex: hex::encode(digest.finalize()),
         files: relative_files,
+        visible_record_count,
+        visible_digest_hex: hex::encode(visible_digest.finalize()),
     })
 }
 
@@ -167,6 +202,17 @@ fn migrate_into_staging(
     required_free_bytes: u64,
 ) -> Result<MigrationReport, MigrationError> {
     std::fs::create_dir_all(staging)?;
+    // Logical state that lives beside the frames: purge tombstones and the
+    // leadership fence. Copying frames alone would make purged records
+    // visible again.
+    let source_meta = LogMeta::load(source)?;
+    if source_meta.base_offset > 0 {
+        return Err(MigrationError::Invalid(format!(
+            "source has a collected prefix (base offset {}); migrate before GC",
+            source_meta.base_offset
+        )));
+    }
+    let fence = (source_meta.leader_generation > 0).then_some(source_meta.leader_generation);
     let config = PartitionLogConfig {
         fsync: FsyncMode::Group,
         ..PartitionLogConfig::default()
@@ -176,23 +222,27 @@ fn migrate_into_staging(
     scan_records(source, WAL_FORMAT_V1, |header, payload| {
         batch.push((header, payload));
         if batch.len() >= COPY_BATCH_RECORDS {
-            target.append_batch(shard_id, std::mem::take(&mut batch), None)?;
+            target.append_batch(shard_id, std::mem::take(&mut batch), fence)?;
         }
         Ok(())
     })?;
     if !batch.is_empty() {
-        target.append_batch(shard_id, batch, None)?;
+        target.append_batch(shard_id, batch, fence)?;
     }
     target.sync()?;
+    target.import_tombstones(&source_meta.purged_offsets)?;
     drop(target);
 
-    if inspect_wal(source)? != source_inspection {
+    if !inspect_wal(source)?.matches(&source_inspection) {
         return Err(MigrationError::SourceChanged);
     }
     let destination_inspection = inspect_wal(staging)?;
     if destination_inspection.format_version != WAL_FORMAT_V2
         || destination_inspection.record_count != source_inspection.record_count
         || destination_inspection.digest_hex != source_inspection.digest_hex
+        || destination_inspection.visible_record_count != source_inspection.visible_record_count
+        || destination_inspection.visible_digest_hex != source_inspection.visible_digest_hex
+        || LogMeta::load(staging)?.leader_generation != source_meta.leader_generation
     {
         return Err(MigrationError::ValidationFailed);
     }
@@ -236,8 +286,8 @@ pub fn rollback_v1_to_v2(destination: impl AsRef<Path>) -> Result<PathBuf, Migra
     let destination = destination.as_ref();
     let bytes = std::fs::read(destination.join(ROLLBACK_FILE))?;
     let rollback: RollbackMetadata = serde_json::from_slice(&bytes)?;
-    if inspect_wal(&rollback.source)? != rollback.source_inspection
-        || inspect_wal(destination)? != rollback.destination_inspection
+    if !inspect_wal(&rollback.source)?.matches(&rollback.source_inspection)
+        || !inspect_wal(destination)?.matches(&rollback.destination_inspection)
     {
         return Err(MigrationError::ValidationFailed);
     }
@@ -433,6 +483,53 @@ mod tests {
         .unwrap();
         assert_eq!(log.high_watermark(), 2500);
         assert_eq!(log.read_range(3, 2490, 20).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn migration_carries_purge_tombstones_and_fence() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("v1");
+        let destination = root.path().join("v2");
+        {
+            let mut log = PartitionLog::open_for_shard(
+                &source,
+                PartitionLogConfig::default(),
+                3,
+                WAL_FORMAT_V1,
+            )
+            .unwrap();
+            let batch = (0..10)
+                .map(|index| (record(index), vec![index as u8; 16]))
+                .collect();
+            log.append_batch(3, batch, Some(7)).unwrap();
+            assert_eq!(log.purge_offsets(&[2, 3, 8]).unwrap(), 3);
+            log.sync().unwrap();
+        }
+        let report = migrate_v1_to_v2(&source, &destination, 3).unwrap();
+        assert_eq!(report.source_inspection.record_count, 10);
+        assert_eq!(report.source_inspection.visible_record_count, 7);
+        assert_eq!(
+            report.source_inspection.visible_digest_hex,
+            report.destination_inspection.visible_digest_hex
+        );
+
+        let meta = LogMeta::load(&destination).unwrap();
+        assert_eq!(meta.leader_generation, 7);
+        let log = PartitionLog::open_for_shard(
+            &destination,
+            PartitionLogConfig::default(),
+            3,
+            WAL_FORMAT_V2,
+        )
+        .unwrap();
+        let offsets: Vec<u64> = log
+            .read_range(3, 0, 100)
+            .unwrap()
+            .iter()
+            .map(|m| m.offset)
+            .collect();
+        assert_eq!(offsets, vec![0, 1, 4, 5, 6, 7, 9]);
+        assert!(rollback_v1_to_v2(&destination).is_ok());
     }
 
     #[test]

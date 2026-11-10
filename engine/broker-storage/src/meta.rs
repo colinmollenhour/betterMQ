@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -44,9 +44,14 @@ pub fn atomic_write_file_with(path: &Path, bytes: &[u8], fsync: bool) -> std::io
 pub struct LogMeta {
     pub next_offset: u64,
     pub segment_roll_count: u64,
-    /// Offsets tombstoned by purge (local log bytes are not rewritten).
-    #[serde(default)]
-    pub purged_offsets: BTreeSet<u64>,
+    /// Offsets tombstoned by purge (local log bytes are not rewritten),
+    /// stored as merged ranges so bulk purges stay small.
+    #[serde(default, rename = "purged_ranges")]
+    pub purged_offsets: OffsetRanges,
+    /// Tombstones in the pre-range format. Merged into `purged_offsets` on
+    /// load and never written back.
+    #[serde(default, rename = "purged_offsets", skip_serializing)]
+    legacy_purged_offsets: BTreeSet<u64>,
     /// Last accepted leadership fence for this partition (local WAL).
     #[serde(default)]
     pub leader_generation: u64,
@@ -80,8 +85,12 @@ impl LogMeta {
             return Ok(Self::default());
         }
         let bytes = std::fs::read(path)?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let mut meta: Self = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        for offset in std::mem::take(&mut meta.legacy_purged_offsets) {
+            meta.purged_offsets.insert(offset);
+        }
+        Ok(meta)
     }
 
     pub fn save(&self, partition_dir: &Path) -> std::io::Result<()> {
@@ -93,5 +102,147 @@ impl LogMeta {
         let bytes = serde_json::to_vec(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         atomic_write_file_with(&path, &bytes, fsync)
+    }
+}
+
+/// Set of offsets kept as disjoint, non-adjacent `[start, end)` ranges.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OffsetRanges {
+    ranges: BTreeMap<u64, u64>,
+}
+
+impl OffsetRanges {
+    pub fn contains(&self, offset: u64) -> bool {
+        self.ranges
+            .range(..=offset)
+            .next_back()
+            .is_some_and(|(_, &end)| offset < end)
+    }
+
+    /// Add `offset`; returns false if it was already present.
+    pub fn insert(&mut self, offset: u64) -> bool {
+        if self.contains(offset) {
+            return false;
+        }
+        self.insert_range(offset, offset.saturating_add(1));
+        true
+    }
+
+    /// Add every offset in `[start, end)`, merging touching ranges.
+    pub fn insert_range(&mut self, mut start: u64, mut end: u64) {
+        if start >= end {
+            return;
+        }
+        if let Some((&previous_start, &previous_end)) = self.ranges.range(..=start).next_back() {
+            if previous_end >= start {
+                start = previous_start;
+                end = end.max(previous_end);
+                self.ranges.remove(&previous_start);
+            }
+        }
+        while let Some((&next_start, &next_end)) = self.ranges.range(start..=end).next() {
+            end = end.max(next_end);
+            self.ranges.remove(&next_start);
+        }
+        self.ranges.insert(start, end);
+    }
+
+    /// Drop every offset below `base`.
+    pub fn remove_below(&mut self, base: u64) {
+        let mut kept = self.ranges.split_off(&base);
+        if let Some((_, &end)) = self.ranges.iter().next_back() {
+            if end > base {
+                kept.insert(base, end);
+            }
+        }
+        self.ranges = kept;
+    }
+
+    /// End of the range containing `offset`, if any.
+    pub fn run_end_from(&self, offset: u64) -> Option<u64> {
+        self.ranges
+            .range(..=offset)
+            .next_back()
+            .filter(|(_, &end)| offset < end)
+            .map(|(_, &end)| end)
+    }
+
+    /// Number of offsets in the set.
+    pub fn len(&self) -> u64 {
+        self.ranges.iter().map(|(start, end)| end - start).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    pub fn ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.ranges.iter().map(|(&start, &end)| (start, end))
+    }
+}
+
+impl Serialize for OffsetRanges {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.ranges())
+    }
+}
+
+impl<'de> Deserialize<'de> for OffsetRanges {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let pairs = Vec::<(u64, u64)>::deserialize(deserializer)?;
+        let mut set = Self::default();
+        for (start, end) in pairs {
+            if start >= end {
+                return Err(serde::de::Error::custom(format!(
+                    "empty purged range [{start}, {end})"
+                )));
+            }
+            set.insert_range(start, end);
+        }
+        Ok(set)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offset_ranges_merge_split_and_prune() {
+        let mut set = OffsetRanges::default();
+        for offset in [5, 3, 4, 10, 6, 11] {
+            assert!(set.insert(offset));
+        }
+        assert!(!set.insert(4));
+        assert_eq!(set.ranges().collect::<Vec<_>>(), vec![(3, 7), (10, 12)]);
+        assert_eq!(set.len(), 6);
+        assert!(set.contains(6) && !set.contains(7) && !set.contains(2));
+        assert_eq!(set.run_end_from(4), Some(7));
+        assert_eq!(set.run_end_from(7), None);
+        set.remove_below(6);
+        assert_eq!(set.ranges().collect::<Vec<_>>(), vec![(6, 7), (10, 12)]);
+        set.insert_range(0, 1_000_000_000);
+        assert_eq!(set.ranges().collect::<Vec<_>>(), vec![(0, 1_000_000_000)]);
+    }
+
+    #[test]
+    fn legacy_purged_offsets_load_as_ranges_and_save_compactly() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            LogMeta::path(dir.path()),
+            br#"{"next_offset":9,"segment_roll_count":0,"purged_offsets":[1,2,3,7]}"#,
+        )
+        .unwrap();
+        let meta = LogMeta::load(dir.path()).unwrap();
+        assert_eq!(
+            meta.purged_offsets.ranges().collect::<Vec<_>>(),
+            vec![(1, 4), (7, 8)]
+        );
+        meta.save(dir.path()).unwrap();
+        let raw = std::fs::read_to_string(LogMeta::path(dir.path())).unwrap();
+        assert!(raw.contains(r#""purged_ranges":[[1,4],[7,8]]"#), "{raw}");
+        assert!(!raw.contains(r#""purged_offsets""#), "{raw}");
+        let reloaded = LogMeta::load(dir.path()).unwrap();
+        assert_eq!(reloaded.purged_offsets, meta.purged_offsets);
     }
 }

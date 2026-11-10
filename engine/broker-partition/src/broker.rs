@@ -1687,14 +1687,22 @@ impl Broker {
         while let Some(position) = next {
             let page = self.list_topic_messages_page(topic, position, 256)?;
             next = page.next;
+            // One durable tombstone write per partition per page, not per record.
+            let mut eligible: std::collections::BTreeMap<u32, Vec<u64>> =
+                std::collections::BTreeMap::new();
             for msg in page.messages {
-                let eligible = match older_than_ms {
+                let keep = match older_than_ms {
                     None => true,
                     Some(cutoff) => msg.published_at_ms > 0 && msg.published_at_ms <= cutoff,
                 };
-                if eligible && self.purge_dlq_message(topic, msg.partition, msg.offset)? {
-                    deleted += 1;
+                if keep {
+                    eligible.entry(msg.partition).or_default().push(msg.offset);
                 }
+            }
+            for (partition, offsets) in eligible {
+                deleted += self
+                    .shard_handle(topic, partition)?
+                    .purge_offsets(offsets)?;
             }
         }
         Ok(deleted)

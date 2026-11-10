@@ -46,8 +46,8 @@ enum ShardCommand {
         reply: Reply<u64>,
     },
     Purge {
-        offset: u64,
-        reply: Reply<bool>,
+        offsets: Vec<u64>,
+        reply: Reply<usize>,
     },
     GcSealed {
         watermark: u64,
@@ -218,7 +218,13 @@ impl ShardHandle {
     }
 
     pub fn purge_offset(&self, offset: u64) -> Result<bool, LogError> {
-        self.call(|reply| ShardCommand::Purge { offset, reply })
+        Ok(self.purge_offsets(vec![offset])? == 1)
+    }
+
+    /// Tombstone records with one durable metadata write; returns how many
+    /// live records were purged.
+    pub fn purge_offsets(&self, offsets: Vec<u64>) -> Result<usize, LogError> {
+        self.call(|reply| ShardCommand::Purge { offsets, reply })
     }
 
     pub fn gc_sealed_below(&self, watermark: u64) -> Result<usize, LogError> {
@@ -399,24 +405,35 @@ fn process_non_commit(
         ShardCommand::HighWatermark { reply } => {
             let _ = reply.send(Ok(backend.high_watermark()));
         }
-        ShardCommand::Purge { offset, reply } => {
-            let existing = backend
-                .read_range(0, offset, 1)
-                .ok()
-                .and_then(|batch| batch.into_iter().find(|message| message.offset == offset));
-            let removed = backend.purge_offset(offset);
-            if removed {
-                if let Some(message) = existing {
-                    if let Some(counts) = dlq_counts.write().as_mut() {
-                        if let Some(count) = counts.get_mut(&(message.tenant_id, message.topic)) {
-                            *count = count.saturating_sub(1);
+        ShardCommand::Purge { offsets, reply } => {
+            let present: Vec<_> = offsets
+                .iter()
+                .filter_map(|&offset| {
+                    backend
+                        .read_range(0, offset, 1)
+                        .ok()
+                        .and_then(|batch| batch.into_iter().find(|m| m.offset == offset))
+                })
+                .collect();
+            let result = backend.purge_offsets(&offsets);
+            if result.as_ref().is_ok_and(|removed| *removed > 0) {
+                let mut counts = dlq_counts.write();
+                if let Some(counts) = counts.as_mut() {
+                    for message in present {
+                        let gone = backend
+                            .read_range(0, message.offset, 1)
+                            .map(|batch| batch.iter().all(|m| m.offset != message.offset))
+                            .unwrap_or(false);
+                        if gone {
+                            if let Some(count) = counts.get_mut(&(message.tenant_id, message.topic))
+                            {
+                                *count = count.saturating_sub(1);
+                            }
                         }
                     }
-                } else {
-                    *dlq_counts.write() = None;
                 }
             }
-            let _ = reply.send(Ok(removed));
+            let _ = reply.send(result);
         }
         ShardCommand::GcSealed { watermark, reply } => {
             let result = backend.gc_sealed_below(watermark);

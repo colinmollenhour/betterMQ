@@ -696,7 +696,7 @@ impl PartitionLog {
             let frame_start = byte_pos;
             match decode_frame(&mut reader) {
                 Ok((_header, _payload)) => {
-                    if !self.meta.purged_offsets.contains(&next_offset) {
+                    if !self.meta.purged_offsets.contains(next_offset) {
                         self.index.insert(
                             next_offset,
                             LogPosition {
@@ -806,7 +806,7 @@ impl PartitionLog {
                     };
                     return Err(self.quarantine(path, next_offset, error));
                 }
-                if !self.meta.purged_offsets.contains(&next_offset) {
+                if !self.meta.purged_offsets.contains(next_offset) {
                     self.index.insert(
                         next_offset,
                         LogPosition {
@@ -1330,6 +1330,12 @@ impl PartitionLog {
         max_messages: usize,
     ) -> Result<Vec<StoredMessage>, LogError> {
         let mut out = Vec::with_capacity(max_messages.min(256));
+        // Skip collected offsets and a purged run (DLQ retention purges in
+        // order) without decoding them.
+        let mut start_offset = start_offset.max(self.meta.base_offset);
+        if let Some(end) = self.meta.purged_offsets.run_end_from(start_offset) {
+            start_offset = end;
+        }
         for segment in self
             .sealed_indexes
             .iter()
@@ -1375,7 +1381,7 @@ impl PartitionLog {
                 let mut offset = point.offset;
                 while offset < segment.last_offset && out.len() < max_messages {
                     let (header, payload) = decode_frame(&mut file)?;
-                    if offset >= start_offset && !self.meta.purged_offsets.contains(&offset) {
+                    if offset >= start_offset && !self.meta.purged_offsets.contains(offset) {
                         out.push(stored_message(header, payload, partition, offset));
                     }
                     offset += 1;
@@ -1396,7 +1402,7 @@ impl PartitionLog {
                         let (header, payload) = decode_frame(&mut frames)?;
                         if offset >= start_offset
                             && offset < segment.last_offset
-                            && !self.meta.purged_offsets.contains(&offset)
+                            && !self.meta.purged_offsets.contains(offset)
                         {
                             out.push(stored_message(header, payload, partition, offset));
                             if out.len() >= max_messages {
@@ -1559,33 +1565,66 @@ impl PartitionLog {
         self.meta.base_offset = self.meta.base_offset.max(base_offset);
         self.meta.base_segment = self.meta.base_segment.max(base_segment);
         // Tombstones below the base refer to records that no longer exist.
-        self.meta.purged_offsets = self.meta.purged_offsets.split_off(&self.meta.base_offset);
+        let base = self.meta.base_offset;
+        self.meta.purged_offsets.remove_below(base);
     }
 
-    /// Tombstone a record: drop from the index and persist the offset in [`LogMeta`].
-    /// WAL/segment bytes are not rewritten; [`Self::rebuild_from_disk`] skips purged offsets.
-    pub fn purge_offset(&mut self, offset: u64) -> bool {
-        if self.meta.purged_offsets.contains(&offset) {
-            return false;
-        }
-        if offset >= self.meta.next_offset {
-            return false;
-        }
-        let removed = self.index.remove(&offset).is_some()
-            || self
-                .sealed_indexes
-                .iter()
-                .any(|segment| offset >= segment.first_offset && offset < segment.last_offset);
-        if removed {
-            self.meta.purged_offsets.insert(offset);
-            self.dirty = true;
-            if self.config.fsync == FsyncMode::Always {
-                if let Err(e) = self.flush_durable() {
-                    tracing::warn!(error = %e, offset, "failed to persist purged offset");
-                }
+    /// Tombstone a record: drop it from reads and persist the offset in
+    /// [`LogMeta`]. Returns whether it was a live record. See
+    /// [`Self::purge_offsets`].
+    pub fn purge_offset(&mut self, offset: u64) -> Result<bool, LogError> {
+        Ok(self.purge_offsets(&[offset])? == 1)
+    }
+
+    /// Tombstone records and make the tombstones durable (one atomic
+    /// meta.json write, fsynced unless the log runs in `os` mode) before
+    /// returning, so a crash cannot bring purged records back. WAL bytes are
+    /// not rewritten; recovery skips tombstoned offsets. Returns how many
+    /// live records were purged.
+    pub fn purge_offsets(&mut self, offsets: &[u64]) -> Result<usize, LogError> {
+        self.ensure_writable()?;
+        let previous = self.meta.purged_offsets.clone();
+        let mut purged = Vec::new();
+        for &offset in offsets {
+            let live = offset >= self.meta.base_offset
+                && offset < self.meta.next_offset
+                && !self.meta.purged_offsets.contains(offset)
+                && (self.index.contains_key(&offset)
+                    || self.sealed_indexes.iter().any(|segment| {
+                        offset >= segment.first_offset && offset < segment.last_offset
+                    }));
+            if live && self.meta.purged_offsets.insert(offset) {
+                purged.push(offset);
             }
         }
-        removed
+        if purged.is_empty() {
+            return Ok(0);
+        }
+        if let Err(error) = self
+            .meta
+            .save_with(&self.dir, self.config.fsync != FsyncMode::Os)
+        {
+            self.meta.purged_offsets = previous;
+            return Err(error.into());
+        }
+        for offset in &purged {
+            self.index.remove(offset);
+        }
+        Ok(purged.len())
+    }
+
+    /// Adopt tombstones carried over from another copy of this log (WAL
+    /// migration). Offsets this log does not hold are ignored.
+    pub(crate) fn import_tombstones(
+        &mut self,
+        purged: &crate::meta::OffsetRanges,
+    ) -> Result<(), LogError> {
+        let offsets: Vec<u64> = purged
+            .ranges()
+            .flat_map(|(start, end)| start..end.min(self.meta.next_offset))
+            .collect();
+        self.purge_offsets(&offsets)?;
+        Ok(())
     }
 
     fn read_at(&self, pos: &LogPosition) -> Result<(LogRecord, Vec<u8>), LogError> {
@@ -1971,7 +2010,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut log = PartitionLog::open(dir.path(), PartitionLogConfig::default()).unwrap();
         log.append(0, sample_record("t"), b"one".to_vec()).unwrap();
-        assert!(log.purge_offset(0));
+        assert!(log.purge_offset(0).unwrap());
         let msgs = log.read_range(0, 0, 10).unwrap();
         assert!(msgs.is_empty());
     }
@@ -1983,7 +2022,7 @@ mod tests {
             let mut log = PartitionLog::open(dir.path(), PartitionLogConfig::default()).unwrap();
             log.append(0, sample_record("t"), b"one".to_vec()).unwrap();
             log.append(0, sample_record("t"), b"two".to_vec()).unwrap();
-            assert!(log.purge_offset(0));
+            assert!(log.purge_offset(0).unwrap());
             log.sync().unwrap();
         }
         let log = PartitionLog::open(dir.path(), PartitionLogConfig::default()).unwrap();
@@ -1991,6 +2030,63 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].offset, 1);
         assert_eq!(msgs[0].payload, b"two");
+    }
+
+    #[test]
+    fn purge_is_durable_without_a_later_flush() {
+        let dir = tempdir().unwrap();
+        let mut log = PartitionLog::open(dir.path(), group_cfg(Duration::from_secs(60))).unwrap();
+        for i in 0..5u8 {
+            log.append(0, sample_record("t"), vec![i]).unwrap();
+        }
+        log.sync().unwrap();
+        assert_eq!(log.purge_offsets(&[0, 1, 3, 3, 99]).unwrap(), 3);
+        assert!(!log.purge_offset(1).unwrap(), "already purged");
+        // Crash: no Drop, no further flush or checkpoint.
+        std::mem::forget(log);
+        let log = PartitionLog::open(dir.path(), group_cfg(Duration::from_secs(60))).unwrap();
+        let offsets: Vec<u64> = log
+            .read_range(0, 0, 10)
+            .unwrap()
+            .iter()
+            .map(|m| m.offset)
+            .collect();
+        assert_eq!(offsets, vec![2, 4]);
+        assert_eq!(
+            log.meta.purged_offsets.ranges().collect::<Vec<_>>(),
+            vec![(0, 2), (3, 4)]
+        );
+    }
+
+    #[test]
+    fn failed_tombstone_write_purges_nothing() {
+        let dir = tempdir().unwrap();
+        let mut log = PartitionLog::open(dir.path(), group_cfg(Duration::from_secs(60))).unwrap();
+        log.append(0, sample_record("t"), b"keep".to_vec()).unwrap();
+        std::fs::create_dir(dir.path().join("meta.json.tmp")).unwrap();
+        assert!(log.purge_offset(0).is_err());
+        assert!(log.meta.purged_offsets.is_empty());
+        assert_eq!(log.read_range(0, 0, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reads_skip_a_purged_prefix_across_segments() {
+        let dir = tempdir().unwrap();
+        let mut log = PartitionLog::open(dir.path(), small_segment_cfg()).unwrap();
+        let mut total = 0;
+        for payload in 0..4 {
+            total += append_until_roll(&mut log, payload);
+        }
+        let purged: Vec<u64> = (0..total - 2).collect();
+        assert_eq!(log.purge_offsets(&purged).unwrap(), purged.len());
+        assert_eq!(log.meta.purged_offsets.ranges().count(), 1);
+        let offsets: Vec<u64> = log
+            .read_range(0, 0, 10)
+            .unwrap()
+            .iter()
+            .map(|m| m.offset)
+            .collect();
+        assert_eq!(offsets, vec![total - 2, total - 1]);
     }
 
     #[test]
@@ -3100,11 +3196,11 @@ mod tests {
         let mut log = open_gc_log(dir.path(), WAL_FORMAT_V2);
         fill_gc_log(&mut log, 2, 1);
         let base = log.sealed_indexes[0].last_offset;
-        assert!(log.purge_offset(0));
-        assert!(log.purge_offset(base));
+        assert!(log.purge_offset(0).unwrap());
+        assert!(log.purge_offset(base).unwrap());
         log.gc_sealed_below(base).unwrap();
-        let purged: Vec<u64> = log.meta.purged_offsets.iter().copied().collect();
-        assert_eq!(purged, vec![base]);
+        let purged: Vec<(u64, u64)> = log.meta.purged_offsets.ranges().collect();
+        assert_eq!(purged, vec![(base, base + 1)]);
         drop(log);
         let log = open_gc_log(dir.path(), WAL_FORMAT_V2);
         assert_eq!(log.read_range(0, 0, 1).unwrap()[0].offset, base + 1);
