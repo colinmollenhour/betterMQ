@@ -36,19 +36,11 @@ const pub = reactive({
 onMounted(async () => {
   await Promise.allSettled([pollHealth(), pollCluster(), refreshQueues(), refreshGroups(), refreshFlows()]);
   try {
-    const [delayed, crons] = await Promise.all([
-      fetchJson("/v1/delayed"),
-      fetchJson("/v1/crons"),
-    ]);
-    kpis.schedules = String(((delayed.delayed as unknown[]) || []).length + ((crons.crons as unknown[]) || []).length);
+    const counts = await fetchJson("/v1/inspection/counts");
+    kpis.schedules = String(Number(counts.delayed || 0) + Number(counts.crons || 0));
+    kpis.dlq = counts.dlq_ready ? String(counts.dlq || 0) : String(counts.dlq_count_reason || "warming");
   } catch {
     kpis.schedules = "—";
-  }
-  try {
-    const sources = (await fetchJson("/v1/dlq/sources")) as { count?: number }[] | { sources?: { count?: number }[] };
-    const list = Array.isArray(sources) ? sources : sources.sources || [];
-    kpis.dlq = String(list.reduce((s, x) => s + (x.count || 0), 0));
-  } catch {
     kpis.dlq = "—";
   }
 });

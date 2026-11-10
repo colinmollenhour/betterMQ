@@ -30,7 +30,7 @@ pub use broker::{
     AppendedRecordRef, AppendedShardBatch, Broker, BrokerConfig, BrokerError,
     CreateSubscriptionRequest, CreateSubscriptionResponse, DestinationSnapshot,
     PreparedPublishBatch, PreparedShardBatch, PreparedShardKey, PublishRequest, PublishResponse,
-    ScheduledInfo, DEFAULT_PARTITIONS, DEFAULT_TENANT,
+    ScheduledInfo, TopicMessagePage, DEFAULT_PARTITIONS, DEFAULT_TENANT,
 };
 pub use flows::{FlowProfile, FlowProfileError, FlowProfileRegistry};
 pub use groups::{DispatchGroup, GroupError, GroupMember, GroupRegistry};

@@ -35,6 +35,8 @@ type Source = {
   kind?: string;
   label?: string;
   count?: number;
+  count_ready?: boolean;
+  count_unavailable_reason?: string;
   queue?: string;
 };
 type Msg = {
@@ -52,6 +54,7 @@ const sources = ref<Source[]>([]);
 const sourceId = ref("");
 const limit = ref(20);
 const rows = ref<Msg[]>([]);
+const nextCursor = ref("");
 const topic = ref("");
 const bodyOpen = ref(false);
 const bodyText = ref("");
@@ -67,7 +70,7 @@ onMounted(() => {
 const options = computed(() =>
   sources.value.map((s) => ({
     value: s.dlq_topic,
-    label: `${s.label || s.dlq_topic} (${s.count || 0})`,
+    label: `${s.label || s.dlq_topic} (${s.count_ready === false ? s.count_unavailable_reason || "warming" : s.count || 0})`,
   })),
 );
 
@@ -95,6 +98,14 @@ function selectedSource() {
 }
 
 async function load() {
+  return loadPage("");
+}
+
+async function nextPage() {
+  return loadPage(nextCursor.value);
+}
+
+async function loadPage(cursor: string) {
   loadStatus.reset();
   const src = selectedSource();
   const dlqTopic = src?.dlq_topic || sourceId.value;
@@ -108,9 +119,11 @@ async function load() {
   if (src?.queue) qs.set("queue", src.queue);
   else qs.set("dlq_topic", dlqTopic);
   qs.set("limit", String(limit.value || 20));
+  if (cursor) qs.set("cursor", cursor);
   try {
-    const data = await apiGet<{ messages?: Msg[]; dlq_topic?: string }>(publicUrl(`/v1/dlq?${qs}`));
+    const data = await apiGet<{ messages?: Msg[]; dlq_topic?: string; next_cursor?: string | null }>(publicUrl(`/v1/dlq?${qs}`));
     rows.value = data.messages || [];
+    nextCursor.value = data.next_cursor || "";
     topic.value = data.dlq_topic || dlqTopic;
   } catch (e) {
     loadStatus.fail(e);
@@ -168,12 +181,22 @@ async function copyBody() {
   }
 }
 
-function view(m: Msg) {
+async function view(m: Msg) {
   bodyTitle.value = `DLQ · ${m.message_id}`;
+  let body: unknown;
   try {
-    bodyText.value = JSON.stringify(typeof m.body === "string" ? JSON.parse(m.body) : m.body, null, 2);
+    const detail = await apiGet<Msg>(publicUrl(`/v1/dlq/message?${new URLSearchParams({
+      dlq_topic: topic.value, partition: String(m.partition), offset: String(m.offset),
+    })}`));
+    body = detail.body;
+  } catch (e) {
+    loadStatus.fail(e);
+    return;
+  }
+  try {
+    bodyText.value = JSON.stringify(typeof body === "string" ? JSON.parse(body) : body, null, 2) ?? "";
   } catch {
-    bodyText.value = String(m.body ?? "");
+    bodyText.value = String(body ?? "");
   }
   bodyOpen.value = true;
 }
@@ -235,7 +258,7 @@ function fmt(ms?: number) {
           <TableBody>
             <TableRow v-if="!rows.length">
               <TableCell colspan="6" class="text-sm text-muted-foreground">
-                {{ sourceId ? "No dead letters for this source." : "Select a source to load messages." }}
+                {{ nextCursor ? "No matches in this scan window. Continue to the next page." : sourceId ? "No dead letters for this source." : "Select a source to load messages." }}
               </TableCell>
             </TableRow>
             <TableRow v-for="m in rows" :key="m.message_id">
@@ -251,6 +274,7 @@ function fmt(ms?: number) {
             </TableRow>
           </TableBody>
         </Table>
+        <Button v-if="nextCursor" class="mt-3" variant="outline" size="sm" @click="nextPage">Next page</Button>
       </CardContent>
     </Card>
     <AlertDialog :open="deleteAllOpen" @update:open="deleteAllOpen = $event">

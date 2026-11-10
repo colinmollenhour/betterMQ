@@ -97,6 +97,17 @@
       }
     },
     "schemas": {
+      "InspectionCounts": {
+        "type": "object", "required": ["delayed", "crons", "dlq", "dlq_ready", "dlq_count_reason", "scope"],
+        "properties": {
+          "delayed": {"type": "integer", "minimum": 0},
+          "crons": {"type": "integer", "minimum": 0},
+          "dlq": {"type": ["integer", "null"], "description": "Exact node-local retained count only when dlq_ready=true; null during recovery and on Slate."},
+          "dlq_ready": {"type": "boolean"},
+          "dlq_count_reason": {"type": ["string", "null"], "description": "Slate reports 'count unavailable on this storage backend'. Local WAL recovery reports its initialization status; partial counts are not presented as exact."},
+          "scope": {"type": "string", "enum": ["node_local"]}
+        }
+      },
       "AdminError": {"type": "object", "required": ["error", "code"], "properties": {"error": {"type": "string"}, "code": {"type": "string"}}},
       "AdminClusterOverview": {
         "type": "object",
@@ -711,8 +722,7 @@
           "schedule_id",
           "queue",
           "key",
-          "deliver_at_ms",
-          "body"
+          "deliver_at_ms"
         ],
         "properties": {
           "schedule_id": {
@@ -742,6 +752,7 @@
           "messages"
         ],
         "properties": {
+          "next_cursor": {"type": ["string", "null"], "description": "Opaque continuation including partition and next offset, bound to this DLQ topic. Continue even if messages is empty; null marks the end."},
           "queue": {
             "type": "string"
           },
@@ -761,7 +772,6 @@
         "required": [
           "message_id",
           "key",
-          "body",
           "published_at_ms",
           "partition",
           "offset"
@@ -807,9 +817,11 @@
           "dlq_topic",
           "kind",
           "label",
-          "count"
+          "count_ready"
         ],
         "properties": {
+          "count_ready": {"type": "boolean"},
+          "count_unavailable_reason": {"type": "string", "description": "Slate: count unavailable on this storage backend. Also explains local recovery in progress. No partial count is returned."},
           "dlq_topic": {
             "type": "string"
           },
@@ -1353,6 +1365,8 @@
       "DelayedListResponse": {
         "type": "object",
         "properties": {
+          "next_cursor": {"type": ["string", "null"], "description": "Opaque exclusive delivery-deadline and schedule-id continuation. Null marks the end."},
+          "total": {"type": "integer", "minimum": 0, "description": "Maintained pending count including in-flight scheduled jobs."},
           "delayed": {
             "type": "array",
             "items": {
@@ -2292,6 +2306,12 @@
     }
   ],
   "paths": {
+    "/v1/inspection/counts": {
+      "get": {"tags": ["Ops"], "summary": "Read maintained node-local schedule and DLQ counts", "description": "No backlog scans. Local WAL DLQ counters recover once at shard startup. During recovery and on Slate, dlq is null and dlq_count_reason explains why; Slate listing remains available. Counts are not a cluster-wide aggregate.", "responses": {"200": {"description": "Counts and recovery/backend availability", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/InspectionCounts"}}}}}}
+    },
+    "/v1/dlq/message": {
+      "get": {"tags": ["DLQ"], "summary": "Read one dead letter with its body on demand", "parameters": [{"name": "dlq_topic", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "partition", "in": "query", "required": true, "schema": {"type": "integer", "minimum": 0}}, {"name": "offset", "in": "query", "required": true, "schema": {"type": "integer", "minimum": 0}}], "responses": {"200": {"description": "Exact message at these coordinates", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DlqMessage"}}}}, "404": {"description": "No matching DLQ record"}, "400": {"description": "Invalid topic or coordinates"}, "503": {"description": "Bounded inspection worker pool is busy"}}}
+    },
     "/admin/v1/health": {
       "get": {"tags": ["Admin"], "summary": "Management listener health", "security": [], "responses": {"200": {"description": "Listener health and mode", "content": {"application/json": {"schema": {"type": "object", "required": ["status", "apiVersion", "mode", "cells"], "properties": {"status": {"type": "string"}, "apiVersion": {"type": "string"}, "mode": {"type": "string", "enum": ["embedded", "standalone"]}, "cells": {"type": "integer"}}}}}}}}
     },
@@ -3556,7 +3576,10 @@
         ],
         "operationId": "listDelayed",
         "summary": "List delayed jobs",
+        "description": "Bounded payload-free metadata ordered by delivery deadline and id. Includes jobs in flight until durable completion. Follow next_cursor until null; counts come from maintained scheduler state.",
+        "parameters": [{"name": "limit", "in": "query", "description": "Clamped to 1..1000", "schema": {"type": "integer", "default": 10, "minimum": 1, "maximum": 1000}}, {"name": "cursor", "in": "query", "description": "Opaque next_cursor from the preceding page", "schema": {"type": "string"}}],
         "responses": {
+          "400": {"description": "Invalid cursor"},
           "200": {
             "description": "OK",
             "content": {
@@ -3607,7 +3630,10 @@
         ],
         "operationId": "listDlq",
         "summary": "List DLQ messages",
+        "description": "Node-local retained records, including legacy hash placement and source-shard-pinned records. Not a cluster-wide snapshot. Each request scans at most 512 records, stops after approximately 8 MiB matching payload bytes (one oversized record may exceed that), and returns no bodies by default. Empty pages may have next_cursor: continue until null. Works on Slate even though exact Slate counts are unavailable.",
         "parameters": [
+          {"name": "cursor", "in": "query", "description": "Opaque partition/offset continuation bound to the selected DLQ topic", "schema": {"type": "string"}},
+          {"name": "include_body", "in": "query", "description": "Opt in to bodies; otherwise fetch an individual body from /v1/dlq/message", "schema": {"type": "boolean", "default": false}},
           {
             "name": "queue",
             "in": "query",
@@ -3629,11 +3655,15 @@
             "in": "query",
             "schema": {
               "type": "integer",
-              "default": 10
+              "default": 10,
+              "minimum": 1,
+              "maximum": 1000
             }
           }
         ],
         "responses": {
+          "400": {"description": "Invalid cursor or DLQ topic"},
+          "503": {"description": "Bounded inspection worker pool is busy"},
           "200": {
             "description": "OK",
             "content": {

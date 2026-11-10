@@ -2,6 +2,7 @@
 
 use broker_proto::{LogRecord, StoredMessage};
 use broker_storage::{FsyncMode, LogError, PartitionBackend};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -111,6 +112,29 @@ impl CommitTicket {
 pub struct ShardHandle {
     sender: mpsc::SyncSender<ShardCommand>,
     committed_hwm: Arc<AtomicU64>,
+    dlq_counts: Arc<parking_lot::RwLock<Option<DlqCounts>>>,
+}
+
+type DlqCounts = HashMap<(String, String), usize>;
+
+fn rebuild_dlq_counts(backend: &PartitionBackend) -> Result<DlqCounts, LogError> {
+    let mut counts = HashMap::new();
+    let mut cursor = 0;
+    while cursor < backend.high_watermark() {
+        let batch = backend.read_range(0, cursor, 16)?;
+        let Some(last) = batch.last() else {
+            break;
+        };
+        cursor = last.offset.saturating_add(1);
+        for message in batch {
+            if crate::is_dlq_topic(&message.topic) {
+                *counts
+                    .entry((message.tenant_id, message.topic))
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+    Ok(counts)
 }
 
 impl ShardHandle {
@@ -126,17 +150,25 @@ impl ShardHandle {
         let handle = Arc::new(Self {
             sender,
             committed_hwm: Arc::new(AtomicU64::new(hwm)),
+            dlq_counts: Arc::new(parking_lot::RwLock::new(None)),
         });
         let actor_hwm = Arc::clone(&handle.committed_hwm);
+        let dlq_counts = Arc::clone(&handle.dlq_counts);
         std::thread::Builder::new()
             .name("bettermq-shard-io".into())
-            .spawn(move || run_actor(backend, receiver, actor_hwm, linger))
+            .spawn(move || run_actor(backend, receiver, actor_hwm, linger, dlq_counts))
             .expect("failed to start shard I/O actor");
         handle
     }
 
     pub fn committed_hwm(&self) -> u64 {
         self.committed_hwm.load(Ordering::Acquire)
+    }
+
+    /// None means the one-time recovery scan has not completed (or failed).
+    /// Reading counts never queues disk work on the shard actor.
+    pub fn dlq_counts(&self) -> Option<HashMap<(String, String), usize>> {
+        self.dlq_counts.read().clone()
     }
 
     pub fn append_batch(
@@ -269,7 +301,12 @@ fn run_actor(
     receiver: mpsc::Receiver<ShardCommand>,
     committed_hwm: Arc<AtomicU64>,
     linger: Duration,
+    dlq_counts: Arc<parking_lot::RwLock<Option<DlqCounts>>>,
 ) {
+    match rebuild_dlq_counts(&backend) {
+        Ok(counts) => *dlq_counts.write() = Some(counts),
+        Err(error) => tracing::error!(%error, "DLQ count recovery failed"),
+    }
     while let Ok(command) = receiver.recv() {
         match command {
             ShardCommand::Commit { offset, reply } => {
@@ -281,14 +318,16 @@ fn run_actor(
                         Ok(ShardCommand::Commit { offset, reply }) => {
                             waiters.push((offset, reply));
                         }
-                        Ok(other) => process_non_commit(other, &mut backend, &committed_hwm),
+                        Ok(other) => {
+                            process_non_commit(other, &mut backend, &committed_hwm, &dlq_counts)
+                        }
                         Err(mpsc::RecvTimeoutError::Timeout) => break,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
                 commit_waiters(&mut backend, &committed_hwm, waiters);
             }
-            other => process_non_commit(other, &mut backend, &committed_hwm),
+            other => process_non_commit(other, &mut backend, &committed_hwm, &dlq_counts),
         }
     }
 }
@@ -297,6 +336,7 @@ fn process_non_commit(
     command: ShardCommand,
     backend: &mut PartitionBackend,
     committed_hwm: &AtomicU64,
+    dlq_counts: &parking_lot::RwLock<Option<DlqCounts>>,
 ) {
     if let Some((shard, records, bytes)) = command.queued_work() {
         crate::telemetry::record_dequeue(shard, records, bytes);
@@ -308,7 +348,21 @@ fn process_non_commit(
             fence_generation,
             reply,
         } => {
+            let previous_hwm = backend.high_watermark();
             let result = backend.append_batch(partition, items, fence_generation);
+            if let Ok(appended) = &result {
+                if let Some(counts) = dlq_counts.write().as_mut() {
+                    for (message, _) in appended {
+                        if message.offset >= previous_hwm && crate::is_dlq_topic(&message.topic) {
+                            *counts
+                                .entry((message.tenant_id.clone(), message.topic.clone()))
+                                .or_insert(0) += 1;
+                        }
+                    }
+                }
+            } else {
+                *dlq_counts.write() = rebuild_dlq_counts(backend).ok();
+            }
             publish_backend_hwm(backend, committed_hwm);
             let _ = reply.send(result);
         }
@@ -318,7 +372,19 @@ fn process_non_commit(
             expected_offset,
             reply,
         } => {
+            let previous_hwm = backend.high_watermark();
             let result = backend.append_raw_frame(partition, &frame, expected_offset);
+            if let Ok(message) = &result {
+                if message.offset >= previous_hwm && crate::is_dlq_topic(&message.topic) {
+                    if let Some(counts) = dlq_counts.write().as_mut() {
+                        *counts
+                            .entry((message.tenant_id.clone(), message.topic.clone()))
+                            .or_insert(0) += 1;
+                    }
+                }
+            } else {
+                *dlq_counts.write() = rebuild_dlq_counts(backend).ok();
+            }
             publish_backend_hwm(backend, committed_hwm);
             let _ = reply.send(result);
         }
@@ -334,10 +400,30 @@ fn process_non_commit(
             let _ = reply.send(Ok(backend.high_watermark()));
         }
         ShardCommand::Purge { offset, reply } => {
-            let _ = reply.send(Ok(backend.purge_offset(offset)));
+            let existing = backend
+                .read_range(0, offset, 1)
+                .ok()
+                .and_then(|batch| batch.into_iter().find(|message| message.offset == offset));
+            let removed = backend.purge_offset(offset);
+            if removed {
+                if let Some(message) = existing {
+                    if let Some(counts) = dlq_counts.write().as_mut() {
+                        if let Some(count) = counts.get_mut(&(message.tenant_id, message.topic)) {
+                            *count = count.saturating_sub(1);
+                        }
+                    }
+                } else {
+                    *dlq_counts.write() = None;
+                }
+            }
+            let _ = reply.send(Ok(removed));
         }
         ShardCommand::GcSealed { watermark, reply } => {
-            let _ = reply.send(backend.gc_sealed_below(watermark));
+            let result = backend.gc_sealed_below(watermark);
+            if result.as_ref().is_ok_and(|deleted| *deleted > 0) {
+                *dlq_counts.write() = rebuild_dlq_counts(backend).ok();
+            }
+            let _ = reply.send(result);
         }
         ShardCommand::Flush { reply } => {
             let result = backend.sync().map(|()| backend.committed_hwm());
@@ -447,6 +533,30 @@ mod tests {
             ..PartitionLogConfig::default()
         };
         ShardHandle::new(PartitionBackend::open_local(dir, config).unwrap())
+    }
+
+    #[test]
+    fn dlq_counters_follow_append_replication_dedup_and_purge() {
+        let leader = handle();
+        let mut header = record(Uuid::new_v4());
+        header.topic = "jobs.__dlq".into();
+        let appended = leader
+            .append_batch(0, vec![(header, b"body".to_vec())], None)
+            .unwrap();
+        let key = ("default".to_string(), "jobs.__dlq".to_string());
+        assert_eq!(leader.dlq_counts().unwrap()[&key], 1);
+        let follower = handle();
+        follower
+            .append_raw_frame(0, &appended[0].1, Some(0))
+            .unwrap();
+        follower
+            .append_raw_frame(0, &appended[0].1, Some(0))
+            .unwrap();
+        assert_eq!(follower.dlq_counts().unwrap()[&key], 1);
+        assert!(follower.purge_offset(0).unwrap());
+        assert_eq!(follower.dlq_counts().unwrap()[&key], 0);
+        assert!(!follower.purge_offset(0).unwrap());
+        assert_eq!(follower.dlq_counts().unwrap()[&key], 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -34,6 +34,8 @@ pub fn bettermq_routes() -> Router<Arc<AppState>> {
         .route("/v1/queues/{queue_id}/enqueue", post(enqueue_to_queue))
         .route("/v1/dlq", get(list_dlq).delete(delete_dlq_message))
         .route("/v1/dlq/sources", get(list_dlq_sources))
+        .route("/v1/dlq/message", get(get_dlq_message))
+        .route("/v1/inspection/counts", get(inspection_counts))
         .route("/v1/flows", get(list_flows).post(create_flow))
         .route("/v1/flows/{flow_id}", delete(delete_flow))
         .route("/v1/queues", get(list_queues).post(create_queue))
@@ -166,6 +168,9 @@ pub struct DlqQuery {
     pub dlq_topic: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub include_body: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy)]
@@ -259,13 +264,15 @@ pub struct DlqListResponse {
     pub queue: String,
     pub dlq_topic: String,
     pub messages: Vec<DlqMessage>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DlqMessage {
     pub message_id: Uuid,
     pub key: String,
-    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
     pub published_at_ms: i64,
     pub partition: u32,
     pub offset: u64,
@@ -296,7 +303,11 @@ pub struct DlqSourceResponse {
     /// `queue` | `direct` | `group_member`
     pub kind: String,
     pub label: String,
-    pub count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
+    pub count_ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count_unavailable_reason: Option<String>,
     /// Set when `kind` is `queue` — pass as `?queue=` to list messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
@@ -329,6 +340,95 @@ pub struct FlowListResponse {
 
 fn default_limit() -> usize {
     10
+}
+
+fn encode_cursor(value: &impl Serialize) -> Result<String, ApiError> {
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(value).map_err(|error| ApiError::BadRequest(error.to_string()))?,
+    ))
+}
+
+fn decode_cursor<T: serde::de::DeserializeOwned>(
+    cursor: Option<&str>,
+) -> Result<Option<T>, ApiError> {
+    use base64::Engine;
+    cursor
+        .map(|cursor| {
+            if cursor.len() > 1024 {
+                return Err(ApiError::BadRequest("invalid listing cursor".into()));
+            }
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(cursor)
+                .map_err(|_| ApiError::BadRequest("invalid listing cursor".into()))?;
+            serde_json::from_slice(&bytes)
+                .map_err(|_| ApiError::BadRequest("invalid listing cursor".into()))
+        })
+        .transpose()
+}
+
+async fn inspection_blocking<T: Send + 'static>(
+    tenant: String,
+    operation: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let permit = SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::Overloaded {
+            retry_after_ms: 1000,
+            message: "inspection workers busy".into(),
+        })?;
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        runtime.block_on(broker_partition::scope_tenant(tenant, async move {
+            operation()
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::Unavailable(format!("inspection task failed: {error}")))?
+}
+
+async fn inspection_counts(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let (counts, ready) = state.broker.dlq_counts();
+    Json(
+        serde_json::json!({ "delayed": state.schedule.count(), "crons": state.crons.count(),
+        "dlq": ready.then(|| counts.values().sum::<usize>()), "dlq_ready": ready,
+        "dlq_count_reason": dlq_count_reason(state.broker.config().storage, ready), "scope": "node_local" }),
+    )
+}
+
+fn dlq_count_reason(storage: broker_storage::StorageMode, ready: bool) -> Option<&'static str> {
+    if ready {
+        None
+    } else if storage == broker_storage::StorageMode::Slate {
+        Some("count unavailable on this storage backend")
+    } else {
+        Some("DLQ count recovery in progress")
+    }
+}
+
+async fn get_dlq_message(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DeleteDlqQuery>,
+) -> Result<Json<DlqMessage>, ApiError> {
+    if !is_dlq_topic(&q.dlq_topic) {
+        return Err(ApiError::BadRequest("invalid DLQ topic".into()));
+    }
+    let (partition, offset) = q
+        .partition
+        .zip(q.offset)
+        .ok_or_else(|| ApiError::BadRequest("partition and offset required".into()))?;
+    let broker = state.broker.clone();
+    inspection_blocking(state.broker.tenant(), move || {
+        let message = broker
+            .get_topic_message(&q.dlq_topic, partition, offset)?
+            .ok_or_else(|| ApiError::NotFound("DLQ message not found".into()))?;
+        Ok(Json(to_dlq_message(message, true)))
+    })
+    .await
 }
 
 fn to_publish_enqueue(req: EnqueueRequest) -> Result<PublishRequest, ApiError> {
@@ -853,7 +953,13 @@ pub(crate) fn spawn_dlq_retention(state: Arc<AppState>) {
                 }
             };
             for topic in topics {
-                match state.broker.purge_dlq_topic(&topic, Some(cutoff)) {
+                let broker = state.broker.clone();
+                let purge_topic = topic.clone();
+                match inspection_blocking(state.broker.tenant(), move || {
+                    Ok(broker.purge_dlq_topic(&purge_topic, Some(cutoff))?)
+                })
+                .await
+                {
                     Ok(0) => {}
                     Ok(deleted) => {
                         tracing::info!(topic, deleted, days, "purged expired DLQ messages")
@@ -1001,6 +1107,37 @@ fn fanout_store_error(error: crate::fanout::FanoutStoreError) -> ApiError {
     ApiError::Broker(BrokerError::Storage(broker_storage::LogError::Io(
         std::io::Error::other(error.to_string()),
     )))
+}
+
+#[cfg(test)]
+mod inspection_tests {
+    use super::*;
+
+    #[test]
+    fn slate_count_unavailability_is_explicit() {
+        assert_eq!(
+            dlq_count_reason(broker_storage::StorageMode::Slate, false),
+            Some("count unavailable on this storage backend")
+        );
+        assert_eq!(
+            dlq_count_reason(broker_storage::StorageMode::Local, true),
+            None
+        );
+        assert!(dlq_count_reason(broker_storage::StorageMode::Local, false).is_some());
+    }
+
+    #[tokio::test]
+    async fn blocking_inspection_preserves_authenticated_tenant_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = broker_partition::Broker::open(broker_partition::BrokerConfig::new(
+            dir.path().to_path_buf(),
+        ))
+        .unwrap();
+        let tenant = inspection_blocking("tenant-a".into(), move || Ok(broker.tenant()))
+            .await
+            .unwrap();
+        assert_eq!(tenant, "tenant-a");
+    }
 }
 
 #[cfg(test)]
@@ -1199,9 +1336,26 @@ fn parse_dlq_payload(body: &str) -> (Option<String>, Option<String>, Option<Stri
     (source_queue, destination_url, reason, display_body)
 }
 
-fn to_dlq_message(msg: StoredMessage) -> DlqMessage {
-    let raw = String::from_utf8_lossy(&msg.payload).into_owned();
-    let (source_queue, destination_url, reason, body) = parse_dlq_payload(&raw);
+fn to_dlq_message(msg: StoredMessage, include_body: bool) -> DlqMessage {
+    #[derive(Deserialize, Default)]
+    struct Metadata {
+        source_queue: Option<String>,
+        destination_url: Option<String>,
+        reason: Option<String>,
+    }
+    let (source_queue, destination_url, reason, body) = if include_body {
+        let raw = String::from_utf8_lossy(&msg.payload);
+        let (source, destination, reason, body) = parse_dlq_payload(&raw);
+        (source, destination, reason, Some(body))
+    } else {
+        let metadata: Metadata = serde_json::from_slice(&msg.payload).unwrap_or_default();
+        (
+            metadata.source_queue,
+            metadata.destination_url,
+            metadata.reason,
+            None,
+        )
+    };
     DlqMessage {
         message_id: msg.id,
         key: msg.routing_key,
@@ -1462,12 +1616,35 @@ async fn list_dlq(
     Query(q): Query<DlqQuery>,
 ) -> Result<Json<DlqListResponse>, ApiError> {
     let topic = resolve_dlq_topic(&q)?;
-    let messages = state
-        .broker
-        .list_topic_messages(&topic, q.limit)?
-        .into_iter()
-        .map(to_dlq_message)
-        .collect();
+    let start = decode_cursor::<(String, u32, u64)>(q.cursor.as_deref())?;
+    if start
+        .as_ref()
+        .is_some_and(|(bound_topic, _, _)| bound_topic != &topic)
+    {
+        return Err(ApiError::BadRequest(
+            "cursor belongs to another DLQ topic".into(),
+        ));
+    }
+    let position = start
+        .map(|(_, partition, offset)| (partition, offset))
+        .unwrap_or((0, 0));
+    let broker = state.broker.clone();
+    let scan_topic = topic.clone();
+    let (messages, next) = inspection_blocking(state.broker.tenant(), move || {
+        let page =
+            broker.list_topic_messages_page(&scan_topic, position, q.limit.clamp(1, 1000))?;
+        Ok((
+            page.messages
+                .into_iter()
+                .map(|message| to_dlq_message(message, q.include_body))
+                .collect(),
+            page.next,
+        ))
+    })
+    .await?;
+    let next_cursor = next
+        .map(|(partition, offset)| encode_cursor(&(topic.clone(), partition, offset)))
+        .transpose()?;
     let queue_label = q
         .queue
         .clone()
@@ -1482,6 +1659,7 @@ async fn list_dlq(
         queue: queue_label,
         dlq_topic: topic,
         messages,
+        next_cursor,
     }))
 }
 
@@ -1496,17 +1674,19 @@ async fn delete_dlq_message(
     }
     match (q.partition, q.offset) {
         (None, None) => {
-            let deleted = state
-                .broker
-                .purge_dlq_topic(&q.dlq_topic, None)
-                .map_err(ApiError::Broker)?;
+            let broker = state.broker.clone();
+            let deleted = inspection_blocking(state.broker.tenant(), move || {
+                Ok(broker.purge_dlq_topic(&q.dlq_topic, None)?)
+            })
+            .await?;
             Ok((StatusCode::OK, Json(DlqDeleteResponse { deleted })).into_response())
         }
         (Some(partition), Some(offset)) => {
-            let removed = state
-                .broker
-                .purge_dlq_message(&q.dlq_topic, partition, offset)
-                .map_err(ApiError::Broker)?;
+            let broker = state.broker.clone();
+            let removed = inspection_blocking(state.broker.tenant(), move || {
+                Ok(broker.purge_dlq_message(&q.dlq_topic, partition, offset)?)
+            })
+            .await?;
             if removed {
                 Ok(StatusCode::NO_CONTENT.into_response())
             } else {
@@ -1523,21 +1703,31 @@ async fn delete_dlq_message(
 async fn list_dlq_sources(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<DlqSourceResponse>>, ApiError> {
-    let topics = collect_dlq_topic_candidates(&state)?;
-    let mut sources = Vec::new();
-    for topic in topics {
-        let count = state.broker.list_topic_messages(&topic, 10_000)?.len();
-        let (kind, label, queue) = dlq_source_label(&state, &topic);
-        sources.push(DlqSourceResponse {
-            dlq_topic: topic,
-            kind,
-            label,
-            count,
-            queue,
-        });
-    }
-    sources.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
-    Ok(Json(sources))
+    inspection_blocking(state.broker.tenant(), move || {
+        let (counts, ready) = state.broker.dlq_counts();
+        let mut topics = collect_dlq_topic_candidates(&state)?;
+        topics.extend(counts.keys().cloned());
+        topics.sort();
+        topics.dedup();
+        let mut sources = Vec::new();
+        for topic in topics {
+            let count = ready.then(|| counts.get(&topic).copied().unwrap_or(0));
+            let (kind, label, queue) = dlq_source_label(&state, &topic);
+            sources.push(DlqSourceResponse {
+                dlq_topic: topic,
+                kind,
+                label,
+                count,
+                count_ready: ready,
+                count_unavailable_reason: dlq_count_reason(state.broker.config().storage, ready)
+                    .map(str::to_string),
+                queue,
+            });
+        }
+        sources.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
+        Ok(Json(sources))
+    })
+    .await
 }
 
 async fn create_queue(
@@ -1641,12 +1831,22 @@ pub struct DelayedJobResponse {
     pub queue: String,
     pub key: String,
     pub deliver_at_ms: i64,
-    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DelayedListResponse {
     pub delayed: Vec<DelayedJobResponse>,
+    pub next_cursor: Option<String>,
+    pub total: usize,
+}
+
+#[derive(Deserialize)]
+struct DelayedQuery {
+    #[serde(default = "default_limit")]
+    limit: usize,
+    cursor: Option<String>,
 }
 
 fn to_delayed_response(item: ScheduledPublish) -> DelayedJobResponse {
@@ -1655,19 +1855,38 @@ fn to_delayed_response(item: ScheduledPublish) -> DelayedJobResponse {
         queue: item.request.topic,
         key: item.request.routing_key,
         deliver_at_ms: item.deliver_at_ms,
-        body: item.request.payload,
+        body: Some(item.request.payload),
     }
 }
 
-async fn list_delayed(State(state): State<Arc<AppState>>) -> Json<DelayedListResponse> {
-    Json(DelayedListResponse {
-        delayed: state
-            .schedule
-            .list()
+async fn list_delayed(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DelayedQuery>,
+) -> Result<Json<DelayedListResponse>, ApiError> {
+    let after = decode_cursor::<(i64, Uuid)>(q.cursor.as_deref())?;
+    let limit = q.limit.clamp(1, 1000);
+    let page = state.schedule.page(after, limit);
+    let next_cursor = if page.len() == limit {
+        page.last()
+            .map(|item| encode_cursor(&(item.deliver_at_ms, item.id)))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(Json(DelayedListResponse {
+        delayed: page
             .into_iter()
-            .map(to_delayed_response)
+            .map(|item| DelayedJobResponse {
+                schedule_id: item.id,
+                queue: item.topic,
+                key: item.routing_key,
+                deliver_at_ms: item.deliver_at_ms,
+                body: None,
+            })
             .collect(),
-    })
+        next_cursor,
+        total: state.schedule.count(),
+    }))
 }
 
 async fn cancel_delayed(

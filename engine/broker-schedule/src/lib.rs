@@ -10,7 +10,7 @@ use persist::{load_json_with_recovery, persist_json_atomic, JsonLoadSource, Meta
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -91,6 +91,26 @@ pub struct ScheduledPublish {
     pub request: ScheduledPublishRequest,
 }
 
+/// Payload-free inspection metadata, ordered by the stable delivery key.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduledSummary {
+    pub id: Uuid,
+    pub deliver_at_ms: i64,
+    pub topic: String,
+    pub routing_key: String,
+}
+
+impl HeapItem {
+    fn summary(&self) -> ScheduledSummary {
+        ScheduledSummary {
+            id: self.id,
+            deliver_at_ms: self.deliver_at_ms,
+            topic: self.request.topic.clone(),
+            routing_key: self.request.routing_key.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HeapItem {
     deliver_at_ms: i64,
@@ -132,6 +152,7 @@ pub struct ScheduleQueue {
 struct ScheduleState {
     heap: BinaryHeap<HeapItem>,
     in_flight: HashMap<Uuid, HeapItem>,
+    listing: BTreeMap<(i64, Uuid), ScheduledSummary>,
     sequence: u64,
     journal_ops: usize,
 }
@@ -248,12 +269,17 @@ impl ScheduleQueue {
             }
         }
 
+        let listing = heap
+            .iter()
+            .map(|item| ((item.deliver_at_ms, item.id), item.summary()))
+            .collect();
         Ok(Self {
             path,
             journal_path,
             state: Arc::new(Mutex::new(ScheduleState {
                 heap,
                 in_flight: HashMap::new(),
+                listing,
                 sequence,
                 journal_ops,
             })),
@@ -274,6 +300,9 @@ impl ScheduleQueue {
         };
         let mut state = self.state.lock();
         self.append_op(&mut state, JournalOp::Add { item: item.clone() })?;
+        state
+            .listing
+            .insert((item.deliver_at_ms, item.id), item.summary());
         state.heap.push(item);
         state.journal_ops += 1;
         self.maybe_compact(&mut state);
@@ -298,6 +327,24 @@ impl ScheduleQueue {
             .collect()
     }
 
+    pub fn count(&self) -> usize {
+        self.state.lock().listing.len()
+    }
+
+    /// At most 1000 metadata rows, exclusively after the supplied stable key.
+    /// Includes due jobs in flight until their durable completion.
+    pub fn page(&self, after: Option<(i64, Uuid)>, limit: usize) -> Vec<ScheduledSummary> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let state = self.state.lock();
+        let lower = after.map_or(Unbounded, Excluded);
+        state
+            .listing
+            .range((lower, Unbounded))
+            .take(limit.min(1000))
+            .map(|(_, item)| item.clone())
+            .collect()
+    }
+
     pub fn cancel(&self, id: Uuid) -> Result<ScheduledPublish, ScheduleError> {
         let mut state = self.state.lock();
         let drained: Vec<HeapItem> = state.heap.drain().collect();
@@ -314,6 +361,7 @@ impl ScheduleQueue {
             state.heap.push(removed);
             return Err(error);
         }
+        state.listing.remove(&(removed.deliver_at_ms, removed.id));
         state.journal_ops += 1;
         self.maybe_compact(&mut state);
         Ok(ScheduledPublish {
@@ -348,7 +396,9 @@ impl ScheduleQueue {
     pub fn complete(&self, id: Uuid) -> Result<(), ScheduleError> {
         let mut state = self.state.lock();
         self.append_op(&mut state, JournalOp::Remove { id })?;
-        state.in_flight.remove(&id);
+        if let Some(item) = state.in_flight.remove(&id) {
+            state.listing.remove(&(item.deliver_at_ms, item.id));
+        }
         state.journal_ops += 1;
         self.maybe_compact(&mut state);
         Ok(())
@@ -358,7 +408,18 @@ impl ScheduleQueue {
     /// in the journal until a successful completion appends Remove.
     pub fn requeue(&self, job: ScheduledPublish) -> Result<(), ScheduleError> {
         let mut state = self.state.lock();
-        state.in_flight.remove(&job.id);
+        if let Some(previous) = state.in_flight.remove(&job.id) {
+            state.listing.remove(&(previous.deliver_at_ms, previous.id));
+        }
+        state.listing.insert(
+            (job.deliver_at_ms, job.id),
+            ScheduledSummary {
+                id: job.id,
+                deliver_at_ms: job.deliver_at_ms,
+                topic: job.request.topic.clone(),
+                routing_key: job.request.routing_key.clone(),
+            },
+        );
         state.heap.push(HeapItem {
             deliver_at_ms: job.deliver_at_ms,
             id: job.id,
@@ -455,6 +516,48 @@ mod schedule_tests {
             sign: None,
             request: None,
         }
+    }
+
+    #[test]
+    fn metadata_pages_and_counts_follow_cancel_requeue_complete_and_reopen() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        for _ in 0..5 {
+            queue.schedule(request(), 0).unwrap();
+        }
+        assert_eq!(queue.count(), 5);
+        let first = queue.page(None, 2);
+        assert_eq!(first.len(), 2);
+        let last = first.last().unwrap();
+        let second = queue.page(Some((last.deliver_at_ms, last.id)), 2);
+        assert_eq!(second.len(), 2);
+        assert!(second
+            .iter()
+            .all(|item| !first.iter().any(|previous| item.id == previous.id)));
+        assert!(serde_json::to_value(&first).unwrap()[0]
+            .get("payload")
+            .is_none());
+        queue.cancel(first[0].id).unwrap();
+        assert_eq!(queue.count(), 4);
+        let mut due = queue.pop_due(i64::MAX);
+        assert_eq!(queue.count(), 4, "in-flight jobs remain visible");
+        queue.requeue(due.pop().unwrap()).unwrap();
+        queue.complete(due.pop().unwrap().id).unwrap();
+        assert_eq!(queue.count(), 3);
+        drop(queue);
+        let reopened = ScheduleQueue::open(dir.path()).unwrap();
+        assert_eq!(reopened.count(), 3);
+        assert_eq!(reopened.page(None, usize::MAX).len(), 3);
+    }
+
+    #[test]
+    fn failed_schedule_does_not_increment_count() {
+        let dir = tempdir().unwrap();
+        let queue = ScheduleQueue::open(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("schedule.journal")).unwrap();
+        assert!(queue.schedule(request(), 0).is_err());
+        assert_eq!(queue.count(), 0);
+        assert!(queue.page(None, 10).is_empty());
     }
 
     #[test]

@@ -64,6 +64,7 @@ const flowOptions = computed(() => [
 const selectedFlow = computed(() => catalog.flows.find((f) => flowId(f) === form.flowId) || null);
 
 const delayed = ref<Delayed[]>([]);
+const delayedNext = ref("");
 const crons = ref<Cron[]>([]);
 const loadStatus = useActionStatus();
 const createStatus = useActionStatus();
@@ -77,12 +78,26 @@ async function load() {
   loadStatus.reset();
   try {
     const [d, c] = await Promise.all([
-      apiGet<{ delayed?: Delayed[] }>(publicUrl("/v1/delayed")),
+      apiGet<{ delayed?: Delayed[]; next_cursor?: string | null }>(publicUrl("/v1/delayed?limit=50")),
       apiGet<{ crons?: Cron[] }>(publicUrl("/v1/crons")),
       refreshFlows(),
     ]);
     delayed.value = d.delayed || [];
+    delayedNext.value = d.next_cursor || "";
     crons.value = c.crons || [];
+  } catch (e) {
+    loadStatus.fail(e);
+  }
+}
+
+async function nextDelayedPage() {
+  loadStatus.reset();
+  try {
+    const data = await apiGet<{ delayed?: Delayed[]; next_cursor?: string | null }>(
+      publicUrl(`/v1/delayed?${new URLSearchParams({ limit: "50", cursor: delayedNext.value })}`),
+    );
+    delayed.value = data.delayed || [];
+    delayedNext.value = data.next_cursor || "";
   } catch (e) {
     loadStatus.fail(e);
   }
@@ -240,6 +255,7 @@ function fmt(ms?: number) {
             </TableRow>
           </TableBody>
         </Table>
+        <Button v-if="delayedNext" class="mt-3" variant="outline" size="sm" @click="nextDelayedPage">Next delayed page</Button>
       </CardContent>
     </Card>
   </div>

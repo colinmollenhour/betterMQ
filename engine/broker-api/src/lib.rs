@@ -567,6 +567,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inspection_lists_page_metadata_and_read_maintained_counts() {
+        async fn get(app: &Router, path: &str) -> (StatusCode, serde_json::Value) {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            (status, value)
+        }
+        let dir = tempdir().unwrap();
+        let state = Arc::new(test_state(&dir));
+        for key in ["a", "b", "c"] {
+            let dead: broker_partition::PublishRequest =
+                serde_json::from_value(serde_json::json!({
+                    "topic": "jobs.__dlq", "routing_key": key,
+                    "payload": { "body": "hidden payload", "reason": "retries exhausted" }
+                }))
+                .unwrap();
+            state.broker.publish(dead).unwrap();
+            let delayed = serde_json::from_value(serde_json::json!({ "payload": "delayed payload", "url": "https://example.com/hook", "secret": "s", "delay_ms": 60000 })).unwrap();
+            ingest::submit_one(&state, delayed, None).await.unwrap();
+        }
+        let app = bettermq::bettermq_routes().with_state(state);
+        let (_, counts) = get(&app, "/v1/inspection/counts").await;
+        let spec: serde_json::Value = serde_json::from_str(include_str!(
+            "../../broker-server/openapi/bettermq.openapi.json"
+        ))
+        .unwrap();
+        assert_contract_fields(
+            &spec,
+            &spec["components"]["schemas"]["InspectionCounts"],
+            &counts,
+        );
+        assert_eq!(counts["delayed"], 3);
+        assert_eq!(counts["dlq"], 3);
+        assert_eq!(counts["dlq_ready"], true);
+        let (_, delayed) = get(&app, "/v1/delayed?limit=2").await;
+        assert_contract_fields(
+            &spec,
+            &spec["components"]["schemas"]["DelayedListResponse"],
+            &delayed,
+        );
+        assert_eq!(delayed["delayed"].as_array().unwrap().len(), 2);
+        assert!(delayed["delayed"][0].get("body").is_none());
+        let (_, delayed_next) = get(
+            &app,
+            &format!(
+                "/v1/delayed?limit=2&cursor={}",
+                delayed["next_cursor"].as_str().unwrap()
+            ),
+        )
+        .await;
+        assert_eq!(delayed_next["delayed"].as_array().unwrap().len(), 1);
+        assert!(delayed_next["next_cursor"].is_null());
+        assert_eq!(
+            get(&app, "/v1/delayed?cursor=!").await.0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut path = "/v1/dlq?dlq_topic=jobs.__dlq&limit=1".to_string();
+        let mut ids = std::collections::HashSet::new();
+        let mut detail_position = None;
+        loop {
+            let (status, page) = get(&app, &path).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_contract_fields(
+                &spec,
+                &spec["components"]["schemas"]["DlqListResponse"],
+                &page,
+            );
+            let rows = page["messages"].as_array().unwrap();
+            assert!(rows.len() <= 1);
+            for row in rows {
+                assert!(row.get("body").is_none());
+                assert_eq!(row["reason"], "retries exhausted");
+                assert!(ids.insert(row["message_id"].as_str().unwrap().to_string()));
+                detail_position = Some((
+                    row["partition"].as_u64().unwrap(),
+                    row["offset"].as_u64().unwrap(),
+                ));
+            }
+            let Some(cursor) = page["next_cursor"].as_str() else {
+                break;
+            };
+            assert_eq!(
+                get(
+                    &app,
+                    &format!("/v1/dlq?dlq_topic=other.__dlq&cursor={cursor}")
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+            path = format!("/v1/dlq?dlq_topic=jobs.__dlq&limit=1&cursor={cursor}");
+        }
+        assert_eq!(ids.len(), 3);
+        let (partition, offset) = detail_position.unwrap();
+        let (_, detail) = get(
+            &app,
+            &format!("/v1/dlq/message?dlq_topic=jobs.__dlq&partition={partition}&offset={offset}"),
+        )
+        .await;
+        assert_eq!(detail["body"], "hidden payload");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::delete("/v1/dlq?dlq_topic=jobs.__dlq")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(get(&app, "/v1/inspection/counts").await.1["dlq"], 0);
+    }
+
+    #[tokio::test]
     async fn storage_api_rejects_slate_on_v2_without_saving() {
         let dir = tempdir().unwrap();
         let layout = broker_partition::ShardLayout {

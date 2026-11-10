@@ -287,6 +287,10 @@ impl CronRegistry {
         self.inner.lock().file.jobs.clone()
     }
 
+    pub fn count(&self) -> usize {
+        self.inner.lock().file.jobs.len()
+    }
+
     pub fn pause(&self, id: Uuid) -> Result<CronJob, CronError> {
         self.set_paused(id, true)
     }

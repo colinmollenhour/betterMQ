@@ -342,6 +342,11 @@ pub struct AppendedRecordRef<'a> {
     pub replication_frame: &'a [u8],
 }
 
+pub struct TopicMessagePage {
+    pub messages: Vec<StoredMessage>,
+    pub next: Option<(u32, u64)>,
+}
+
 impl AppendedShardBatch {
     pub fn len(&self) -> usize {
         self.appended.len()
@@ -518,7 +523,7 @@ impl Broker {
         let groups = GroupRegistry::open(&config.data_dir)?;
         let blob_store = crate::blob::open_blob_store(&config.data_dir, config.storage)?;
 
-        Ok(Self {
+        let broker = Self {
             inner: Arc::new(BrokerInner {
                 config,
                 metadata,
@@ -533,7 +538,69 @@ impl Broker {
                 #[cfg(feature = "slate")]
                 slate,
             }),
-        })
+        };
+        broker.initialize_dlq_counts()?;
+        Ok(broker)
+    }
+
+    /// Recover ephemeral counters once at shard open, never on a count request.
+    fn initialize_dlq_counts(&self) -> Result<(), BrokerError> {
+        if self.inner.config.storage != StorageMode::Local {
+            return Ok(());
+        }
+        if self.layout().is_physical() {
+            for partition in 0..self.shard_count() {
+                if self
+                    .layout()
+                    .physical_shard_dir(&self.inner.config.data_dir, partition)
+                    .exists()
+                {
+                    self.shard_handle("__physical", partition)?;
+                }
+            }
+        } else {
+            for topic in self.list_dlq_topics_on_disk()? {
+                for partition in 0..self.shard_count() {
+                    if partition_dir(
+                        &self.inner.config.data_dir,
+                        &self.tenant(),
+                        &topic,
+                        partition,
+                    )?
+                    .exists()
+                    {
+                        self.shard_handle(&topic, partition)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Node-local retained DLQ counts, plus recovery completeness. No WAL reads.
+    pub fn dlq_counts(&self) -> (HashMap<String, usize>, bool) {
+        let tenant = self.tenant();
+        let mut counts = HashMap::new();
+        let mut ready = self.inner.config.storage == StorageMode::Local;
+        for handle in self
+            .inner
+            .shards
+            .read()
+            .values()
+            .flat_map(|partitions| partitions.values())
+        {
+            match handle.dlq_counts() {
+                Some(shard_counts) => {
+                    for ((record_tenant, topic), count) in shard_counts {
+                        if record_tenant == tenant {
+                            *counts.entry(topic).or_insert(0) += count;
+                        }
+                    }
+                }
+                None => ready = false,
+            }
+        }
+        (counts, ready)
     }
 
     /// Slate + cluster: only the elected shard leader may append; generation is the fence token.
@@ -1417,6 +1484,88 @@ impl Broker {
         Ok(self.inner.config.partitions)
     }
 
+    /// Scan at most 512 records across partitions. An empty page can still have
+    /// a continuation when a shared shard contains only other logical topics.
+    pub fn list_topic_messages_page(
+        &self,
+        topic: &str,
+        start: (u32, u64),
+        limit: usize,
+    ) -> Result<TopicMessagePage, BrokerError> {
+        let (mut partition, mut offset) = start;
+        if partition >= self.shard_count() {
+            return Err(BrokerError::InvalidConfig(
+                "invalid listing partition".into(),
+            ));
+        }
+        let limit = limit.clamp(1, 1000);
+        let mut scanned = 0;
+        let mut messages = Vec::new();
+        let mut payload_bytes = 0usize;
+        while partition < self.shard_count() && scanned < 512 && messages.len() < limit {
+            if self.inner.config.storage == StorageMode::Local {
+                let path = if self.layout().is_physical() {
+                    self.layout()
+                        .physical_shard_dir(&self.inner.config.data_dir, partition)
+                } else {
+                    partition_dir(
+                        &self.inner.config.data_dir,
+                        &self.tenant(),
+                        topic,
+                        partition,
+                    )?
+                };
+                if !path.exists() {
+                    partition += 1;
+                    offset = 0;
+                    continue;
+                }
+            }
+            let handle = self.shard_handle(topic, partition)?;
+            let batch = handle.read_range(partition, offset, 4.min(512 - scanned))?;
+            if batch.is_empty() {
+                partition += 1;
+                offset = 0;
+                continue;
+            }
+            for message in batch {
+                offset = message.offset.saturating_add(1);
+                scanned += 1;
+                if message.topic == topic {
+                    payload_bytes = payload_bytes.saturating_add(message.payload.len());
+                    messages.push(message);
+                }
+                if messages.len() >= limit || payload_bytes >= 8 * 1024 * 1024 {
+                    break;
+                }
+            }
+            if offset >= handle.high_watermark()? {
+                partition += 1;
+                offset = 0;
+            }
+            if payload_bytes >= 8 * 1024 * 1024 {
+                break;
+            }
+        }
+        Ok(TopicMessagePage {
+            messages,
+            next: (partition < self.shard_count()).then_some((partition, offset)),
+        })
+    }
+
+    pub fn get_topic_message(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<Option<StoredMessage>, BrokerError> {
+        Ok(self
+            .shard_handle(topic, partition)?
+            .read_range(partition, offset, 1)?
+            .into_iter()
+            .find(|message| message.offset == offset && message.topic == topic))
+    }
+
     /// Page messages for one partition starting at `from_offset` (inclusive).
     pub fn list_topic_messages_from(
         &self,
@@ -1534,23 +1683,17 @@ impl Broker {
             return Ok(0);
         }
         let mut deleted = 0usize;
-        let partitions = self.partition_count(topic)?;
-        for partition in 0..partitions {
-            let mut from = 0u64;
-            loop {
-                let batch = self.list_topic_messages_from(topic, partition, from, 256)?;
-                let Some(last) = batch.last().map(|message| message.offset) else {
-                    break;
+        let mut next = Some((0, 0));
+        while let Some(position) = next {
+            let page = self.list_topic_messages_page(topic, position, 256)?;
+            next = page.next;
+            for msg in page.messages {
+                let eligible = match older_than_ms {
+                    None => true,
+                    Some(cutoff) => msg.published_at_ms > 0 && msg.published_at_ms <= cutoff,
                 };
-                from = last.saturating_add(1);
-                for msg in batch {
-                    let eligible = match older_than_ms {
-                        None => true,
-                        Some(cutoff) => msg.published_at_ms > 0 && msg.published_at_ms <= cutoff,
-                    };
-                    if eligible && self.purge_dlq_message(topic, msg.partition, msg.offset)? {
-                        deleted += 1;
-                    }
+                if eligible && self.purge_dlq_message(topic, msg.partition, msg.offset)? {
+                    deleted += 1;
                 }
             }
         }
@@ -2247,6 +2390,49 @@ mod tests {
         )
         .unwrap();
         Broker::open(BrokerConfig::new(path.to_path_buf())).unwrap()
+    }
+
+    #[test]
+    fn dlq_pages_bound_shared_shard_scans_and_counts_survive_reopen() {
+        let dir = tempdir().unwrap();
+        let broker = open_v2_broker(dir.path(), 1);
+        execute_prepared(
+            &broker,
+            (0..600).map(|_| direct_request("normal", None)).collect(),
+        );
+        let topic = "jobs.__dlq";
+        broker.publish(queue_request(topic, "dead letter")).unwrap();
+        let first = broker
+            .list_topic_messages_page(topic, (0, 0), usize::MAX)
+            .unwrap();
+        assert!(first.messages.is_empty());
+        assert_eq!(first.next, Some((0, 512)));
+        let second = broker
+            .list_topic_messages_page(topic, first.next.unwrap(), 100)
+            .unwrap();
+        assert_eq!(second.messages.len(), 1);
+        assert_eq!(second.next, None);
+        assert_eq!(
+            broker.dlq_counts(),
+            (HashMap::from([(topic.to_string(), 1)]), true)
+        );
+        broker.flush_wal().unwrap();
+        drop(broker);
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let message = broker
+            .list_topic_messages_page(topic, (0, 600), 1)
+            .unwrap()
+            .messages
+            .pop()
+            .unwrap();
+        assert_eq!(
+            broker.dlq_counts(),
+            (HashMap::from([(topic.to_string(), 1)]), true)
+        );
+        assert_eq!(message.offset, 600);
+        assert_eq!(broker.purge_dlq_topic(topic, None).unwrap(), 1);
+        assert_eq!(broker.dlq_counts().0[topic], 0);
+        assert!(broker.list_topic_messages_page(topic, (1, 0), 1).is_err());
     }
 
     fn execute_prepared(broker: &Broker, requests: Vec<PublishRequest>) -> Vec<PublishResponse> {

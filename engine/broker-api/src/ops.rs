@@ -353,7 +353,7 @@ pub async fn block_host(
 pub async fn aggregate_ops_status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let local_leases = state.leases.active_count();
     let blocked = state.dispatch.host_blocker().blocked_hosts().len();
-    let delayed = state.schedule.list().len();
+    let delayed = state.schedule.count();
     let mut peers = Vec::new();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
