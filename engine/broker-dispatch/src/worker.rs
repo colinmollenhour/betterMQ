@@ -8,7 +8,7 @@ use crate::memory_guard::{MemoryGuard, MemoryGuardConfig};
 use crate::outbound::{apply_to_reqwest, build_outbound};
 use crate::retry_state::{RetryKey, RetryRecord, RetryState};
 use broker_partition::{dlq_topic, group_member_dlq_topic};
-use broker_partition::{Broker, PublishRequest, DIRECT_TOPIC};
+use broker_partition::{Broker, PublishRequest, PublishResponse, DIRECT_TOPIC};
 use broker_proto::RetryDefaults;
 use broker_storage::StoredMessage;
 use std::cmp::Ordering as CmpOrdering;
@@ -167,6 +167,35 @@ pub enum DispatchError {
     Failed(String),
 }
 
+/// Makes a freshly appended DLQ record durable before the source message
+/// completes: local fsync on a single node, replication quorum in a cell
+/// (implemented in broker-api, which owns replication). An error leaves the
+/// DLQ transition `Prepared` and the source cursor where it was.
+pub trait DlqDurability: Send + Sync {
+    fn make_durable<'a>(
+        &'a self,
+        response: &'a mut PublishResponse,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), DispatchError>>;
+}
+
+struct LocalDlqDurability(Broker);
+
+impl DlqDurability for LocalDlqDurability {
+    fn make_durable<'a>(
+        &'a self,
+        response: &'a mut PublishResponse,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), DispatchError>> {
+        Box::pin(async move {
+            if let (Some(partition), Some(offset)) = (response.partition, response.offset) {
+                self.0
+                    .wait_committed(&response.topic, partition, offset)
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+}
+
 /// Outcome of [`DispatchEngine::fail_leased_delivery`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeasedFailure {
@@ -287,6 +316,7 @@ pub struct DispatchEngine {
     /// each `(topic, target)` log is quorum-verified up to `target` (`None`
     /// while the local log is still being caught up).
     recovering: Arc<parking_lot::Mutex<HashMap<u32, Option<RecoveryTargets>>>>,
+    dlq_durability: Arc<std::sync::OnceLock<Arc<dyn DlqDurability>>>,
 }
 
 impl DispatchEngine {
@@ -365,10 +395,12 @@ impl DispatchEngine {
                     .collect(),
             ),
             recovering: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            dlq_durability: Arc::new(std::sync::OnceLock::new()),
         };
         if let Some(handle) = engine.memory_guard.spawn_monitor() {
             engine.background.lock().push(handle);
         }
+        engine.finish_committed_dlq_transitions();
         if workers_enabled {
             engine.spawn_workers(high_rx);
             engine.spawn_defer_scheduler(defer_rx);
@@ -1042,6 +1074,50 @@ impl DispatchEngine {
         }
     }
 
+    /// Finish DLQ moves that crashed after the DLQ record became durable:
+    /// drop the retry record (it would pin the lane behind a retry fence) and
+    /// complete the source. Runs at startup in every mode, before replay and
+    /// backfill, so a dead-lettered message is not delivered again.
+    fn finish_committed_dlq_transitions(&self) {
+        for transition in self.lifecycle.pending() {
+            if transition.phase != DlqPhase::DlqCommitted {
+                continue;
+            }
+            let source = &transition.source;
+            let finished = (|| -> Result<(), DispatchError> {
+                self.clear_retry_key(source)?;
+                if let Ok(msg) =
+                    self.broker
+                        .read_message(&source.topic, source.partition, source.offset)
+                {
+                    if msg.id == source.message_id {
+                        let tenant = crate::scan::dispatch_tenant(&self.broker, &msg);
+                        self.advance_cursor_locked(
+                            &tenant,
+                            &source.topic,
+                            &transition.cursor_key,
+                            source.partition,
+                            source.offset,
+                            source.message_id,
+                        )?;
+                    }
+                }
+                self.lifecycle
+                    .clear(source)
+                    .map_err(|error| DispatchError::Failed(error.to_string()))
+            })();
+            if let Err(error) = finished {
+                warn!(%error, offset = source.offset, "finishing committed DLQ move failed");
+            }
+        }
+    }
+
+    fn clear_retry_key(&self, key: &RetryKey) -> Result<(), DispatchError> {
+        self.retry_state
+            .clear(key)
+            .map_err(|error| DispatchError::Failed(error.to_string()))
+    }
+
     fn replay_lifecycle_state(&self) {
         for transition in self.lifecycle.pending() {
             let source = &transition.source;
@@ -1626,6 +1702,20 @@ impl DispatchEngine {
         // read-compute-write so a slower task cannot write a cursor computed
         // from an older read over a newer one.
         let _lane = self.cursor_lock(tenant_id, cursor_key, partition).await;
+        self.advance_cursor_locked(tenant_id, topic, cursor_key, partition, offset, message_id)
+    }
+
+    /// Body of [`Self::commit_dispatch_offset`]; the caller holds the lane lock
+    /// (or, at startup, nothing else can touch the lane yet).
+    fn advance_cursor_locked(
+        &self,
+        tenant_id: &str,
+        topic: &str,
+        cursor_key: &str,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
+    ) -> Result<(), DispatchError> {
         let cursor = self
             .broker
             .dispatch_offset(tenant_id, cursor_key, partition)?;
@@ -1727,6 +1817,9 @@ impl DispatchEngine {
         } else {
             msg.tenant_id.clone()
         };
+        // DLQ record durable → clear the retry → advance the cursor. A crash
+        // in between is finished at startup from the committed transition.
+        self.clear_retry(msg)?;
         self.commit_dispatch_offset(
             &tenant,
             &msg.topic,
@@ -1736,7 +1829,6 @@ impl DispatchEngine {
             msg.id,
         )
         .await?;
-        self.clear_retry(msg)?;
         self.lifecycle
             .clear(&source)
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
@@ -1761,16 +1853,17 @@ impl DispatchEngine {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.encode(dlq_record(&msg, &reason))
         };
-        let dlq_response = self.broker.publish_immediate(PublishRequest {
+        let key = format!(
+            "dlq:{}:{}:{}:{}",
+            msg.topic, msg.partition, msg.offset, msg.id
+        );
+        let request = PublishRequest {
             routing_id: None,
             topic: dlq,
             routing_key: msg.id.to_string(),
             payload: record,
             payload_encoding: Some("base64".into()),
-            idempotency_key: Some(format!(
-                "dlq:{}:{}:{}:{}",
-                msg.topic, msg.partition, msg.offset, msg.id
-            )),
+            idempotency_key: Some(key.clone()),
             delay_ms: None,
             priority: None,
             parallelism: None,
@@ -1788,12 +1881,29 @@ impl DispatchEngine {
             headers: None,
             sign: None,
             request: None,
-        })?;
-        if let (Some(partition), Some(offset)) = (dlq_response.partition, dlq_response.offset) {
-            self.broker
-                .wait_committed(&dlq_response.topic, partition, offset)
-                .await?;
+        };
+        // Pinned to the source shard, which this node leads while it
+        // dead-letters, so the move depends only on that shard's quorum.
+        let (mut response, mut pending) = self
+            .broker
+            .publish_to_shard(request.clone(), msg.partition)?;
+        if response.duplicate {
+            if self.dlq_record_durable(&response)? {
+                warn!(queue = %msg.topic, message_id = %msg.id, "message already in DLQ");
+                return Ok(());
+            }
+            // Dedup hits are verified below the quorum watermark, so this is a
+            // safety net: append again without the key (a duplicate DLQ record
+            // beats a lost one); the key keeps pointing at the old record.
+            let mut again = request;
+            again.idempotency_key = None;
+            (response, pending) = self.broker.publish_to_shard(again, msg.partition)?;
         }
+        let durability = self.dlq_durability();
+        durability.make_durable(&mut response).await?;
+        // Record the key only once the DLQ record is quorum-durable; dropping
+        // `pending` on an error above releases it unrecorded.
+        self.broker.commit_publish_dedup(pending)?;
         debug!(
             queue = %msg.topic,
             message_id = %msg.id,
@@ -1812,6 +1922,36 @@ impl DispatchEngine {
 
     pub(crate) fn record_flow_error(&self) {
         self.telemetry.record_flow_error();
+    }
+
+    /// A deduplicated DLQ record counts only when it is quorum-durable and is
+    /// the record the dedup entry names.
+    fn dlq_record_durable(&self, response: &PublishResponse) -> Result<bool, DispatchError> {
+        let (Some(partition), Some(offset), Some(message_id)) =
+            (response.partition, response.offset, response.message_id)
+        else {
+            return Ok(false);
+        };
+        if offset >= self.broker.quorum_hwm(&response.topic, partition)? {
+            return Ok(false);
+        }
+        Ok(self
+            .broker
+            .read_message(&response.topic, partition, offset)
+            .is_ok_and(|record| record.id == message_id && record.topic == response.topic))
+    }
+
+    fn dlq_durability(&self) -> Arc<dyn DlqDurability> {
+        self.dlq_durability
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(LocalDlqDurability(self.broker.clone())))
+    }
+
+    /// Install the cluster-aware DLQ durability step (replication quorum).
+    /// Without it a DLQ record only waits for local fsync (single node).
+    pub fn set_dlq_durability(&self, durability: Arc<dyn DlqDurability>) {
+        let _ = self.dlq_durability.set(durability);
     }
 
     /// Broker side of a failed fleet delivery: count the attempt in the
@@ -2690,6 +2830,85 @@ mod tests {
         assert_eq!(stored_body, body.as_slice());
         assert_eq!(meta["headers_truncated"], true);
         assert_eq!(meta["message_id"], msg.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn crash_after_dlq_commit_drops_the_retry_and_completes_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let response = broker
+            .publish(PublishRequest {
+                topic: String::new(),
+                queue_id: None,
+                group_id: None,
+                group_member_id: None,
+                routing_key: "crash".into(),
+                payload: "body".into(),
+                routing_id: None,
+                payload_encoding: None,
+                idempotency_key: None,
+                delay_ms: None,
+                priority: None,
+                flow_id: None,
+                url: Some("https://example.com/hook".into()),
+                secret: Some("secret".into()),
+                destination: None,
+                flow: None,
+                parallelism: None,
+                max_retries: Some(3),
+                retry_backoff: None,
+                method: None,
+                headers: None,
+                sign: None,
+                request: None,
+            })
+            .unwrap();
+        broker.flush_wal().unwrap();
+        let partition = response.partition.unwrap();
+        let offset = response.offset.unwrap();
+        let message = broker
+            .read_message(&response.topic, partition, offset)
+            .unwrap();
+        let source = DispatchEngine::retry_key(&message);
+        let lane = broker_partition::flow_lane_owner(&message).to_string();
+        // Crash window: the DLQ record is durable and the transition committed,
+        // but the retry record and the source cursor were not finished.
+        let retries = RetryState::open(&broker.config().data_dir).unwrap();
+        retries
+            .schedule(RetryRecord {
+                key: source.clone(),
+                cursor_key: lane.clone(),
+                fifo_key: None,
+                attempts: 2,
+                due_at_ms: chrono::Utc::now().timestamp_millis() + 3_600_000,
+                last_error: "HTTP 503".into(),
+            })
+            .unwrap();
+        drop(retries);
+        let lifecycle = LifecycleStore::open(&broker.config().data_dir).unwrap();
+        lifecycle
+            .prepare(DlqTransition {
+                source: source.clone(),
+                cursor_key: lane.clone(),
+                reason: "exhausted".into(),
+                phase: DlqPhase::Prepared,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+        lifecycle.mark_dlq_committed(&source).unwrap();
+        drop(lifecycle);
+
+        // Broker-only (fleet) brokers finish the move too.
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        assert!(engine.retry_state.get(&source).is_none());
+        assert!(engine.retry_state.pending().is_empty());
+        assert_eq!(
+            broker
+                .dispatch_offset(&broker.tenant(), &lane, partition)
+                .unwrap(),
+            offset + 1
+        );
+        assert!(engine.lifecycle.pending().is_empty());
     }
 
     #[tokio::test]

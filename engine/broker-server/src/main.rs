@@ -751,6 +751,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         control_plane,
     });
 
+    // DLQ moves replicate to the source shard's quorum before completing.
+    app_state
+        .dispatch
+        .set_dlq_durability(Arc::new(broker_api::ClusterDlqDurability::new(&app_state)));
+
     let mut bg_tasks = Vec::new();
     if let Some(task) = first_boot_task {
         bg_tasks.push(task);

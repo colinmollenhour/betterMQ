@@ -66,8 +66,8 @@ pub use catalog_tombstones::CatalogTombstones;
 pub use cluster::{
     build_cluster_status, catalog_peer_targets, enqueue_dispatch_after_publish,
     publish_with_cluster, push_catalog_to_recovered_peer, spawn_cluster_catalog_sync,
-    sync_catalog_from_peers, ClusterGossipRequest, ClusterGossipResponse, ClusterHandle as Cluster,
-    ClusterStatusResponse, DispatchCursorCheckpoint, DispatchCursorEntry,
+    sync_catalog_from_peers, ClusterDlqDurability, ClusterGossipRequest, ClusterGossipResponse,
+    ClusterHandle as Cluster, ClusterStatusResponse, DispatchCursorCheckpoint, DispatchCursorEntry,
 };
 pub use gateway::GatewayOnlyState;
 pub use local_auth::{close_setup_window, open_setup_window};

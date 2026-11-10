@@ -350,6 +350,56 @@ async fn replicate_if_needed(
     }
 }
 
+/// DLQ durability for dispatch: a dead-letter record appended to the source
+/// shard is replicated to a quorum (and the quorum watermark advanced) before
+/// the source message completes. Single node and Slate wait for local fsync.
+pub struct ClusterDlqDurability {
+    state: std::sync::Weak<AppState>,
+}
+
+impl ClusterDlqDurability {
+    pub fn new(state: &Arc<AppState>) -> Self {
+        Self {
+            state: Arc::downgrade(state),
+        }
+    }
+}
+
+impl broker_dispatch::DlqDurability for ClusterDlqDurability {
+    fn make_durable<'a>(
+        &'a self,
+        response: &'a mut PublishResponse,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), broker_dispatch::DispatchError>> {
+        Box::pin(async move {
+            let state = self.state.upgrade().ok_or_else(|| {
+                broker_dispatch::DispatchError::Failed("broker is shutting down".into())
+            })?;
+            let local = {
+                let broker = state.broker.clone();
+                let topic = response.topic.clone();
+                let (partition, offset) = (response.partition, response.offset);
+                async move {
+                    match (partition, offset) {
+                        (Some(partition), Some(offset)) => broker
+                            .wait_committed(&topic, partition, offset)
+                            .await
+                            .map_err(ApiError::from),
+                        _ => Ok(0),
+                    }
+                }
+            };
+            replicate_if_needed(&state, response, local)
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    broker_dispatch::DispatchError::Failed(format!(
+                        "DLQ record not durable on a quorum: {error}"
+                    ))
+                })
+        })
+    }
+}
+
 async fn publish_on_leader(
     state: &Arc<AppState>,
     req: PublishRequest,

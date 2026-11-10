@@ -40,6 +40,6 @@ pub use telemetry::{
     MAX_DISPATCH_CURSOR_LANES, MAX_DISPATCH_TELEMETRY_SHARDS, WEBHOOK_DURATION_BUCKETS,
 };
 pub use worker::{
-    DeliveryJob, DeliveryPriority, DispatchConfig, DispatchEngine, DispatchError, LeasedFailure,
-    DLQ_ENVELOPE_ALLOWANCE, DLQ_RECORD_MAGIC,
+    DeliveryJob, DeliveryPriority, DispatchConfig, DispatchEngine, DispatchError, DlqDurability,
+    LeasedFailure, DLQ_ENVELOPE_ALLOWANCE, DLQ_RECORD_MAGIC,
 };

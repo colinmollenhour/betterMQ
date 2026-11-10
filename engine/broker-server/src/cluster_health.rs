@@ -20,16 +20,29 @@ use uuid::Uuid;
 const LEGACY_REPAIR_RETRY_TICKS: u64 = 30;
 
 pub(crate) fn discover_topics(state: &AppState) -> HashSet<String> {
-    let mut topics = HashSet::from([broker_partition::DIRECT_TOPIC.to_string()]);
+    let mut topics = HashSet::from([
+        broker_partition::DIRECT_TOPIC.to_string(),
+        broker_partition::dlq_topic(broker_partition::DIRECT_TOPIC),
+    ]);
     if let Ok(queues) = state.broker.list_queues() {
-        topics.extend(queues.into_iter().map(|queue| queue.topic));
+        for queue in queues {
+            topics.insert(broker_partition::dlq_topic(&queue.topic));
+            topics.insert(queue.topic);
+        }
     }
+    // DLQ namespaces come from the catalog too: a node taking over a shard may
+    // never have received the first record of a DLQ topic.
     if let Ok(groups) = state.broker.list_groups() {
-        topics.extend(
-            groups
-                .into_iter()
-                .map(|group| broker_partition::group_topic(group.id)),
-        );
+        for group in groups {
+            topics.insert(broker_partition::group_topic(group.id));
+            if let Ok(members) = state.broker.list_group_members(group.id) {
+                topics.extend(
+                    members.into_iter().map(|member| {
+                        broker_partition::group_member_dlq_topic(group.id, member.id)
+                    }),
+                );
+            }
+        }
     }
     let root = state
         .broker

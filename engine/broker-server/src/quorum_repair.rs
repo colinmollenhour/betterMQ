@@ -467,4 +467,82 @@ mod tests {
             .is_err());
         assert_eq!(state.broker.dispatch_hwm(&topic, partition).unwrap(), 0);
     }
+
+    async fn dead_letter_first_message(
+        state: &Arc<AppState>,
+    ) -> (String, u32, u64, Result<(), String>) {
+        state
+            .dispatch
+            .set_dlq_durability(Arc::new(broker_api::ClusterDlqDurability::new(state)));
+        let (topic, partition) = publish(&state.broker);
+        let offset = state.broker.committed_hwm(&topic, partition).unwrap() - 1;
+        // The source was delivered, so it is quorum-durable.
+        state
+            .broker
+            .record_quorum_commit(&topic, partition, 0, offset + 1)
+            .unwrap();
+        let result = state
+            .dispatch
+            .dead_letter_offset(&topic, partition, offset, "retries exhausted")
+            .await
+            .map_err(|e| e.to_string());
+        (topic, partition, offset, result)
+    }
+
+    #[tokio::test]
+    async fn dlq_move_is_quorum_replicated_on_the_source_shard() {
+        let (_cluster, state, _dir, peers) = cell(true).await;
+        let (topic, partition, offset, result) = dead_letter_first_message(&state).await;
+        result.unwrap();
+        let dlq = broker_partition::dlq_topic(&topic);
+        let records = state.broker.list_topic_messages(&dlq, 10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].partition, partition,
+            "pinned to the source shard"
+        );
+        assert!(
+            state.broker.quorum_hwm(&dlq, partition).unwrap() > records[0].offset,
+            "the DLQ record is quorum-durable"
+        );
+        let lane = broker_partition::flow_lane_owner(
+            &state
+                .broker
+                .read_message(&topic, partition, offset)
+                .unwrap(),
+        )
+        .to_string();
+        assert_eq!(
+            state
+                .broker
+                .dispatch_offset(&state.broker.tenant(), &lane, partition)
+                .unwrap(),
+            offset + 1
+        );
+        let replicated = peers[0].received_requests().await.unwrap();
+        assert!(!replicated.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dlq_move_without_quorum_leaves_the_source_pending() {
+        let (_cluster, state, _dir, _peers) = cell(false).await;
+        let (topic, partition, offset, result) = dead_letter_first_message(&state).await;
+        assert!(result.is_err(), "no quorum, no DLQ completion");
+        let lane = broker_partition::flow_lane_owner(
+            &state
+                .broker
+                .read_message(&topic, partition, offset)
+                .unwrap(),
+        )
+        .to_string();
+        assert_eq!(
+            state
+                .broker
+                .dispatch_offset(&state.broker.tenant(), &lane, partition)
+                .unwrap(),
+            0,
+            "the source cursor does not advance"
+        );
+        assert_eq!(state.dispatch.telemetry_snapshot().dlq_pending_prepared, 1);
+    }
 }

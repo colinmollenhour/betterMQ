@@ -1605,11 +1605,19 @@ impl Broker {
         &self,
         requests: Vec<PublishRequest>,
     ) -> Result<PreparedPublishBatch, BrokerError> {
+        self.prepare_publish_batch_on(requests, None)
+    }
+
+    fn prepare_publish_batch_on(
+        &self,
+        requests: Vec<PublishRequest>,
+        forced_partition: Option<u32>,
+    ) -> Result<PreparedPublishBatch, BrokerError> {
         let tenant_id = self.tenant();
         let reservations = self
             .try_reserve_batch_dedup(&tenant_id, &requests)?
             .map_err(DedupInFlight::into_error)?;
-        self.prepare_reserved_batch(requests, reservations)
+        self.prepare_reserved_batch(requests, reservations, forced_partition)
     }
 
     /// Like [`Broker::prepare_publish_batch`], but waits asynchronously (up to
@@ -1623,7 +1631,9 @@ impl Broker {
         let deadline = tokio::time::Instant::now() + DEDUP_IN_FLIGHT_WAIT;
         loop {
             match self.try_reserve_batch_dedup(&tenant_id, &requests)? {
-                Ok(reservations) => return self.prepare_reserved_batch(requests, reservations),
+                Ok(reservations) => {
+                    return self.prepare_reserved_batch(requests, reservations, None)
+                }
                 Err(in_flight) => {
                     let key = in_flight.idempotency_key.clone();
                     if tokio::time::timeout_at(deadline, in_flight.released())
@@ -1668,6 +1678,7 @@ impl Broker {
         &self,
         requests: Vec<PublishRequest>,
         mut reservations: HashMap<String, ReservationOutcome>,
+        forced_partition: Option<u32>,
     ) -> Result<PreparedPublishBatch, BrokerError> {
         let mut slots = Vec::with_capacity(requests.len());
         let mut groups: Vec<PreparedShardBatch> = Vec::new();
@@ -1712,7 +1723,7 @@ impl Broker {
                 None
             };
 
-            let record = self.prepare_record(request, payload, reservation)?;
+            let record = self.prepare_record(request, payload, reservation, forced_partition)?;
             let message_id = record.header.id;
             if let Some(key) = record.header.idempotency_key.as_ref() {
                 local_owners.insert(key.clone(), message_id);
@@ -1977,6 +1988,36 @@ impl Broker {
     }
 
     /// Append without recording idempotency until replication quorum succeeds.
+    /// Append a dead-letter record to `partition` — the shard of the source
+    /// message, which this node leads while it dead-letters — instead of the
+    /// hash placement, so the DLQ write depends only on the source shard's own
+    /// leadership fence and quorum. Internal: only DLQ topics, partition
+    /// bounds and the leadership fence are checked. Idempotency stays reserved
+    /// in the returned [`PendingDedup`]: pass it to
+    /// [`Broker::commit_publish_dedup`] once the record is durable on a quorum.
+    /// A concurrent request holding the same key fails fast.
+    pub fn publish_to_shard(
+        &self,
+        mut req: PublishRequest,
+        partition: u32,
+    ) -> Result<(PublishResponse, PendingDedup), BrokerError> {
+        if !is_dlq_topic(&req.topic) {
+            return Err(BrokerError::InvalidConfig(format!(
+                "publish_to_shard is only for dead-letter topics, not {}",
+                req.topic
+            )));
+        }
+        if partition >= self.inner.layout.shard_count {
+            return Err(BrokerError::InvalidConfig(format!(
+                "unknown shard {partition}; layout has {} shards",
+                self.inner.layout.shard_count
+            )));
+        }
+        req.delay_ms = None;
+        let prepared = self.prepare_publish_batch_on(vec![req], Some(partition))?;
+        self.publish_prepared(prepared, false)
+    }
+
     /// The key stays reserved in the returned [`PendingDedup`] so a retry
     /// during replication waits for this request instead of appending again.
     pub async fn publish_defer_dedup(
@@ -2009,6 +2050,7 @@ impl Broker {
         mut req: PublishRequest,
         payload: Vec<u8>,
         reservation: Option<ReservationToken>,
+        forced_partition: Option<u32>,
     ) -> Result<PreparedRecord, BrokerError> {
         let tenant_id = self.tenant();
         let message_id = Uuid::new_v4();
@@ -2074,10 +2116,11 @@ impl Broker {
             req.routing_id = Some(message_id);
         }
         let partition_key = req.shard_routing_key();
-        let partition = self
-            .inner
-            .layout
-            .assign(&tenant_id, &req.topic, &partition_key);
+        let partition = forced_partition.unwrap_or_else(|| {
+            self.inner
+                .layout
+                .assign(&tenant_id, &req.topic, &partition_key)
+        });
         let fence_gen = self.require_shard_fence(partition)?;
 
         let http = HttpDeliverySpec::merge(
