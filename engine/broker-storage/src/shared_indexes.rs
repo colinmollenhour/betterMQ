@@ -1572,4 +1572,17 @@ mod tests {
         assert_eq!(b.get_dedup("tenant", "key").unwrap().unwrap().offset, 1);
         assert_eq!(b.dispatch_offset("tenant", "lane", 0).unwrap(), 9);
     }
+
+    #[test]
+    fn shared_cursor_never_moves_backwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SharedMetadataStore::open(dir.path()).unwrap();
+        store
+            .mark_dispatch_complete("tenant", "lane", 0, 25)
+            .unwrap();
+        store.set_dispatch_offset("tenant", "lane", 0, 20).unwrap();
+        store.set_dispatch_offset("tenant", "lane", 0, 11).unwrap();
+        assert_eq!(store.dispatch_offset("tenant", "lane", 0).unwrap(), 20);
+        assert!(store.is_dispatch_complete("tenant", "lane", 0, 25).unwrap());
+    }
 }

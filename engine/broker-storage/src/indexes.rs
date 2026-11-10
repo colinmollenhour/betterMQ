@@ -588,6 +588,9 @@ impl MetadataStore {
         }
     }
 
+    /// Advance a lane cursor. Cursors are monotonic: a value at or below the
+    /// stored cursor is ignored, so a stale concurrent completion can never
+    /// move it backwards (and the completion markers it covered are gone).
     pub fn set_dispatch_offset(
         &self,
         tenant_id: &str,
@@ -1058,5 +1061,26 @@ mod tests {
         assert!(store.is_dispatch_complete("tenant", "queue", 0, 1).unwrap());
         assert!(store.is_dispatch_complete("tenant", "queue", 0, 3).unwrap());
         assert_eq!(store.dispatch_offset("tenant", "queue", 0).unwrap(), 2);
+    }
+
+    #[test]
+    fn dispatch_cursor_never_moves_backwards() {
+        let dir = tempdir().unwrap();
+        let store = MetadataStore::open(dir.path()).unwrap();
+        store
+            .mark_dispatch_complete("tenant", "queue", 0, 25)
+            .unwrap();
+        store.set_dispatch_offset("tenant", "queue", 0, 20).unwrap();
+        // A stale completion computed from an older cursor.
+        store.set_dispatch_offset("tenant", "queue", 0, 11).unwrap();
+        assert_eq!(store.dispatch_offset("tenant", "queue", 0).unwrap(), 20);
+        assert!(store
+            .is_dispatch_complete("tenant", "queue", 0, 25)
+            .unwrap());
+
+        let mut batch = MetadataWriteBatch::default();
+        batch.set_dispatch_offset("tenant", "queue", 0, 5);
+        store.write_batch(batch).unwrap();
+        assert_eq!(store.dispatch_offset("tenant", "queue", 0).unwrap(), 20);
     }
 }

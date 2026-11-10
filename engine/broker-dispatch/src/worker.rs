@@ -279,6 +279,8 @@ pub struct DispatchEngine {
     scan: crate::scan::DispatchScan,
     backfill_rotation: Arc<AtomicUsize>,
     claim_rates: crate::lease::ClaimRates,
+    /// Striped per-lane locks around cursor advancement (see `commit_dispatch_offset`).
+    cursor_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
 }
 
 impl DispatchEngine {
@@ -351,6 +353,11 @@ impl DispatchEngine {
             scan,
             backfill_rotation: Arc::new(AtomicUsize::new(0)),
             claim_rates: crate::lease::ClaimRates::default(),
+            cursor_locks: Arc::new(
+                (0..CURSOR_LOCK_STRIPES)
+                    .map(|_| tokio::sync::Mutex::new(()))
+                    .collect(),
+            ),
         };
         if let Some(handle) = engine.memory_guard.spawn_monitor() {
             engine.background.lock().push(handle);
@@ -814,6 +821,9 @@ impl DispatchEngine {
         }
     }
 }
+
+/// Lock stripes for per-lane cursor advancement.
+const CURSOR_LOCK_STRIPES: usize = 256;
 
 /// Wall-clock budget of one backfill pass.
 const BACKFILL_PASS_BUDGET: Duration = Duration::from_secs(2);
@@ -1484,6 +1494,19 @@ impl DispatchEngine {
             .map_err(|error| DispatchError::Failed(error.to_string()))
     }
 
+    async fn cursor_lock(
+        &self,
+        tenant_id: &str,
+        cursor_key: &str,
+        partition: u32,
+    ) -> tokio::sync::MutexGuard<'_, ()> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (tenant_id, cursor_key, partition).hash(&mut hasher);
+        let stripe = (hasher.finish() as usize) % self.cursor_locks.len();
+        self.cursor_locks[stripe].lock().await
+    }
+
     async fn commit_dispatch_offset(
         &self,
         tenant_id: &str,
@@ -1492,6 +1515,10 @@ impl DispatchEngine {
         partition: u32,
         offset: u64,
     ) -> Result<(), DispatchError> {
+        // Completions of one lane run concurrently; serialise the
+        // read-compute-write so a slower task cannot write a cursor computed
+        // from an older read over a newer one.
+        let _lane = self.cursor_lock(tenant_id, cursor_key, partition).await;
         let cursor = self
             .broker
             .dispatch_offset(tenant_id, cursor_key, partition)?;
@@ -2374,6 +2401,79 @@ mod tests {
         assert_eq!(shard.completions, 1);
         assert_eq!(shard.cursor_advanced_records, 2);
         assert_eq!(shard.completion_gap_records, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_completions_never_move_the_cursor_backwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let mut offsets = Vec::new();
+        for i in 0..64 {
+            let response = broker
+                .publish(PublishRequest {
+                    topic: String::new(),
+                    queue_id: None,
+                    group_id: None,
+                    group_member_id: None,
+                    routing_key: "lane".into(),
+                    payload: format!("m{i}"),
+                    routing_id: None,
+                    payload_encoding: None,
+                    idempotency_key: None,
+                    delay_ms: None,
+                    priority: None,
+                    flow_id: None,
+                    url: Some("https://example.com/hook".into()),
+                    secret: Some("secret".into()),
+                    destination: None,
+                    flow: None,
+                    parallelism: None,
+                    max_retries: None,
+                    retry_backoff: None,
+                    method: None,
+                    headers: None,
+                    sign: None,
+                    request: None,
+                })
+                .unwrap();
+            offsets.push((
+                response.topic,
+                response.partition.unwrap(),
+                response.offset.unwrap(),
+            ));
+        }
+        broker.flush_wal().unwrap();
+        let (topic, partition, first) = offsets[0].clone();
+        let last = offsets.last().unwrap().2;
+        let lane = broker_partition::flow_lane_owner(
+            &broker.read_message(&topic, partition, first).unwrap(),
+        )
+        .to_string();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let tenant = broker.tenant();
+        let tasks: Vec<_> = offsets
+            .iter()
+            .rev()
+            .map(|(topic, partition, offset)| {
+                let engine = engine.clone();
+                let (topic, lane, tenant) = (topic.clone(), lane.clone(), tenant.clone());
+                let (partition, offset) = (*partition, *offset);
+                tokio::spawn(async move {
+                    engine
+                        .commit_cursor(&tenant, &topic, &lane, partition, offset)
+                        .await
+                        .unwrap();
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(
+            broker.dispatch_offset(&tenant, &lane, partition).unwrap(),
+            last + 1,
+            "every offset completed, so the cursor covers them all"
+        );
     }
 
     fn sample_message(payload: Vec<u8>, headers: Option<String>) -> StoredMessage {
