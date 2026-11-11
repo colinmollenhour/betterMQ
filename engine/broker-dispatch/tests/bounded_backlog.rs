@@ -105,3 +105,61 @@ async fn saturated_fifo_lane_drains_without_loss_duplicates_or_overtaking() {
     assert_eq!(*order.lock().unwrap(), (0..128).collect::<Vec<_>>());
     dispatch.shutdown_background().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_cancels_hung_flow_deliveries_and_releases_all_capacity() {
+    use tokio::io::AsyncReadExt;
+    std::env::set_var("BETTERMQ_ALLOW_PRIVATE_DESTINATIONS", "1");
+    std::env::set_var("BETTERMQ_DISPATCH_QUEUE_CAP", "32");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (arrived, received) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = [0; 1024];
+        assert!(socket.read(&mut bytes).await.unwrap() > 0);
+        arrived.send(()).unwrap();
+        while socket.read(&mut bytes).await.unwrap() > 0 {}
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+    let response = broker
+        .publish(
+            serde_json::from_value(serde_json::json!({
+                "url": format!("http://{address}/hook"), "secret": "test", "payload": "body",
+                "flow": { "key": "lane", "parallelism": 1 },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    broker.flush_wal().unwrap();
+    let dispatch = DispatchEngine::new(
+        broker,
+        DispatchConfig {
+            http_timeout_secs: 60,
+            ..DispatchConfig::default()
+        },
+    );
+    dispatch.enqueue(DeliveryJob::live(
+        response.topic,
+        response.partition.unwrap(),
+        response.offset.unwrap(),
+        response.message_id.unwrap(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), received)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), dispatch.shutdown_background())
+        .await
+        .expect("shutdown must cancel child delivery tasks, not just their parent workers");
+    let snapshot = dispatch.telemetry_snapshot();
+    assert_eq!(snapshot.active_http_deliveries, 0);
+    assert_eq!(snapshot.in_flight_deliveries, 0);
+    assert_eq!(snapshot.queue_depth, 0);
+    assert_eq!(dispatch.flow.pending_count().await, 0);
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+}

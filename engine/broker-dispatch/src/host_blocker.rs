@@ -188,12 +188,16 @@ impl HostBlocker {
     }
 
     pub fn is_blocked(&self, url: &str) -> bool {
-        self.maybe_reload_shared();
         let Some(key) = Self::host_key(url) else {
             return false;
         };
+        self.is_host_key_blocked(&key)
+    }
+
+    pub(crate) fn is_host_key_blocked(&self, key: &str) -> bool {
+        self.maybe_reload_shared();
         let hosts = self.hosts.lock();
-        let Some(state) = hosts.get(&key) else {
+        let Some(state) = hosts.get(key) else {
             return false;
         };
         state.blocked_until_ms.is_some_and(|until| now_ms() < until)

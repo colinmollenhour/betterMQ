@@ -222,7 +222,7 @@ struct DeferredQueue {
 }
 
 impl DeferredQueue {
-    fn insert(&mut self, deferred: DeferredJob, cap: usize) {
+    fn insert(&mut self, deferred: DeferredJob, cap: usize) -> bool {
         let key = (
             deferred.job.topic.clone(),
             deferred.job.partition,
@@ -231,16 +231,17 @@ impl DeferredQueue {
         let due = (deferred.due, deferred.sequence);
         if let Some(previous) = self.keys.get(&key) {
             if previous.0 <= deferred.due {
-                return;
+                return true;
             }
             self.jobs.remove(previous);
         } else if self.keys.len() >= cap {
             // These are wakeups, not authoritative work: the durable scan
             // retains every pending delivery even when this cache is full.
-            return;
+            return false;
         }
         self.keys.insert(key, due);
         self.jobs.insert(due, deferred.job);
+        true
     }
 
     fn pop_due(&mut self, now: tokio::time::Instant) -> Option<DeliveryJob> {
@@ -311,7 +312,8 @@ pub struct DispatchState {
     client: reqwest::Client,
     long_client: reqwest::Client,
     high_tx: mpsc::Sender<DeliveryJob>,
-    defer_tx: mpsc::Sender<DeferredJob>,
+    deferred: Arc<parking_lot::Mutex<DeferredQueue>>,
+    defer_notify: Arc<Notify>,
     pub flow: FlowController,
     in_flight_jobs: InFlightSet,
     job_capacity: Arc<Semaphore>,
@@ -335,6 +337,8 @@ pub struct DispatchState {
     telemetry: Arc<crate::telemetry::DispatchTelemetry>,
     pressure_logs: Arc<PressureLogs>,
     background: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
+    delivery_tasks: tokio_util::task::TaskTracker,
+    cancellation: tokio_util::sync::CancellationToken,
     scan: crate::scan::DispatchScan,
     backfill_rotation: Arc<AtomicUsize>,
     claim_rates: crate::lease::ClaimRates,
@@ -374,8 +378,19 @@ impl DispatchEngine {
     }
 
     fn new_with_mode(broker: Broker, config: DispatchConfig, workers_enabled: bool) -> Self {
+        Self::new_with_controls(broker, config, workers_enabled, None, None)
+    }
+
+    /// Install lease/leadership controls before recovery can enqueue any work.
+    /// A replicated cell starts fenced until its quorum recovery completes.
+    pub fn new_with_controls(
+        broker: Broker,
+        config: DispatchConfig,
+        workers_enabled: bool,
+        leases: Option<crate::lease::LeaseTable>,
+        is_shard_leader: Option<ShardLeaderFn>,
+    ) -> Self {
         let (high_tx, high_rx) = mpsc::channel(dispatch_queue_cap());
-        let (defer_tx, defer_rx) = mpsc::channel(dispatch_queue_cap());
         let config_clone = config.clone();
         let memory_guard = Arc::new(MemoryGuard::new(config_clone.memory_guard.clone()));
         // Apply fleet long-wait tier when set (Phase E).
@@ -389,6 +404,13 @@ impl DispatchEngine {
         let lifecycle = LifecycleStore::open(&broker.config().data_dir)
             .expect("open durable dispatch lifecycle state");
         let scan = crate::scan::DispatchScan::open(Some(&broker.config().data_dir));
+        let recovering = if broker.quorum_gating() && is_shard_leader.is_some() {
+            (0..broker.layout().shard_count)
+                .map(|partition| (partition, None))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let engine = Self {
             inner: Arc::new(DispatchState {
                 broker,
@@ -410,17 +432,18 @@ impl DispatchEngine {
                     .build()
                     .expect("reqwest long client"),
                 high_tx,
-                defer_tx,
+                deferred: Arc::new(parking_lot::Mutex::new(DeferredQueue::default())),
+                defer_notify: Arc::new(Notify::new()),
                 flow: FlowController::new(global_max, memory_guard.clone()),
                 in_flight_jobs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 job_capacity: Arc::new(Semaphore::new(
                     dispatch_queue_cap().min(Semaphore::MAX_PERMITS),
                 )),
-                is_shard_leader: Arc::new(parking_lot::RwLock::new(None)),
+                is_shard_leader: Arc::new(parking_lot::RwLock::new(is_shard_leader)),
                 host_blocker: Arc::new(HostBlocker::new(config_clone.host_blocker.clone())),
                 memory_guard,
                 in_flight: Arc::new(Semaphore::new(dispatch_max_in_flight())),
-                leases: Arc::new(parking_lot::RwLock::new(None)),
+                leases: Arc::new(parking_lot::RwLock::new(leases)),
                 local_holder: format!("local-{}", Uuid::new_v4()),
                 workers_enabled,
                 stop: Arc::new(AtomicBool::new(false)),
@@ -435,6 +458,8 @@ impl DispatchEngine {
                 telemetry: Arc::new(crate::telemetry::DispatchTelemetry::new()),
                 pressure_logs: Arc::new(PressureLogs::default()),
                 background: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                delivery_tasks: tokio_util::task::TaskTracker::new(),
+                cancellation: tokio_util::sync::CancellationToken::new(),
                 scan,
                 backfill_rotation: Arc::new(AtomicUsize::new(0)),
                 claim_rates: crate::lease::ClaimRates::default(),
@@ -443,7 +468,7 @@ impl DispatchEngine {
                         .map(|_| Arc::new(tokio::sync::Mutex::new(())))
                         .collect(),
                 ),
-                recovering: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                recovering: Arc::new(parking_lot::Mutex::new(recovering)),
                 dlq_durability: Arc::new(std::sync::OnceLock::new()),
             }),
         };
@@ -453,7 +478,7 @@ impl DispatchEngine {
         engine.finish_committed_dlq_transitions();
         if workers_enabled {
             engine.spawn_workers(high_rx);
-            engine.spawn_defer_scheduler(defer_rx);
+            engine.spawn_defer_scheduler();
             engine.replay_lifecycle_state();
             engine.replay_retry_state();
         } else {
@@ -519,6 +544,7 @@ impl DispatchEngine {
     /// is still alive. Prevents Tokio's "context was found, but it is being shutdown".
     pub async fn shutdown_background(&self) {
         self.stop();
+        self.cancellation.cancel();
         self.memory_guard.stop();
         let mut handles: Vec<_> = std::mem::take(&mut *self.background.lock());
         handles.extend(self.flow.take_drainer_tasks());
@@ -529,6 +555,22 @@ impl DispatchEngine {
             let _ = handle.await;
         }
         self.flow.discard_pending().await;
+        self.delivery_tasks.close();
+        self.delivery_tasks.wait().await;
+        self.in_flight_jobs.lock().clear();
+        *self.deferred.lock() = DeferredQueue::default();
+        self.telemetry.reset_queue();
+    }
+
+    pub(crate) fn spawn_delivery(
+        &self,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        self.delivery_tasks.spawn(future);
+    }
+
+    pub(crate) fn delivery_cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.cancellation.clone()
     }
 
     fn active_http_guard(&self) -> ActiveHttpGuard {
@@ -784,6 +826,15 @@ impl DispatchEngine {
             return;
         }
         let key = (job.topic.clone(), job.partition, job.offset);
+        if self
+            .deferred
+            .lock()
+            .keys
+            .get(&key)
+            .is_some_and(|(due, _)| *due > tokio::time::Instant::now())
+        {
+            return;
+        }
         {
             let mut inflight = self.in_flight_jobs.lock();
             if inflight.contains_key(&key) {
@@ -912,6 +963,8 @@ impl DispatchEngine {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut enqueued = 0u64;
         let mut more = false;
+        let mut paused = HashMap::new();
+        let mut observed = HashSet::new();
         'targets: for step in 0..targets.len() {
             let index = (start + step) % targets.len();
             if Instant::now() >= deadline {
@@ -958,8 +1011,46 @@ impl DispatchEngine {
                 }
                 // Backlog telemetry also on broker-only (fleet) brokers, which
                 // deliver nothing themselves and so never enqueue.
-                self.observe_pending_entry(&entry, hwm);
+                if observed.insert((entry.partition, entry.cursor_key.clone())) {
+                    self.observe_pending_entry(&entry, hwm);
+                }
                 if !self.workers_enabled {
+                    continue;
+                }
+                let key = (entry.topic.clone(), entry.partition, entry.offset);
+                if self
+                    .deferred
+                    .lock()
+                    .keys
+                    .get(&key)
+                    .is_some_and(|(due, _)| *due > tokio::time::Instant::now())
+                {
+                    continue;
+                }
+                if entry
+                    .host_key
+                    .as_deref()
+                    .is_some_and(|host| self.host_blocker.is_host_key_blocked(host))
+                {
+                    continue;
+                }
+                if entry.queue_id.is_some_and(|id| {
+                    *paused.entry((false, id)).or_insert_with(|| {
+                        self.broker
+                            .get_queue_by_id(id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|queue| queue.paused)
+                    })
+                }) || entry.group_member_id.is_some_and(|id| {
+                    *paused.entry((true, id)).or_insert_with(|| {
+                        self.broker
+                            .get_group_member(id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|member| member.paused)
+                    })
+                }) {
                     continue;
                 }
                 // A due-later retry is owned by the defer scheduler; re-enqueueing
@@ -1080,16 +1171,20 @@ impl DispatchEngine {
                                 break;
                             }
                         };
-                        tokio::spawn(async move {
+                        let tasks = engine.delivery_tasks.clone();
+                        let cancellation = engine.cancellation.clone();
+                        tasks.spawn(async move {
                             let _permit = permit;
                             let key = (job.topic.clone(), job.partition, job.offset);
                             let ownership = DeliveryOwnership { key,
                                 jobs: engine.in_flight_jobs.clone(), notify: engine.drain_notify.clone(),
                                 backfill_notify: engine.backfill_notify.clone(), lease: None };
-                            let result = engine.deliver_job(job, ownership).await;
-                            if let Err(e) = result {
+                            tokio::select! {
+                                _ = cancellation.cancelled() => {},
+                                result = engine.deliver_job(job, ownership) => if let Err(e) = result {
                                 engine.record_pressure(3);
                                 debug!(error = %e, "delivery job failed");
+                                },
                             }
                         });
                     }
@@ -1099,24 +1194,25 @@ impl DispatchEngine {
         self.background.lock().push(handle);
     }
 
-    fn spawn_defer_scheduler(&self, mut rx: mpsc::Receiver<DeferredJob>) {
+    fn spawn_defer_scheduler(&self) {
         let this = self.clone();
         let handle = tokio::spawn(async move {
-            let mut heap = DeferredQueue::default();
-            let cap = dispatch_queue_cap();
             loop {
-                if let Some((&(due, _), _)) = heap.jobs.first_key_value() {
+                let due = this
+                    .deferred
+                    .lock()
+                    .jobs
+                    .first_key_value()
+                    .map(|(key, _)| key.0);
+                if let Some(due) = due {
                     tokio::select! {
                         _ = this.stop_notify.notified() => break,
-                        incoming = rx.recv() => {
-                            match incoming {
-                                Some(job) => heap.insert(job, cap),
-                                None => break,
-                            }
-                        }
+                        _ = this.defer_notify.notified() => {},
                         _ = tokio::time::sleep_until(due) => {
                             let now = tokio::time::Instant::now();
-                            while let Some(job) = heap.pop_due(now) {
+                            loop {
+                                let job = this.deferred.lock().pop_due(now);
+                                let Some(job) = job else { break };
                                 this.enqueue(job);
                             }
                         }
@@ -1124,12 +1220,7 @@ impl DispatchEngine {
                 } else {
                     tokio::select! {
                         _ = this.stop_notify.notified() => break,
-                        incoming = rx.recv() => {
-                            match incoming {
-                                Some(job) => heap.insert(job, cap),
-                                None => break,
-                            }
-                        }
+                        _ = this.defer_notify.notified() => {},
                     }
                 }
             }
@@ -1354,19 +1445,11 @@ impl DispatchEngine {
             sequence: self.defer_sequence.fetch_add(1, Ordering::Relaxed),
             job,
         };
-        match self.defer_tx.try_send(deferred) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(job)) => {
-                self.telemetry.record_defer_rejected();
-                self.record_pressure(2);
-                debug!(
-                    topic = %job.job.topic,
-                    offset = job.job.offset,
-                    reason,
-                    "defer scheduler full; relying on durable backfill"
-                );
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        if self.deferred.lock().insert(deferred, dispatch_queue_cap()) {
+            self.defer_notify.notify_one();
+        } else {
+            self.telemetry.record_defer_rejected();
+            self.record_pressure(2);
         }
     }
 
@@ -2415,6 +2498,81 @@ mod tests {
         assert!(!worker.shard_leader(0));
         assert!(worker.leases.read().is_some());
         engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn startup_replay_obeys_controls_installed_before_workers_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let msg = publish_test_message(&broker, "http://169.254.169.254/hook");
+        let retry = RetryState::open(dir.path()).unwrap();
+        retry
+            .schedule(RetryRecord {
+                key: DispatchEngine::retry_key(&msg),
+                cursor_key: broker_partition::flow_lane_owner(&msg).to_string(),
+                fifo_key: None,
+                attempts: 1,
+                due_at_ms: 0,
+                last_error: "retry after restart".into(),
+            })
+            .unwrap();
+        drop(retry);
+        let engine = DispatchEngine::new_with_controls(
+            broker,
+            DispatchConfig::default(),
+            true,
+            Some(crate::lease::LeaseTable::new()),
+            Some(Arc::new(|_| false)),
+        );
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        engine.backfill_pending();
+        assert_eq!(engine.telemetry_snapshot().dlq_committed, 0, "follower replay must not attempt or dead-letter deliveries before leadership is established");
+        assert_eq!(engine.telemetry_snapshot().in_flight_deliveries, 0);
+        assert!(engine
+            .retry_state
+            .get(&DispatchEngine::retry_key(&msg))
+            .is_some());
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn backfill_and_live_notifications_do_not_churn_deferred_host_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let msg = publish_test_message(&broker, "https://blocked.example/hook");
+        let engine = DispatchEngine::new(broker, DispatchConfig::default());
+        engine
+            .host_blocker
+            .block_manual("https://blocked.example", 60_000);
+        for _ in 0..5 {
+            engine.backfill_pending();
+        }
+        assert_eq!(
+            engine.telemetry_snapshot().deferred_jobs,
+            0,
+            "blocked hosts are filtered before admission"
+        );
+        let job = DeliveryJob::live(&msg.topic, msg.partition, msg.offset, msg.id);
+        engine.enqueue(job.clone());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.telemetry_snapshot().deferred_jobs == 0
+                || !engine.in_flight_jobs.lock().is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..100 {
+            engine.enqueue(job.clone());
+            engine.backfill_pending();
+        }
+        assert_eq!(engine.telemetry_snapshot().deferred_jobs, 1);
+        assert_eq!(engine.deferred.lock().jobs.len(), 1);
+        engine.shutdown_background().await;
+        assert!(engine.deferred.lock().jobs.is_empty());
     }
 
     #[tokio::test]

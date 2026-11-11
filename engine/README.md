@@ -16,6 +16,14 @@ Build from repo root:
 cargo build --release -p broker-server
 ```
 
+The server uses mimalloc by default to reduce cross-thread heap fragmentation
+and reclaim unused heap pages after bursts. Reusable broker crates do not select
+an allocator. For a system-allocator diagnostic build:
+
+```bash
+cargo build --release -p broker-server --no-default-features
+```
+
 Run locally:
 
 ```bash

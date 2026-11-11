@@ -46,6 +46,7 @@ pub(crate) struct PendingEntry {
     pub fifo_key: Option<String>,
     pub queue_id: Option<Uuid>,
     pub group_member_id: Option<Uuid>,
+    pub host_key: Option<String>,
     /// Flow lane and limits frozen on the message, when it is flow-controlled.
     pub flow: Option<FlowAdmission>,
 }
@@ -369,6 +370,10 @@ impl DispatchScan {
                         fifo_key: crate::worker::DispatchEngine::fifo_retry_key(&msg),
                         queue_id: msg.queue_id,
                         group_member_id: msg.group_member_id,
+                        host_key: msg
+                            .destination_url
+                            .as_deref()
+                            .and_then(crate::host_blocker::HostBlocker::host_key),
                         flow: FlowAdmission::for_message(&msg),
                     });
                     scan.index_fifo(&entry);

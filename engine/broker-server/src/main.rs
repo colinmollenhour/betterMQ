@@ -30,6 +30,13 @@ use tower_http::{
     trace::TraceLayer,
 };
 
+// Cross-thread dispatch churn fragments the system allocator's thread arenas.
+// Keep the allocation policy in the binary, not reusable broker libraries.
+// `--no-default-features` retains a system-allocator diagnostic build.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod cluster_health;
 mod docs;
 #[cfg(test)]
@@ -710,26 +717,18 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let dispatch_cfg = dispatch_config(&settings);
     let leases = broker_dispatch::LeaseTable::new();
     let broker_only = settings.broker_only || settings.dispatch_fleet;
-    let mut dispatch = if broker_only {
-        DispatchEngine::new_broker_only(broker.clone(), dispatch_cfg)
-    } else {
-        DispatchEngine::new(broker.clone(), dispatch_cfg)
-    };
-    dispatch = dispatch.with_leases(leases.clone());
-    if let Some(ref c) = cluster {
+    let leader_check = cluster.as_ref().map(|c| {
         let cluster = c.clone();
-        dispatch = dispatch.with_shard_leader_check(Arc::new(move |p| {
-            cluster.catalog_ready() && cluster.runtime.is_leader_for_shard(p)
-        }));
-    }
-    if broker.quorum_gating() {
-        // After a restart every shard is a takeover: the health monitor
-        // catches it up, the quorum repair task verifies its tail and lifts
-        // the fence.
-        for shard in 0..broker.layout().shard_count {
-            dispatch.fence_partition(shard);
-        }
-    }
+        Arc::new(move |p| cluster.catalog_ready() && cluster.runtime.is_leader_for_shard(p))
+            as Arc<dyn Fn(u32) -> bool + Send + Sync>
+    });
+    let dispatch = DispatchEngine::new_with_controls(
+        broker.clone(),
+        dispatch_cfg,
+        !broker_only,
+        Some(leases.clone()),
+        leader_check,
+    );
     // One bounded pass at boot; the backfill loop continues if work remains.
     let boot_backfill_more = !broker_only && dispatch.backfill_pending();
 

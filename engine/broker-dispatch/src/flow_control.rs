@@ -88,6 +88,27 @@ impl Drop for LanePending {
     }
 }
 
+struct ActiveFlow {
+    lane: Arc<FlowLane>,
+    global_active: Arc<AtomicU32>,
+    member: (String, u32, u64),
+    _global_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for ActiveFlow {
+    fn drop(&mut self) {
+        let mut members = self.lane.members.lock();
+        members.remove(&self.member);
+        if members.capacity() > members.len().saturating_mul(4).max(64) {
+            let target = members.len().saturating_mul(2).max(16);
+            members.shrink_to(target);
+        }
+        self.lane.active.fetch_sub(1, AtomicOrdering::AcqRel);
+        self.global_active.fetch_sub(1, AtomicOrdering::AcqRel);
+        self.lane.notify.notify_one();
+    }
+}
+
 struct OrderedWork {
     backfill: bool,
     priority: u8,
@@ -199,7 +220,7 @@ struct FlowLane {
     rate: Mutex<RateWindow>,
     paused: Mutex<bool>,
     pinned: Mutex<PinnedLimits>,
-    members: Mutex<HashSet<(String, u32, u64)>>,
+    members: parking_lot::Mutex<HashSet<(String, u32, u64)>>,
     notify: Notify,
 }
 
@@ -316,7 +337,8 @@ impl FlowController {
         }
         let lane_pending = LanePending(lane.pending.clone());
         let member = (msg.topic.clone(), msg.partition, msg.offset);
-        let mut members = lane.members.lock().await;
+        let mut heap = lane.waitlist.lock().await;
+        let mut members = lane.members.lock();
         if members.contains(&member) {
             return;
         }
@@ -328,7 +350,6 @@ impl FlowController {
             _lane_pending: lane_pending,
             _ownership: ownership,
         };
-        let mut heap = lane.waitlist.lock().await;
         let cap = std::env::var("BETTERMQ_FLOW_WAITLIST_CAP")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -576,7 +597,7 @@ impl FlowController {
                 rate: None,
                 period_secs: None,
             }),
-            members: Mutex::new(HashSet::new()),
+            members: parking_lot::Mutex::new(HashSet::new()),
             notify: Notify::new(),
         });
         if !self.stop.load(AtomicOrdering::Acquire) {
@@ -714,35 +735,30 @@ fn spawn_lane_drainer(
             lane.active.fetch_add(1, AtomicOrdering::Relaxed);
             global_active.fetch_add(1, AtomicOrdering::Relaxed);
 
-            let lane2 = lane.clone();
-            let global_active2 = global_active.clone();
-            tokio::spawn(async move {
-                let _global_permit = global_permit;
-                let member = (
+            let active = ActiveFlow {
+                lane: lane.clone(),
+                global_active: global_active.clone(),
+                member: (
                     ordered.work.job.topic.clone(),
                     ordered.work.job.partition,
                     ordered.work.job.offset,
-                );
-                if ordered
+                ),
+                _global_permit: global_permit,
+            };
+            let engine = ordered.work.engine.clone();
+            let cancellation = engine.delivery_cancellation();
+            engine.spawn_delivery(async move {
+                let _active = active;
+                tokio::select! {
+                    _ = cancellation.cancelled() => {},
+                    result = ordered
                     .work
                     .engine
                     .deliver_flow_job(&ordered.work.job)
-                    .await
-                    .is_err()
-                {
+                    => if result.is_err() {
                     ordered.work.engine.record_flow_error();
+                    },
                 }
-                {
-                    let mut members = lane2.members.lock().await;
-                    members.remove(&member);
-                    if members.capacity() > members.len().saturating_mul(4).max(64) {
-                        let target = members.len().saturating_mul(2).max(16);
-                        members.shrink_to(target);
-                    }
-                }
-                lane2.active.fetch_sub(1, AtomicOrdering::Relaxed);
-                global_active2.fetch_sub(1, AtomicOrdering::Relaxed);
-                lane2.notify.notify_one();
                 // Keep ownership and the capacity permit until completion,
                 // including across awaits (do not capture only engine/job).
                 drop(ordered);

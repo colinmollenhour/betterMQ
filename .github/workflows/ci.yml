@@ -71,6 +71,9 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: system-allocator fallback compiles
+        run: cargo check -p broker-server --no-default-features
+
       - name: test
         run: cargo test --workspace
 
@@ -170,7 +173,8 @@ jobs:
           cargo test -p broker-dispatch egress -- --nocapture
           cargo test -p broker-dispatch lease -- --nocapture
           cargo test -p broker-dispatch host_blocker -- --nocapture
-          cargo test -p broker-dispatch completion_race -- --nocapture
+          cargo test -p broker-dispatch --test completion_race -- --nocapture
+          cargo test -p broker-dispatch --test bounded_backlog -- --nocapture
           cargo test -p broker-storage group_commit -- --nocapture
           cargo test -p broker-raft-meta epoch -- --nocapture
 
