@@ -429,13 +429,24 @@ impl MetadataStore {
                             rocks_batch.put(key, next.to_le_bytes());
                             let prefix =
                                 Self::complete_prefix(&tenant_id, &subscription_id, partition);
-                            let end =
-                                Self::complete_key(&tenant_id, &subscription_id, partition, next);
+                            let end = Self::ordered_complete_key(
+                                &tenant_id,
+                                &subscription_id,
+                                partition,
+                                next,
+                            );
                             for item in db.prefix_iterator(&prefix) {
                                 let (key, _) = item?;
                                 if !key.starts_with(&prefix) || key.as_ref() >= end.as_slice() {
                                     break;
                                 }
+                                let offset = Self::ordered_offset(&key, prefix.len())?;
+                                rocks_batch.delete(Self::complete_key(
+                                    &tenant_id,
+                                    &subscription_id,
+                                    partition,
+                                    offset,
+                                ));
                                 rocks_batch.delete(key);
                             }
                         }
@@ -464,10 +475,14 @@ impl MetadataStore {
                             .unwrap_or(0),
                     };
                     if offset >= cursor {
-                        let key = Self::complete_key(&tenant, &sub, partition, offset);
-                        match message_id {
-                            Some(id) => rocks_batch.put(key, id.as_bytes()),
-                            None => rocks_batch.put(key, [1u8]),
+                        for key in [
+                            Self::complete_key(&tenant, &sub, partition, offset),
+                            Self::ordered_complete_key(&tenant, &sub, partition, offset),
+                        ] {
+                            match message_id {
+                                Some(id) => rocks_batch.put(key, id.as_bytes()),
+                                None => rocks_batch.put(key, [1u8]),
+                            }
                         }
                     }
                 }
@@ -687,6 +702,15 @@ impl MetadataStore {
         partition: u32,
         offset: u64,
     ) -> Vec<u8> {
+        format!("dcomp:{tenant_id}:{subscription_id}:p{partition}:{offset}").into_bytes()
+    }
+
+    fn ordered_complete_key(
+        tenant_id: &str,
+        subscription_id: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Vec<u8> {
         format!("dcomp2:{tenant_id}:{subscription_id}:p{partition}:{offset:020}").into_bytes()
     }
 
@@ -694,9 +718,23 @@ impl MetadataStore {
         format!("dcomp2:{tenant_id}:{subscription_id}:p{partition}:").into_bytes()
     }
 
-    /// Decimal legacy keys sort lexically (10 before 2), requiring a full
-    /// completion-gap scan on every cursor advance. Upgrade in bounded atomic
-    /// batches; interruption leaves either representation recoverable here.
+    fn ordered_offset(key: &[u8], prefix_len: usize) -> Result<u64, IndexError> {
+        std::str::from_utf8(&key[prefix_len..])
+            .ok()
+            .and_then(|offset| offset.parse().ok())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid ordered completion key",
+                )
+                .into()
+            })
+    }
+
+    /// Decimal authoritative keys sort lexically (10 before 2). Build an
+    /// ordered, derived cleanup index in bounded atomic batches, preserving the
+    /// original markers so older binaries still understand every completion.
+    /// Rebuild on every open to incorporate writes made by an older binary.
     fn migrate_completion_keys(db: &DB, options: &WriteOptions) -> Result<(), IndexError> {
         let mut batch = WriteBatch::default();
         let mut count = 0;
@@ -714,7 +752,6 @@ impl MetadataStore {
                 .parse()
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
             batch.put(format!("dcomp2:{lane}:{offset:020}"), value);
-            batch.delete(key);
             count += 1;
             if count % 512 == 0 {
                 db.write_opt(std::mem::take(&mut batch), options)?;
@@ -824,7 +861,15 @@ impl MetadataStore {
                     .lock()
                     .map_err(|_| std::io::Error::other("metadata mutation lock poisoned"))?;
                 let key = Self::complete_key(tenant_id, subscription_id, partition, offset);
-                db.delete_opt(key, sync_writes)?;
+                let mut batch = WriteBatch::default();
+                batch.delete(key);
+                batch.delete(Self::ordered_complete_key(
+                    tenant_id,
+                    subscription_id,
+                    partition,
+                    offset,
+                ));
+                db.write_opt(batch, sync_writes)?;
                 Ok(())
             }
         }
@@ -1005,6 +1050,8 @@ impl MetadataStore {
                     if !key.starts_with(&prefix) {
                         break;
                     }
+                    let completed = Self::ordered_offset(&key, prefix.len())?;
+                    batch.delete(Self::complete_key(tenant, sub, partition, completed));
                     batch.delete(key);
                 }
                 db.write_opt(batch, sync_writes)?;
@@ -1030,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_completion_upgrade_preserves_identity_and_numeric_order() {
+    fn ordered_completion_index_preserves_identity_numeric_order_and_rollback() {
         let dir = tempdir().unwrap();
         let id = Uuid::new_v4();
         {
@@ -1044,6 +1091,12 @@ mod tests {
             db.put("dcomp:tenant:other:p0:2", [1]).unwrap();
         }
         let store = MetadataStore::open(dir.path()).unwrap();
+        if let MetaBackend::Rocks { db, .. } = &store.backend {
+            assert!(
+                db.get(b"dcomp:tenant:lane:p0:100").unwrap().is_some(),
+                "an older binary must still understand the authoritative markers"
+            );
+        }
         for offset in [0, 2, 9, 10, 99, 100, u64::MAX] {
             assert_eq!(
                 store
@@ -1074,10 +1127,25 @@ mod tests {
             DispatchCompletion::Legacy
         );
         drop(store);
+        {
+            // An older binary knows nothing about the ordered index.
+            let db = DB::open(&Options::default(), dir.path()).unwrap();
+            db.put(b"dcomp:tenant:lane:p0:200", id.as_bytes()).unwrap();
+            db.delete(b"dcomp:tenant:lane:p0:100").unwrap();
+        }
         let store = MetadataStore::open(dir.path()).unwrap();
         assert_eq!(
             store.dispatch_completion("tenant", "lane", 0, 100).unwrap(),
+            DispatchCompletion::Missing
+        );
+        assert_eq!(
+            store.dispatch_completion("tenant", "lane", 0, 200).unwrap(),
             DispatchCompletion::Message(id)
+        );
+        store.set_dispatch_offset("tenant", "lane", 0, 201).unwrap();
+        assert_eq!(
+            store.dispatch_completion("tenant", "lane", 0, 200).unwrap(),
+            DispatchCompletion::Missing
         );
     }
 
