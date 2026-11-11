@@ -121,6 +121,10 @@ engine.
 - **Verification ledger.** Every payload carries a stream/sequence header. The
   sink keeps a byte per message (about 2 MB per million) to detect loss,
   duplicates, per-key order inversions and over-parallelism with no locks.
+  Final accounting reads every DLQ page and matches each record to its source
+  stream, sequence, and fan-out member. A permanent HTTP rejection alone is not
+  proof of a dead letter; duplicate or unrelated DLQ rows cannot hide another
+  missing delivery. Failed inspection or nonadvancing pagination fails the trial.
 - **SLO.** A load step passes when ACK p99, error rate and achieved/offered are
   within limits (`--slo-ack-p99-ms`, `--slo-delivery-p99-ms`). The sustained
   ceiling is the last passing step before the first failure.
