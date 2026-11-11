@@ -32,3 +32,29 @@ sustained-ceiling metric ignores an isolated failed step (see the README).
 Ramp metrics in these files were recomputed with `bettermq-bench reanalyze`, so
 write amplification, payload MB/s and log bytes per message are absent for the
 ramp scenarios.
+
+## Allocator experiment
+
+Three serialized, interleaved `standard` `memory-cycles` trials compared the
+system allocator and mimalloc on identical broker code at `e798277`. Each trial
+used five burst/drain/idle cycles. Both builds passed the suite's correctness
+checks without critical findings. The slim reports retain per-trial metrics and
+environment data, but omit time series:
+
+- [`issue-2-system-e798277.json`](issue-2-system-e798277.json)
+- [`issue-2-mimalloc-e798277.json`](issue-2-mimalloc-e798277.json)
+
+| Metric (median across three trials) | System | mimalloc |
+|---|---:|---:|
+| RSS before load | 35.2 MiB | 68.3 MiB |
+| Peak RSS | 125.5 MiB | 217.8 MiB |
+| Settled RSS after the final cycle | 125.5 MiB | 202.9 MiB |
+| RSS growth per cycle after warmup | 4.39 MiB | 8.46 MiB |
+
+The settled-RSS ranges did not overlap: **109.2–129.7 MiB** for the system
+allocator versus **182.0–212.1 MiB** for mimalloc. These were shared-host runs,
+and several metrics are marked noisy; they are not a quiet-host throughput
+claim. Mimalloc's smaller retained-growth percentage did not offset its larger
+absolute footprint. The broker therefore keeps the system allocator, with no
+allocator feature or extra native dependency. Bounded queues and blocking-I/O
+admission remain necessary regardless of allocator choice.

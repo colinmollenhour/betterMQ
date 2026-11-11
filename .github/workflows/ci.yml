@@ -71,9 +71,6 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: system-allocator fallback compiles
-        run: cargo check -p broker-server --no-default-features
-
       - name: test
         run: cargo test --workspace
 

@@ -30,13 +30,6 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-// Cross-thread dispatch churn fragments the system allocator's thread arenas.
-// Keep the allocation policy in the binary, not reusable broker libraries.
-// `--no-default-features` retains a system-allocator diagnostic build.
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 mod cluster_health;
 mod docs;
 #[cfg(test)]

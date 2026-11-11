@@ -16,13 +16,10 @@ Build from repo root:
 cargo build --release -p broker-server
 ```
 
-The server uses mimalloc by default to reduce cross-thread heap fragmentation
-and reclaim unused heap pages after bursts. Reusable broker crates do not select
-an allocator. For a system-allocator diagnostic build:
-
-```bash
-cargo build --release -p broker-server --no-default-features
-```
+The server and reusable broker crates use the system allocator. Interleaved
+burst/idle measurements favored its lower absolute resident memory over
+mimalloc's lower retained-growth percentage; see the
+[allocator experiment](../tools/bettermq-bench/baselines/README.md#allocator-experiment).
 
 See [bounded dispatch and memory](PERFORMANCE.md) for the scheduling, ordering,
 recovery, and memory-accounting tradeoffs.

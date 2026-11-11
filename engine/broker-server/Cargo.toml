@@ -9,15 +9,10 @@ description = "BetterMQ broker binary"
 name = "bettermq"
 path = "src/main.rs"
 
-[features]
-default = ["mimalloc"]
-mimalloc = ["dep:mimalloc"]
-
 [lints]
 workspace = true
 
 [dependencies]
-mimalloc = { version = "0.1", default-features = false, optional = true }
 rust-embed = "8"
 mime_guess = "2"
 axum = { workspace = true }

@@ -85,12 +85,13 @@ identity-aware completion marker for recovery.
 
 ## RSS is not an HTTP concurrency counter
 
-The server uses mimalloc by default; reusable crates do not choose an
-allocator. Unused heap pages can be reclaimed after bursts, while live work,
-WAL indexes, RocksDB working sets, and retained allocator pages still contribute
-to resident set size (RSS). A smaller queue does not imply an immediate return
-to the exact startup RSS. The [build guide](README.md) includes the
-system-allocator fallback for comparisons.
+The server retains the system allocator. Three interleaved burst/idle trials
+per allocator favored its lower absolute resident memory over mimalloc's lower
+retained-growth percentage; the [allocator experiment](../tools/bettermq-bench/baselines/README.md#allocator-experiment)
+records the comparison and its shared-host limitations. Live work, WAL indexes,
+RocksDB working sets, and retained allocator pages still contribute to resident
+set size (RSS). A smaller queue does not imply an immediate return to the exact
+startup RSS.
 
 `bettermq_dispatch_in_flight_deliveries` preserves its historical meaning:
 **owned jobs**, including ready and flow-waiting work. It can exceed a flow's
