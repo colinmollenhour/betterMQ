@@ -458,12 +458,10 @@ async fn finish_publish(
     let epoch = replicate_if_needed(state, &mut resp, wait).await?;
     resp.commit_epoch = Some(epoch);
     if !pending_dedup.is_empty() {
-        let broker = state.broker.clone();
-        broker_partition::run_blocking_io(move || broker.commit_publish_dedup(pending_dedup))
-            .await
-            .map_err(|error| {
-                ApiError::Unavailable(format!("dedup commit task failed: {error}"))
-            })??;
+        state
+            .broker
+            .commit_publish_dedup_async(pending_dedup)
+            .await?;
     }
     if let Some(m) = meter {
         if !resp.duplicate {

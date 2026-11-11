@@ -7,7 +7,7 @@ description = "WAL, segments, and RocksDB indexes"
 
 [features]
 default = []
-s3 = ["dep:object_store", "dep:tokio", "dep:bytes", "dep:futures"]
+s3 = ["dep:object_store", "dep:bytes"]
 slate = ["s3", "dep:slatedb"]
 
 [dependencies]
@@ -20,8 +20,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 bytes = { version = "1", optional = true }
-tokio = { workspace = true, optional = true, features = ["rt-multi-thread"] }
-futures = { version = "0.3", optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+futures = "0.3"
 slatedb = { version = "0.13", optional = true }
 object_store = { version = "0.12", optional = true, features = ["aws"] }
 fs2 = "0.4"

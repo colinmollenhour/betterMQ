@@ -1966,21 +1966,50 @@ impl DispatchEngine {
         let tenant_id = tenant_id.to_owned();
         let topic = topic.to_owned();
         let cursor_key = cursor_key.to_owned();
-        broker_partition::run_blocking_io(move || {
+        let runtime = tokio::runtime::Handle::current();
+        let completion = broker_partition::run_blocking_io(move || {
             // The guard travels with the I/O: cancelling the HTTP task must
             // not unlock a lane whose durable read/compute/write is running.
-            let _lane = lane;
-            engine.advance_cursor_locked(
+            if !engine.broker.supports_metadata_group_commit() {
+                let _lane = lane;
+                return engine
+                    .advance_cursor_locked(
+                        &tenant_id,
+                        &topic,
+                        &cursor_key,
+                        partition,
+                        offset,
+                        message_id,
+                    )
+                    .map(|()| None);
+            }
+            let mut progress = engine.prepare_cursor_progress(
                 &tenant_id,
                 &topic,
                 &cursor_key,
                 partition,
                 offset,
                 message_id,
-            )
+            )?;
+            // Transfer ownership before this admitted closure returns. The
+            // detached continuation and writer receipt retain the lane even
+            // when the original delivery is cancelled at either await point.
+            Ok(Some(runtime.spawn(async move {
+                let _receipt = engine
+                    .broker
+                    .commit_metadata_batch_grouped(std::mem::take(&mut progress.batch), lane)
+                    .await?;
+                engine.finish_cursor_progress(&topic, &cursor_key, partition, offset, progress)
+            })))
         })
         .await
-        .map_err(|error| DispatchError::Failed(error.to_string()))?
+        .map_err(|error| DispatchError::Failed(error.to_string()))??;
+        match completion {
+            Some(completion) => completion
+                .await
+                .map_err(|error| DispatchError::Failed(error.to_string()))?,
+            None => Ok(()),
+        }
     }
 
     /// Body of [`Self::commit_dispatch_offset`]; the caller holds the lane lock
@@ -1994,12 +2023,31 @@ impl DispatchEngine {
         offset: u64,
         message_id: Uuid,
     ) -> Result<(), DispatchError> {
+        let mut progress = self
+            .prepare_cursor_progress(tenant_id, topic, cursor_key, partition, offset, message_id)?;
+        self.broker
+            .commit_metadata_batch(std::mem::take(&mut progress.batch))?;
+        self.finish_cursor_progress(topic, cursor_key, partition, offset, progress)
+    }
+
+    fn prepare_cursor_progress(
+        &self,
+        tenant_id: &str,
+        topic: &str,
+        cursor_key: &str,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
+    ) -> Result<CursorProgress, DispatchError> {
         let cursor = self
             .broker
             .dispatch_offset(tenant_id, cursor_key, partition)?;
         if offset < cursor {
-            self.scan.mark_done(topic, partition, offset);
-            return Ok(());
+            return Ok(CursorProgress {
+                batch: Default::default(),
+                stats: None,
+                error: None,
+            });
         }
         let newly_completed = !self
             .broker
@@ -2047,19 +2095,57 @@ impl DispatchEngine {
             Err(error) => {
                 // A read failure must not forget an HTTP success. Leave its
                 // identity-aware marker durable for the next backfill/restart.
-                self.broker.mark_dispatch_complete_for(
+                let mut batch = broker_storage::MetadataWriteBatch::default();
+                batch.mark_dispatch_complete_for(
                     tenant_id, cursor_key, partition, offset, message_id,
-                )?;
-                return Err(error);
+                );
+                return Ok(CursorProgress {
+                    batch,
+                    stats: None,
+                    error: Some(error),
+                });
             }
         };
-        self.broker
-            .commit_dispatch_progress(tenant_id, cursor_key, partition, offset, message_id, next)?;
+        let mut batch = broker_storage::MetadataWriteBatch::default();
+        batch.mark_dispatch_complete_for(tenant_id, cursor_key, partition, offset, message_id);
+        batch.set_dispatch_offset(tenant_id, cursor_key, partition, next);
+        Ok(CursorProgress {
+            batch,
+            stats: Some(CursorProgressStats {
+                cursor,
+                next,
+                hwm,
+                newly_completed,
+                next_head,
+            }),
+            error: None,
+        })
+    }
+
+    fn finish_cursor_progress(
+        &self,
+        topic: &str,
+        cursor_key: &str,
+        partition: u32,
+        offset: u64,
+        progress: CursorProgress,
+    ) -> Result<(), DispatchError> {
+        if let Some(error) = progress.error {
+            return Err(error);
+        }
         self.scan.mark_done(topic, partition, offset);
-        self.telemetry
-            .record_completion(partition, cursor_key, cursor, next, hwm, newly_completed);
-        self.telemetry
-            .advance_pending_head(partition, cursor_key, next, next_head);
+        if let Some(stats) = progress.stats {
+            self.telemetry.record_completion(
+                partition,
+                cursor_key,
+                stats.cursor,
+                stats.next,
+                stats.hwm,
+                stats.newly_completed,
+            );
+            self.telemetry
+                .advance_pending_head(partition, cursor_key, stats.next, stats.next_head);
+        }
         Ok(())
     }
 
@@ -2144,10 +2230,7 @@ impl DispatchEngine {
         let durability = self.dlq_durability();
         durability.make_durable(&mut response).await?;
         // Publish the dedup mapping only after the DLQ record is quorum-durable.
-        let broker = self.broker.clone();
-        broker_partition::run_blocking_io(move || broker.commit_publish_dedup(pending))
-            .await
-            .map_err(|error| DispatchError::Failed(error.to_string()))??;
+        self.broker.commit_publish_dedup_async(pending).await?;
         debug!(queue = %msg.topic, message_id = %msg.id, "message moved to DLQ");
         Ok(())
     }
@@ -2351,6 +2434,20 @@ impl DispatchEngine {
 
 /// Prefix of a DLQ record: `MAGIC`, one line of JSON metadata, then the
 /// original body bytes verbatim (binary-safe, never re-encoded or escaped).
+struct CursorProgress {
+    batch: broker_storage::MetadataWriteBatch,
+    stats: Option<CursorProgressStats>,
+    error: Option<DispatchError>,
+}
+
+struct CursorProgressStats {
+    cursor: u64,
+    next: u64,
+    hwm: u64,
+    newly_completed: bool,
+    next_head: Option<(u64, i64)>,
+}
+
 pub const DLQ_RECORD_MAGIC: &[u8] = b"BMQDLQ1\n";
 
 /// Bytes a DLQ record may add on top of the original body. Ingest limits

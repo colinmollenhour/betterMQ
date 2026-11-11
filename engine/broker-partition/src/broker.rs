@@ -1281,6 +1281,23 @@ impl Broker {
         Ok(())
     }
 
+    pub fn supports_metadata_group_commit(&self) -> bool {
+        self.inner.metadata.supports_group_commit()
+    }
+
+    pub fn commit_metadata_batch(&self, batch: MetadataWriteBatch) -> Result<(), BrokerError> {
+        self.inner.metadata.write_batch(batch)?;
+        Ok(())
+    }
+
+    pub async fn commit_metadata_batch_grouped<G: Send + 'static>(
+        &self,
+        batch: MetadataWriteBatch,
+        held: G,
+    ) -> Result<broker_storage::MetadataWriteReceipt, BrokerError> {
+        Ok(self.inner.metadata.write_batch_grouped(batch, held).await?)
+    }
+
     /// Whether the record `message_id` at `offset` of `topic` was delivered or
     /// dead-lettered. Identity-aware: a completion marker for a different
     /// message (offset reused after failover) is dropped and reports false; an
@@ -2072,9 +2089,7 @@ impl Broker {
                                 .wait_committed(&response.topic, partition, offset)
                                 .await?;
                         }
-                        crate::run_blocking_io(move || broker.commit_publish_dedup(pending))
-                            .await
-                            .map_err(blocking_task_error)??;
+                        broker.commit_publish_dedup_async(pending).await?;
                     }
                     Ok(response)
                 })
@@ -2463,6 +2478,37 @@ impl Broker {
         for (token, _) in pending.entries {
             token.release();
         }
+        Ok(())
+    }
+
+    /// Await the local metadata writer directly, without parking an admitted
+    /// blocking thread. The queued intent owns the reservations until durable.
+    pub async fn commit_publish_dedup_async(
+        &self,
+        pending: PendingDedup,
+    ) -> Result<(), BrokerError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if !self.inner.metadata.supports_group_commit() {
+            let broker = self.clone();
+            return crate::run_blocking_io(move || broker.commit_publish_dedup(pending))
+                .await
+                .map_err(blocking_task_error)?;
+        }
+        let mut batch = MetadataWriteBatch::default();
+        for (token, entry) in &pending.entries {
+            batch.put_dedup(
+                token.key.tenant_id.clone(),
+                token.key.idempotency_key.clone(),
+                entry.clone(),
+            );
+        }
+        let _receipt = self
+            .inner
+            .metadata
+            .write_batch_grouped(batch, pending)
+            .await?;
         Ok(())
     }
 

@@ -13,6 +13,10 @@ use std::sync::{
 use thiserror::Error;
 use uuid::Uuid;
 
+mod group_commit;
+pub use group_commit::MetadataWriteReceipt;
+use group_commit::MetadataWriter;
+
 #[derive(Debug, Error)]
 pub enum IndexError {
     #[error("rocksdb error: {0}")]
@@ -66,6 +70,35 @@ pub(crate) enum MetadataOperation {
 }
 
 impl MetadataWriteBatch {
+    fn estimated_bytes(&self) -> usize {
+        self.operations.iter().fold(0usize, |bytes, operation| {
+            let strings = match operation {
+                MetadataOperation::PutDedup {
+                    tenant_id,
+                    key,
+                    entry,
+                } => tenant_id
+                    .len()
+                    .saturating_add(key.len())
+                    .saturating_add(entry.topic.len()),
+                MetadataOperation::DeleteDedup { tenant_id, key } => {
+                    tenant_id.len().saturating_add(key.len())
+                }
+                MetadataOperation::SetDispatchOffset {
+                    tenant_id,
+                    subscription_id,
+                    ..
+                }
+                | MetadataOperation::MarkDispatchComplete {
+                    tenant_id,
+                    subscription_id,
+                    ..
+                } => tenant_id.len().saturating_add(subscription_id.len()),
+            };
+            bytes.saturating_add(strings).saturating_add(128)
+        })
+    }
+
     pub fn put_dedup(
         &mut self,
         tenant_id: impl Into<String>,
@@ -249,9 +282,9 @@ struct RocksControl {
 
 enum MetaBackend {
     Rocks {
-        db: DB,
-        sync_writes: WriteOptions,
-        control: RocksControl,
+        db: std::sync::Arc<DB>,
+        sync_writes: std::sync::Arc<WriteOptions>,
+        control: std::sync::Arc<RocksControl>,
     },
     Shared(Box<SharedMetadataStore>),
     #[cfg(feature = "slate")]
@@ -262,6 +295,7 @@ enum MetaBackend {
 pub struct MetadataStore {
     backend: MetaBackend,
     retention_ms: u64,
+    writer: Option<std::sync::Arc<MetadataWriter>>,
 }
 
 impl MetadataStore {
@@ -290,6 +324,7 @@ impl MetadataStore {
                 return Ok(Self {
                     backend: MetaBackend::Shared(Box::new(store)),
                     retention_ms,
+                    writer: None,
                 });
             }
         }
@@ -321,18 +356,32 @@ impl MetadataStore {
             db.put_opt(b"_meta/dedup-migration-ms", now.to_le_bytes(), &sync_writes)?;
             now
         };
+        let db = std::sync::Arc::new(db);
+        let sync_writes = std::sync::Arc::new(sync_writes);
+        let control = std::sync::Arc::new(RocksControl {
+            mutation: Mutex::new(()),
+            sweep_cursor: Mutex::new(Vec::new()),
+            operations: AtomicU64::new(0),
+            migration_ms,
+        });
+        let direct = Self {
+            backend: MetaBackend::Rocks {
+                db: db.clone(),
+                sync_writes: sync_writes.clone(),
+                control: control.clone(),
+            },
+            retention_ms,
+            writer: None,
+        };
+        let writer = MetadataWriter::start(direct)?;
         Ok(Self {
             backend: MetaBackend::Rocks {
                 db,
                 sync_writes,
-                control: RocksControl {
-                    mutation: Mutex::new(()),
-                    sweep_cursor: Mutex::new(Vec::new()),
-                    operations: AtomicU64::new(0),
-                    migration_ms,
-                },
+                control,
             },
             retention_ms,
+            writer: Some(writer),
         })
     }
 
@@ -346,10 +395,18 @@ impl MetadataStore {
         Ok(Self {
             backend: MetaBackend::Slate(store),
             retention_ms: dedup_retention_ms()?,
+            writer: None,
         })
     }
 
     pub fn is_ready(&self) -> bool {
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.check_ready().is_err())
+        {
+            return false;
+        }
         match &self.backend {
             #[cfg(feature = "slate")]
             MetaBackend::Slate(store) => store.is_ready(),
@@ -359,6 +416,9 @@ impl MetadataStore {
     }
 
     pub fn check_ready(&self) -> Result<(), IndexError> {
+        if let Some(writer) = &self.writer {
+            writer.check_ready()?;
+        }
         if let MetaBackend::Shared(store) = &self.backend {
             store.check_ready()?;
         }
@@ -374,6 +434,47 @@ impl MetadataStore {
     /// Shared metadata appends the entire batch under one lock and one fdatasync.
     /// Slate remains a single-broker compatibility backend.
     pub fn write_batch(&self, batch: MetadataWriteBatch) -> Result<(), IndexError> {
+        if batch.operations.is_empty() {
+            return Ok(());
+        }
+        if let Some(writer) = &self.writer {
+            return writer.write_sync(batch);
+        }
+        self.write_batch_direct(batch, 1)
+    }
+
+    /// Local RocksDB metadata supports bounded asynchronous group admission.
+    /// Other backends retain their synchronous compatibility path.
+    pub fn supports_group_commit(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    /// Queue one atomic caller batch and transfer cancellation-sensitive guards
+    /// into the writer. The receipt retains them through caller bookkeeping.
+    pub async fn write_batch_grouped<G: Send + 'static>(
+        &self,
+        batch: MetadataWriteBatch,
+        held: G,
+    ) -> Result<MetadataWriteReceipt, IndexError> {
+        let writer = self.writer.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "metadata backend has no group writer",
+            )
+        })?;
+        writer.write(batch, Box::new(held)).await
+    }
+
+    /// Batched local write epochs since open, excluding maintenance barriers.
+    pub fn group_commit_epochs(&self) -> Option<u64> {
+        self.writer.as_ref().map(|writer| writer.epoch_count())
+    }
+
+    fn write_batch_direct(
+        &self,
+        batch: MetadataWriteBatch,
+        logical_requests: u64,
+    ) -> Result<(), IndexError> {
         if batch.operations.is_empty() {
             return Ok(());
         }
@@ -487,7 +588,7 @@ impl MetadataStore {
                     }
                 }
                 db.write_opt(rocks_batch, sync_writes)?;
-                self.sweep_rocks(db, sync_writes, control)?;
+                self.sweep_rocks(db, sync_writes, control, logical_requests)?;
                 Ok(())
             }
             MetaBackend::Shared(store) => {
@@ -547,6 +648,7 @@ impl MetadataStore {
         tenant_id: &str,
         idempotency_key: &str,
     ) -> Result<Option<DedupEntry>, IndexError> {
+        self.check_ready()?;
         match &self.backend {
             MetaBackend::Shared(s) => Ok(s.get_dedup(tenant_id, idempotency_key)?),
             #[cfg(feature = "slate")]
@@ -563,6 +665,13 @@ impl MetadataStore {
                     Some(bytes) => {
                         let entry = DedupEntry::decoded(&bytes, control.migration_ms)?;
                         if entry.expired(now_ms(), self.retention_ms) {
+                            if let Some(writer) = &self.writer {
+                                let tenant_id = tenant_id.to_owned();
+                                let idempotency_key = idempotency_key.to_owned();
+                                return writer.exclusive(move |store| {
+                                    store.get_dedup(&tenant_id, &idempotency_key)
+                                });
+                            }
                             // Healthy lookups never wait for an unrelated
                             // delivery's fsync. Only expiration mutates; reread
                             // under the lock so it cannot delete a fresh retry.
@@ -650,6 +759,7 @@ impl MetadataStore {
         subscription_id: &str,
         partition: u32,
     ) -> Result<u64, IndexError> {
+        self.check_ready()?;
         match &self.backend {
             MetaBackend::Shared(s) => {
                 Ok(s.dispatch_offset(tenant_id, subscription_id, partition)?)
@@ -812,6 +922,7 @@ impl MetadataStore {
         partition: u32,
         offset: u64,
     ) -> Result<DispatchCompletion, IndexError> {
+        self.check_ready()?;
         match &self.backend {
             MetaBackend::Shared(s) => {
                 Ok(s.dispatch_completion(tenant_id, subscription_id, partition, offset)?)
@@ -844,6 +955,13 @@ impl MetadataStore {
         partition: u32,
         offset: u64,
     ) -> Result<(), IndexError> {
+        if let Some(writer) = &self.writer {
+            let tenant = tenant_id.to_owned();
+            let subscription = subscription_id.to_owned();
+            return writer.exclusive(move |store| {
+                store.clear_dispatch_complete(&tenant, &subscription, partition, offset)
+            });
+        }
         match &self.backend {
             MetaBackend::Shared(s) => {
                 s.clear_dispatch_complete(tenant_id, subscription_id, partition, offset)?;
@@ -892,6 +1010,7 @@ impl MetadataStore {
     /// stores cursors in the shared object store, where every node already
     /// sees them, so it reports none.
     pub fn dispatch_offsets(&self) -> Result<Vec<(String, String, u32, u64)>, IndexError> {
+        self.check_ready()?;
         match &self.backend {
             MetaBackend::Shared(s) => Ok(s.dispatch_offsets()?),
             #[cfg(feature = "slate")]
@@ -952,6 +1071,9 @@ impl MetadataStore {
     /// Additional RocksDB WAL barrier for shutdown/checkpoints. Normal writes
     /// are already synchronous. No-op for shared-file / slate.
     pub fn flush_epoch(&self) -> Result<(), IndexError> {
+        if let Some(writer) = &self.writer {
+            return writer.exclusive(Self::flush_epoch);
+        }
         match &self.backend {
             MetaBackend::Rocks { db, .. } => {
                 db.flush_wal(true)?;
@@ -972,8 +1094,12 @@ impl MetadataStore {
         db: &DB,
         options: &WriteOptions,
         control: &RocksControl,
+        logical_requests: u64,
     ) -> Result<(), IndexError> {
-        if (control.operations.fetch_add(1, Ordering::Relaxed) + 1) % 256 != 0 {
+        let before = control
+            .operations
+            .fetch_add(logical_requests, Ordering::Relaxed);
+        if before / 256 == before.saturating_add(logical_requests) / 256 {
             return Ok(());
         }
         let mut cursor = control
@@ -1025,6 +1151,13 @@ impl MetadataStore {
         partition: u32,
         offset: u64,
     ) -> Result<(), IndexError> {
+        if let Some(writer) = &self.writer {
+            let tenant = tenant.to_owned();
+            let sub = sub.to_owned();
+            return writer.exclusive(move |store| {
+                store.reset_dispatch_offset(&tenant, &sub, partition, offset)
+            });
+        }
         match &self.backend {
             MetaBackend::Shared(store) => {
                 store.reset_dispatch_offset(tenant, sub, partition, offset)?;
@@ -1069,6 +1202,173 @@ impl MetadataStore {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn uncertain_group_sync_failure_fences_reads_and_all_queued_acknowledgements() {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        use std::sync::{atomic::Ordering, Arc};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(super::MetadataStore::open(dir.path()).unwrap());
+        let seed = super::DedupEntry::new(uuid::Uuid::new_v4(), 0, 0, "topic".into());
+        store.put_dedup("tenant", "seed", &seed).unwrap();
+        let writer = store.writer.as_ref().unwrap().clone();
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (release, gate) = std::sync::mpsc::sync_channel(1);
+        *writer.gate.lock().unwrap() = Some((started, gate));
+        let first_store = store.clone();
+        let first = tokio::spawn(async move {
+            let mut batch = super::MetadataWriteBatch::default();
+            batch.set_dispatch_offset("tenant", "first", 0, 1);
+            first_store.write_batch_grouped(batch, ()).await
+        });
+        start.await.unwrap();
+        let mut pending = FuturesUnordered::new();
+        for index in 0..32 {
+            let store = store.clone();
+            pending.push(async move {
+                let mut batch = super::MetadataWriteBatch::default();
+                batch.set_dispatch_offset("tenant", "queued", 0, index);
+                store.write_batch_grouped(batch, ()).await
+            });
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), pending.next())
+                .await
+                .is_err()
+        );
+        writer.fail_next_sync.store(true, Ordering::SeqCst);
+        release.send(()).unwrap();
+        assert!(first
+            .await
+            .unwrap()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("uncertain"));
+        while let Some(result) = pending.next().await {
+            assert!(result.is_err());
+        }
+        assert!(!store.is_ready());
+        assert!(store.get_dedup("tenant", "seed").is_err());
+        assert!(store.dispatch_offset("tenant", "first", 0).is_err());
+        assert!(store.flush_epoch().is_err());
+        drop(writer);
+        drop(store);
+        let recovered = super::MetadataStore::open(dir.path()).unwrap();
+        assert!(recovered.is_ready());
+        assert_eq!(
+            recovered
+                .get_dedup("tenant", "seed")
+                .unwrap()
+                .unwrap()
+                .message_id,
+            seed.message_id
+        );
+        assert_eq!(recovered.dispatch_offset("tenant", "first", 0).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn grouped_writes_bound_admission_and_keep_cancelled_ownership_until_durable() {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(super::MetadataStore::open(dir.path()).unwrap());
+        let entry = super::DedupEntry::new(uuid::Uuid::new_v4(), 0, 0, "topic".into());
+        store.put_dedup("tenant", "healthy", &entry).unwrap();
+        let writer = store.writer.as_ref().unwrap().clone();
+        let epochs = writer.epoch_count();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        struct Guard(Arc<AtomicUsize>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (release, gate) = std::sync::mpsc::sync_channel(1);
+        *writer.gate.lock().unwrap() = Some((started, gate));
+        let first_store = store.clone();
+        let owned = Guard(dropped.clone());
+        let first = tokio::spawn(async move {
+            let mut batch = super::MetadataWriteBatch::default();
+            batch.set_dispatch_offset("tenant", "cancelled", 0, 1);
+            first_store.write_batch_grouped(batch, owned).await
+        });
+        start.await.unwrap();
+        first.abort();
+        assert!(first.await.err().unwrap().is_cancelled());
+        let mut pending = FuturesUnordered::new();
+        for index in 0..400 {
+            let store = store.clone();
+            pending.push(async move {
+                let mut batch = super::MetadataWriteBatch::default();
+                batch.mark_dispatch_complete_for("tenant", "lane", 0, index, uuid::Uuid::new_v4());
+                batch.set_dispatch_offset("tenant", "lane", 0, index);
+                store.write_batch_grouped(batch, ()).await
+            });
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::select! {
+                _ = pending.next() => panic!("no write may finish before the durability gate"),
+                _ = async {
+                    while writer.available_queue_slots() != 0 { tokio::task::yield_now().await; }
+                } => {},
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), pending.next())
+                .await
+                .is_err(),
+            "queue admission and durable replies must not block the runtime"
+        );
+        assert_eq!(
+            writer.available_queue_slots(),
+            0,
+            "the bounded queue applies async backpressure"
+        );
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "cancelled callers cannot release queued guards"
+        );
+        assert_eq!(
+            store
+                .get_dedup("tenant", "healthy")
+                .unwrap()
+                .unwrap()
+                .message_id,
+            entry.message_id,
+            "healthy reads do not wait on the writer's fsync"
+        );
+        release.send(()).unwrap();
+        while let Some(result) = pending.next().await {
+            drop(result.unwrap());
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(store.dispatch_offset("tenant", "lane", 0).unwrap(), 399);
+        assert_eq!(
+            store.dispatch_completion("tenant", "lane", 0, 398).unwrap(),
+            super::DispatchCompletion::Missing,
+            "a later epoch must not resurrect a marker below the final cursor"
+        );
+        assert!(
+            writer.epoch_count() - epochs < 100,
+            "ready caller batches must share durable barriers"
+        );
+        drop(writer);
+        drop(store);
+        let reopened = super::MetadataStore::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.dispatch_offset("tenant", "cancelled", 0).unwrap(),
+            1
+        );
+        assert_eq!(reopened.dispatch_offset("tenant", "lane", 0).unwrap(), 399);
+    }
+
     use super::*;
     use tempfile::tempdir;
 

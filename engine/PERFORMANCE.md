@@ -23,13 +23,36 @@ Inline delivery borrows the verified message rather than cloning its body
 before building the outbound request. External-blob hydration runs on the
 blocking pool and still verifies blob integrity before delivery.
 
-Hot-path blocking I/O shares a process-wide concurrency budget of 32 operations
+Blocking preparation, reads, and journal I/O share a process-wide budget of 32 operations
 (`BETTERMQ_BLOCKING_IO_CONCURRENCY` overrides it). Callers wait asynchronously
 before submitting to Tokio's blocking pool, rather than creating hundreds of
 native threads that contend for the same storage locks. Running I/O keeps its
 permit after caller cancellation. The cost is explicit queueing under storage
 saturation; unrelated Tokio blocking work is not capped. Request tenant scope
 is captured before crossing task/thread boundaries and restored on return.
+
+Asynchronous keyed publishes use the shared WAL commit coordinator rather than
+forcing a private flush. An admitted append transfers its response and dedup
+reservation directly into an owned completion task. The task waits for local
+or quorum durability outside the blocking-I/O budget, then persists dedup.
+Cancelling the request cannot release an already-appended key prematurely.
+Synchronous publishing and Slate keep their existing durability behavior.
+
+Local RocksDB metadata has one dedicated writer and a 256-request queue.
+Asynchronous dedup and completion calls await that queue directly, without
+occupying blocking-I/O permits. Ready caller batches share a synchronous,
+atomic RocksDB write, bounded to 64 requests, 4,096 operations, and roughly
+4 MiB of estimated metadata per group. A larger existing atomic caller batch
+runs alone rather than being split. This costs one native thread per local
+store and explicit queueing under saturation; it does not relax fsync.
+
+Dedup reservations and cursor-lane guards travel with queued writes and their
+receipts, surviving caller cancellation through persistence and bookkeeping.
+Expiry deletes, explicit rewinds, marker cleanup, and checkpoint barriers use
+the same writer ordering. Uncertain RocksDB failures fence new writes and
+metadata reads until recovery on reopen. Shared-file and Slate metadata retain
+their synchronous compatibility paths. The synchronous local API uses channel
+primitives without requiring an active Tokio runtime.
 
 Retry and dead-letter journal writes also use that offload path. Even clearing
 a nonexistent retry must serialize behind an in-progress writer; it cannot
