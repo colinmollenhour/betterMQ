@@ -227,6 +227,10 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Slim { results, out } => {
             let mut report = report::load(&resolve_results(&results))?;
+            // Committable files must not carry local paths.
+            report.meta.data_root = String::new();
+            report.meta.broker_binary = String::new();
+            report.meta.command_line = String::new();
             for sc in &mut report.scenarios {
                 for t in &mut sc.trials {
                     t.series = model::Series::default();
