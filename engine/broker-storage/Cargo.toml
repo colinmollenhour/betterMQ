@@ -7,7 +7,7 @@ description = "WAL, segments, and RocksDB indexes"
 
 [features]
 default = []
-s3 = ["dep:object_store", "dep:bytes"]
+s3 = ["dep:object_store", "dep:bytes", "dep:futures"]
 slate = ["s3", "dep:slatedb"]
 
 [dependencies]
@@ -21,7 +21,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 bytes = { version = "1", optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-futures = "0.3"
+futures = { version = "0.3", optional = true }
 slatedb = { version = "0.13", optional = true }
 object_store = { version = "0.12", optional = true, features = ["aws"] }
 fs2 = "0.4"
@@ -34,6 +34,7 @@ crc32c = "0.6"
 libc = "0.2"
 
 [dev-dependencies]
+futures = "0.3"
 tempfile = "3"
 criterion = "0.5"
 fjall = "2.11.2"

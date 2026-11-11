@@ -1202,6 +1202,58 @@ impl MetadataStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn synchronous_metadata_is_reentrant_inside_a_futures_executor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::MetadataStore::open(dir.path()).unwrap();
+        futures::executor::block_on(async {
+            let mut expired = super::DedupEntry::new(uuid::Uuid::new_v4(), 0, 0, "topic".into());
+            expired.inserted_at_ms = 1;
+            store.put_dedup("tenant", "expired", &expired).unwrap();
+            assert!(store.get_dedup("tenant", "expired").unwrap().is_none());
+            store.set_dispatch_offset("tenant", "lane", 0, 10).unwrap();
+            store.reset_dispatch_offset("tenant", "lane", 0, 2).unwrap();
+            store.flush_epoch().unwrap();
+        });
+        assert_eq!(store.dispatch_offset("tenant", "lane", 0).unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn synchronous_metadata_does_not_exhaust_tokio_cooperative_budget() {
+        const CHILD: &str = "BETTERMQ_TEST_SYNC_META_CHILD";
+        if let Some(path) = std::env::var_os(CHILD) {
+            let store = super::MetadataStore::open(std::path::PathBuf::from(path)).unwrap();
+            // No yield: a nested channel bridge must not consume this task's
+            // budget and then defer its only wake until this poll returns.
+            for next in 1..300 {
+                store
+                    .set_dispatch_offset("tenant", "lane", 0, next)
+                    .unwrap();
+                if next % 8 == 0 {
+                    store.flush_epoch().unwrap();
+                }
+            }
+            assert_eq!(store.dispatch_offset("tenant", "lane", 0).unwrap(), 299);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "indexes::tests::synchronous_metadata_does_not_exhaust_tokio_cooperative_budget",
+                "--nocapture",
+            ])
+            .env(CHILD, dir.path())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+            .await
+            .expect("synchronous metadata exhausted its enclosing Tokio task's budget")
+            .unwrap();
+        assert!(status.success());
+    }
+
     #[tokio::test]
     async fn uncertain_group_sync_failure_fences_reads_and_all_queued_acknowledgements() {
         use futures::stream::{FuturesUnordered, StreamExt};

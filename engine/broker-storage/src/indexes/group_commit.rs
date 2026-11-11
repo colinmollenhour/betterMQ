@@ -1,6 +1,7 @@
 //! One bounded durable writer per local metadata store.
 
 use super::{IndexError, MetadataStore, MetadataWriteBatch};
+use std::future::Future;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
@@ -47,6 +48,30 @@ pub(super) struct MetadataWriter {
 
 fn unavailable(message: impl Into<String>) -> IndexError {
     std::io::Error::other(message.into()).into()
+}
+
+/// Channel synchronization without executor re-entry or consumption of an
+/// enclosing Tokio task's cooperative budget. Unpark permits retain a wake
+/// that arrives between polling the future and parking this thread.
+fn wait_channel<F: Future>(future: F) -> F::Output {
+    struct WakeThread(std::thread::Thread);
+    impl std::task::Wake for WakeThread {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(WakeThread(std::thread::current())));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(tokio::task::unconstrained(future));
+    loop {
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(value) => return value,
+            std::task::Poll::Pending => std::thread::park(),
+        }
+    }
 }
 
 impl MetadataWriter {
@@ -129,10 +154,8 @@ impl MetadataWriter {
     }
 
     pub(super) fn write_sync(&self, batch: MetadataWriteBatch) -> Result<(), IndexError> {
-        // Tokio channels need no runtime driver. The futures executor avoids
-        // blocking_recv/blocking_send panics in legacy synchronous callers that
-        // happen to be invoked from a current-thread Tokio runtime.
-        futures::executor::block_on(self.write(batch, Box::new(()))).map(drop)
+        // Also safe inside a futures executor and one long Tokio task poll.
+        wait_channel(self.write(batch, Box::new(()))).map(drop)
     }
 
     pub(super) fn exclusive<T: Send + 'static>(
@@ -151,14 +174,14 @@ impl MetadataWriter {
             let _ = reply.send(result);
             poison
         }));
-        futures::executor::block_on(
+        wait_channel(
             self.sender
                 .as_ref()
                 .expect("live metadata writer")
                 .send(command),
         )
         .map_err(|_| unavailable("metadata writer stopped"))?;
-        futures::executor::block_on(receiver)
+        wait_channel(receiver)
             .map_err(|_| unavailable("metadata writer stopped before its durable reply"))?
     }
 
