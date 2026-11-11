@@ -251,11 +251,14 @@ impl Drop for FanoutExecutionGuard {
 }
 
 pub(crate) fn try_begin_execution(id: Uuid) -> Option<FanoutExecutionGuard> {
-    ACTIVE_FANOUTS
+    let acquired = ACTIVE_FANOUTS
         .get_or_init(Default::default)
         .lock()
-        .insert(id)
-        .then_some(FanoutExecutionGuard { id })
+        .insert(id);
+    // Construct a guard only for an acquired entry, and after releasing the
+    // registry lock. Eager `then_some` constructed/dropped a losing guard under
+    // that same lock, deadlocking live publishing against outbox replay.
+    acquired.then(|| FanoutExecutionGuard { id })
 }
 
 impl FanoutStore {
@@ -818,6 +821,44 @@ fn apply_event(state: &mut FanoutSnapshot, event: FanoutEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn execution_conflicts_do_not_drop_the_owners_guard_or_deadlock() {
+        const CHILD: &str = "BETTERMQ_TEST_FANOUT_GUARD_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let id = Uuid::new_v4();
+            let guard = try_begin_execution(id).unwrap();
+            for _ in 0..16 {
+                assert!(try_begin_execution(id).is_none());
+            }
+            let other = try_begin_execution(Uuid::new_v4()).unwrap();
+            drop(other);
+            assert!(try_begin_execution(id).is_none());
+            drop(guard);
+            let reacquired = try_begin_execution(id).unwrap();
+            assert!(try_begin_execution(id).is_none());
+            drop(reacquired);
+            return;
+        }
+
+        // Isolate a regression's synchronous deadlock so the timeout can stop
+        // it without wedging every test that shares the process-wide registry.
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fanout::tests::execution_conflicts_do_not_drop_the_owners_guard_or_deadlock",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+            .await
+            .expect("conflicting fanout execution deadlocked")
+            .unwrap();
+        assert!(status.success());
+    }
 
     fn request() -> PublishRequest {
         PublishRequest {

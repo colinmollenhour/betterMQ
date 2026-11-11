@@ -328,7 +328,7 @@ impl FlowController {
         if lane
             .pending
             .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |pending| {
-                (pending < lane.pending_limit.load(AtomicOrdering::Acquire)).then_some(pending + 1)
+                (pending < lane.pending_limit.load(AtomicOrdering::Acquire)).then(|| pending + 1)
             })
             .is_err()
         {

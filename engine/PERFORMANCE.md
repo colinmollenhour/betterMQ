@@ -43,6 +43,10 @@ pending scan therefore indexes FIFO heads, and delivery waits for earlier
 durable work of the same lane. Group topics participate in backfill too, so
 fan-out records remain recoverable after overflow or restart.
 
+Live fan-out publishing and outbox replay share an execution registry. Failed
+claims never create cleanup guards: dropping an eagerly constructed guard while
+holding that registry's mutex would deadlock both publishing and replay.
+
 Production construction installs lease and leadership controls before replay
 or workers start. Replicated cells begin fenced until quorum recovery finishes.
 Tracked child deliveries are cancelled and awaited during shutdown; RAII guards
