@@ -253,18 +253,33 @@ fn val(v: f64, unit: &str) -> String {
     }
 }
 
+fn build_name(r: &RunReport) -> String {
+    let m = &r.meta;
+    if m.label.is_empty() {
+        format!(
+            "`{}` @ `{}` (broker sha256 {})",
+            m.git_branch,
+            m.git_sha,
+            m.broker_sha256.chars().take(10).collect::<String>()
+        )
+    } else {
+        format!(
+            "**{}** (broker sha256 {}, run {})",
+            m.label,
+            m.broker_sha256.chars().take(10).collect::<String>(),
+            m.started_at.chars().take(10).collect::<String>()
+        )
+    }
+}
+
 pub fn render_markdown(a: &RunReport, b: &RunReport, c: &Comparison) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "# betterMQ benchmark comparison\n");
     let _ = writeln!(
         s,
-        "Baseline `{}` @ `{}` ({}) → candidate `{}` @ `{}` ({}).\n",
-        a.meta.git_branch,
-        a.meta.git_sha,
-        a.meta.started_at,
-        b.meta.git_branch,
-        b.meta.git_sha,
-        b.meta.started_at
+        "Baseline {} → candidate {}.\n",
+        build_name(a),
+        build_name(b)
     );
     let _ = writeln!(
         s,

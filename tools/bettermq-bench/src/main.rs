@@ -71,6 +71,14 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Recompute ramp headline metrics from stored steps with the current
+    /// knee definition and re-render the report.
+    Reanalyze {
+        results: PathBuf,
+        /// Output directory.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Pool several results files (e.g. one invocation per scenario and trial,
     /// interleaved with another build) into one multi-trial result.
     Merge {
@@ -133,6 +141,9 @@ struct RunArgs {
     /// Keep broker data directories after each trial.
     #[arg(long)]
     keep_data: bool,
+    /// Name for the broker build under test, shown in comparisons.
+    #[arg(long, default_value = "")]
+    label: String,
     /// Abort instead of warning when the host is noisy, the CPU governor is not
     /// `performance`, the data dir is on tmpfs, etc. Use for baselines.
     #[arg(long)]
@@ -190,6 +201,13 @@ fn main() -> anyhow::Result<()> {
             let dir = out.unwrap_or_else(|| path.parent().unwrap_or(Path::new(".")).to_path_buf());
             report::write_all(&report, &dir)?;
             eprintln!("report written to {}", dir.display());
+            Ok(())
+        }
+        Cmd::Reanalyze { results, out } => {
+            let mut r = report::load(&resolve_results(&results))?;
+            runner::reanalyze(&mut r);
+            report::write_all(&r, &out)?;
+            eprintln!("reanalyzed into {}", out.display());
             Ok(())
         }
         Cmd::Merge { inputs, out } => {
@@ -361,6 +379,7 @@ fn run_cmd(args: RunArgs) -> anyhow::Result<()> {
         bench_cpus: bench_list.unwrap_or_else(|| "unpinned".into()),
         command_line: std::env::args().collect::<Vec<_>>().join(" "),
         strict_env: args.strict_env,
+        label: args.label.clone(),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

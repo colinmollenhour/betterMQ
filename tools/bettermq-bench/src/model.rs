@@ -6,6 +6,33 @@ use std::collections::BTreeMap;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// JSON has no NaN: non-finite floats are written as `null`. Read them back as NaN.
+mod nan {
+    use serde::{Deserialize, Deserializer};
+
+    pub fn f64<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        Ok(Option::<f64>::deserialize(d)?.unwrap_or(f64::NAN))
+    }
+
+    pub fn vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f64>, D::Error> {
+        Ok(Vec::<Option<f64>>::deserialize(d)?
+            .into_iter()
+            .map(|v| v.unwrap_or(f64::NAN))
+            .collect())
+    }
+
+    pub fn map<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<std::collections::BTreeMap<String, f64>, D::Error> {
+        Ok(
+            std::collections::BTreeMap::<String, Option<f64>>::deserialize(d)?
+                .into_iter()
+                .map(|(k, v)| (k, v.unwrap_or(f64::NAN)))
+                .collect(),
+        )
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RunReport {
     pub schema: u32,
@@ -27,6 +54,9 @@ pub struct RunMeta {
     pub git_sha: String,
     pub git_dirty: bool,
     pub git_branch: String,
+    /// Human name for the broker build under test (e.g. a branch).
+    #[serde(default)]
+    pub label: String,
     pub broker_binary: String,
     pub broker_sha256: String,
     pub broker_size_bytes: u64,
@@ -38,9 +68,9 @@ pub struct RunMeta {
     pub data_root: String,
     pub auth: String,
     pub slo: Slo,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nan::f64")]
     pub rate_scale: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nan::f64")]
     pub time_scale: f64,
     #[serde(default)]
     pub broker_env: Vec<String>,
@@ -50,12 +80,16 @@ pub struct RunMeta {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Slo {
     /// Durable-ACK p99 limit (ms), measured from the *intended* send time.
+    #[serde(default, deserialize_with = "nan::f64")]
     pub ack_p99_ms: f64,
     /// Maximum fraction of offered messages that may be rejected or fail.
+    #[serde(default, deserialize_with = "nan::f64")]
     pub max_error_rate: f64,
     /// Achieved throughput must reach this fraction of offered.
+    #[serde(default, deserialize_with = "nan::f64")]
     pub min_achieved_ratio: f64,
     /// End-to-end delivery p99 limit (ms) where a scenario enforces it.
+    #[serde(default, deserialize_with = "nan::f64")]
     pub delivery_p99_ms: f64,
 }
 
@@ -81,6 +115,7 @@ pub struct EnvInfo {
     pub governor: String,
     pub data_fs_type: String,
     pub data_device_rotational: Option<bool>,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub load_avg_start: f64,
     /// Share of the broker CPUs already busy with other work before the run (%).
     pub preflight_busy_broker_cpus_pct: Option<f64>,
@@ -95,8 +130,11 @@ pub struct EnvInfo {
 /// server, so readers know when a result is generator-limited.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Calibration {
+    #[serde(default, deserialize_with = "nan::f64")]
     pub null_server_msgs_s: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub null_server_p50_us: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub null_server_p99_us: f64,
     pub connections: u32,
     pub note: String,
@@ -115,6 +153,7 @@ pub struct Metric {
     pub id: String,
     pub label: String,
     pub unit: String,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub value: f64,
     pub direction: Direction,
     /// Scorecard section, e.g. "throughput", "latency", "cpu", "memory".
@@ -122,7 +161,7 @@ pub struct Metric {
     /// Shown in the report's headline scorecard.
     pub headline: bool,
     /// Per-trial values when the scenario was repeated.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nan::vec")]
     pub samples: Vec<f64>,
 }
 
@@ -216,7 +255,9 @@ pub enum PhaseKind {
 pub struct Phase {
     pub name: String,
     pub kind: PhaseKind,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub start_s: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub end_s: f64,
 }
 
@@ -256,40 +297,68 @@ impl Series {
 pub struct StepResult {
     pub index: usize,
     pub label: String,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub offered_msg_s: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub achieved_msg_s: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub duration_s: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub ack_p50_ms: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub ack_p99_ms: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub ack_p999_ms: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub ack_max_ms: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub error_rate: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub cpu_cores: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub rss_mb: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub gen_lag_p99_ms: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub backlog_growth_per_s: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub delivered_msg_s: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub delivery_p99_ms: f64,
     pub passed: bool,
     pub fail_reasons: Vec<String>,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub start_s: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub end_s: f64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MemoryRelease {
+    #[serde(default, deserialize_with = "nan::f64")]
     pub idle_start_mb: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub peak_mb: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub post_drain_mb: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub settled_mb: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub settled_anon_mb: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub settled_file_mb: f64,
     /// (settled - idle) / (peak - idle), clamped to >= 0.
+    #[serde(default, deserialize_with = "nan::f64")]
     pub retained_pct: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub settle_secs: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub disk_idle_mb: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub disk_peak_mb: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub disk_settled_mb: f64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub disk_retained_pct: f64,
 }
 
@@ -322,6 +391,7 @@ pub struct ConcurrencyCheck {
 pub struct TrialResult {
     pub index: u32,
     pub seed: u64,
+    #[serde(default, deserialize_with = "nan::f64")]
     pub duration_s: f64,
     pub phases: Vec<Phase>,
     pub series: Series,
@@ -338,6 +408,7 @@ pub struct TrialResult {
     #[serde(default)]
     pub broker_log_top: Vec<(String, u64)>,
     /// Last scrape of broker counters, kept for forensics.
+    #[serde(default, deserialize_with = "nan::map")]
     pub final_counters: BTreeMap<String, f64>,
 }
 
@@ -421,6 +492,23 @@ mod tests {
         assert_eq!(m[0].value, 3.0);
         assert_eq!(m[0].samples, vec![1.0, 5.0, 3.0]);
         assert!(m[0].cv().unwrap() > 0.5);
+    }
+
+    #[test]
+    fn non_finite_values_survive_a_json_round_trip() {
+        let mut m = Metric::new("a", "A", "ms", f64::NAN, Direction::LowerBetter, "latency");
+        m.samples = vec![1.0, f64::NAN];
+        let step = StepResult {
+            ack_p99_ms: f64::NAN,
+            ..Default::default()
+        };
+        let back: Metric = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert!(back.value.is_nan());
+        assert_eq!(back.samples[0], 1.0);
+        assert!(back.samples[1].is_nan());
+        let back: StepResult =
+            serde_json::from_str(&serde_json::to_string(&step).unwrap()).unwrap();
+        assert!(back.ack_p99_ms.is_nan());
     }
 
     #[test]

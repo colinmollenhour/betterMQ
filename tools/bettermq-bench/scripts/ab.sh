@@ -13,11 +13,13 @@
 # Result: <dir>/a, <dir>/b (pooled multi-trial reports) and <dir>/compare.md.
 set -euo pipefail
 
-A=""; B=""; OUT=""; TRIALS=3; PROFILE=standard; SCEN=""; SEED=20260101
+A=""; B=""; LA="a"; LB="b"; OUT=""; TRIALS=3; PROFILE=standard; SCEN=""; SEED=20260101
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --a) A="$2"; shift 2;;
     --b) B="$2"; shift 2;;
+    --label-a) LA="$2"; shift 2;;
+    --label-b) LB="$2"; shift 2;;
     --out) OUT="$2"; shift 2;;
     --trials) TRIALS="$2"; shift 2;;
     --profile) PROFILE="$2"; shift 2;;
@@ -43,12 +45,12 @@ for ((t = 0; t < TRIALS; t++)); do
     order=(a b); if (( (t + round) % 2 == 1 )); then order=(b a); fi
     round=$((round + 1))
     for side in "${order[@]}"; do
-      bin="$A"; [[ "$side" == b ]] && bin="$B"
+      bin="$A"; label="$LA"; [[ "$side" == b ]] && { bin="$B"; label="$LB"; }
       dir="$OUT/runs/$side/t$t-$sc"
       if [[ -f "$dir/results.json" ]]; then continue; fi
       echo "[$(date +%H:%M:%S)] trial $((t + 1))/$TRIALS $sc $side"
       "$BENCH" run --profile "$PROFILE" --repeats 1 --seed "$seed" --scenarios "$sc" \
-        --broker-bin "$bin" --out "$dir" --no-calibrate "$@" || echo "  (invocation failed; continuing)"
+        --broker-bin "$bin" --label "$label" --out "$dir" --no-calibrate "$@" || echo "  (invocation failed; continuing)"
     done
   done
 done

@@ -73,18 +73,17 @@ pub struct Knee {
     pub peak_achieved: f64,
 }
 
+/// Locate the sustained ceiling and the breakdown.
+///
+/// A failing step is only a *confirmed* failure when the next step also fails
+/// (or it is the last one). An isolated failure followed by a pass is a
+/// transient (a cold first step, a noisy second on a shared host), not the
+/// limit; this mirrors the ramp, which stops after two consecutive failures.
 pub fn find_knee(steps: &[StepResult]) -> Knee {
-    let mut sustained: Option<&StepResult> = None;
-    let mut first_fail = None;
-    for (i, s) in steps.iter().enumerate() {
-        if s.passed {
-            if first_fail.is_none() {
-                sustained = Some(s);
-            }
-        } else if first_fail.is_none() {
-            first_fail = Some(i);
-        }
-    }
+    let confirmed = |i: usize| !steps[i].passed && (i + 1 == steps.len() || !steps[i + 1].passed);
+    let first_fail = (0..steps.len()).find(|i| confirmed(*i));
+    let limit = first_fail.unwrap_or(steps.len());
+    let sustained = steps[..limit].iter().rev().find(|s| s.passed);
     Knee {
         sustained_offered: sustained.map(|s| s.offered_msg_s),
         sustained_achieved: sustained.map(|s| s.achieved_msg_s),
@@ -421,7 +420,8 @@ mod tests {
             step(100.0, 100.0, 2.0, 0.0),
             step(200.0, 200.0, 3.0, 0.0),
             step(400.0, 400.0, 90.0, 0.0),
-            step(800.0, 800.0, 4.0, 0.0), // would pass, but we already broke
+            step(800.0, 800.0, 95.0, 0.0),
+            step(1600.0, 1600.0, 4.0, 0.0), // would pass, but we already broke
         ];
         for s in &mut steps {
             classify_step(s, &slo, false);
@@ -429,7 +429,27 @@ mod tests {
         let knee = find_knee(&steps);
         assert_eq!(knee.sustained_offered, Some(200.0));
         assert_eq!(knee.first_fail, Some(2));
-        assert_eq!(knee.peak_achieved, 800.0);
+        assert_eq!(knee.peak_achieved, 1600.0);
+    }
+
+    #[test]
+    fn an_isolated_failure_is_a_transient_not_the_ceiling() {
+        let slo = Slo::default();
+        // Cold first step fails alone, then the broker is fine up to 800.
+        let mut steps = vec![
+            step(100.0, 100.0, 120.0, 0.0),
+            step(200.0, 200.0, 3.0, 0.0),
+            step(400.0, 400.0, 4.0, 0.0),
+            step(800.0, 800.0, 5.0, 0.0),
+            step(1600.0, 900.0, 80.0, 0.0),
+            step(3200.0, 900.0, 200.0, 0.0),
+        ];
+        for s in &mut steps {
+            classify_step(s, &slo, false);
+        }
+        let knee = find_knee(&steps);
+        assert_eq!(knee.sustained_offered, Some(800.0));
+        assert_eq!(knee.first_fail, Some(4));
     }
 
     #[test]
