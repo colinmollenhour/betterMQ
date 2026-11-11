@@ -24,6 +24,9 @@ an allocator. For a system-allocator diagnostic build:
 cargo build --release -p broker-server --no-default-features
 ```
 
+See [bounded dispatch and memory](PERFORMANCE.md) for the scheduling, ordering,
+recovery, and memory-accounting tradeoffs.
+
 Run locally:
 
 ```bash

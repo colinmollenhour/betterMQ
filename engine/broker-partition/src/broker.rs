@@ -1662,7 +1662,7 @@ impl Broker {
     /// Normalize an engine-facing batch without appending. Existing and
     /// within-batch duplicates retain their input slots.
     ///
-    /// Never blocks: if another request holds one of the batch's idempotency
+    /// Never waits for another request: if one holds the batch's idempotency
     /// keys, every reservation taken so far is released and
     /// [`BrokerError::IdempotencyInFlight`] is returned. Async callers should
     /// use [`Broker::prepare_publish_batch_waiting`].
@@ -1690,21 +1690,29 @@ impl Broker {
     /// batch's idempotency keys, so a retry resolves to the original message.
     pub async fn prepare_publish_batch_waiting(
         &self,
-        requests: Vec<PublishRequest>,
+        mut requests: Vec<PublishRequest>,
     ) -> Result<PreparedPublishBatch, BrokerError> {
-        let tenant_id = self.tenant();
         let deadline = tokio::time::Instant::now() + DEDUP_IN_FLIGHT_WAIT;
         loop {
-            match self.try_reserve_batch_dedup(&tenant_id, &requests)? {
-                Ok(reservations) => {
-                    let broker = self.clone();
-                    return tokio::task::spawn_blocking(move || {
-                        broker.prepare_reserved_batch(requests, reservations, None)
-                    })
-                    .await
-                    .map_err(blocking_task_error)?;
+            let broker = self.clone();
+            // Reservation verification can read the WAL and migrate or remove
+            // durable metadata. Keep the entire attempt off the async worker,
+            // not just payload preparation. Return ownership on conflict rather
+            // than cloning the batch's payloads for each retry.
+            let attempt = tokio::task::spawn_blocking(move || {
+                match broker.try_reserve_batch_dedup(&broker.tenant(), &requests)? {
+                    Ok(reservations) => broker
+                        .prepare_reserved_batch(requests, reservations, None)
+                        .map(Ok),
+                    Err(in_flight) => Ok(Err((requests, in_flight))),
                 }
-                Err(in_flight) => {
+            })
+            .await
+            .map_err(blocking_task_error)??;
+            match attempt {
+                Ok(prepared) => return Ok(prepared),
+                Err((retry_requests, in_flight)) => {
+                    requests = retry_requests;
                     let key = in_flight.idempotency_key.clone();
                     if tokio::time::timeout_at(deadline, in_flight.released())
                         .await
@@ -2340,7 +2348,7 @@ impl Broker {
             if entry.offset >= self.dedup_visible_hwm(&topic, entry.partition)? {
                 continue;
             }
-            match shard.read_range(entry.partition, entry.offset, 1) {
+            match shard.read_range_metadata(entry.partition, entry.offset, 1) {
                 Ok(messages)
                     if messages.iter().any(|message| {
                         message.offset == entry.offset && message.id == entry.message_id
@@ -4183,6 +4191,54 @@ mod tests {
                 assert_eq!(response.offset, owner.offset);
             }
         });
+    }
+
+    #[test]
+    fn dedup_verification_does_not_block_a_single_runtime_worker() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let original = broker
+            .publish(direct_request("owner", Some("durable-key".into())))
+            .unwrap();
+        broker.flush_wal().unwrap();
+
+        // Dedup verification must consult the shard map. Simulate a slow
+        // storage operation there; only the runtime's sibling future can
+        // release it. A bounded watchdog also lets the old blocking path fail
+        // the test instead of hanging the suite.
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let holder = broker.clone();
+        let thread = std::thread::spawn(move || {
+            let _guard = holder.inner.shards.write();
+            locked_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+        });
+        locked_rx.recv().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (prepared, ()) = runtime.block_on(async {
+            tokio::join!(
+                broker.prepare_publish_batch_waiting(vec![direct_request(
+                    "retry",
+                    Some("durable-key".into()),
+                )]),
+                async {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let _ = release_tx.send(());
+                }
+            )
+        });
+        assert!(
+            thread.join().unwrap(),
+            "dedup verification blocked the runtime"
+        );
+        let response = prepared.unwrap().finish().unwrap().pop().unwrap();
+        assert!(response.duplicate);
+        assert_eq!(response.message_id, original.message_id);
+        assert_eq!(response.offset, original.offset);
     }
 
     #[test]
