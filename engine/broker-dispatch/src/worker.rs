@@ -1381,13 +1381,21 @@ impl DispatchEngine {
             })
     }
 
+    #[cfg(test)]
     fn clear_retry(&self, msg: &StoredMessage) -> Result<(), DispatchError> {
         self.retry_state
             .clear(&Self::retry_key(msg))
             .map_err(|error| DispatchError::Failed(error.to_string()))
     }
 
-    fn schedule_retry(
+    async fn clear_retry_async(&self, msg: &StoredMessage) -> Result<(), DispatchError> {
+        self.retry_state
+            .clear_async(&Self::retry_key(msg))
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))
+    }
+
+    async fn schedule_retry(
         &self,
         msg: &StoredMessage,
         attempts: u32,
@@ -1395,7 +1403,8 @@ impl DispatchEngine {
         reason: String,
     ) -> Result<(), DispatchError> {
         let delay_ms = delay_ms.max(1);
-        self.persist_retry(msg, attempts, delay_ms, reason)?;
+        self.persist_retry_async(msg, attempts, delay_ms, reason)
+            .await?;
         self.telemetry.record_retry_scheduled();
         self.defer_job(
             DeliveryJob::live(msg.topic.clone(), msg.partition, msg.offset, msg.id),
@@ -1405,6 +1414,27 @@ impl DispatchEngine {
         Ok(())
     }
 
+    fn retry_record(
+        msg: &StoredMessage,
+        attempts: u32,
+        delay_ms: u64,
+        reason: String,
+    ) -> RetryRecord {
+        let delay_ms = delay_ms.max(1);
+        let due_at_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_add(delay_ms.min(i64::MAX as u64) as i64);
+        RetryRecord {
+            key: Self::retry_key(msg),
+            cursor_key: broker_partition::flow_lane_owner(msg).to_string(),
+            fifo_key: Self::fifo_retry_key(msg),
+            attempts,
+            due_at_ms,
+            last_error: reason,
+        }
+    }
+
+    #[cfg(test)]
     fn persist_retry(
         &self,
         msg: &StoredMessage,
@@ -1412,21 +1442,23 @@ impl DispatchEngine {
         delay_ms: u64,
         reason: String,
     ) -> Result<(), DispatchError> {
-        let delay_ms = delay_ms.max(1);
-        let due_at_ms = chrono::Utc::now()
-            .timestamp_millis()
-            .saturating_add(delay_ms.min(i64::MAX as u64) as i64);
         self.retry_state
-            .schedule(RetryRecord {
-                key: Self::retry_key(msg),
-                cursor_key: broker_partition::flow_lane_owner(msg).to_string(),
-                fifo_key: Self::fifo_retry_key(msg),
-                attempts,
-                due_at_ms,
-                last_error: reason,
-            })
+            .schedule(Self::retry_record(msg, attempts, delay_ms, reason))
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
         Ok(())
+    }
+
+    async fn persist_retry_async(
+        &self,
+        msg: &StoredMessage,
+        attempts: u32,
+        delay_ms: u64,
+        reason: String,
+    ) -> Result<(), DispatchError> {
+        self.retry_state
+            .schedule_async(Self::retry_record(msg, attempts, delay_ms, reason))
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))
     }
 
     /// Re-enqueue after a delay without advancing the dispatch cursor (pause / host block).
@@ -1708,7 +1740,8 @@ impl DispatchEngine {
             )
             .await?;
             self.lifecycle
-                .clear(&Self::retry_key(msg))
+                .clear_async(&Self::retry_key(msg))
+                .await
                 .map_err(|error| DispatchError::Failed(error.to_string()))?;
             return Ok(());
         }
@@ -1765,7 +1798,7 @@ impl DispatchEngine {
                 Ok(resp) if resp.status().is_success() => {
                     self.host_blocker.record_success_async(url).await;
                     discard_body_capped(resp).await;
-                    self.clear_retry(msg)?;
+                    self.clear_retry_async(msg).await?;
                     self.commit_dispatch_offset(
                         &tenant_id,
                         &msg.topic,
@@ -1880,7 +1913,8 @@ impl DispatchEngine {
         let delay_ms = requested_retry_after_ms
             .unwrap_or(backoff)
             .min(backoff_cfg.max_ms);
-        self.schedule_retry(msg, attempt, delay_ms, last_failure)?;
+        self.schedule_retry(msg, attempt, delay_ms, last_failure)
+            .await?;
         Ok(())
     }
 
@@ -2037,20 +2071,21 @@ impl DispatchEngine {
         let source = Self::retry_key(msg);
         let cursor_key = broker_partition::flow_lane_owner(msg).to_string();
         self.lifecycle
-            .prepare(DlqTransition {
+            .prepare_async(DlqTransition {
                 source: source.clone(),
                 cursor_key: cursor_key.clone(),
                 reason: reason.clone(),
                 phase: DlqPhase::Prepared,
                 updated_at_ms: chrono::Utc::now().timestamp_millis(),
             })
+            .await
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
         self.telemetry.record_dlq_prepared();
         if let Err(error) = self.move_to_dlq(msg, reason).await {
             self.telemetry.record_dlq_failure();
             return Err(error);
         }
-        if let Err(error) = self.lifecycle.mark_dlq_committed(&source) {
+        if let Err(error) = self.lifecycle.mark_dlq_committed_async(&source).await {
             self.telemetry.record_dlq_failure();
             return Err(DispatchError::Failed(error.to_string()));
         }
@@ -2062,7 +2097,7 @@ impl DispatchEngine {
         };
         // DLQ record durable → clear the retry → advance the cursor. A crash
         // in between is finished at startup from the committed transition.
-        self.clear_retry(msg)?;
+        self.clear_retry_async(msg).await?;
         self.commit_dispatch_offset(
             &tenant,
             &msg.topic,
@@ -2073,7 +2108,8 @@ impl DispatchEngine {
         )
         .await?;
         self.lifecycle
-            .clear(&source)
+            .clear_async(&source)
+            .await
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
         Ok(())
     }
@@ -2083,7 +2119,43 @@ impl DispatchEngine {
         msg: &StoredMessage,
         reason: impl Into<String>,
     ) -> Result<(), DispatchError> {
-        let mut msg = msg.clone();
+        let tenant = if msg.tenant_id.is_empty() {
+            self.broker.tenant()
+        } else {
+            msg.tenant_id.clone()
+        };
+        broker_partition::scope_tenant(tenant, self.move_to_dlq_scoped(msg, reason.into())).await
+    }
+
+    async fn move_to_dlq_scoped(
+        &self,
+        msg: &StoredMessage,
+        reason: String,
+    ) -> Result<(), DispatchError> {
+        let engine = self.clone();
+        let owned = msg.clone();
+        let prepared = broker_partition::run_blocking_io(move || engine.prepare_dlq(owned, reason))
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))??;
+        let Some((mut response, pending)) = prepared else {
+            return Ok(());
+        };
+        let durability = self.dlq_durability();
+        durability.make_durable(&mut response).await?;
+        // Publish the dedup mapping only after the DLQ record is quorum-durable.
+        let broker = self.broker.clone();
+        broker_partition::run_blocking_io(move || broker.commit_publish_dedup(pending))
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))??;
+        debug!(queue = %msg.topic, message_id = %msg.id, "message moved to DLQ");
+        Ok(())
+    }
+
+    fn prepare_dlq(
+        &self,
+        mut msg: StoredMessage,
+        reason: String,
+    ) -> Result<Option<(PublishResponse, broker_partition::PendingDedup)>, DispatchError> {
         self.broker
             .hydrate_message_payload(&mut msg)
             .map_err(DispatchError::Broker)?;
@@ -2091,7 +2163,6 @@ impl DispatchEngine {
             (Some(gid), Some(mid)) => group_member_dlq_topic(gid, mid),
             _ => dlq_topic(&msg.topic),
         };
-        let reason = reason.into();
         let record = {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.encode(dlq_record(&msg, &reason))
@@ -2133,7 +2204,7 @@ impl DispatchEngine {
         if response.duplicate {
             if self.dlq_record_durable(&response)? {
                 warn!(queue = %msg.topic, message_id = %msg.id, "message already in DLQ");
-                return Ok(());
+                return Ok(None);
             }
             // Dedup hits are verified below the quorum watermark, so this is a
             // safety net: append again without the key (a duplicate DLQ record
@@ -2142,17 +2213,7 @@ impl DispatchEngine {
             again.idempotency_key = None;
             (response, pending) = self.broker.publish_to_shard(again, msg.partition)?;
         }
-        let durability = self.dlq_durability();
-        durability.make_durable(&mut response).await?;
-        // Record the key only once the DLQ record is quorum-durable; dropping
-        // `pending` on an error above releases it unrecorded.
-        self.broker.commit_publish_dedup(pending)?;
-        debug!(
-            queue = %msg.topic,
-            message_id = %msg.id,
-            "message moved to DLQ"
-        );
-        Ok(())
+        Ok(Some((response, pending)))
     }
 
     fn record_http_result(
@@ -2211,7 +2272,10 @@ impl DispatchEngine {
         reason: &str,
         retry_after_ms: u64,
     ) -> Result<LeasedFailure, DispatchError> {
-        let msg = self.broker.read_message(topic, partition, offset)?;
+        let msg = self
+            .broker
+            .read_message_async(topic, partition, offset)
+            .await?;
         let attempts = self
             .retry_state
             .get(&Self::retry_key(&msg))
@@ -2231,7 +2295,8 @@ impl DispatchEngine {
             return Ok(LeasedFailure::DeadLettered);
         }
         let delay_ms = retry_after_ms.max(1);
-        self.persist_retry(&msg, attempts, delay_ms, reason.to_string())?;
+        self.persist_retry_async(&msg, attempts, delay_ms, reason.to_string())
+            .await?;
         self.telemetry.record_retry_scheduled();
         Ok(LeasedFailure::RetryScheduled { attempts, delay_ms })
     }
@@ -2267,9 +2332,13 @@ impl DispatchEngine {
         offset: u64,
         reason: &str,
     ) -> Result<(), DispatchError> {
-        let msgs = self
-            .broker
-            .list_topic_messages_from(topic, partition, offset, 8)?;
+        let broker = self.broker.clone();
+        let topic = topic.to_owned();
+        let msgs = broker_partition::run_blocking_io(move || {
+            broker.list_topic_messages_from(&topic, partition, offset, 8)
+        })
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))??;
         let Some(msg) = msgs.into_iter().find(|m| m.offset == offset) else {
             return Err(DispatchError::Failed(
                 "message not found for dead-letter".into(),
@@ -3233,6 +3302,48 @@ mod tests {
         );
         broker.blob_store().delete_blob(&reference).unwrap();
         assert!(engine.hydrate_delivery_message(&external).await.is_err());
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn dead_lettering_keeps_the_stored_tenant_across_io_handoffs() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(broker_partition::BrokerConfig::new(dir.path().into())).unwrap();
+        let response = broker_partition::scope_tenant("tenant-a".into(), async {
+            broker
+                .publish_async(
+                    serde_json::from_value(serde_json::json!({
+                        "url": "http://127.0.0.1:1/hook", "secret": "secret", "payload": "body"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+        })
+        .await;
+        broker.flush_wal().unwrap();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        for _ in 0..2 {
+            // No request scope exists on background delivery workers.
+            engine
+                .dead_letter_offset(
+                    &response.topic,
+                    response.partition.unwrap(),
+                    response.offset.unwrap(),
+                    "rejected",
+                )
+                .await
+                .unwrap();
+        }
+        let records = broker
+            .list_topic_messages(&dlq_topic(&response.topic), 10)
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "the scoped DLQ key must suppress a second move"
+        );
+        assert_eq!(records[0].tenant_id, "tenant-a");
         engine.shutdown_background().await;
     }
 

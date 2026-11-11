@@ -31,6 +31,15 @@ permit after caller cancellation. The cost is explicit queueing under storage
 saturation; unrelated Tokio blocking work is not capped. Request tenant scope
 is captured before crossing task/thread boundaries and restored on return.
 
+Retry and dead-letter journal writes also use that offload path. Even clearing
+a nonexistent retry must serialize behind an in-progress writer; it cannot
+simply return early while the writer's new row is not visible yet. A no-op
+cleanup stays synchronous only when it can take the writer lock without
+waiting. Compaction copies cached metadata under the state lock, then encodes,
+persists and rotates under the separate writer lock so cached readers do not
+wait for its fsync. DLQ preparation, local append and dedup persistence remain
+ordered around the asynchronous quorum durability step.
+
 Backfill shares pending metadata through reference-counted entries. Its window
 is bounded to 4,096 entries **per topic/partition**, not per process, so metadata
 memory still depends on the number of active topics and partitions. Message
