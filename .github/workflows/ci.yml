@@ -124,6 +124,7 @@ jobs:
           python3 tests/test_internal_compose.py
           python3 tests/test_installers.py
           python3 ../scripts/test_load_test.py
+          python3 ../tools/bettermq-bench/scripts/test_ab.py
           bash tests/test_backup_restore.sh
 
   slate-minio:

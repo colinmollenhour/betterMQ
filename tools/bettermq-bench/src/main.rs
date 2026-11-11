@@ -399,5 +399,9 @@ fn run_cmd(args: RunArgs) -> anyhow::Result<()> {
     eprintln!("\nreport: {}", out_dir.join("report.html").display());
     eprintln!("        {}", out_dir.join("report.md").display());
     eprintln!("        {}", out_dir.join("results.json").display());
+    anyhow::ensure!(
+        !report.meta.finished_at.is_empty(),
+        "benchmark interrupted; partial results were saved but are not a completed run"
+    );
     Ok(())
 }

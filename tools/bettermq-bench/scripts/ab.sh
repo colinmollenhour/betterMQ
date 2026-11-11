@@ -47,10 +47,11 @@ for ((t = 0; t < TRIALS; t++)); do
     for side in "${order[@]}"; do
       bin="$A"; label="$LA"; [[ "$side" == b ]] && { bin="$B"; label="$LB"; }
       dir="$OUT/runs/$side/t$t-$sc"
-      if [[ -f "$dir/results.json" ]]; then continue; fi
+      if [[ -f "$dir/results.json" && -f "$dir/.ab-complete" ]]; then continue; fi
       echo "[$(date +%H:%M:%S)] trial $((t + 1))/$TRIALS $sc $side"
       "$BENCH" run --profile "$PROFILE" --repeats 1 --seed "$seed" --scenarios "$sc" \
-        --broker-bin "$bin" --label "$label" --out "$dir" --no-calibrate "$@" || echo "  (invocation failed; continuing)"
+        --broker-bin "$bin" --label "$label" --out "$dir" --no-calibrate "$@" \
+        && touch "$dir/.ab-complete" || echo "  (invocation failed; continuing)"
     done
   done
 done

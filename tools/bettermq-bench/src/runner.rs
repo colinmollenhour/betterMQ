@@ -157,7 +157,6 @@ pub async fn run(
                 r = scenarios::run(id, ctx.clone(), t, seed) => r,
                 _ = tokio::signal::ctrl_c() => {
                     eprintln!("interrupted; writing partial results");
-                    report.meta.finished_at = chrono::Utc::now().to_rfc3339();
                     return Ok(report);
                 }
             };
@@ -227,6 +226,12 @@ fn headline_summary(t: &TrialResult) -> String {
 /// pooled (so per-invocation runs interleaved with another build become one
 /// multi-trial result), metrics re-aggregated, and findings re-derived.
 pub fn merge(reports: Vec<RunReport>) -> anyhow::Result<RunReport> {
+    anyhow::ensure!(
+        reports
+            .iter()
+            .all(|report| !report.meta.finished_at.is_empty()),
+        "cannot merge unfinished runs; rerun interrupted invocations first"
+    );
     let mut iter = reports.into_iter();
     let mut out = iter
         .next()
@@ -520,7 +525,10 @@ mod tests {
         };
         RunReport {
             schema: SCHEMA_VERSION,
-            meta: RunMeta::default(),
+            meta: RunMeta {
+                finished_at: "2026-11-11T00:00:00Z".into(),
+                ..Default::default()
+            },
             env: EnvInfo::default(),
             calibration: None,
             scenarios: vec![ScenarioResult {
@@ -550,5 +558,12 @@ mod tests {
         assert_eq!(sc.metrics[0].value, 3.0);
         assert_eq!(sc.metrics[0].samples.len(), 3);
         assert_eq!(merged.meta.repeats, 3);
+    }
+
+    #[test]
+    fn merge_rejects_an_unfinished_input() {
+        let mut interrupted = rep(2.0);
+        interrupted.meta.finished_at.clear();
+        assert!(merge(vec![rep(1.0), interrupted]).is_err());
     }
 }

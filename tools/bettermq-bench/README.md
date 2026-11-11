@@ -55,6 +55,11 @@ correctness: a candidate scenario that errors or fails, a new critical finding
 (lost messages, FIFO violations), or a metric that vanished or became
 non-finite, however fast it was.
 
+Interrupted runs keep partial results but exit unsuccessfully; `merge` rejects
+unfinished inputs and comparison gates reject unfinished candidates or missing
+scenarios. The interleaved `scripts/ab.sh` helper resumes only invocations with
+both results and a successful completion marker, never a partial results file.
+
 ## Profiles
 
 | Profile | Purpose | Trials | Approx. time (all scenarios) |

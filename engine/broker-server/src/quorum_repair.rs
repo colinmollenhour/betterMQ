@@ -435,6 +435,17 @@ mod tests {
         (response.topic, response.partition.unwrap())
     }
 
+    async fn assert_replicated_to_a_peer(peers: &[MockServer]) {
+        // minISR includes the local leader and either healthy follower. The
+        // slower request may be cancelled once quorum is reached, so no fixed
+        // follower is guaranteed to have received it.
+        let mut received = 0;
+        for peer in peers {
+            received += peer.received_requests().await.unwrap().len();
+        }
+        assert!(received > 0, "quorum verification must contact a follower");
+    }
+
     #[tokio::test]
     async fn unreplicated_tail_is_verified_on_quorum_before_dispatch() {
         let (cluster, state, _dir, peers) = cell(true).await;
@@ -454,7 +465,7 @@ mod tests {
             state.broker.dispatch_hwm(&topic, partition).unwrap(),
             committed
         );
-        assert!(!peers[0].received_requests().await.unwrap().is_empty());
+        assert_replicated_to_a_peer(&peers).await;
     }
 
     #[tokio::test]
@@ -519,8 +530,7 @@ mod tests {
                 .unwrap(),
             offset + 1
         );
-        let replicated = peers[0].received_requests().await.unwrap();
-        assert!(!replicated.is_empty());
+        assert_replicated_to_a_peer(&peers).await;
     }
 
     #[tokio::test]

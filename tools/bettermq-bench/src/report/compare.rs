@@ -73,9 +73,15 @@ pub fn compare(a: &RunReport, b: &RunReport, threshold: f64) -> Comparison {
     let mut only_base = Vec::new();
     let mut only_cand = Vec::new();
     let mut hard: Vec<String> = Vec::new();
+    if b.meta.finished_at.is_empty() {
+        hard.push("candidate run is unfinished".into());
+    }
     for sa in &a.scenarios {
         match b.scenarios.iter().find(|s| s.id == sa.id) {
-            None => only_base.push(sa.id.clone()),
+            None => {
+                only_base.push(sa.id.clone());
+                hard.push(format!("{}: scenario is missing from the candidate", sa.id));
+            }
             Some(sb) => {
                 for ma in &sa.metrics {
                     if !sb.metrics.iter().any(|m| m.id == ma.id) && ma.value.is_finite() {
@@ -383,7 +389,10 @@ mod tests {
     fn report(status: Status, findings: Vec<Finding>, metric: f64) -> RunReport {
         RunReport {
             schema: SCHEMA_VERSION,
-            meta: RunMeta::default(),
+            meta: RunMeta {
+                finished_at: "2026-11-11T00:00:00Z".into(),
+                ..Default::default()
+            },
             env: EnvInfo::default(),
             calibration: None,
             scenarios: vec![ScenarioResult {
@@ -447,6 +456,24 @@ mod tests {
         let base = report(Status::Fail, vec![critical.clone()], 100.0);
         let candidate = report(Status::Fail, vec![critical], 50.0);
         assert!(!compare(&base, &candidate, 0.1).hard_failures.is_empty());
+    }
+
+    #[test]
+    fn unfinished_runs_and_missing_scenarios_fail_the_gate() {
+        let base = report(Status::Pass, vec![], 100.0);
+        let mut candidate = report(Status::Pass, vec![], 50.0);
+        assert!(compare(&base, &candidate, 0.1).hard_failures.is_empty());
+        candidate.meta.finished_at.clear();
+        assert!(compare(&base, &candidate, 0.1)
+            .hard_failures
+            .iter()
+            .any(|failure| failure.contains("unfinished")));
+        candidate.meta.finished_at = base.meta.finished_at.clone();
+        candidate.scenarios.clear();
+        assert!(compare(&base, &candidate, 0.1)
+            .hard_failures
+            .iter()
+            .any(|failure| failure.contains("scenario is missing")));
     }
 
     #[test]
