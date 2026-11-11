@@ -245,7 +245,8 @@ async fn replicated_http_ingest_survives_sigkill_and_refuses_missing_quorum() {
 
     let publish = json!({"url":"https://example.com/hook", "secret":"delivery-secret", "body":"direct-single", "key":"failover-key", "idempotency_key":"publish-one"});
     let (status, body) = post(&client, &nodes[1], "/v1/publish", &publish).await;
-    acknowledged.insert(accepted_id(status, &body));
+    let old_leader_id = accepted_id(status, &body);
+    acknowledged.insert(old_leader_id);
     let shard = body["delivery"]["shard"].as_u64().unwrap();
     let batch = json!({"messages": (0..16).map(|index| json!({
         "topic":"http-test", "routing_key": if index % 2 == 0 { "" } else { "   " },
@@ -312,6 +313,12 @@ async fn replicated_http_ingest_survives_sigkill_and_refuses_missing_quorum() {
     )
     .await;
     assert_eq!(accepted_id(status, &body), failover_id);
+
+    // The takeover also needs the original leader's durable producer keys,
+    // not only keys first created on the new leader after election.
+    let (status, body) = post(&client, &nodes[survivors[0]], "/v1/publish", &publish).await;
+    assert_eq!(accepted_id(status, &body), old_leader_id);
+    assert_eq!(body["duplicate"], true);
 
     nodes[survivors[0]].crash();
     let lone = survivors[1];

@@ -1007,6 +1007,7 @@ impl PartitionLog {
         }
 
         Ok(StoredMessage {
+            idempotency_key: header.idempotency_key,
             id: header.id,
             tenant_id: header.tenant_id,
             topic: header.topic,
@@ -1087,6 +1088,7 @@ impl PartitionLog {
         }
 
         let stored = StoredMessage {
+            idempotency_key: header.idempotency_key,
             id: header.id,
             tenant_id: header.tenant_id,
             topic: header.topic,
@@ -1173,6 +1175,7 @@ impl PartitionLog {
             ));
             byte_offset += frame.len() as u64;
             let stored = StoredMessage {
+                idempotency_key: header.idempotency_key,
                 id: header.id,
                 tenant_id: header.tenant_id,
                 topic: header.topic,
@@ -2135,6 +2138,7 @@ fn stored_message(
     offset: u64,
 ) -> StoredMessage {
     StoredMessage {
+        idempotency_key: header.idempotency_key,
         id: header.id,
         tenant_id: header.tenant_id,
         topic: header.topic,

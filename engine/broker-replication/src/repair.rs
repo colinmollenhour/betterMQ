@@ -201,7 +201,7 @@ impl ReplicationClient {
             .filter(|entry| !entry.in_sync)
             .collect();
         for entry in lagging {
-            if !runtime.is_leader_for_shard(entry.partition) {
+            if !runtime.is_recovery_leader_for_shard(entry.partition) {
                 continue;
             }
             let targets = self.targets_for_shard(entry.partition);
@@ -231,8 +231,9 @@ impl ReplicationClient {
             return Ok(None);
         };
         let epoch = runtime.shard_generation(shard);
-        let still_leader =
-            || runtime.is_leader_for_shard(shard) && runtime.shard_generation(shard) == epoch;
+        let still_leader = || {
+            runtime.is_recovery_leader_for_shard(shard) && runtime.shard_generation(shard) == epoch
+        };
         if !still_leader() {
             return Ok(None);
         }
@@ -932,6 +933,26 @@ mod tests {
 
     fn ids(log: &[Vec<u8>]) -> Vec<Uuid> {
         log.iter().map(|bytes| frame_id(bytes).unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn elected_leader_repairs_followers_while_takeover_ingest_is_fenced() {
+        let leader: Vec<_> = (0..8).map(|_| frame(Uuid::new_v4())).collect();
+        let harness = harness(leader.clone(), leader[..3].to_vec()).await;
+        let runtime = harness.client.runtime.as_ref().unwrap();
+        runtime.set_shard_ready(0, false);
+        assert!(!runtime.is_leader_for_shard(0));
+        assert!(runtime.is_recovery_leader_for_shard(0));
+        harness
+            .client
+            .schedule_repair("orders", 0, harness.peer.clone());
+        settle(&harness).await;
+        assert_eq!(harness.follower.ids(), ids(&leader));
+        assert!(in_sync(&harness));
+        assert!(
+            !runtime.shard_ready(0),
+            "repair itself must not bypass the takeover barrier"
+        );
     }
 
     #[tokio::test]

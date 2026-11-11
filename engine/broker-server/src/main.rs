@@ -671,6 +671,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         broker.enable_quorum_gating();
     }
     if let Some(ref c) = cluster {
+        if broker.quorum_gating() {
+            for shard in 0..broker.shard_count() {
+                c.runtime.set_shard_ready(shard, false);
+            }
+        }
         c.attach_local_log(broker.clone(), &settings.data_dir)
             .context("open replica fence")?;
         if c.runtime.config().node_count() > 1 && storage == StorageMode::Local {
@@ -915,6 +920,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             }
         }
     }
+    drop(server);
 
     if let Some((fleet, delivery)) = &fleet {
         stop_fleet(fleet, delivery, shutdown_deadline).await;
@@ -929,6 +935,21 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         tracing::warn!("dispatch drain deadline exceeded; retry state remains durable");
     }
 
+    // Stop delivery producers before closing owned completion admission. Keep
+    // quorum repair alive while orphaned publishes finish their durability
+    // waits; stopping repair first could strand a verified-prefix waiter.
+    app_state.dispatch.shutdown_background().await;
+    match tokio::time::timeout(
+        Duration::from_secs(shutdown_deadline),
+        app_state.broker.close_and_drain_owned_completions(),
+    )
+    .await
+    {
+        Ok(()) => info!("owned ingest and completion drain complete"),
+        Err(_) => tracing::warn!("owned ingest and completion drain deadline exceeded"),
+    }
+    abort_and_join(bg_tasks, Duration::from_secs(shutdown_deadline.min(5))).await;
+
     let broker = app_state.broker.clone();
     match tokio::time::timeout(
         Duration::from_secs(shutdown_deadline),
@@ -941,8 +962,6 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         Ok(Err(error)) => tracing::warn!(%error, "WAL flush task failed"),
         Err(_) => tracing::warn!("WAL flush deadline exceeded"),
     }
-    abort_and_join(bg_tasks, Duration::from_secs(shutdown_deadline.min(5))).await;
-    app_state.dispatch.shutdown_background().await;
     drop(app_state);
     // Let reqwest/hyper drop timers before #[tokio::main] tears down the runtime.
     tokio::task::yield_now().await;

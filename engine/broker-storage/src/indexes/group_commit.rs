@@ -50,6 +50,10 @@ fn unavailable(message: impl Into<String>) -> IndexError {
     std::io::Error::other(message.into()).into()
 }
 
+fn uncertain(error: &IndexError) -> bool {
+    matches!(error, IndexError::Rocks(_) | IndexError::Uncertain(_))
+}
+
 /// Channel synchronization without executor re-entry or consumption of an
 /// enclosing Tokio task's cooperative budget. Unpark permits retain a wake
 /// that arrives between polling the future and parking this thread.
@@ -167,7 +171,7 @@ impl MetadataWriter {
         let poisoned = self.poisoned.clone();
         let command = Command::Exclusive(Box::new(move |store| {
             let result = store.and_then(operation);
-            let poison = matches!(result, Err(IndexError::Rocks(_)));
+            let poison = result.as_ref().is_err_and(uncertain);
             if poison {
                 poisoned.store(true, Ordering::Release);
             }
@@ -265,8 +269,13 @@ fn run(
             }
         }
         let mut batch = MetadataWriteBatch::default();
-        for intent in &mut group {
-            batch.operations.append(&mut intent.batch.operations);
+        for intent in &group {
+            // Retain original caller boundaries for isolation if preparation
+            // fails before any write. This costs at most one bounded group of
+            // cloned metadata, never cloned message bodies.
+            batch
+                .operations
+                .extend(intent.batch.operations.iter().cloned());
         }
         #[cfg(test)]
         if let Some((started, release)) = gate.lock().unwrap().take() {
@@ -296,8 +305,29 @@ fn run(
         if result.is_ok() && operations != 0 {
             epochs.fetch_add(1, Ordering::Relaxed);
         }
-        if matches!(result, Err(IndexError::Rocks(_))) {
+        if result.as_ref().is_err_and(uncertain) {
             poisoned.store(true, Ordering::Release);
+        }
+        if result.is_err() && group.len() > 1 && !poisoned.load(Ordering::Acquire) {
+            // A validation failure is not an uncertain fsync. Retry original
+            // intents in order, so one corrupt lane cannot drop unrelated
+            // appended producer mappings or acknowledge an unpersisted write.
+            for intent in group {
+                let result = if poisoned.load(Ordering::Acquire) {
+                    Err(unavailable("metadata writer is fenced; restart to recover"))
+                } else {
+                    store.write_batch_direct(intent.batch, 1)
+                };
+                if result.as_ref().is_err_and(uncertain) {
+                    poisoned.store(true, Ordering::Release);
+                }
+                if result.is_ok() {
+                    epochs.fetch_add(1, Ordering::Relaxed);
+                }
+                let result = result.map(|()| MetadataWriteReceipt { _held: intent.held });
+                let _ = intent.reply.send(result);
+            }
+            continue;
         }
         let error = result.err().map(|error| error.to_string());
         for intent in group {

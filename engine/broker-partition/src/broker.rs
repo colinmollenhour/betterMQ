@@ -31,6 +31,10 @@ use uuid::Uuid;
 pub const DEFAULT_TENANT: &str = "default";
 pub const DEFAULT_PARTITIONS: u32 = 4;
 
+tokio::task_local! {
+    static OWNED_BROKER: Uuid;
+}
+
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
     pub data_dir: PathBuf,
@@ -97,6 +101,8 @@ pub enum BrokerError {
     InvalidConfig(String),
     #[error("idempotency key {0} is in flight on another request; retry shortly")]
     IdempotencyInFlight(String),
+    #[error("idempotency key {0} is awaiting contiguous quorum verification; retry shortly")]
+    DedupQuorumPending(String),
 }
 
 fn blocking_task_error(error: tokio::task::JoinError) -> BrokerError {
@@ -330,6 +336,12 @@ enum ReservationOutcome {
     Acquired(ReservationToken),
 }
 
+enum DedupVerification {
+    Verified(String),
+    Unverified,
+    Stale,
+}
+
 /// Idempotency reservations kept past the local append until replication
 /// quorum resolves. [`Broker::commit_publish_dedup`] records the mappings and
 /// releases the keys; dropping it releases the keys without recording them, so
@@ -550,6 +562,9 @@ struct BrokerInner {
     // Serialize opens of the same backend without blocking unrelated shards.
     shard_open_locks: Mutex<ShardOpenLocks>,
     dedup_reservations: Arc<DedupReservations>,
+    owned_completions: tokio_util::task::TaskTracker,
+    accepting_owned: std::sync::atomic::AtomicBool,
+    owned_id: Uuid,
     shard_leader_check: Mutex<Option<ShardFenceFn>>,
     /// Gate dispatch on the quorum watermark (multi-node local-WAL cells).
     quorum_gating: std::sync::atomic::AtomicBool,
@@ -572,6 +587,60 @@ pub struct QuorumStatus {
 }
 
 impl Broker {
+    /// Register before handing admitted storage work to a native closure or
+    /// detached continuation. Registration after the shutdown fence is refused.
+    pub fn owned_completion_token(&self) -> Result<impl Send + 'static, BrokerError> {
+        let token = self.inner.owned_completions.token();
+        let nested = OWNED_BROKER
+            .try_with(|id| *id == self.inner.owned_id)
+            .unwrap_or(false);
+        if !nested
+            && !self
+                .inner
+                .accepting_owned
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(BrokerError::Storage(broker_storage::LogError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "broker is draining owned storage work",
+                ),
+            )));
+        }
+        Ok(token)
+    }
+
+    /// Own the whole admitted operation, including caller-supplied resource
+    /// guards, until it completes even if its response waiter disappears.
+    pub fn spawn_owned<F>(
+        &self,
+        future: F,
+    ) -> Result<tokio::task::JoinHandle<F::Output>, BrokerError>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let token = self.owned_completion_token()?;
+        let tenant = self.tenant();
+        Ok(tokio::spawn(OWNED_BROKER.scope(
+            self.inner.owned_id,
+            crate::scope_tenant(tenant, async move {
+                let _owned = token;
+                future.await
+            }),
+        )))
+    }
+
+    /// Stop new owned work and await admitted continuations before the final
+    /// WAL/metadata checkpoint. Producers must be stopped before invoking this.
+    pub async fn close_and_drain_owned_completions(&self) {
+        self.inner
+            .accepting_owned
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.inner.owned_completions.close();
+        self.inner.owned_completions.wait().await;
+    }
+
     /// Only the standalone server invokes this. Cells seed/adopt through Raft.
     pub fn import_legacy_shared_catalog(&self) -> Result<(), BrokerError> {
         crate::catalog_import::import(
@@ -809,6 +878,9 @@ impl Broker {
                 shards: RwLock::new(HashMap::new()),
                 shard_open_locks: Mutex::new(HashMap::new()),
                 dedup_reservations: Arc::new(DedupReservations::default()),
+                owned_completions: tokio_util::task::TaskTracker::new(),
+                accepting_owned: std::sync::atomic::AtomicBool::new(true),
+                owned_id: Uuid::new_v4(),
                 shard_leader_check: Mutex::new(None),
                 quorum_gating: std::sync::atomic::AtomicBool::new(false),
                 quorum: RwLock::new(HashMap::new()),
@@ -1180,6 +1252,20 @@ impl Broker {
             .map_err(|error| BrokerError::Storage(broker_storage::LogError::Io(error)))
     }
 
+    /// Wait for the contiguous quorum prefix, not just this record's own ACKs.
+    /// The caller supplies its timeout and leadership/generation fence.
+    pub async fn wait_quorum_visible(
+        &self,
+        topic: &str,
+        partition: u32,
+        end: u64,
+    ) -> Result<(), BrokerError> {
+        if self.quorum_gating() {
+            self.quorum_watermark(topic, partition)?.wait_for(end).await;
+        }
+        Ok(())
+    }
+
     /// Identity-less completion markers count only below this offset: above
     /// it the offset may hold a different record than the one completed.
     pub fn legacy_completion_trusted_below(
@@ -1325,14 +1411,45 @@ impl Broker {
             )? {
                 broker_storage::DispatchCompletion::Missing => false,
                 broker_storage::DispatchCompletion::Message(id) if id == message_id => true,
-                broker_storage::DispatchCompletion::Message(_) => {
-                    self.inner.metadata.clear_dispatch_complete(
+                broker_storage::DispatchCompletion::Message(stale_id) => {
+                    // A late completion/query may itself refer to a previous
+                    // occupant of this offset. Only the current WAL identity
+                    // is allowed to classify a different marker as stale.
+                    let current = self
+                        .shard_handle(topic, partition)?
+                        .read_range_metadata(partition, offset, 1)?;
+                    if !current.iter().any(|message| {
+                        message.offset == offset
+                            && message.id == message_id
+                            && message.topic == topic
+                    }) {
+                        return Ok(false);
+                    }
+                    self.inner.metadata.clear_dispatch_complete_for(
                         tenant_id,
                         subscription_id,
                         partition,
                         offset,
+                        stale_id,
                     )?;
-                    false
+                    offset
+                        < self.inner.metadata.dispatch_offset(
+                            tenant_id,
+                            subscription_id,
+                            partition,
+                        )?
+                        || match self.inner.metadata.dispatch_completion(
+                            tenant_id,
+                            subscription_id,
+                            partition,
+                            offset,
+                        )? {
+                            broker_storage::DispatchCompletion::Message(id) => id == message_id,
+                            broker_storage::DispatchCompletion::Legacy => {
+                                offset < self.legacy_completion_trusted_below(topic, partition)?
+                            }
+                            broker_storage::DispatchCompletion::Missing => false,
+                        }
                 }
                 broker_storage::DispatchCompletion::Legacy => {
                     offset < self.legacy_completion_trusted_below(topic, partition)?
@@ -1385,6 +1502,58 @@ impl Broker {
             out.push((msg.offset, frame));
         }
         Ok(out)
+    }
+
+    /// Rebuild a bounded page of producer identities before a recovered shard
+    /// accepts writes. Follower WALs retain the original keys, including across
+    /// catch-up. Preserve the original timestamp rather than extending TTL on
+    /// every election, and never replace a newer valid tenant-wide mapping.
+    pub fn recover_dedup_page(
+        &self,
+        topic: &str,
+        partition: u32,
+        from: u64,
+        target: u64,
+    ) -> Result<u64, BrokerError> {
+        let messages = self
+            .shard_handle(topic, partition)?
+            .read_range_metadata(partition, from, 256)?;
+        let mut batch = MetadataWriteBatch::default();
+        let mut next = from;
+        for message in messages
+            .into_iter()
+            .take_while(|message| message.offset < target)
+        {
+            next = message.offset.saturating_add(1);
+            let Some(key) = message.idempotency_key else {
+                continue;
+            };
+            let timestamp = u64::try_from(message.published_at_ms).unwrap_or(1).max(1);
+            if let Some(existing) = self.inner.metadata.get_dedup(&message.tenant_id, &key)? {
+                if existing.message_id == message.id
+                    || (existing.inserted_at_ms > timestamp
+                        && matches!(
+                            self.verify_dedup_hit_with_visibility(
+                                &message.tenant_id,
+                                &existing,
+                                false
+                            )?,
+                            DedupVerification::Verified(_)
+                        ))
+                {
+                    continue;
+                }
+            }
+            let mut entry = DedupEntry::new(message.id, message.offset, partition, message.topic);
+            entry.inserted_at_ms = timestamp;
+            batch.put_dedup(message.tenant_id, key, entry);
+        }
+        self.inner.metadata.write_batch(batch)?;
+        Ok(if next == from {
+            target
+        } else {
+            next.min(target)
+        })
     }
 
     /// Block until `offset` is on the shard's committed high watermark.
@@ -2122,11 +2291,17 @@ impl Broker {
         let broker = self.clone();
         let tenant = self.tenant();
         let runtime = tokio::runtime::Handle::current();
+        let owned = self.owned_completion_token()?;
+        let owner_id = self.inner.owned_id;
         let completion = crate::run_blocking_io(move || {
             let (response, pending) = broker.publish_prepared(prepared, false)?;
-            Ok::<_, BrokerError>(runtime.spawn(crate::scope_tenant(tenant, async move {
-                complete(response, pending).await
-            })))
+            Ok::<_, BrokerError>(runtime.spawn(OWNED_BROKER.scope(
+                owner_id,
+                crate::scope_tenant(tenant, async move {
+                    let _owned = owned;
+                    complete(response, pending).await
+                }),
+            )))
         })
         .await
         .map_err(blocking_task_error)??;
@@ -2351,16 +2526,22 @@ impl Broker {
             Err(in_flight) => return Ok(Err(in_flight)),
         };
         if let Some(entry) = self.inner.metadata.get_dedup(tenant_id, idempotency_key)? {
-            if let Some(topic) = self.verify_dedup_hit(tenant_id, &entry)? {
-                if entry.topic.is_empty() && !topic.is_empty() {
-                    let mut migrated = entry.clone();
-                    migrated.topic = topic;
-                    self.inner
-                        .metadata
-                        .put_dedup(tenant_id, idempotency_key, &migrated)?;
+            match self.verify_dedup_hit(tenant_id, &entry)? {
+                DedupVerification::Unverified => {
+                    return Err(BrokerError::DedupQuorumPending(idempotency_key.to_owned()));
                 }
-                token.release();
-                return Ok(Ok(ReservationOutcome::Existing(entry)));
+                DedupVerification::Verified(topic) => {
+                    if entry.topic.is_empty() && !topic.is_empty() {
+                        let mut migrated = entry.clone();
+                        migrated.topic = topic;
+                        self.inner
+                            .metadata
+                            .put_dedup(tenant_id, idempotency_key, &migrated)?;
+                    }
+                    token.release();
+                    return Ok(Ok(ReservationOutcome::Existing(entry)));
+                }
+                DedupVerification::Stale => {}
             }
             // Provably stale (its record is absent or belongs to another
             // message): drop it and publish as new under the held key.
@@ -2381,7 +2562,16 @@ impl Broker {
         &self,
         tenant: &str,
         entry: &DedupEntry,
-    ) -> Result<Option<String>, BrokerError> {
+    ) -> Result<DedupVerification, BrokerError> {
+        self.verify_dedup_hit_with_visibility(tenant, entry, true)
+    }
+
+    fn verify_dedup_hit_with_visibility(
+        &self,
+        tenant: &str,
+        entry: &DedupEntry,
+        quorum: bool,
+    ) -> Result<DedupVerification, BrokerError> {
         let legacy_topic_unknown = entry.topic.is_empty() && !self.inner.layout.is_physical();
         let topics = if !entry.topic.is_empty() {
             vec![entry.topic.clone()]
@@ -2398,6 +2588,7 @@ impl Broker {
             self.local_dedup_topics(tenant)?
         };
         let mut ambiguous_reclaimed_topic = false;
+        let mut unverified = false;
         for topic in topics {
             let shard = self.shard_handle(&topic, entry.partition)?;
             // D4's safe retained base proves a reclaimed record was committed
@@ -2407,9 +2598,18 @@ impl Broker {
                     ambiguous_reclaimed_topic = true;
                     continue;
                 }
-                return Ok(Some(topic));
+                return Ok(DedupVerification::Verified(topic));
             }
-            if entry.offset >= self.dedup_visible_hwm(&topic, entry.partition)? {
+            let visible = if quorum {
+                self.dedup_visible_hwm(&topic, entry.partition)?
+            } else {
+                shard.committed_hwm()
+            };
+            if entry.offset >= visible {
+                // A locally durable record above the contiguous quorum prefix
+                // is not stale. Repair may still be proving an earlier gap.
+                unverified |=
+                    quorum && self.quorum_gating() && entry.offset < shard.committed_hwm();
                 continue;
             }
             match shard.read_range_metadata(entry.partition, entry.offset, 1) {
@@ -2418,7 +2618,7 @@ impl Broker {
                         message.offset == entry.offset && message.id == entry.message_id
                     }) =>
                 {
-                    return Ok(Some(topic))
+                    return Ok(DedupVerification::Verified(topic))
                 }
                 Ok(_) | Err(broker_storage::LogError::OffsetNotFound(_)) => {}
                 Err(error) => return Err(error.into()),
@@ -2428,9 +2628,13 @@ impl Broker {
             // Keep pre-upgrade behavior when retention makes a topic-less
             // legacy mapping unverifiable. Do not invent a topic to migrate.
             broker_storage::record_legacy_unverifiable_dedup_hit();
-            return Ok(Some(String::new()));
+            return Ok(DedupVerification::Verified(String::new()));
         }
-        Ok(None)
+        Ok(if unverified {
+            DedupVerification::Unverified
+        } else {
+            DedupVerification::Stale
+        })
     }
 
     fn local_dedup_topics(&self, tenant: &str) -> Result<Vec<String>, BrokerError> {
@@ -3299,7 +3503,7 @@ fn encode_replication_frame(msg: &StoredMessage) -> Result<Vec<u8>, BrokerError>
         tenant_id: msg.tenant_id.clone(),
         topic: msg.topic.clone(),
         routing_key: msg.routing_key.clone(),
-        idempotency_key: None,
+        idempotency_key: msg.idempotency_key.clone(),
         published_at_ms: msg.published_at_ms,
         priority: msg.priority,
         flow_parallelism: msg.flow_parallelism,
@@ -3793,6 +3997,115 @@ mod tests {
                 .unwrap();
         }
         prepared.finish().unwrap()
+    }
+
+    #[test]
+    fn unverified_dedup_survives_out_of_order_quorum_and_returns_original_identity() {
+        let dir = tempdir().unwrap();
+        let broker = open_v2_broker(dir.path(), 1);
+        broker.enable_quorum_gating();
+        broker
+            .publish(direct_request("unverified prefix", None))
+            .unwrap();
+        let original = broker
+            .publish(direct_request("original", Some("quorum-gap".into())))
+            .unwrap();
+        broker.flush_wal().unwrap();
+        assert_eq!(original.offset, Some(1));
+        assert_eq!(
+            broker.record_quorum_commit(DIRECT_TOPIC, 0, 1, 2).unwrap(),
+            0
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                broker.publish(direct_request("retry", Some("quorum-gap".into()))),
+                Err(BrokerError::DedupQuorumPending(_))
+            ));
+            assert_eq!(
+                broker
+                    .inner
+                    .metadata
+                    .get_dedup(&broker.tenant(), "quorum-gap")
+                    .unwrap()
+                    .unwrap()
+                    .message_id,
+                original.message_id.unwrap()
+            );
+            assert_eq!(broker.partition_high_watermark(DIRECT_TOPIC, 0).unwrap(), 2);
+        }
+        assert_eq!(
+            broker.record_quorum_commit(DIRECT_TOPIC, 0, 0, 1).unwrap(),
+            2
+        );
+        let retry = broker
+            .publish(direct_request("retry", Some("quorum-gap".into())))
+            .unwrap();
+        assert!(retry.duplicate);
+        assert_eq!(retry.message_id, original.message_id);
+    }
+
+    #[test]
+    fn catchup_retains_keys_and_recovery_rebuilds_old_leader_dedup_without_extending_ttl() {
+        let leader_dir = tempdir().unwrap();
+        let follower_dir = tempdir().unwrap();
+        let leader = open_v2_broker(leader_dir.path(), 1);
+        let original = leader
+            .publish(direct_request("old leader", Some("old-leader-key".into())))
+            .unwrap();
+        leader.flush_wal().unwrap();
+        let follower = open_v2_broker(follower_dir.path(), 1);
+        let frames = leader
+            .namespace_replication_frames(DIRECT_TOPIC, 0, 0, 256, 1024 * 1024)
+            .unwrap();
+        for (offset, frame) in &frames {
+            follower
+                .append_replicated_frame(DIRECT_TOPIC, 0, frame, Some(*offset))
+                .unwrap();
+        }
+        follower.flush_wal().unwrap();
+        assert!(follower
+            .inner
+            .metadata
+            .get_dedup(&follower.tenant(), "old-leader-key")
+            .unwrap()
+            .is_none());
+        follower.enable_quorum_gating();
+        follower
+            .record_quorum_commit(DIRECT_TOPIC, 0, 0, 1)
+            .unwrap();
+        assert_eq!(
+            follower.recover_dedup_page(DIRECT_TOPIC, 0, 0, 1).unwrap(),
+            1
+        );
+        let entry = follower
+            .inner
+            .metadata
+            .get_dedup(&follower.tenant(), "old-leader-key")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.inserted_at_ms,
+            leader
+                .read_message(DIRECT_TOPIC, 0, 0)
+                .unwrap()
+                .published_at_ms as u64
+        );
+        let retry = follower
+            .publish(direct_request("retry", Some("old-leader-key".into())))
+            .unwrap();
+        assert!(retry.duplicate);
+        assert_eq!(retry.message_id, original.message_id);
+        assert_eq!(
+            follower.partition_high_watermark(DIRECT_TOPIC, 0).unwrap(),
+            1
+        );
+        let caught_up_again = follower
+            .namespace_replication_frames(DIRECT_TOPIC, 0, 0, 1, 1024 * 1024)
+            .unwrap();
+        assert_eq!(
+            frames, caught_up_again,
+            "catch-up must not erase the original WAL header"
+        );
     }
 
     #[test]

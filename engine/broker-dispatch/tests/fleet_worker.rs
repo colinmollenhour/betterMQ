@@ -33,6 +33,7 @@ fn job(offset: u64, url: &str) -> ClaimedJob {
         committed_hwm: offset + 100,
         cursor_key: "lane".into(),
         message: Some(StoredMessage {
+            idempotency_key: None,
             id: message_id,
             tenant_id: "default".into(),
             topic: "__direct".into(),

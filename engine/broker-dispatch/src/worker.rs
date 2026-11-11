@@ -345,6 +345,8 @@ pub struct DispatchState {
     claim_rates: crate::lease::ClaimRates,
     /// Striped per-lane locks around cursor advancement (see `commit_dispatch_offset`).
     cursor_locks: Arc<Vec<Arc<tokio::sync::Mutex<()>>>>,
+    /// A rewind must drain precomputed and queued progress for its partition.
+    cursor_recovery: Arc<Vec<Arc<tokio::sync::RwLock<()>>>>,
     /// Partitions taken over but not yet verified: dispatch is fenced until
     /// each `(topic, target)` log is quorum-verified up to `target` (`None`
     /// while the local log is still being caught up).
@@ -414,6 +416,11 @@ impl DispatchEngine {
         };
         let engine = Self {
             inner: Arc::new(DispatchState {
+                cursor_recovery: Arc::new(
+                    (0..broker.shard_count())
+                        .map(|_| Arc::new(tokio::sync::RwLock::new(())))
+                        .collect(),
+                ),
                 broker,
                 config,
                 client: reqwest::Client::builder()
@@ -772,6 +779,15 @@ impl DispatchEngine {
     /// above it could skip an offset that now holds a different record),
     /// rescan, and lift the fence. Returns how many cursors were clamped.
     pub fn complete_recovery(&self, partition: u32) -> Result<usize, DispatchError> {
+        let barrier = self
+            .cursor_recovery
+            .get(partition as usize)
+            .ok_or_else(|| DispatchError::Failed("invalid recovery partition".into()))?;
+        // Do not block a runtime thread on async continuations; repair retries
+        // while fenced if an old completion still owns a metadata receipt.
+        let _rewind = barrier.try_write().map_err(|_| {
+            DispatchError::Failed("cursor completions are still draining before recovery".into())
+        })?;
         let Some(Some(targets)) = self.recovering.lock().get(&partition).cloned() else {
             return Ok(0);
         };
@@ -1961,17 +1977,27 @@ impl DispatchEngine {
         // Completions of one lane run concurrently; serialise the
         // read-compute-write so a slower task cannot write a cursor computed
         // from an older read over a newer one.
+        let recovery = self
+            .cursor_recovery
+            .get(partition as usize)
+            .ok_or_else(|| DispatchError::Failed("invalid cursor partition".into()))?
+            .clone()
+            .read_owned()
+            .await;
         let lane = self.cursor_lock(tenant_id, cursor_key, partition).await;
         let engine = self.clone();
         let tenant_id = tenant_id.to_owned();
         let topic = topic.to_owned();
         let cursor_key = cursor_key.to_owned();
         let runtime = tokio::runtime::Handle::current();
+        let owned = self.broker.owned_completion_token()?;
         let completion = broker_partition::run_blocking_io(move || {
             // The guard travels with the I/O: cancelling the HTTP task must
             // not unlock a lane whose durable read/compute/write is running.
             if !engine.broker.supports_metadata_group_commit() {
+                let _owned = owned;
                 let _lane = lane;
+                let _recovery = recovery;
                 return engine
                     .advance_cursor_locked(
                         &tenant_id,
@@ -1995,9 +2021,13 @@ impl DispatchEngine {
             // detached continuation and writer receipt retain the lane even
             // when the original delivery is cancelled at either await point.
             Ok(Some(runtime.spawn(async move {
+                let _owned = owned;
                 let _receipt = engine
                     .broker
-                    .commit_metadata_batch_grouped(std::mem::take(&mut progress.batch), lane)
+                    .commit_metadata_batch_grouped(
+                        std::mem::take(&mut progress.batch),
+                        (lane, recovery),
+                    )
                     .await?;
                 engine.finish_cursor_progress(&topic, &cursor_key, partition, offset, progress)
             })))
@@ -2048,6 +2078,19 @@ impl DispatchEngine {
                 stats: None,
                 error: None,
             });
+        }
+        if self.broker.quorum_gating() {
+            let (current, _) = self
+                .broker
+                .scan_topic_metadata(topic, partition, offset, 1)?;
+            if !current
+                .iter()
+                .any(|message| message.offset == offset && message.id == message_id)
+            {
+                return Err(DispatchError::Failed(
+                    "completion belongs to an obsolete WAL identity".into(),
+                ));
+            }
         }
         let newly_completed = !self
             .broker
@@ -2674,6 +2717,88 @@ mod tests {
                 response.offset.unwrap(),
             )
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn obsolete_completion_cannot_erase_or_replace_the_current_identity_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let message = publish_test_message(&broker, "https://example.com/hook");
+        broker.enable_quorum_gating();
+        broker
+            .record_quorum_commit(&message.topic, message.partition, 0, message.offset + 1)
+            .unwrap();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let tenant = broker.tenant();
+        let lane = broker_partition::flow_lane_owner(&message).to_string();
+        let old = Uuid::new_v4();
+        broker
+            .mark_dispatch_complete_for(
+                &tenant,
+                &lane,
+                message.partition,
+                message.offset,
+                message.id,
+            )
+            .unwrap();
+        assert!(!broker
+            .is_delivery_complete(
+                &message.topic,
+                &tenant,
+                &lane,
+                message.partition,
+                message.offset,
+                old
+            )
+            .unwrap());
+        assert!(engine
+            .commit_dispatch_offset(
+                &tenant,
+                &message.topic,
+                &lane,
+                message.partition,
+                message.offset,
+                old
+            )
+            .await
+            .is_err());
+        assert!(broker
+            .is_delivery_complete(
+                &message.topic,
+                &tenant,
+                &lane,
+                message.partition,
+                message.offset,
+                message.id
+            )
+            .unwrap());
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn recovery_rewind_waits_for_precomputed_metadata_progress_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        broker.enable_quorum_gating();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let tenant = broker.tenant();
+        let lane = Uuid::new_v4().to_string();
+        broker.set_dispatch_offset(&tenant, &lane, 0, 7).unwrap();
+        engine.fence_partition(0);
+        engine.set_recovery_targets(0, Vec::new());
+        // This guard is carried through the same durable writer receipt as
+        // precomputed completion batches, even if their caller is cancelled.
+        let receipt = engine.cursor_recovery[0].clone().read_owned().await;
+        let mut stale = broker_storage::MetadataWriteBatch::default();
+        stale.set_dispatch_offset(&tenant, &lane, 0, 9);
+        assert!(engine.complete_recovery(0).is_err());
+        assert!(engine.is_fenced(0));
+        broker.commit_metadata_batch(stale).unwrap();
+        drop(receipt);
+        assert_eq!(engine.complete_recovery(0).unwrap(), 1);
+        assert_eq!(broker.dispatch_offset(&tenant, &lane, 0).unwrap(), 0);
+        assert!(!engine.is_fenced(0));
+        engine.shutdown_background().await;
     }
 
     #[tokio::test]
@@ -3346,6 +3471,7 @@ mod tests {
 
     fn sample_message(payload: Vec<u8>, headers: Option<String>) -> StoredMessage {
         StoredMessage {
+            idempotency_key: None,
             id: Uuid::new_v4(),
             tenant_id: "t".into(),
             topic: "orders".into(),

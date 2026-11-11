@@ -244,6 +244,7 @@ impl ApiError {
                 ("invalid_request", false, None)
             }
             Self::Broker(BrokerError::NotShardLeader(_)) => ("not_shard_leader", true, None),
+            Self::Broker(BrokerError::DedupQuorumPending(_)) => ("quorum_pending", true, Some(100)),
             Self::Broker(_) => ("internal_error", true, None),
         };
         crate::ingest::IngestFailure {
@@ -384,6 +385,14 @@ impl IntoResponse for ApiError {
                 })),
             )
                 .into_response(),
+            ApiError::Broker(BrokerError::DedupQuorumPending(key)) => {
+                let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                    "error": "quorum_pending", "code": "quorum_pending", "retryable": true,
+                    "message": format!("idempotency key {key} is awaiting quorum verification; retry with the same key")
+                }))).into_response();
+                response.headers_mut().insert("retry-after", axum::http::HeaderValue::from_static("1"));
+                response
+            }
             ApiError::Broker(BrokerError::IdempotencyInFlight(key)) => {
                 let mut resp = (
                     StatusCode::CONFLICT,

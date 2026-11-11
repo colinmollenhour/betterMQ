@@ -1121,6 +1121,31 @@ impl SharedMetadataStore {
             offset,
         )])
     }
+    /// Clear only an exact stale identity under the shared writer lock.
+    pub fn clear_dispatch_complete_for(
+        &self,
+        tenant: &str,
+        sub: &str,
+        partition: u32,
+        offset: u64,
+        stale_id: Uuid,
+    ) -> Result<bool, SharedIndexError> {
+        let key = (tenant.into(), sub.into(), partition);
+        self.locked(|cache| {
+            if cache
+                .index
+                .completed_ids
+                .get(&key)
+                .and_then(|ids| ids.get(&offset))
+                != Some(&stale_id)
+            {
+                return Ok(false);
+            }
+            self.commit_locked(cache, vec![Operation::ClearDispatchComplete(key, offset)])?;
+            Ok(true)
+        })
+    }
+
     /// The completion marker at `offset` (ignores the lane cursor).
     pub fn dispatch_completion(
         &self,

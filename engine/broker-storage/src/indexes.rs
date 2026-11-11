@@ -31,6 +31,8 @@ pub enum IndexError {
     Shared(#[from] SharedIndexError),
     #[error("metadata JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("metadata outcome uncertain: {0}")]
+    Uncertain(String),
     #[cfg(feature = "slate")]
     #[error("slate index error: {0}")]
     Slate(#[from] SlateIndexError),
@@ -588,7 +590,8 @@ impl MetadataStore {
                     }
                 }
                 db.write_opt(rocks_batch, sync_writes)?;
-                self.sweep_rocks(db, sync_writes, control, logical_requests)?;
+                self.sweep_rocks(db, sync_writes, control, logical_requests)
+                    .map_err(|error| IndexError::Uncertain(error.to_string()))?;
                 Ok(())
             }
             MetaBackend::Shared(store) => {
@@ -993,6 +996,66 @@ impl MetadataStore {
         }
     }
 
+    /// Delete only the identity observed stale by the caller. A queued cleanup
+    /// must not erase a newer, correct completion written before it executes.
+    pub fn clear_dispatch_complete_for(
+        &self,
+        tenant: &str,
+        subscription: &str,
+        partition: u32,
+        offset: u64,
+        stale_id: Uuid,
+    ) -> Result<bool, IndexError> {
+        if let Some(writer) = &self.writer {
+            let tenant = tenant.to_owned();
+            let subscription = subscription.to_owned();
+            return writer.exclusive(move |store| {
+                store.clear_dispatch_complete_for(
+                    &tenant,
+                    &subscription,
+                    partition,
+                    offset,
+                    stale_id,
+                )
+            });
+        }
+        match &self.backend {
+            MetaBackend::Shared(store) => Ok(store.clear_dispatch_complete_for(
+                tenant,
+                subscription,
+                partition,
+                offset,
+                stale_id,
+            )?),
+            #[cfg(feature = "slate")]
+            MetaBackend::Slate(_) => Ok(false),
+            MetaBackend::Rocks {
+                db,
+                sync_writes,
+                control,
+            } => {
+                let _mutation = control
+                    .mutation
+                    .lock()
+                    .map_err(|_| std::io::Error::other("metadata mutation lock poisoned"))?;
+                let key = Self::complete_key(tenant, subscription, partition, offset);
+                if db.get(&key)?.as_deref() != Some(stale_id.as_bytes().as_slice()) {
+                    return Ok(false);
+                }
+                let mut batch = WriteBatch::default();
+                batch.delete(key);
+                batch.delete(Self::ordered_complete_key(
+                    tenant,
+                    subscription,
+                    partition,
+                    offset,
+                ));
+                db.write_opt(batch, sync_writes)?;
+                Ok(true)
+            }
+        }
+    }
+
     /// Every lane cursor of `partition` as `(tenant, lane, next_offset)`.
     pub fn dispatch_offsets_for_partition(
         &self,
@@ -1203,6 +1266,65 @@ impl MetadataStore {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn conditional_cleanup_cannot_delete_a_newer_completion_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::MetadataStore::open(dir.path()).unwrap();
+        let old = uuid::Uuid::new_v4();
+        let current = uuid::Uuid::new_v4();
+        store
+            .mark_dispatch_complete_for("tenant", "lane", 0, 5, old)
+            .unwrap();
+        assert_eq!(
+            store.dispatch_completion("tenant", "lane", 0, 5).unwrap(),
+            super::DispatchCompletion::Message(old)
+        );
+        store
+            .mark_dispatch_complete_for("tenant", "lane", 0, 5, current)
+            .unwrap();
+        assert!(!store
+            .clear_dispatch_complete_for("tenant", "lane", 0, 5, old)
+            .unwrap());
+        assert_eq!(
+            store.dispatch_completion("tenant", "lane", 0, 5).unwrap(),
+            super::DispatchCompletion::Message(current)
+        );
+        assert!(store
+            .clear_dispatch_complete_for("tenant", "lane", 0, 5, current)
+            .unwrap());
+        assert_eq!(
+            store.dispatch_completion("tenant", "lane", 0, 5).unwrap(),
+            super::DispatchCompletion::Missing
+        );
+    }
+
+    #[test]
+    fn shared_conditional_cleanup_preserves_a_newer_completion_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::SharedMetadataStore::open(dir.path()).unwrap();
+        let old = uuid::Uuid::new_v4();
+        let current = uuid::Uuid::new_v4();
+        for id in [old, current] {
+            let mut batch = super::MetadataWriteBatch::default();
+            batch.mark_dispatch_complete_for("tenant", "lane", 0, 5, id);
+            store.apply_batch(batch.operations).unwrap();
+        }
+        assert!(!store
+            .clear_dispatch_complete_for("tenant", "lane", 0, 5, old)
+            .unwrap());
+        assert_eq!(
+            store.dispatch_completion("tenant", "lane", 0, 5).unwrap(),
+            super::DispatchCompletion::Message(current)
+        );
+        assert!(store
+            .clear_dispatch_complete_for("tenant", "lane", 0, 5, current)
+            .unwrap());
+        assert_eq!(
+            store.dispatch_completion("tenant", "lane", 0, 5).unwrap(),
+            super::DispatchCompletion::Missing
+        );
+    }
+
+    #[test]
     fn synchronous_metadata_is_reentrant_inside_a_futures_executor() {
         let dir = tempfile::tempdir().unwrap();
         let store = super::MetadataStore::open(dir.path()).unwrap();
@@ -1252,6 +1374,98 @@ mod tests {
             .expect("synchronous metadata exhausted its enclosing Tokio task's budget")
             .unwrap();
         assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn prewrite_validation_failure_isolated_from_other_grouped_producer_keys() {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(super::MetadataStore::open(dir.path()).unwrap());
+        if let super::MetaBackend::Rocks { db, .. } = &store.backend {
+            let mut malformed = super::MetadataStore::complete_prefix("tenant", "corrupt", 0);
+            malformed.push(0); // an ordered offset must have exactly eight bytes
+            db.put(malformed, [1u8]).unwrap();
+        } else {
+            panic!("test requires local metadata");
+        }
+        let writer = store.writer.as_ref().unwrap().clone();
+        let (started, start) = tokio::sync::oneshot::channel();
+        let (release, gate) = std::sync::mpsc::sync_channel(1);
+        *writer.gate.lock().unwrap() = Some((started, gate));
+        let first_store = store.clone();
+        let first = tokio::spawn(async move {
+            let mut batch = super::MetadataWriteBatch::default();
+            batch.set_dispatch_offset("tenant", "first", 0, 1);
+            first_store.write_batch_grouped(batch, ()).await
+        });
+        start.await.unwrap();
+        let mut pending = FuturesUnordered::new();
+        let ids = [
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        ];
+        for (index, id) in ids.into_iter().enumerate() {
+            let store = store.clone();
+            pending.push(async move {
+                let mut batch = super::MetadataWriteBatch::default();
+                batch.put_dedup(
+                    "tenant",
+                    format!("key-{index}"),
+                    super::DedupEntry::new(id, index as u64, 0, "topic".into()),
+                );
+                if index == 1 {
+                    batch.set_dispatch_offset("tenant", "corrupt", 0, 2);
+                }
+                (index, store.write_batch_grouped(batch, ()).await)
+            });
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), pending.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(writer.available_queue_slots(), 256 - 3);
+        release.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        while let Some((index, result)) = pending.next().await {
+            assert_eq!(
+                result.is_ok(),
+                index != 1,
+                "only the malformed caller must fail"
+            );
+        }
+        assert!(
+            store.is_ready(),
+            "a prewrite validation error is not an uncertain fsync"
+        );
+        for (index, id) in ids.into_iter().enumerate() {
+            let entry = store.get_dedup("tenant", &format!("key-{index}")).unwrap();
+            assert_eq!(
+                entry.map(|entry| entry.message_id),
+                (index != 1).then_some(id)
+            );
+        }
+        drop(writer);
+        drop(store);
+        let reopened = super::MetadataStore::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .get_dedup("tenant", "key-0")
+                .unwrap()
+                .unwrap()
+                .message_id,
+            ids[0]
+        );
+        assert_eq!(
+            reopened
+                .get_dedup("tenant", "key-2")
+                .unwrap()
+                .unwrap()
+                .message_id,
+            ids[2]
+        );
     }
 
     #[tokio::test]

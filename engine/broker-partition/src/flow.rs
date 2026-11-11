@@ -174,6 +174,7 @@ mod tests {
 
     fn msg_with_flow_key(key: &str) -> StoredMessage {
         StoredMessage {
+            idempotency_key: None,
             id: Uuid::nil(),
             tenant_id: "t".into(),
             topic: "orders".into(),

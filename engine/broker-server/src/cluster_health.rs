@@ -110,6 +110,7 @@ async fn catch_up_reconciling_tail(
     state: &AppState,
     shard: u32,
 ) -> Result<(), CatchUpError> {
+    let generation = cluster.runtime.shard_generation(shard);
     let mut reconciled = 0;
     loop {
         let error = match catch_up_shard(cluster, state, shard).await {
@@ -119,6 +120,7 @@ async fn catch_up_reconciling_tail(
         let Some((topic, to_offset)) = error.reconcile_target() else {
             return Err(error);
         };
+        ensure_recovery_owner(cluster, shard, generation)?;
         if reconciled >= MAX_TAIL_RECONCILIATIONS {
             return Err(error);
         }
@@ -351,6 +353,8 @@ async fn catch_up_shard(
     state: &AppState,
     shard: u32,
 ) -> Result<(), CatchUpError> {
+    let generation = cluster.runtime.shard_generation(shard);
+    ensure_recovery_owner(cluster, shard, generation)?;
     // Probe the shard's replica set directly instead of trusting this node's
     // health view: a briefly "dead" replica may hold acknowledged records.
     let node_id = cluster.runtime.config().node_id;
@@ -379,7 +383,9 @@ async fn catch_up_shard(
         };
         let mut answered = Vec::new();
         let mut failed = HashSet::new();
-        for (peer, result) in probe_replicas(cluster, &peers, &request).await {
+        let answers = probe_replicas(cluster, &peers, &request).await;
+        ensure_recovery_owner(cluster, shard, generation)?;
+        for (peer, result) in answers {
             match result {
                 Ok(range) => answered.push((peer.internal_base().to_owned(), range)),
                 Err(error) => {
@@ -449,6 +455,7 @@ async fn catch_up_shard(
         }
 
         loop {
+            ensure_recovery_owner(cluster, shard, generation)?;
             let mut last_appended = None;
             for frame in &page.frames {
                 state
@@ -476,6 +483,7 @@ async fn catch_up_shard(
                     .wait_committed(&topic, shard, offset)
                     .await
                     .map_err(|e| format!("{topic}/{shard}: fsync catch-up page: {e}"))?;
+                ensure_recovery_owner(cluster, shard, generation)?;
             }
             local_leo = state
                 .broker
@@ -503,6 +511,21 @@ async fn catch_up_shard(
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+fn ensure_recovery_owner(
+    cluster: &Cluster,
+    shard: u32,
+    generation: u64,
+) -> Result<(), CatchUpError> {
+    if !cluster.runtime.is_recovery_leader_for_shard(shard)
+        || cluster.runtime.shard_generation(shard) != generation
+    {
+        return Err(CatchUpError::Retryable(format!(
+            "shard {shard}: recovery ownership changed"
+        )));
     }
     Ok(())
 }
@@ -744,11 +767,20 @@ pub fn spawn_cluster_health_monitor(
                 sync_catalog_from_peers(&state).await;
                 let mut caught_up = Vec::new();
                 for shard in gained_shards {
+                    let generation = runtime.shard_generation(shard);
+                    if ensure_recovery_owner(&cluster, shard, generation).is_err() {
+                        prev_leaders.remove(&shard);
+                        continue;
+                    }
                     match recover_gained_shard(&cluster, &state, shard).await {
                         Ok(()) => {
                             // Legacy blob references must be repaired before
                             // the shard serves; unrepairable ones stay deferred.
                             let repair = broker_api::repair_legacy_payloads(&state, shard).await;
+                            if ensure_recovery_owner(&cluster, shard, generation).is_err() {
+                                prev_leaders.remove(&shard);
+                                continue;
+                            }
                             if repair.unresolved > 0 {
                                 warn!(
                                     shard,
@@ -762,7 +794,11 @@ pub fn spawn_cluster_health_monitor(
                                     crate::quorum_repair::recovery_targets(&state, shard),
                                 );
                             }
-                            runtime.set_shard_ready(shard, true);
+                            // Recovery can prove the prefix under elected/lease
+                            // ownership while ingest remains fenced.
+                            if !gated {
+                                runtime.set_shard_ready(shard, true);
+                            }
                             caught_up.push(shard);
                         }
                         Err(error) => {
@@ -792,7 +828,7 @@ pub fn spawn_cluster_health_monitor(
                 if !caught_up.is_empty() && gated {
                     info!(
                         shards = ?caught_up,
-                        "failover catch-up complete; ingest open, dispatch waits for quorum verification"
+                        "failover catch-up complete; ingest and dispatch wait for quorum verification"
                     );
                 } else if !caught_up.is_empty() {
                     info!(shards = ?caught_up, "failover catch-up complete; shards unfenced");
@@ -939,6 +975,11 @@ mod tests {
             generation: 1,
             hash_version: 1,
         }));
+        for peer in peer_ids {
+            cluster
+                .runtime
+                .record_peer_alive(peer, Utc::now().timestamp_millis());
+        }
         let broker = Broker::open(broker_partition::BrokerConfig::new(dir.path().into())).unwrap();
         let state = Arc::new(AppState {
             schedule: broker_schedule::ScheduleQueue::open(dir.path()).unwrap(),

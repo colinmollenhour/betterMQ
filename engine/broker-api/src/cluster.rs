@@ -12,8 +12,8 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use broker_config::{load_managed_config, stable_node_id};
 use broker_partition::{
-    is_dlq_topic, DispatchGroup, FlowProfile, GroupMember, PublishRequest, PublishResponse,
-    Subscription,
+    is_dlq_topic, BrokerError, DispatchGroup, FlowProfile, GroupMember, PublishRequest,
+    PublishResponse, Subscription,
 };
 use broker_raft_meta::ClusterRuntime;
 use broker_replication::{
@@ -333,6 +333,11 @@ async fn replicate_if_needed(
         .await
     {
         Ok(outcome) => {
+            if !cluster.runtime.is_leader_for_shard(partition)
+                || cluster.runtime.shard_generation(partition) != leader_generation
+            {
+                return Err(BrokerError::NotShardLeader(partition).into());
+            }
             // Expose the record to dispatch only once it is quorum-durable,
             // and only after the watermark is persisted.
             state
@@ -388,14 +393,20 @@ impl broker_dispatch::DlqDurability for ClusterDlqDurability {
                     }
                 }
             };
-            replicate_if_needed(&state, response, local)
-                .await
-                .map(|_| ())
-                .map_err(|error| {
-                    broker_dispatch::DispatchError::Failed(format!(
-                        "DLQ record not durable on a quorum: {error}"
-                    ))
-                })
+            let durability = async {
+                replicate_if_needed(&state, response, local).await?;
+                if let (Some(partition), Some(offset)) = (response.partition, response.offset) {
+                    wait_publish_visible(&state, &response.topic, partition, offset).await?;
+                }
+                response.replication_frame = None;
+                Ok::<_, ApiError>(())
+            }
+            .await;
+            durability.map_err(|error| {
+                broker_dispatch::DispatchError::Failed(format!(
+                    "DLQ record not durable on a quorum: {error}"
+                ))
+            })
         })
     }
 }
@@ -455,20 +466,77 @@ async fn finish_publish(
             }
         }
     };
-    let epoch = replicate_if_needed(state, &mut resp, wait).await?;
-    resp.commit_epoch = Some(epoch);
-    if !pending_dedup.is_empty() {
+    let durability = replicate_if_needed(state, &mut resp, wait).await;
+    // Retain a locally durable key even if quorum failed or is waiting on an
+    // earlier gap. A retry must not create a new identity for repairable work.
+    let locally_durable = match (resp.partition, resp.offset) {
+        (Some(partition), Some(offset)) => {
+            state.broker.committed_hwm(&resp.topic, partition)? > offset
+        }
+        _ => true,
+    };
+    if !pending_dedup.is_empty() && locally_durable {
         state
             .broker
             .commit_publish_dedup_async(pending_dedup)
             .await?;
+    }
+    resp.commit_epoch = Some(durability?);
+    if let (Some(partition), Some(offset)) = (resp.partition, resp.offset) {
+        wait_publish_visible(state, &resp.topic, partition, offset).await?;
     }
     if let Some(m) = meter {
         if !resp.duplicate {
             crate::metering::record_ingest(state, m.tenant_id, body_bytes).await;
         }
     }
+    // HTTP callers and fan-out outboxes need identities, not an additional
+    // payload-sized replication frame retained after its durability barrier.
+    resp.replication_frame = None;
     Ok(resp)
+}
+
+/// An individually proven epoch cannot be ACKed across a hole in the quorum
+/// prefix. Keep the durable dedup mapping while repair fills the hole, and
+/// refuse success if this request loses its leader generation in the meantime.
+pub(crate) async fn wait_publish_visible(
+    state: &AppState,
+    topic: &str,
+    partition: u32,
+    offset: u64,
+) -> Result<(), ApiError> {
+    if !state.broker.quorum_gating() {
+        return Ok(());
+    }
+    let Some(cluster) = &state.cluster else {
+        return Ok(());
+    };
+    let generation = cluster.runtime.shard_generation(partition);
+    let visible = state
+        .broker
+        .wait_quorum_visible(topic, partition, offset.saturating_add(1));
+    tokio::pin!(visible);
+    let timeout = tokio::time::sleep(Duration::from_secs(30));
+    tokio::pin!(timeout);
+    let mut ownership = tokio::time::interval(Duration::from_millis(50));
+    loop {
+        if !cluster.runtime.is_leader_for_shard(partition)
+            || cluster.runtime.shard_generation(partition) != generation
+        {
+            return Err(BrokerError::NotShardLeader(partition).into());
+        }
+        tokio::select! {
+            result = &mut visible => {
+                result?;
+                if !cluster.runtime.is_leader_for_shard(partition) || cluster.runtime.shard_generation(partition) != generation {
+                    return Err(BrokerError::NotShardLeader(partition).into());
+                }
+                return Ok(());
+            }
+            _ = &mut timeout => return Err(ApiError::Unavailable("contiguous quorum verification is pending; retry with the same idempotency key".into())),
+            _ = ownership.tick() => {}
+        }
+    }
 }
 
 async fn forward_publish_to_leader(
@@ -1690,7 +1758,19 @@ pub async fn internal_cluster_publish(
             "this node is not leader for shard {shard}"
         )));
     }
-    let resp = publish_on_leader(&state, req, None).await?;
+    state.broker.check_publish_body(&req)?;
+    let permit = crate::admission::check_admission(&state, None, req.payload.len())?;
+    let owned = state.clone();
+    let resp = state
+        .broker
+        .spawn_owned(async move {
+            let _permit = permit;
+            publish_on_leader(&owned, req, None).await
+        })?
+        .await
+        .map_err(|error| {
+            ApiError::Unavailable(format!("owned forwarded ingest failed: {error}"))
+        })??;
     enqueue_dispatch_after_publish(&state, &resp);
     Ok(Json(resp))
 }
@@ -1750,7 +1830,45 @@ pub async fn internal_replicate(
         .broker
         .wait_committed(&body.topic, body.partition, body.offset)
         .await?;
+    if header.idempotency_key.is_some() {
+        preserve_replica_keys(
+            &state.broker,
+            body.topic.clone(),
+            body.partition,
+            body.offset,
+            body.offset.saturating_add(1),
+        )
+        .await?;
+    }
     Ok(StatusCode::OK)
+}
+
+/// Persist producer keys on followers before ACK, not only on takeover. WAL
+/// retention may later collect the source frames while the key TTL is live.
+async fn preserve_replica_keys(
+    broker: &broker_partition::Broker,
+    topic: String,
+    partition: u32,
+    from: u64,
+    end: u64,
+) -> Result<(), ApiError> {
+    let owned = broker.clone();
+    broker
+        .spawn_owned(async move {
+            let mut next = from;
+            while next < end {
+                let broker = owned.clone();
+                let topic = topic.clone();
+                next = broker_partition::run_blocking_io(move || {
+                    broker.recover_dedup_page(&topic, partition, next, end)
+                })
+                .await
+                .map_err(|error| ApiError::Unavailable(error.to_string()))??;
+            }
+            Ok::<_, ApiError>(())
+        })?
+        .await
+        .map_err(|error| ApiError::Unavailable(error.to_string()))?
 }
 
 fn validate_replication_epoch(
@@ -1836,6 +1954,7 @@ pub async fn internal_replicate_batch(
     // An empty epoch topic denotes a V2 physical-shard epoch containing several
     // logical topics; each validated frame then carries its authoritative topic.
     let mut frame_topics = Vec::with_capacity(body.frames.len());
+    let mut has_keys = false;
     for frame in &body.frames {
         let (header, _) = broker_proto::decode_frame(std::io::Cursor::new(frame))
             .map_err(|e| ApiError::BadRequest(format!("invalid frame: {e}")))?;
@@ -1849,6 +1968,7 @@ pub async fn internal_replicate_batch(
                 "replicate frame tenant does not match epoch tenant".into(),
             ));
         }
+        has_keys |= header.idempotency_key.is_some();
         frame_topics.push(header.topic);
     }
 
@@ -1901,7 +2021,18 @@ pub async fn internal_replicate_batch(
         .broker
         .wait_committed(&commit_topic, body.partition, last_offset)
         .await?;
+    if has_keys {
+        preserve_replica_keys(
+            &state.broker,
+            commit_topic,
+            body.partition,
+            body.first_offset,
+            last_offset.saturating_add(1),
+        )
+        .await?;
+    }
     if let Some(cluster) = &state.cluster {
+        validate_replication_epoch(&cluster.runtime, &body)?;
         let stream = cluster.replication.progress_stream(&body.topic);
         if let Err(error) = cluster.replication.follower_fence().record_ack(
             &stream,

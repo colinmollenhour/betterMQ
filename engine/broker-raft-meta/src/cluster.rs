@@ -503,8 +503,12 @@ impl ClusterRuntime {
     }
 
     pub fn is_leader_for_shard(&self, shard: u32) -> bool {
+        self.is_recovery_leader_for_shard(shard) && self.shard_ready(shard)
+    }
+
+    /// Lease-authorized elected ownership, independent of the ingest fence.
+    pub fn is_recovery_leader_for_shard(&self, shard: u32) -> bool {
         (!self.durable || self.has_controller_lease())
-            && !self.blocked_shards.lock().contains(&shard)
             && self.elect_leader_for_shard(shard) == Some(self.config.node_id)
     }
 

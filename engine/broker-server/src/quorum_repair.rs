@@ -61,6 +61,7 @@ async fn verify_tail(
     topic: &str,
     shard: u32,
     committed: u64,
+    generation: u64,
 ) -> Result<u64, String> {
     let broker = &state.broker;
     let mut quorum = broker
@@ -72,6 +73,11 @@ async fn verify_tail(
         topic.to_string()
     };
     for _ in 0..VERIFY_EPOCHS_PER_TICK {
+        if !cluster.runtime.is_recovery_leader_for_shard(shard)
+            || cluster.runtime.shard_generation(shard) != generation
+        {
+            return Err("shard recovery ownership changed".into());
+        }
         if quorum >= committed {
             break;
         }
@@ -108,7 +114,7 @@ async fn verify_tail(
             epoch_topic.clone(),
             shard,
             cluster.runtime.config().node_id,
-            cluster.runtime.shard_generation(shard),
+            generation,
             quorum,
             run,
         )
@@ -118,6 +124,11 @@ async fn verify_tail(
             .replicate_batch(request, committed)
             .await
             .map_err(|e| format!("verify [{quorum}, {end}) on minISR: {e}"))?;
+        if !cluster.runtime.is_recovery_leader_for_shard(shard)
+            || cluster.runtime.shard_generation(shard) != generation
+        {
+            return Err("shard recovery ownership changed during replication".into());
+        }
         quorum = broker
             .record_quorum_commit(topic, shard, quorum, end)
             .map_err(|e| e.to_string())?;
@@ -136,9 +147,10 @@ pub fn spawn_quorum_repair(cluster: Cluster, state: Arc<AppState>) -> tokio::tas
             let recovering: HashMap<u32, Vec<(String, u64)>> =
                 state.dispatch.recovery_targets().into_iter().collect();
             for shard in 0..state.broker.layout().shard_count {
-                if !cluster.runtime.is_leader_for_shard(shard) {
+                if !cluster.runtime.is_recovery_leader_for_shard(shard) {
                     continue;
                 }
+                let generation = cluster.runtime.shard_generation(shard);
                 let fenced = recovering.contains_key(&shard);
                 for topic in quorum_namespaces(&state, shard) {
                     let (Ok(quorum), Ok(committed)) = (
@@ -157,7 +169,7 @@ pub fn spawn_quorum_repair(cluster: Cluster, state: Arc<AppState>) -> tokio::tas
                         continue;
                     }
                     if let Err(error) =
-                        verify_tail(&cluster, &state, &topic, shard, committed).await
+                        verify_tail(&cluster, &state, &topic, shard, committed, generation).await
                     {
                         let now = Instant::now();
                         if warned
@@ -187,8 +199,61 @@ pub fn spawn_quorum_repair(cluster: Cluster, state: Arc<AppState>) -> tokio::tas
                     if !verified {
                         continue;
                     }
+                    if !cluster.runtime.is_recovery_leader_for_shard(shard)
+                        || cluster.runtime.shard_generation(shard) != generation
+                    {
+                        continue;
+                    }
+                    let mut recovery_error = None;
+                    for (topic, target) in targets {
+                        let mut next = 0;
+                        while next < *target {
+                            if !cluster.runtime.is_recovery_leader_for_shard(shard)
+                                || cluster.runtime.shard_generation(shard) != generation
+                            {
+                                recovery_error = Some(
+                                    "shard ownership changed during dedup recovery".to_owned(),
+                                );
+                                break;
+                            }
+                            let broker = state.broker.clone();
+                            let topic = topic.clone();
+                            let target = *target;
+                            match broker_partition::run_blocking_io(move || {
+                                broker.recover_dedup_page(&topic, shard, next, target)
+                            })
+                            .await
+                            {
+                                Ok(Ok(reached)) => next = reached,
+                                result => {
+                                    recovery_error =
+                                        Some(format!("dedup recovery failed: {result:?}"));
+                                    break;
+                                }
+                            }
+                        }
+                        if recovery_error.is_some() {
+                            break;
+                        }
+                    }
+                    if let Some(error) = recovery_error {
+                        warn!(shard, %error, "takeover remains fenced");
+                        continue;
+                    }
+                    if !cluster.runtime.is_recovery_leader_for_shard(shard)
+                        || cluster.runtime.shard_generation(shard) != generation
+                    {
+                        continue;
+                    }
                     match state.dispatch.complete_recovery(shard) {
                         Ok(clamped) => {
+                            if !cluster.runtime.is_recovery_leader_for_shard(shard)
+                                || cluster.runtime.shard_generation(shard) != generation
+                            {
+                                state.dispatch.fence_partition(shard);
+                                continue;
+                            }
+                            cluster.runtime.set_shard_ready(shard, true);
                             info!(
                                 shard,
                                 clamped, "takeover verified on minISR; dispatch resumed"
@@ -379,9 +444,21 @@ mod tests {
             hash_version: 1,
         };
         let runtime = ClusterRuntime::open(dir.path(), config).unwrap();
+        for peer in peers {
+            runtime.record_peer_alive(peer, chrono::Utc::now().timestamp_millis());
+        }
+        runtime
+            .observe_controller_leader(&broker_raft_meta::ControllerLeaderProof {
+                term: 1,
+                leader_id: local,
+                cluster_generation: 1,
+            })
+            .unwrap();
         assert_eq!(runtime.shard_generation(0), generation);
         let cluster = Cluster::new(runtime);
-        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let mut config = BrokerConfig::new(dir.path().to_path_buf());
+        config.partitions = 1;
+        let broker = Broker::open(config).unwrap();
         broker.enable_quorum_gating();
         let state = Arc::new(AppState {
             broker: broker.clone(),
@@ -447,6 +524,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn takeover_repairs_while_ingest_fenced_and_only_opens_after_prefix_verification() {
+        let (cluster, mut state, dir, _peers) = cell(true).await;
+        let mut config = cluster.runtime.config().clone();
+        let generation = cluster.runtime.shard_generation(0);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut servers = Vec::new();
+        for node in config.nodes.iter_mut().skip(1) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            node.addr = format!("http://{}", listener.local_addr().unwrap());
+            let node_id = node.id;
+            let gate = gate.clone();
+            let entered = entered.clone();
+            let app = axum::Router::new().route(
+                "/internal/v1/replicate/batch",
+                axum::routing::post(move || {
+                    let gate = gate.clone();
+                    let entered = entered.clone();
+                    async move {
+                        entered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _permit = gate.acquire().await.unwrap();
+                        axum::Json(ReplicateBatchAck {
+                            node_id,
+                            partition: 0,
+                            leader_epoch: generation,
+                            durable_hwm: u64::MAX / 2,
+                        })
+                    }
+                }),
+            );
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+        }
+        let runtime = ClusterRuntime::open(dir.path(), config).unwrap();
+        for node in runtime.config().nodes.iter().skip(1) {
+            runtime.record_peer_alive(node.id, chrono::Utc::now().timestamp_millis());
+        }
+        runtime
+            .observe_controller_leader(&broker_raft_meta::ControllerLeaderProof {
+                term: 1,
+                leader_id: runtime.config().node_id,
+                cluster_generation: 1,
+            })
+            .unwrap();
+        let cluster = Cluster::new(runtime);
+        Arc::get_mut(&mut state).unwrap().cluster = Some(cluster.clone());
+        let (topic, partition) = publish(&state.broker);
+        let target = state.broker.committed_hwm(&topic, partition).unwrap();
+        cluster.runtime.set_shard_ready(partition, false);
+        state.dispatch.fence_partition(partition);
+        state
+            .dispatch
+            .set_recovery_targets(partition, vec![(topic.clone(), target)]);
+        assert!(!cluster.runtime.is_leader_for_shard(partition));
+        assert!(cluster.runtime.is_recovery_leader_for_shard(partition));
+        let repair = spawn_quorum_repair(cluster.clone(), state.clone());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if entered.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !cluster.runtime.shard_ready(partition),
+            "unacknowledged verification cannot open ingest"
+        );
+        assert!(state.dispatch.is_fenced(partition));
+        gate.add_permits(2);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !cluster.runtime.shard_ready(partition) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.broker.quorum_hwm(&topic, partition).unwrap() >= target);
+        assert!(!state.dispatch.is_fenced(partition));
+        repair.abort();
+        let _ = repair.await;
+        for server in servers {
+            server.abort();
+            let _ = server.await;
+        }
+        state.dispatch.shutdown_background().await;
+    }
+
+    #[tokio::test]
     async fn unreplicated_tail_is_verified_on_quorum_before_dispatch() {
         let (cluster, state, _dir, peers) = cell(true).await;
         let (topic, partition) = publish(&state.broker);
@@ -457,9 +626,16 @@ mod tests {
             0,
             "locally durable but unreplicated records are not dispatchable"
         );
-        let reached = verify_tail(&cluster, &state, &topic, partition, committed)
-            .await
-            .unwrap();
+        let reached = verify_tail(
+            &cluster,
+            &state,
+            &topic,
+            partition,
+            committed,
+            cluster.runtime.shard_generation(partition),
+        )
+        .await
+        .unwrap();
         assert_eq!(reached, committed);
         assert_eq!(
             state.broker.dispatch_hwm(&topic, partition).unwrap(),
@@ -473,9 +649,16 @@ mod tests {
         let (cluster, state, _dir, _peers) = cell(false).await;
         let (topic, partition) = publish(&state.broker);
         let committed = state.broker.committed_hwm(&topic, partition).unwrap();
-        assert!(verify_tail(&cluster, &state, &topic, partition, committed)
-            .await
-            .is_err());
+        assert!(verify_tail(
+            &cluster,
+            &state,
+            &topic,
+            partition,
+            committed,
+            cluster.runtime.shard_generation(partition)
+        )
+        .await
+        .is_err());
         assert_eq!(state.broker.dispatch_hwm(&topic, partition).unwrap(), 0);
     }
 

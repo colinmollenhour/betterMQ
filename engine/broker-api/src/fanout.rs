@@ -786,15 +786,19 @@ pub async fn garbage_collect_authoritative(
 
 fn apply_event(state: &mut FanoutSnapshot, event: FanoutEvent) {
     match event {
-        FanoutEvent::Accept { fanout } => {
+        FanoutEvent::Accept { mut fanout } => {
+            strip_replication_frames(&mut fanout);
             state.commands.entry(fanout.id).or_insert(fanout);
         }
         FanoutEvent::RecordResult {
             fanout_id,
             member_id,
-            outcome,
+            mut outcome,
             updated_at_ms,
         } => {
+            if let Some(response) = &mut outcome.response {
+                response.replication_frame = None;
+            }
             if let Some(fanout) = state.commands.get_mut(&fanout_id) {
                 fanout.outcomes.insert(member_id, outcome);
                 fanout.updated_at_ms = updated_at_ms;
@@ -809,11 +813,20 @@ fn apply_event(state: &mut FanoutSnapshot, event: FanoutEvent) {
                 }
             }
         }
-        FanoutEvent::Replace { fanout } => {
+        FanoutEvent::Replace { mut fanout } => {
+            strip_replication_frames(&mut fanout);
             state.commands.insert(fanout.id, fanout);
         }
         FanoutEvent::GarbageCollect { ids } => {
             state.commands.retain(|id, _| !ids.contains(id));
+        }
+    }
+}
+
+fn strip_replication_frames(command: &mut FanoutCommand) {
+    for outcome in command.outcomes.values_mut() {
+        if let Some(response) = &mut outcome.response {
+            response.replication_frame = None;
         }
     }
 }
@@ -935,7 +948,7 @@ mod tests {
                         duplicate: false,
                         scheduled: None,
                         commit_epoch: Some(8),
-                        replication_frame: None,
+                        replication_frame: Some(vec![42; 128 * 1024]),
                     }),
                     error: None,
                     attempts: 1,
@@ -944,6 +957,15 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(
+            store.get(fanout_id).unwrap().unwrap().outcomes[&member_id]
+                .response
+                .as_ref()
+                .unwrap()
+                .replication_frame
+                .is_none(),
+            "cached fan-out outcomes must not retain payload-sized replication frames"
+        );
         store.evict_cached_state();
         drop(store);
 

@@ -180,6 +180,10 @@ pub struct StoredMessage {
     pub partition: u32,
     pub offset: u64,
     pub routing_key: String,
+    /// WAL identity needed by replica catch-up and takeover dedup recovery.
+    /// Internal only: preserve the existing consumer JSON representation.
+    #[serde(skip)]
+    pub idempotency_key: Option<String>,
     pub payload: Vec<u8>,
     pub published_at_ms: i64,
     pub priority: u8,
