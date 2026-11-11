@@ -23,6 +23,14 @@ Inline delivery borrows the verified message rather than cloning its body
 before building the outbound request. External-blob hydration runs on the
 blocking pool and still verifies blob integrity before delivery.
 
+Hot-path blocking I/O shares a process-wide concurrency budget of 32 operations
+(`BETTERMQ_BLOCKING_IO_CONCURRENCY` overrides it). Callers wait asynchronously
+before submitting to Tokio's blocking pool, rather than creating hundreds of
+native threads that contend for the same storage locks. Running I/O keeps its
+permit after caller cancellation. The cost is explicit queueing under storage
+saturation; unrelated Tokio blocking work is not capped. Request tenant scope
+is captured before crossing task/thread boundaries and restored on return.
+
 Backfill shares pending metadata through reference-counted entries. Its window
 is bounded to 4,096 entries **per topic/partition**, not per process, so metadata
 memory still depends on the number of active topics and partitions. Message

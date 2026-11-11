@@ -209,7 +209,7 @@ impl HostBlocker {
         {
             let this = self.clone();
             let url = url.to_owned();
-            return tokio::task::spawn_blocking(move || this.is_blocked(&url))
+            return broker_partition::run_blocking_io(move || this.is_blocked(&url))
                 .await
                 .unwrap_or(true);
         }
@@ -339,7 +339,9 @@ impl HostBlocker {
         }
         let this = self.clone();
         let url = url.to_owned();
-        if let Err(error) = tokio::task::spawn_blocking(move || this.record_success(&url)).await {
+        if let Err(error) =
+            broker_partition::run_blocking_io(move || this.record_success(&url)).await
+        {
             tracing::error!(%error, "shared breaker success update failed");
         }
     }
@@ -352,7 +354,7 @@ impl HostBlocker {
         let this = self.clone();
         let url = url.to_owned();
         if let Err(error) =
-            tokio::task::spawn_blocking(move || this.record_transport_failure(&url)).await
+            broker_partition::run_blocking_io(move || this.record_transport_failure(&url)).await
         {
             tracing::error!(%error, "shared breaker failure update failed");
         }

@@ -658,17 +658,19 @@ async fn submit_local_leader_batch(
     let mut append_tasks = JoinSet::new();
     for shard_batch in prepared.take_shard_batches() {
         let broker = state.broker.clone();
-        append_tasks.spawn_blocking(move || broker.append_prepared_batch(shard_batch));
+        append_tasks.spawn(broker_partition::run_blocking_io(move || {
+            broker.append_prepared_batch(shard_batch)
+        }));
     }
     let mut appended_batches = Vec::new();
     let mut append_error = None;
     while let Some(joined) = append_tasks.join_next().await {
         match joined {
-            Ok(Ok(appended)) => appended_batches.push(appended),
-            Ok(Err(error)) => {
+            Ok(Ok(Ok(appended))) => appended_batches.push(appended),
+            Ok(Ok(Err(error))) => {
                 append_error.get_or_insert_with(|| format!("batch append failed: {error}"));
             }
-            Err(error) => {
+            Ok(Err(error)) | Err(error) => {
                 append_error.get_or_insert_with(|| format!("batch append task failed: {error}"));
             }
         }
@@ -841,7 +843,7 @@ async fn submit_local_leader_batch(
 
     let broker = state.broker.clone();
     let finalized =
-        tokio::task::spawn_blocking(move || -> Result<_, broker_partition::BrokerError> {
+        broker_partition::run_blocking_io(move || -> Result<_, broker_partition::BrokerError> {
             let mut epochs = HashMap::new();
             for (appended, response_keys, epoch) in committed {
                 broker.finalize_prepared_batch(&mut prepared, appended, true)?;

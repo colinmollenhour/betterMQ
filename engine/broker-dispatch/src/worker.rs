@@ -1590,7 +1590,7 @@ impl DispatchEngine {
             let broker = self.broker.clone();
             let scan = self.scan.clone();
             let msg = msg.clone();
-            tokio::task::spawn_blocking(move || scan.is_fifo_head(&broker, &msg))
+            broker_partition::run_blocking_io(move || scan.is_fifo_head(&broker, &msg))
                 .await
                 .map_err(|error| DispatchError::Failed(error.to_string()))??
         } else {
@@ -1618,7 +1618,7 @@ impl DispatchEngine {
         }
         let broker = self.broker.clone();
         let mut hydrated = msg.clone();
-        let hydrated = tokio::task::spawn_blocking(move || {
+        let hydrated = broker_partition::run_blocking_io(move || {
             broker.hydrate_message_payload(&mut hydrated)?;
             Ok::<_, broker_partition::BrokerError>(hydrated)
         })
@@ -1931,7 +1931,7 @@ impl DispatchEngine {
         let tenant_id = tenant_id.to_owned();
         let topic = topic.to_owned();
         let cursor_key = cursor_key.to_owned();
-        tokio::task::spawn_blocking(move || {
+        broker_partition::run_blocking_io(move || {
             // The guard travels with the I/O: cancelling the HTTP task must
             // not unlock a lane whose durable read/compute/write is running.
             let _lane = lane;

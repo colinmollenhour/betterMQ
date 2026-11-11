@@ -1454,7 +1454,7 @@ impl Broker {
             None => {
                 let broker = self.clone();
                 let topic = topic.to_owned();
-                tokio::task::spawn_blocking(move || broker.shard_handle(&topic, partition))
+                crate::run_blocking_io(move || broker.shard_handle(&topic, partition))
                     .await
                     .map_err(|error| {
                         BrokerError::Storage(broker_storage::LogError::Io(std::io::Error::other(
@@ -1699,7 +1699,7 @@ impl Broker {
             // durable metadata. Keep the entire attempt off the async worker,
             // not just payload preparation. Return ownership on conflict rather
             // than cloning the batch's payloads for each retry.
-            let attempt = tokio::task::spawn_blocking(move || {
+            let attempt = crate::run_blocking_io(move || {
                 match broker.try_reserve_batch_dedup(&broker.tenant(), &requests)? {
                     Ok(reservations) => broker
                         .prepare_reserved_batch(requests, reservations, None)
@@ -2062,10 +2062,9 @@ impl Broker {
     pub async fn publish_async(&self, req: PublishRequest) -> Result<PublishResponse, BrokerError> {
         let prepared = self.prepare_publish_batch_waiting(vec![req]).await?;
         let broker = self.clone();
-        let (response, _) =
-            tokio::task::spawn_blocking(move || broker.publish_prepared(prepared, true))
-                .await
-                .map_err(blocking_task_error)??;
+        let (response, _) = crate::run_blocking_io(move || broker.publish_prepared(prepared, true))
+            .await
+            .map_err(blocking_task_error)??;
         Ok(response)
     }
 
@@ -2108,7 +2107,7 @@ impl Broker {
     ) -> Result<(PublishResponse, PendingDedup), BrokerError> {
         let prepared = self.prepare_publish_batch_waiting(vec![req]).await?;
         let broker = self.clone();
-        tokio::task::spawn_blocking(move || broker.publish_prepared(prepared, false))
+        crate::run_blocking_io(move || broker.publish_prepared(prepared, false))
             .await
             .map_err(blocking_task_error)?
     }
@@ -4239,6 +4238,51 @@ mod tests {
         assert!(response.duplicate);
         assert_eq!(response.message_id, original.message_id);
         assert_eq!(response.offset, original.offset);
+    }
+
+    #[tokio::test]
+    async fn async_publish_and_dedup_keep_the_request_tenant() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let mut originals = Vec::new();
+        for tenant in ["tenant-a", "tenant-b"] {
+            let response = crate::scope_tenant(tenant.into(), async {
+                broker
+                    .publish_async(direct_request("body", Some("shared-key".into())))
+                    .await
+                    .unwrap()
+            })
+            .await;
+            assert!(!response.duplicate);
+            let stored = broker
+                .read_message(
+                    &response.topic,
+                    response.partition.unwrap(),
+                    response.offset.unwrap(),
+                )
+                .unwrap();
+            assert_eq!(stored.tenant_id, tenant);
+            let dedup = broker
+                .inner
+                .metadata
+                .get_dedup(tenant, "shared-key")
+                .unwrap()
+                .unwrap();
+            assert_eq!(Some(dedup.message_id), response.message_id);
+            originals.push(response);
+        }
+        assert_ne!(originals[0].message_id, originals[1].message_id);
+        for (tenant, original) in ["tenant-a", "tenant-b"].into_iter().zip(originals) {
+            let retry = crate::scope_tenant(tenant.into(), async {
+                broker
+                    .publish_async(direct_request("retry", Some("shared-key".into())))
+                    .await
+                    .unwrap()
+            })
+            .await;
+            assert!(retry.duplicate);
+            assert_eq!(retry.message_id, original.message_id);
+        }
     }
 
     #[test]

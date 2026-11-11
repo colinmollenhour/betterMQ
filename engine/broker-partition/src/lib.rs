@@ -1,6 +1,7 @@
 //! Single-node broker: topics, publish, push dispatch, purge.
 
 mod blob;
+mod blocking_io;
 mod broker;
 mod catalog_cache;
 mod catalog_journal;
@@ -30,6 +31,7 @@ pub use priority::{
     clamp_priority, normalize_priority, DEFAULT_PRIORITY, MAX_PRIORITY, MIN_PRIORITY,
 };
 
+pub use blocking_io::run_blocking_io;
 pub use broker::{
     decoded_body_len, decoded_payload_len, AppendedRecordRef, AppendedShardBatch, Broker,
     BrokerConfig, BrokerError, CreateSubscriptionRequest, CreateSubscriptionResponse,

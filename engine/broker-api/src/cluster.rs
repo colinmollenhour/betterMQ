@@ -443,7 +443,7 @@ async fn publish_on_leader(
     resp.commit_epoch = Some(epoch);
     if !pending_dedup.is_empty() {
         let broker = state.broker.clone();
-        tokio::task::spawn_blocking(move || broker.commit_publish_dedup(pending_dedup))
+        broker_partition::run_blocking_io(move || broker.commit_publish_dedup(pending_dedup))
             .await
             .map_err(|error| {
                 ApiError::Unavailable(format!("dedup commit task failed: {error}"))
