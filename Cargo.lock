@@ -487,6 +487,7 @@ dependencies = [
  "broker-partition",
  "broker-payload",
  "broker-proto",
+ "broker-replication",
  "broker-storage",
  "bytes",
  "chrono",
