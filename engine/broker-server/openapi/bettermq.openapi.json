@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "BetterMQ API",
-    "description": "HTTP message broker — publish, queues, enqueue, flow control, cron, and DLQ. Authenticate with a panel-generated `sk_local_…` Bearer token.",
+    "description": "HTTP message broker — publish, queues, enqueue, flow control, cron, and DLQ. Authenticate with a panel-generated `sk_local_…` Bearer token. Cell catalog mutations require controller quorum commit and requesting-node application. Send X-BetterMQ-Operation-Id (UUID) for safe retries; responses echo it and include X-BetterMQ-Catalog-Revision and X-BetterMQ-Catalog-Version after commit. Optional If-Match carries the identity version, not the global revision. A committed retry returns 200 with {operation_id,catalog_revision,catalog_version,replayed:true,resources:[{kind,id,deleted}]} rather than the original object. Reusing an operation UUID for a different method/path/tenant/body is 409. No quorum is 503; a timeout after submission means outcome unknown, retry the same UUID. A local apply failure remains committed and fences the node. Standalone behavior stays local-only.",
     "version": "0.6.2",
     "license": {
       "name": "MIT OR Apache-2.0"
@@ -69,17 +69,54 @@
     {
       "name": "Infra",
       "description": "Self-host config, storage, and HA cluster management"
+    },
+    {
+      "name": "Admin",
+      "description": "Management listener API. Supply an administrator session bearer token for embedded mode or the cluster-secret bearer for standalone mode. Dynamic controller snapshots may gain fields."
+    },
+    {
+      "name": "Infrastructure",
+      "description": "Fresh-node enrollment"
+    },
+    {
+      "name": "Observability",
+      "description": "Prometheus exposition and gateway-only status"
     }
   ],
   "components": {
+    "responses": {
+      "AdminUnauthorized": {"description": "Administrator authentication required", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AdminError"}}}},
+      "AdminFailure": {"description": "Invalid management request or rejected controller operation", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AdminError"}}}},
+      "AdminResult": {"description": "Management operation result; includes operation-specific fields and probe diagnostics", "content": {"application/json": {"schema": {"type": "object", "additionalProperties": true}}}}
+    },
     "securitySchemes": {
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "API token (`Authorization: Bearer sk_local_…`)"
+        "description": "API token for data-plane requests (`Authorization: Bearer sk_local_…`); administrator session token for embedded management or cluster-secret bearer for standalone management."
       }
     },
     "schemas": {
+      "InspectionCounts": {
+        "type": "object", "required": ["delayed", "crons", "dlq", "dlq_ready", "dlq_count_reason", "scope"],
+        "properties": {
+          "delayed": {"type": "integer", "minimum": 0},
+          "crons": {"type": "integer", "minimum": 0},
+          "dlq": {"type": ["integer", "null"], "description": "Exact node-local retained count only when dlq_ready=true; null during recovery and on Slate."},
+          "dlq_ready": {"type": "boolean"},
+          "dlq_count_reason": {"type": ["string", "null"], "description": "Slate reports 'count unavailable on this storage backend'. Local WAL recovery reports its initialization status; partial counts are not presented as exact."},
+          "scope": {"type": "string", "enum": ["node_local"]}
+        }
+      },
+      "AdminError": {"type": "object", "required": ["error", "code"], "properties": {"error": {"type": "string"}, "code": {"type": "string"}}},
+      "AdminClusterOverview": {
+        "type": "object",
+        "required": ["apiVersion", "ready", "clusterHealthy", "nodeCount", "replicationFactor", "minIsr", "catalogEpoch", "local"],
+        "properties": {"apiVersion": {"type": "string"}, "ready": {"type": "boolean"}, "clusterHealthy": {"type": "boolean"}, "nodeCount": {"type": "integer"}, "replicationFactor": {"type": "integer"}, "minIsr": {"type": "integer"}, "catalogEpoch": {"type": "integer"}, "local": {"type": "boolean"}}
+      },
+      "AdminCellRecord": {"type": "object", "required": ["id", "region", "controllerUrl"], "properties": {"id": {"type": "string"}, "region": {"type": "string"}, "controllerUrl": {"type": "string", "format": "uri"}, "label": {"type": "string", "nullable": true}}},
+      "AdminCellMember": {"type": "object", "required": ["profile", "reachUrl", "advertiseUrl", "name", "cellId"], "properties": {"profile": {"type": "string"}, "reachUrl": {"type": "string", "format": "uri"}, "advertiseUrl": {"type": "string", "format": "uri"}, "name": {"type": "string"}, "cellId": {"type": "string"}}},
+      "AdminCellRegistry": {"type": "object", "required": ["cells", "members"], "properties": {"cells": {"type": "array", "items": {"$ref": "#/components/schemas/AdminCellRecord"}}, "members": {"type": "array", "items": {"$ref": "#/components/schemas/AdminCellMember"}}}},
       "Error": {
         "type": "object",
         "properties": {
@@ -350,6 +387,8 @@
           "duplicate"
         ],
         "properties": {
+          "fanout_id": {"type": "string", "format": "uuid", "description": "Durable fan-out identity. Unaccepted members are replayed by the broker; preserve the original idempotency key when retrying the same command."},
+          "partial": {"type": "boolean", "description": "True when group member attempts produced mixed outcomes."},
           "message_id": {
             "type": "string",
             "format": "uuid"
@@ -385,12 +424,17 @@
         "type": "object",
         "required": [
           "accepted",
+          "failed",
+          "partial",
           "message_ids"
         ],
         "properties": {
           "accepted": {
             "type": "integer"
           },
+          "failed": {"type": "integer", "minimum": 0},
+          "partial": {"type": "boolean", "description": "True when accepted and failed items coexist. Retry only failed items marked retryable, preserving their idempotency keys."},
+          "results": {"type": "array", "items": {"$ref": "#/components/schemas/IngestItemResult"}},
           "message_ids": {
             "type": "array",
             "items": {
@@ -398,6 +442,25 @@
               "format": "uuid"
             }
           }
+        }
+      },
+      "IngestItemResult": {
+        "type": "object",
+        "required": ["index", "accepted", "topic", "duplicate", "message_id", "partition", "offset", "commit_epoch"],
+        "properties": {
+          "index": {"type": "integer", "minimum": 0, "description": "Original zero-based input index."},
+          "accepted": {"type": "boolean"},
+          "message_id": {"type": "string", "format": "uuid", "nullable": true},
+          "topic": {"type": "string"},
+          "partition": {"type": "integer", "nullable": true},
+          "offset": {"type": "integer", "nullable": true},
+          "duplicate": {"type": "boolean"},
+          "commit_epoch": {"type": "integer", "nullable": true},
+          "scheduled": {"$ref": "#/components/schemas/ScheduledInfo"},
+          "error": {"type": "string"},
+          "code": {"type": "string", "description": "Stable failure code; present only on failures."},
+          "retryable": {"type": "boolean", "description": "Retry only failed items with retryable=true. Retain idempotency keys because infrastructure failures can have an ambiguous commit outcome."},
+          "retry_after_ms": {"type": "integer", "minimum": 0}
         }
       },
       "BatchPublishMessage": {
@@ -659,8 +722,7 @@
           "schedule_id",
           "queue",
           "key",
-          "deliver_at_ms",
-          "body"
+          "deliver_at_ms"
         ],
         "properties": {
           "schedule_id": {
@@ -690,6 +752,7 @@
           "messages"
         ],
         "properties": {
+          "next_cursor": {"type": ["string", "null"], "description": "Opaque continuation including partition and next offset, bound to this DLQ topic. Continue even if messages is empty; null marks the end."},
           "queue": {
             "type": "string"
           },
@@ -709,7 +772,6 @@
         "required": [
           "message_id",
           "key",
-          "body",
           "published_at_ms",
           "partition",
           "offset"
@@ -739,6 +801,11 @@
             "type": "string",
             "description": "Why the message was moved to the DLQ (HTTP status, transport error, retries exhausted, …)"
           },
+          "body_encoding": {
+            "type": "string",
+            "enum": ["utf8", "base64"],
+            "description": "How `body` is encoded. `base64` means the original payload was not valid UTF-8 and `body` holds its base64 encoding; `utf8` means `body` is the original text. Absent for records written before this field existed."
+          },
           "partition": {
             "type": "integer",
             "format": "uint32"
@@ -755,9 +822,11 @@
           "dlq_topic",
           "kind",
           "label",
-          "count"
+          "count_ready"
         ],
         "properties": {
+          "count_ready": {"type": "boolean"},
+          "count_unavailable_reason": {"type": "string", "description": "Slate: count unavailable on this storage backend. Also explains local recovery in progress. No partial count is returned."},
           "dlq_topic": {
             "type": "string"
           },
@@ -785,9 +854,12 @@
         "type": "object",
         "required": [
           "member_id",
+          "accepted",
           "duplicate"
         ],
         "properties": {
+          "accepted": {"type": "boolean", "description": "Whether this member was committed or scheduled."},
+          "error": {"type": "string", "description": "Member failure or accepted-for-replay detail."},
           "member_id": {
             "type": "string",
             "format": "uuid"
@@ -1076,12 +1148,43 @@
           },
           "auth_configured": {
             "type": "boolean"
+          },
+          "draining": {
+            "type": "boolean"
+          },
+          "archive_blocked": {
+            "type": "boolean"
+          },
+          "memory_critical": {
+            "type": "boolean"
+          },
+          "controller_ready": {
+            "type": "boolean"
+          },
+          "local_shards_ready": {
+            "type": "boolean"
+          },
+          "catalog_ready": {
+            "type": "boolean"
           }
         }
       },
       "MetricsResponse": {
         "type": "object",
         "properties": {
+          "quorum": {
+            "type": "object",
+            "description": "Quorum-gated dispatch in multi-node local-WAL cells (absent elsewhere). Dispatch only delivers records proven on a replication quorum.",
+            "properties": {
+              "max_lag_records": { "type": "integer", "format": "uint64", "description": "Largest count of locally committed records not yet proven on a quorum, per log" },
+              "total_lag_records": { "type": "integer", "format": "uint64" },
+              "logs_lagging": { "type": "integer" },
+              "pending_ranges": { "type": "integer", "description": "Quorum-proven epochs waiting behind an unproven gap" },
+              "fenced_partitions": { "type": "integer", "description": "Partitions taken over whose dispatch waits for quorum verification" },
+              "dlq_pending_prepared": { "type": "integer", "format": "uint64" },
+              "dlq_pending_committed": { "type": "integer", "format": "uint64" }
+            }
+          },
           "blocked_hosts": {
             "type": "integer"
           },
@@ -1115,6 +1218,7 @@
       },
       "BlockedHostsResponse": {
         "type": "object",
+        "allOf": [{ "$ref": "#/components/schemas/DestinationControlScope" }],
         "properties": {
           "hosts": {
             "type": "array",
@@ -1123,6 +1227,21 @@
             }
           }
         }
+      },
+      "DestinationControlScope": {
+        "type": "object",
+        "required": ["scope", "applied_nodes", "shared_metadata"],
+        "properties": {
+          "scope": { "type": "string", "enum": ["serving_process"] },
+          "applied_nodes": { "type": "array", "items": { "type": "string" }, "description": "Nodes that confirmed this action; not a fleet-wide acknowledgement." },
+          "shared_metadata": { "type": "boolean", "description": "Shared-metadata peers may observe changes asynchronously." }
+        }
+      },
+      "DestinationControlResponse": {
+        "allOf": [
+          { "$ref": "#/components/schemas/BlockedHostEntry" },
+          { "$ref": "#/components/schemas/DestinationControlScope" }
+        ]
       },
       "UnblockHostRequest": {
         "type": "object",
@@ -1191,7 +1310,8 @@
             "description": "HMAC secret required with url"
           },
           "idempotency_key": {
-            "type": "string"
+            "type": "string",
+            "description": "Optional suffix for the per-run idempotency key. Each run publishes with its own key, cron:<id>:<scheduled run time ms>[:<idempotency_key>]: retries of one run dedupe, and this value never suppresses later runs."
           },
           "body_encoding": {
             "type": "string",
@@ -1282,6 +1402,8 @@
       "DelayedListResponse": {
         "type": "object",
         "properties": {
+          "next_cursor": {"type": ["string", "null"], "description": "Opaque exclusive delivery-deadline and schedule-id continuation. Null marks the end."},
+          "total": {"type": "integer", "minimum": 0, "description": "Maintained pending count including in-flight scheduled jobs."},
           "delayed": {
             "type": "array",
             "items": {
@@ -1554,6 +1676,10 @@
             "type": "integer",
             "format": "uint64",
             "description": "Seconds left on the first-boot window"
+          },
+          "setup_code_required": {
+            "type": "boolean",
+            "description": "Setup needs the one-time setup code printed in the startup log"
           }
         }
       },
@@ -1579,6 +1705,22 @@
           }
         }
       },
+      "LocalAuthSetupBody": {
+        "type": "object",
+        "required": [
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string",
+            "minLength": 12
+          },
+          "setup_code": {
+            "type": "string",
+            "description": "One-time code printed to stderr when the setup window opens (or BETTERMQ_SETUP_CODE). Case and dashes are ignored. Not needed with BETTERMQ_ALLOW_OPEN_SETUP."
+          }
+        }
+      },
       "LocalAuthTokenResponse": {
         "type": "object",
         "required": [
@@ -1591,6 +1733,41 @@
           },
           "show_once": {
             "type": "boolean"
+          },
+          "propagation": {
+            "type": "object",
+            "description": "Present in a cluster. Peers in `failed` did not apply the new credentials: after a regenerate they still accept the previous token.",
+            "required": [
+              "peers",
+              "applied",
+              "failed"
+            ],
+            "properties": {
+              "peers": {
+                "type": "integer"
+              },
+              "applied": {
+                "type": "integer"
+              },
+              "failed": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "peer",
+                    "error"
+                  ],
+                  "properties": {
+                    "peer": {
+                      "type": "string"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       },
@@ -1607,6 +1784,10 @@
           },
           "public_url": {
             "type": "string"
+          },
+          "internal_url": {
+            "type": ["string", "null"],
+            "description": "Private peer URL; defaults to public_url when absent."
           },
           "id": {
             "type": "string",
@@ -1651,6 +1832,10 @@
           },
           "public_url": {
             "type": "string"
+          },
+          "internal_url": {
+            "type": ["string", "null"],
+            "description": "Advertised private peer URL."
           },
           "node_name": {
             "type": "string"
@@ -1803,6 +1988,10 @@
           },
           "publicUrl": {
             "type": "string"
+          },
+          "internalUrl": {
+            "type": ["string", "null"],
+            "description": "Private peer URL; defaults to publicUrl when absent."
           }
         }
       },
@@ -1828,6 +2017,9 @@
                 },
                 "publicUrl": {
                   "type": "string"
+                },
+                "internalUrl": {
+                  "type": ["string", "null"]
                 }
               }
             }
@@ -1945,9 +2137,12 @@
           "public_url": {
             "type": "string"
           },
+          "internal_url": {
+            "type": ["string", "null"]
+          },
           "listen": {
             "type": "string",
-            "default": "0.0.0.0:8080"
+            "description": "Optional. When omitted, preserve the saved listener unchanged."
           }
         }
       },
@@ -2093,8 +2288,17 @@
           "public_url": {
             "type": "string"
           },
+          "internal_url": {
+            "type": ["string", "null"],
+            "description": "Private peer URL advertised during enrollment; uses local configuration when omitted."
+          },
           "node_name": {
             "type": "string"
+          },
+          "force": {
+            "type": "boolean",
+            "default": false,
+            "description": "Replace this node's existing cluster membership. Without it, joining a node that is already in a cluster returns 409."
           }
         }
       },
@@ -2199,6 +2403,79 @@
     }
   ],
   "paths": {
+    "/v1/inspection/counts": {
+      "get": {"tags": ["Ops"], "summary": "Read maintained node-local schedule and DLQ counts", "description": "No backlog scans. Local WAL DLQ counters recover once at shard startup. During recovery and on Slate, dlq is null and dlq_count_reason explains why; Slate listing remains available. Counts are not a cluster-wide aggregate.", "responses": {"200": {"description": "Counts and recovery/backend availability", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/InspectionCounts"}}}}}}
+    },
+    "/v1/dlq/message": {
+      "get": {"tags": ["DLQ"], "summary": "Read one dead letter with its body on demand", "parameters": [{"name": "dlq_topic", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "partition", "in": "query", "required": true, "schema": {"type": "integer", "minimum": 0}}, {"name": "offset", "in": "query", "required": true, "schema": {"type": "integer", "minimum": 0}}], "responses": {"200": {"description": "Exact message at these coordinates", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DlqMessage"}}}}, "404": {"description": "No matching DLQ record"}, "400": {"description": "Invalid topic or coordinates"}, "503": {"description": "Bounded inspection worker pool is busy"}}}
+    },
+    "/admin/v1/health": {
+      "get": {"tags": ["Admin"], "summary": "Management listener health", "security": [], "responses": {"200": {"description": "Listener health and mode", "content": {"application/json": {"schema": {"type": "object", "required": ["status", "apiVersion", "mode", "cells"], "properties": {"status": {"type": "string"}, "apiVersion": {"type": "string"}, "mode": {"type": "string", "enum": ["embedded", "standalone"]}, "cells": {"type": "integer"}}}}}}}}
+    },
+    "/admin/v1/cluster": {
+      "get": {"tags": ["Admin"], "summary": "Cluster overview", "responses": {"200": {"description": "Cluster health and replication policy", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AdminClusterOverview"}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/nodes": {
+      "get": {"tags": ["Admin"], "summary": "Controller data-node inventory", "responses": {"200": {"description": "Nodes (empty when no local controller)", "content": {"application/json": {"schema": {"type": "object", "properties": {"nodes": {"type": "array", "items": {"type": "object", "additionalProperties": true}}}}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/shards": {
+      "get": {"tags": ["Admin"], "summary": "Controller shard placements", "responses": {"200": {"description": "Shards (empty when no local controller)", "content": {"application/json": {"schema": {"type": "object", "properties": {"shards": {"type": "array", "items": {"type": "object", "additionalProperties": true}}}}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/catalog": {
+      "get": {"tags": ["Admin"], "summary": "Controller catalog snapshot", "responses": {"200": {"description": "Catalog epoch, records and authority flag", "content": {"application/json": {"schema": {"type": "object", "properties": {"epoch": {"type": "integer"}, "records": {"type": "object", "additionalProperties": true}, "authoritative": {"type": "boolean"}}}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/metrics": {
+      "get": {"tags": ["Admin"], "summary": "Management metrics snapshot", "responses": {"200": {"description": "Native broker metrics", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/MetricsResponse"}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/readyz": {
+      "get": {"tags": ["Admin"], "summary": "Management readiness snapshot", "responses": {"200": {"description": "Readiness fields (inspect ready, not only HTTP status)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ReadyResponse"}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/audit": {
+      "get": {"tags": ["Admin"], "summary": "Management audit events", "description": "Currently returns an empty event list; limit is reserved and is not applied.", "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 0}}], "responses": {"200": {"description": "Audit event list", "content": {"application/json": {"schema": {"type": "object", "properties": {"events": {"type": "array", "items": {"type": "object"}}}}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/cells": {
+      "get": {"tags": ["Admin"], "summary": "List registered cells and members", "responses": {"200": {"description": "Cell registry", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AdminCellRegistry"}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}},
+      "post": {"tags": ["Admin"], "summary": "Upsert a registered cell", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AdminCellRecord"}}}}, "responses": {"200": {"description": "Updated registry", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AdminCellRegistry"}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/cells/{id}/members": {
+      "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}],
+      "get": {"tags": ["Admin"], "summary": "Cell brokers and attached members", "responses": {"200": {"description": "Cell inventory", "content": {"application/json": {"schema": {"type": "object", "properties": {"cellId": {"type": "string"}, "brokers": {"type": "array", "items": {"type": "object"}}, "members": {"type": "array", "items": {"$ref": "#/components/schemas/AdminCellMember"}}}}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/cells/query/{kind}": {
+      "parameters": [{"name": "kind", "in": "path", "required": true, "schema": {"type": "string", "enum": ["cluster", "nodes", "shards", "catalog"]}}],
+      "get": {"tags": ["Admin"], "summary": "Federated cell query with explicit per-cell failures", "responses": {"200": {"description": "Successful and failed cells", "content": {"application/json": {"schema": {"type": "object", "properties": {"ok": {"type": "array", "items": {"type": "object", "properties": {"cell": {"type": "string"}, "data": {"type": "object", "additionalProperties": true}}}}, "failed": {"type": "array", "items": {"type": "object", "properties": {"cell": {"type": "string"}, "error": {"type": "string"}}}}}}}}}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/probe": {
+      "post": {"tags": ["Admin"], "summary": "Probe an attach target", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["reachUrl"], "properties": {"reachUrl": {"type": "string", "format": "uri"}}}}}}, "responses": {"200": {"$ref": "#/components/responses/AdminResult"}, "400": {"$ref": "#/components/responses/AdminFailure"}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/attach": {
+      "post": {"tags": ["Admin"], "summary": "Attach a broker or fleet process", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["profile", "reachUrl", "advertiseUrl", "nodeName"], "properties": {"profile": {"type": "string"}, "reachUrl": {"type": "string", "format": "uri"}, "advertiseUrl": {"type": "string", "format": "uri"}, "nodeName": {"type": "string"}, "joinToken": {"type": "string"}, "seedUrl": {"type": "string", "format": "uri"}, "cellId": {"type": "string"}}}}}}, "responses": {"200": {"$ref": "#/components/responses/AdminResult"}, "400": {"$ref": "#/components/responses/AdminFailure"}, "409": {"$ref": "#/components/responses/AdminFailure"}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/expand-rf": {
+      "post": {"tags": ["Admin"], "summary": "Expand the replication policy", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"nodeName": {"type": "string"}, "advertiseUrl": {"type": "string", "format": "uri"}}}}}}, "responses": {"200": {"$ref": "#/components/responses/AdminResult"}, "400": {"$ref": "#/components/responses/AdminFailure"}, "409": {"$ref": "#/components/responses/AdminFailure"}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/rebalance": {
+      "post": {"tags": ["Admin"], "summary": "Begin a shard rebalance", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["shard"], "properties": {"shard": {"type": "integer", "minimum": 0}, "add": {"type": "string", "format": "uuid"}, "remove": {"type": "string", "format": "uuid"}}}}}}, "responses": {"200": {"$ref": "#/components/responses/AdminResult"}, "400": {"$ref": "#/components/responses/AdminFailure"}, "409": {"$ref": "#/components/responses/AdminFailure"}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/nodes/drain": {
+      "post": {"tags": ["Admin"], "summary": "Drain a data node", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["nodeId"], "properties": {"nodeId": {"type": "string", "format": "uuid"}}}}}}, "responses": {"200": {"$ref": "#/components/responses/AdminResult"}, "400": {"$ref": "#/components/responses/AdminFailure"}, "409": {"$ref": "#/components/responses/AdminFailure"}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/controller/voters": {
+      "post": {"tags": ["Admin"], "summary": "Change controller voter membership", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["nodeId", "action"], "properties": {"nodeId": {"type": "string", "format": "uuid"}, "action": {"type": "string", "enum": ["add", "remove"]}}}}}}, "responses": {"200": {"$ref": "#/components/responses/AdminResult"}, "400": {"$ref": "#/components/responses/AdminFailure"}, "409": {"$ref": "#/components/responses/AdminFailure"}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/admin/v1/gc/{shard}": {
+      "parameters": [{"name": "shard", "in": "path", "required": true, "schema": {"type": "integer", "minimum": 0}}],
+      "post": {"tags": ["Admin"], "summary": "Advance a shard GC watermark and collect sealed segments", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["watermark"], "properties": {"watermark": {"type": "integer", "minimum": 0}}}}}}, "responses": {"200": {"$ref": "#/components/responses/AdminResult"}, "409": {"$ref": "#/components/responses/AdminFailure"}, "401": {"$ref": "#/components/responses/AdminUnauthorized"}}}
+    },
+    "/v1/infra/cluster/enroll": {
+      "post": {"tags": ["Infrastructure"], "summary": "Enroll a fresh broker using a seed join token", "description": "Uses the join token in the request body, not a local API token. Unsupported on dispatch fleets and WAL-less processes.", "security": [], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ClusterJoinRequest"}}}}, "responses": {"200": {"description": "Membership saved; restart required", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ClusterJoinResponse"}}}}, "400": {"description": "Invalid token, seed, configuration or unsupported process role"}}}
+    },
+    "/metrics/prometheus": {
+      "get": {"tags": ["Observability"], "summary": "Prometheus exposition", "security": [], "responses": {"200": {"description": "Prometheus text exposition format", "content": {"text/plain": {"schema": {"type": "string"}}}}}}
+    },
+    "/v1/gateway/status": {
+      "get": {"tags": ["Observability"], "summary": "Stateless gateway status", "description": "Mounted on gateway-only listeners.", "security": [], "responses": {"200": {"description": "Gateway configuration and broker probe counts", "content": {"application/json": {"schema": {"type": "object", "required": ["mode", "ready", "healthy_brokers", "configured_brokers", "shard_count", "layout_version"], "properties": {"mode": {"type": "string"}, "ready": {"type": "boolean"}, "healthy_brokers": {"type": "integer"}, "configured_brokers": {"type": "integer"}, "shard_count": {"type": "integer"}, "layout_version": {"type": "integer"}}}}}}}}
+    },
     "/healthz": {
       "get": {
         "tags": [
@@ -2271,7 +2548,8 @@
               }
             }
           }
-        }
+        },
+        "description": "Peers are queried with the trimmed BETTERMQ_CLUSTER_SECRET. Each entry in `peers` has `reachable`; an unreachable peer has `active_leases: null` and an `error`, and `fleet.complete` is false with `fleet.peers_unreachable` counting them, so `fleet.active_leases_total` is a lower bound in that case."
       }
     },
     "/metrics": {
@@ -2318,6 +2596,7 @@
           }
         },
         "responses": {
+          "207": {"description": "Group member outcomes. Failed members remain in the durable outbox for replay; preserve the original idempotency key.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AcceptResponse"}}}},
           "200": {
             "description": "Duplicate idempotency key",
             "content": {
@@ -2337,6 +2616,72 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Another request holding the same idempotency key is still being published (waited up to 10 s). Retry after the Retry-After interval; the retry returns the original message as a duplicate once it commits.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "idempotency_in_flight"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Local-WAL multi-node cell only: the message body is larger than the cell's inline body limit (`cell_max_inline_body`, about 14.8 MiB by default). Nothing was written. In a batch, only the oversize items fail with this error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "payload_too_large_for_cell"
+                      ]
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "limit": {
+                      "type": "integer",
+                      "description": "Largest accepted body in bytes"
+                    },
+                    "size": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Not available in a cluster: the request sets delay (including 0), which multi-node cells do not support in this release. Nothing was accepted."
+          },
+          "429": {
+            "description": "Delayed backlog is full (BETTERMQ_SCHEDULE_MAX_PENDING / BETTERMQ_SCHEDULE_MAX_PENDING_BYTES); nothing was accepted. Retry after the Retry-After header."
           }
         },
         "description": "Provide either url+secret (1:1) or group_id (fan-out). Shared options: delay, retries, idempotency, priority, outbound HTTP fields."
@@ -2453,6 +2798,72 @@
           },
           "400": {
             "description": "Missing/disabled query secret or invalid destination"
+          },
+          "409": {
+            "description": "Another request holding the same idempotency key is still being published (waited up to 10 s). Retry after the Retry-After interval; the retry returns the original message as a duplicate once it commits.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "idempotency_in_flight"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Local-WAL multi-node cell only: the message body is larger than the cell's inline body limit (`cell_max_inline_body`, about 14.8 MiB by default). Nothing was written. In a batch, only the oversize items fail with this error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "payload_too_large_for_cell"
+                      ]
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "limit": {
+                      "type": "integer",
+                      "description": "Largest accepted body in bytes"
+                    },
+                    "size": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Not available in a cluster: the request sets delay (including 0), which multi-node cells do not support in this release. Nothing was accepted."
+          },
+          "429": {
+            "description": "Delayed backlog is full (BETTERMQ_SCHEDULE_MAX_PENDING / BETTERMQ_SCHEDULE_MAX_PENDING_BYTES); nothing was accepted. Retry after the Retry-After header."
           }
         }
       }
@@ -2476,6 +2887,7 @@
           }
         },
         "responses": {
+          "207": {"description": "Group member outcomes. Failed members remain in the durable outbox for replay; preserve the original idempotency key.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AcceptResponse"}}}},
           "200": {
             "description": "Duplicate idempotency key",
             "content": {
@@ -2495,6 +2907,72 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Another request holding the same idempotency key is still being published (waited up to 10 s). Retry after the Retry-After interval; the retry returns the original message as a duplicate once it commits.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "idempotency_in_flight"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Local-WAL multi-node cell only: the message body is larger than the cell's inline body limit (`cell_max_inline_body`, about 14.8 MiB by default). Nothing was written. In a batch, only the oversize items fail with this error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "payload_too_large_for_cell"
+                      ]
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "limit": {
+                      "type": "integer",
+                      "description": "Largest accepted body in bytes"
+                    },
+                    "size": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Not available in a cluster: the request sets delay (including 0), which multi-node cells do not support in this release. Nothing was accepted."
+          },
+          "429": {
+            "description": "Delayed backlog is full (BETTERMQ_SCHEDULE_MAX_PENDING / BETTERMQ_SCHEDULE_MAX_PENDING_BYTES); nothing was accepted. Retry after the Retry-After header."
           }
         }
       }
@@ -2548,6 +3026,72 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Another request holding the same idempotency key is still being published (waited up to 10 s). Retry after the Retry-After interval; the retry returns the original message as a duplicate once it commits.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "idempotency_in_flight"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Local-WAL multi-node cell only: the message body is larger than the cell's inline body limit (`cell_max_inline_body`, about 14.8 MiB by default). Nothing was written. In a batch, only the oversize items fail with this error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string",
+                      "enum": [
+                        "payload_too_large_for_cell"
+                      ]
+                    },
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "limit": {
+                      "type": "integer",
+                      "description": "Largest accepted body in bytes"
+                    },
+                    "size": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "501": {
+            "description": "Not available in a cluster: the request sets delay (including 0), which multi-node cells do not support in this release. Nothing was accepted."
+          },
+          "429": {
+            "description": "Delayed backlog is full (BETTERMQ_SCHEDULE_MAX_PENDING / BETTERMQ_SCHEDULE_MAX_PENDING_BYTES); nothing was accepted. Retry after the Retry-After header."
           }
         }
       }
@@ -3263,6 +3807,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: creating or changing crons is not supported in multi-node cells in this release (deleting still works)."
           }
         }
       }
@@ -3352,6 +3899,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: creating or changing crons is not supported in multi-node cells in this release (deleting still works)."
           }
         }
       }
@@ -3383,6 +3933,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: creating or changing crons is not supported in multi-node cells in this release (deleting still works)."
           }
         }
       }
@@ -3394,7 +3947,10 @@
         ],
         "operationId": "listDelayed",
         "summary": "List delayed jobs",
+        "description": "Bounded payload-free metadata ordered by delivery deadline and id. Includes jobs in flight until durable completion. Follow next_cursor until null; counts come from maintained scheduler state.",
+        "parameters": [{"name": "limit", "in": "query", "description": "Clamped to 1..1000", "schema": {"type": "integer", "default": 10, "minimum": 1, "maximum": 1000}}, {"name": "cursor", "in": "query", "description": "Opaque next_cursor from the preceding page", "schema": {"type": "string"}}],
         "responses": {
+          "400": {"description": "Invalid cursor"},
           "200": {
             "description": "OK",
             "content": {
@@ -3445,7 +4001,10 @@
         ],
         "operationId": "listDlq",
         "summary": "List DLQ messages",
+        "description": "Node-local retained records, including legacy hash placement and source-shard-pinned records. Not a cluster-wide snapshot. Each request scans at most 512 records, stops after approximately 8 MiB matching payload bytes (one oversized record may exceed that), and returns no bodies by default. Empty pages may have next_cursor: continue until null. Works on Slate even though exact Slate counts are unavailable.",
         "parameters": [
+          {"name": "cursor", "in": "query", "description": "Opaque partition/offset continuation bound to the selected DLQ topic", "schema": {"type": "string"}},
+          {"name": "include_body", "in": "query", "description": "Opt in to bodies; otherwise fetch an individual body from /v1/dlq/message", "schema": {"type": "boolean", "default": false}},
           {
             "name": "queue",
             "in": "query",
@@ -3467,11 +4026,15 @@
             "in": "query",
             "schema": {
               "type": "integer",
-              "default": 10
+              "default": 10,
+              "minimum": 1,
+              "maximum": 1000
             }
           }
         ],
         "responses": {
+          "400": {"description": "Invalid cursor or DLQ topic"},
+          "503": {"description": "Bounded inspection worker pool is busy"},
           "200": {
             "description": "OK",
             "content": {
@@ -3588,6 +4151,7 @@
           }
         },
         "responses": {
+          "207": {"description": "Indexed outcomes; retry only failures marked retryable, retaining idempotency keys.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BatchEnqueueResponse"}}}},
           "202": {
             "description": "Accepted",
             "content": {
@@ -3597,6 +4161,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: a record sets delay. The whole batch is refused (one rejected result per record) and nothing is committed."
           }
         }
       }
@@ -3619,6 +4186,7 @@
           }
         },
         "responses": {
+          "207": {"description": "Indexed outcomes; retry only failures marked retryable, retaining idempotency keys.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BatchEnqueueResponse"}}}},
           "202": {
             "description": "Accepted",
             "content": {
@@ -3650,6 +4218,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: a record sets delay. The whole batch is refused (one rejected result per record) and nothing is committed."
           }
         }
       }
@@ -3673,6 +4244,7 @@
           }
         },
         "responses": {
+          "207": {"description": "Indexed outcomes; retry only failures marked retryable, retaining idempotency keys.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BatchEnqueueResponse"}}}},
           "202": {
             "description": "Accepted",
             "content": {
@@ -3707,6 +4279,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: a record sets delay. The whole batch is refused (one rejected result per record) and nothing is committed."
           }
         }
       }
@@ -3729,6 +4304,7 @@
           }
         },
         "responses": {
+          "207": {"description": "Indexed outcomes; retry only failures marked retryable, retaining idempotency keys.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/BatchEnqueueResponse"}}}},
           "202": {
             "description": "Accepted",
             "content": {
@@ -3738,6 +4314,9 @@
                 }
               }
             }
+          },
+          "501": {
+            "description": "Not available in a cluster: a record sets delay. The whole batch is refused (one rejected result per record) and nothing is committed."
           }
         }
       }
@@ -4093,7 +4672,7 @@
           "Ops"
         ],
         "operationId": "listBlockedHosts",
-        "summary": "List hosts blocked by the delivery circuit breaker",
+        "summary": "List hosts blocked on the serving node, with explicit application scope",
         "responses": {
           "200": {
             "description": "OK",
@@ -4114,7 +4693,7 @@
           "Ops"
         ],
         "operationId": "blockHost",
-        "summary": "Operator override — manually block a destination host",
+        "summary": "Block a destination host on the serving node (not fleet-wide)",
         "requestBody": {
           "required": true,
           "content": {
@@ -4127,11 +4706,11 @@
         },
         "responses": {
           "200": {
-            "description": "Blocked",
+            "description": "Confirmed on applied_nodes only; peers and fleet workers are not acknowledged",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BlockedHostEntry"
+                  "$ref": "#/components/schemas/DestinationControlResponse"
                 }
               }
             }
@@ -4145,7 +4724,7 @@
           "Ops"
         ],
         "operationId": "unblockHost",
-        "summary": "Operator override — unblock a host",
+        "summary": "Unblock a host on the serving node (not fleet-wide)",
         "requestBody": {
           "required": true,
           "content": {
@@ -4158,7 +4737,8 @@
         },
         "responses": {
           "200": {
-            "description": "Unblocked"
+            "description": "Confirmed on applied_nodes only",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DestinationControlResponse" } } }
           }
         }
       }
@@ -4220,7 +4800,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/LocalAuthPasswordBody"
+                "$ref": "#/components/schemas/LocalAuthSetupBody"
               }
             }
           }
@@ -4235,6 +4815,9 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "Setup window closed, or setup code missing or wrong"
           }
         }
       }
@@ -4268,7 +4851,8 @@
               }
             }
           }
-        }
+        },
+        "description": "Revokes the current API token (data plane and admin) and pushes the new versioned credentials to every cluster peer; configured peers accept a strictly newer version. Check `propagation.failed`."
       }
     },
     "/v1/infra/join/bootstrap": {
@@ -4295,6 +4879,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "x-bettermq-cluster-challenge",
+            "in": "header",
+            "description": "Nonce from the joiner. When the seed has BETTERMQ_CLUSTER_SECRET set, it answers with x-bettermq-cluster-proof = hex HMAC-SHA256(secret, \"bettermq-seed-proof-v1\\n\" + nonce). Joiners with a cluster secret refuse seeds that do not prove it.",
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            }
           }
         ],
         "responses": {
@@ -4304,6 +4897,14 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/BootstrapResponse"
+                }
+              }
+            },
+            "headers": {
+              "x-bettermq-cluster-proof": {
+                "description": "Seed's answer to x-bettermq-cluster-challenge.",
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -4339,6 +4940,54 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/infra/cluster/enroll": {
+      "post": {
+        "tags": [
+          "Infra"
+        ],
+        "operationId": "infraClusterEnroll",
+        "summary": "Join a cluster on behalf of the panel attach flow",
+        "security": [],
+        "description": "Same as /v1/infra/cluster/join, on the public router. A node with local auth configured requires its own API token (Authorization: Bearer). An unconfigured node requires x-bettermq-enroll-proof = `<unix_ms>.<hex HMAC-SHA256(BETTERMQ_CLUSTER_SECRET, \"bettermq-enroll-v1\\n\" + unix_ms + \"\\n\" + raw body)>`, at most 5 minutes old. Rejected on dispatch-fleet processes.",
+        "parameters": [
+          {
+            "name": "x-bettermq-enroll-proof",
+            "in": "header",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClusterJoinRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterJoinResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid API token or enroll proof"
+          },
+          "409": {
+            "description": "Node already in a cluster (pass force)"
           }
         }
       }
@@ -4422,7 +5071,8 @@
           "Infra"
         ],
         "operationId": "infraUpdateStorage",
-        "summary": "Update storage mode (local / slate)",
+        "summary": "Update same-location storage credentials",
+        "description": "Live backend or location changes (endpoint, WAL/payload bucket, region) are refused. Stop ingestion and use a verified offline migration or a new deployment; this API never migrates messages. Credential changes on the same store require restart.",
         "requestBody": {
           "required": true,
           "content": {
@@ -4443,6 +5093,9 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Storage backend or location change requires an offline migration or new deployment"
           }
         }
       }
@@ -4485,6 +5138,7 @@
         ],
         "operationId": "infraClusterCreate",
         "summary": "Create HA cluster and issue join token",
+        "description": "Initialize an unclustered node only. Existing saved, active or runtime membership cannot be replaced.",
         "responses": {
           "200": {
             "description": "OK",
@@ -4495,6 +5149,9 @@
                 }
               }
             }
+          },
+          "409": {
+            "description": "Cluster membership already exists"
           }
         }
       }

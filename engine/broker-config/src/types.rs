@@ -1,4 +1,5 @@
 use broker_proto::RetryDefaults;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
@@ -15,8 +16,8 @@ pub enum ConfigError {
     Invalid(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BetterMqConfig {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -40,6 +41,13 @@ pub struct BetterMqConfig {
     pub panel: Option<crate::components::PanelSection>,
     #[serde(default)]
     pub replication: Option<crate::components::ReplicationPolicyConfig>,
+    /// Idempotency retention in seconds, at least the seven-day retry window.
+    #[serde(default = "default_dedup_retention", alias = "dedup_retention")]
+    pub dedup_retention: u64,
+}
+
+fn default_dedup_retention() -> u64 {
+    broker_proto::DEFAULT_DEDUP_RETENTION_SECS
 }
 
 fn default_version() -> u32 {
@@ -50,21 +58,23 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from("./data")
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NodeSection {
     pub name: String,
     #[serde(default = "default_listen")]
     pub listen: String,
     pub public_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_url: Option<String>,
 }
 
 fn default_listen() -> String {
     "0.0.0.0:8080".into()
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum StorageConfig {
     #[serde(alias = "rocksdb", alias = "wal")]
     #[default]
@@ -74,8 +84,28 @@ pub enum StorageConfig {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+impl<'de> Deserialize<'de> for StorageConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Serde's internally tagged *unit* variant ignores extra fields even
+        // with deny_unknown_fields. An empty struct variant enforces strictness.
+        #[derive(Deserialize)]
+        #[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
+        enum StrictStorage {
+            #[serde(alias = "rocksdb", alias = "wal")]
+            Local {},
+            Slate {
+                s3: S3Config,
+            },
+        }
+        Ok(match StrictStorage::deserialize(deserializer)? {
+            StrictStorage::Local {} => Self::Local,
+            StrictStorage::Slate { s3 } => Self::Slate { s3 },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct S3Config {
     pub endpoint: String,
     pub bucket: String,
@@ -91,8 +121,8 @@ fn default_region() -> String {
     "auto".into()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "mode", rename_all = "lowercase", deny_unknown_fields)]
 pub enum AuthConfig {
     #[serde(alias = "panel")]
     Local {
@@ -111,15 +141,90 @@ impl Default for AuthConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DispatchConfigSection {
     #[serde(default = "default_http_timeout")]
     pub http_timeout_secs: u64,
     #[serde(default = "default_long_http_timeout")]
     pub long_http_timeout_secs: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_config_retry")]
+    #[schemars(with = "ConfigRetryDefaults")]
     pub retry: RetryDefaults,
+}
+
+// Config-only adapters keep strictness and schema in sync without changing the
+// shared per-message retry wire format.
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfigRetryDefaults {
+    #[serde(default = "default_config_max_retries")]
+    max_retries: u32,
+    #[serde(default)]
+    backoff: ConfigRetryBackoff,
+}
+
+fn default_config_max_retries() -> u32 {
+    RetryDefaults::default().max_retries
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfigRetryBackoff {
+    #[serde(default)]
+    kind: ConfigRetryKind,
+    #[serde(default = "default_initial_ms")]
+    initial_ms: u64,
+    #[serde(default = "default_max_ms")]
+    max_ms: u64,
+    #[serde(default = "default_multiplier")]
+    multiplier: f64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+enum ConfigRetryKind {
+    Fixed,
+    #[default]
+    Exponential,
+}
+
+fn default_initial_ms() -> u64 {
+    broker_proto::RetryBackoff::default().initial_ms
+}
+fn default_max_ms() -> u64 {
+    broker_proto::RetryBackoff::default().max_ms
+}
+fn default_multiplier() -> f64 {
+    broker_proto::RetryBackoff::default().multiplier
+}
+impl Default for ConfigRetryBackoff {
+    fn default() -> Self {
+        Self {
+            kind: ConfigRetryKind::default(),
+            initial_ms: default_initial_ms(),
+            max_ms: default_max_ms(),
+            multiplier: default_multiplier(),
+        }
+    }
+}
+
+fn deserialize_config_retry<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<RetryDefaults, D::Error> {
+    let retry = ConfigRetryDefaults::deserialize(deserializer)?;
+    Ok(RetryDefaults {
+        max_retries: retry.max_retries,
+        backoff: broker_proto::RetryBackoff {
+            kind: match retry.backoff.kind {
+                ConfigRetryKind::Fixed => broker_proto::RetryBackoffKind::Fixed,
+                ConfigRetryKind::Exponential => broker_proto::RetryBackoffKind::Exponential,
+            },
+            initial_ms: retry.backoff.initial_ms,
+            max_ms: retry.backoff.max_ms,
+            multiplier: retry.backoff.multiplier,
+        },
+    })
 }
 
 impl Default for DispatchConfigSection {
@@ -140,8 +245,8 @@ fn default_long_http_timeout() -> u64 {
     7200
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClusterConfigSection {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -156,15 +261,35 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClusterNode {
     pub name: String,
     pub public_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_url: Option<String>,
+}
+
+impl ClusterNode {
+    pub fn internal_base(&self) -> &str {
+        self.internal_url
+            .as_deref()
+            .unwrap_or(&self.public_url)
+            .trim()
+            .trim_end_matches('/')
+    }
 }
 
 impl BetterMqConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.dedup_retention < default_dedup_retention()
+            || self.dedup_retention.checked_mul(1000).is_none()
+        {
+            return Err(ConfigError::Invalid(
+                "dedup_retention must cover the documented seven-day retry window (604800 seconds)"
+                    .into(),
+            ));
+        }
         if self.version != crate::components::CONFIG_VERSION_V1
             && self.version != crate::components::CONFIG_VERSION_V2
         {
@@ -179,7 +304,63 @@ impl BetterMqConfig {
         if self.node.public_url.trim().is_empty() {
             return Err(ConfigError::Invalid("node.public_url is required".into()));
         }
+        if self
+            .node
+            .internal_url
+            .as_ref()
+            .is_some_and(|url| url.trim().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "node.internal_url must not be empty".into(),
+            ));
+        }
         parse_listen(&self.node.listen)?;
+        crate::components::resolve_component_set(self, None, &[], false, false, false, false)?;
+        if let Some(listeners) = &self.listeners {
+            for (name, value) in [
+                ("public", &listeners.public),
+                ("admin", &listeners.admin),
+                ("internal", &listeners.internal),
+            ] {
+                if let Some(value) = value {
+                    validate_listen(&format!("listeners.{name}"), value)?;
+                }
+            }
+        }
+        if let Some(panel) = &self.panel {
+            let mode = crate::components::resolve_panel_mode(self, None, false, false)?;
+            if let Some(value) = &panel.listen {
+                validate_listen("panel.listen", value)?;
+            }
+            if mode == crate::components::PanelMode::SeparateListener
+                && panel.listen.is_none()
+                && self
+                    .listeners
+                    .as_ref()
+                    .and_then(|s| s.admin.as_ref())
+                    .is_none()
+            {
+                return Err(ConfigError::Invalid(
+                    "panel separateListener mode requires panel.listen or listeners.admin".into(),
+                ));
+            }
+            if let Some(controller) = &panel.controller {
+                if !url::Url::parse(controller)
+                    .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+                {
+                    return Err(ConfigError::Invalid(
+                        "panel.controller must be an HTTP(S) URL".into(),
+                    ));
+                }
+            }
+        }
+        if let Some(policy) = &self.replication {
+            if policy.factor == 0 || policy.min_isr == 0 || policy.min_isr > policy.factor {
+                return Err(ConfigError::Invalid(
+                    "replication requires 1 <= minIsr <= factor".into(),
+                ));
+            }
+        }
 
         match &self.storage {
             StorageConfig::Local => {}
@@ -199,6 +380,11 @@ impl BetterMqConfig {
 
         if let Some(cluster) = &self.cluster {
             if cluster.enabled {
+                if cluster.nodes.len() > 1 && matches!(self.storage, StorageConfig::Slate { .. }) {
+                    return Err(ConfigError::Invalid(
+                        broker_proto::SLATE_SINGLE_BROKER.into(),
+                    ));
+                }
                 if cluster.nodes.is_empty() {
                     return Err(ConfigError::Invalid(
                         "cluster.nodes must list at least one broker when cluster.enabled is true"
@@ -215,6 +401,15 @@ impl BetterMqConfig {
                     if n.public_url.trim().is_empty() {
                         return Err(ConfigError::Invalid(format!(
                             "cluster node {} needs public_url",
+                            n.name
+                        )));
+                    }
+                    if n.internal_url
+                        .as_ref()
+                        .is_some_and(|url| url.trim().is_empty())
+                    {
+                        return Err(ConfigError::Invalid(format!(
+                            "cluster node {} needs a nonempty internal_url",
                             n.name
                         )));
                     }
@@ -261,7 +456,7 @@ impl BetterMqConfig {
     }
 }
 
-fn validate_s3(s3: &S3Config) -> Result<(), ConfigError> {
+pub(crate) fn validate_s3(s3: &S3Config) -> Result<(), ConfigError> {
     if s3.endpoint.trim().is_empty() {
         return Err(ConfigError::Invalid(
             "storage.s3.endpoint is required".into(),
@@ -293,9 +488,16 @@ fn validate_s3(s3: &S3Config) -> Result<(), ConfigError> {
 }
 
 pub fn parse_listen(listen: &str) -> Result<std::net::SocketAddr, ConfigError> {
+    validate_listen("node.listen", listen)
+}
+
+pub(crate) fn validate_listen(
+    field: &str,
+    listen: &str,
+) -> Result<std::net::SocketAddr, ConfigError> {
     listen
         .parse()
-        .map_err(|e| ConfigError::Invalid(format!("invalid node.listen '{listen}': {e}")))
+        .map_err(|e| ConfigError::Invalid(format!("invalid {field} '{listen}': {e}")))
 }
 
 impl BetterMqConfig {
@@ -304,6 +506,7 @@ impl BetterMqConfig {
         Self {
             version: CONFIG_VERSION,
             node: NodeSection {
+                internal_url: None,
                 name: "default".into(),
                 listen: default_listen(),
                 public_url: "http://localhost:8080".into(),
@@ -317,6 +520,7 @@ impl BetterMqConfig {
             listeners: None,
             panel: None,
             replication: None,
+            dedup_retention: default_dedup_retention(),
         }
     }
 
@@ -325,6 +529,7 @@ impl BetterMqConfig {
         Self {
             version: CONFIG_VERSION,
             node: NodeSection {
+                internal_url: None,
                 name: "default".into(),
                 listen: default_listen(),
                 public_url: "http://localhost:8080".into(),
@@ -347,6 +552,7 @@ impl BetterMqConfig {
             listeners: None,
             panel: None,
             replication: None,
+            dedup_retention: default_dedup_retention(),
         }
     }
 
@@ -355,6 +561,7 @@ impl BetterMqConfig {
         Self {
             version: CONFIG_VERSION,
             node: NodeSection {
+                internal_url: None,
                 name: "broker1".into(),
                 listen: default_listen(),
                 public_url: "http://broker1:8080".into(),
@@ -362,7 +569,7 @@ impl BetterMqConfig {
             data_dir: PathBuf::from("/data"),
             storage: StorageConfig::Local,
             auth: AuthConfig::Local {
-                auth_file: Some(PathBuf::from("/cluster-shared/local-auth.json")),
+                auth_file: Some(PathBuf::from("/cluster-shared/meta/local-auth.json")),
             },
             dispatch: DispatchConfigSection::default(),
             cluster: Some(ClusterConfigSection {
@@ -370,14 +577,17 @@ impl BetterMqConfig {
                 id: Some("selfhost-cluster".into()),
                 nodes: vec![
                     ClusterNode {
+                        internal_url: None,
                         name: "broker1".into(),
                         public_url: "http://broker1:8080".into(),
                     },
                     ClusterNode {
+                        internal_url: None,
                         name: "broker2".into(),
                         public_url: "http://broker2:8080".into(),
                     },
                     ClusterNode {
+                        internal_url: None,
                         name: "broker3".into(),
                         public_url: "http://broker3:8080".into(),
                     },
@@ -391,6 +601,7 @@ impl BetterMqConfig {
             listeners: None,
             panel: None,
             replication: Some(crate::components::ReplicationPolicyConfig::default()),
+            dedup_retention: default_dedup_retention(),
         }
     }
 
@@ -400,6 +611,7 @@ impl BetterMqConfig {
         Self {
             version: CONFIG_VERSION,
             node: NodeSection {
+                internal_url: None,
                 name: "broker1".into(),
                 listen: default_listen(),
                 public_url: "http://broker:8080".into(),
@@ -424,6 +636,7 @@ impl BetterMqConfig {
             listeners: None,
             panel: None,
             replication: None,
+            dedup_retention: default_dedup_retention(),
         }
     }
 }
@@ -440,6 +653,53 @@ mod tests {
     }
 
     #[test]
+    fn cluster_auth_is_inside_the_persistent_meta_mount() {
+        let cfg = BetterMqConfig::template_cluster_local();
+        let AuthConfig::Local {
+            auth_file: Some(path),
+        } = cfg.auth
+        else {
+            panic!("local auth")
+        };
+        assert_eq!(
+            path.parent(),
+            cfg.cluster.unwrap().shared_meta_dir.as_deref()
+        );
+    }
+
+    #[test]
+    fn dedup_retention_defaults_and_rejects_short_retry_windows() {
+        let mut config = BetterMqConfig::template_single_local();
+        assert_eq!(config.dedup_retention, 604800);
+        let mut json = serde_json::to_value(&config).unwrap();
+        json.as_object_mut().unwrap().remove("dedupRetention");
+        let legacy: BetterMqConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(legacy.dedup_retention, 604800);
+        json["dedup_retention"] = serde_json::json!(1209600);
+        assert_eq!(
+            serde_json::from_value::<BetterMqConfig>(json)
+                .unwrap()
+                .dedup_retention,
+            1209600
+        );
+        config.dedup_retention = 60;
+        assert!(config.validate().is_err());
+        config.dedup_retention = u64::MAX;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn slate_rejects_multi_broker_membership() {
+        let mut config = BetterMqConfig::template_cluster_local();
+        config.storage = BetterMqConfig::template_single_slate().storage;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains(broker_proto::SLATE_SINGLE_BROKER));
+    }
+
+    #[test]
     fn rejects_cluster_without_self_in_nodes() {
         let mut cfg = BetterMqConfig::template_cluster_local();
         cfg.node.name = "broker9".into();
@@ -453,6 +713,7 @@ mod tests {
             enabled: true,
             id: Some("seed".into()),
             nodes: vec![ClusterNode {
+                internal_url: cfg.node.internal_url.clone(),
                 name: cfg.node.name.clone(),
                 public_url: cfg.node.public_url.clone(),
             }],
@@ -503,5 +764,22 @@ mod tests {
         cfg.validate().expect("v1 config loads");
         assert_eq!(cfg.version, 1);
         assert!(cfg.components.is_none());
+    }
+
+    #[test]
+    fn legacy_mode_aliases_remain_strict_and_readable() {
+        for mode in ["local", "rocksdb", "wal"] {
+            let storage: StorageConfig =
+                serde_json::from_value(serde_json::json!({"mode": mode})).unwrap();
+            assert!(matches!(storage, StorageConfig::Local));
+            assert!(serde_json::from_value::<StorageConfig>(
+                serde_json::json!({"mode": mode, "typo": true})
+            )
+            .is_err());
+        }
+        assert!(matches!(
+            serde_json::from_value::<AuthConfig>(serde_json::json!({"mode": "panel"})).unwrap(),
+            AuthConfig::Local { .. }
+        ));
     }
 }

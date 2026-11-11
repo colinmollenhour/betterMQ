@@ -12,6 +12,8 @@ default = []
 workspace = true
 
 [dependencies]
+schemars = "1"
+url = "2"
 broker-proto = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

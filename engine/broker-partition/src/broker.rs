@@ -9,7 +9,7 @@ use crate::priority::normalize_priority;
 use crate::shard::ShardHandle;
 use crate::subscriptions::{Subscription, SubscriptionRegistry};
 use crate::topic::{group_topic, is_dlq_topic, partition_dir, DIRECT_TOPIC};
-use broker_payload::{hydrate_payload, prepare_for_log, BlobStore};
+use broker_payload::{hydrate_payload, prepare_for_log_with, BlobStore, PayloadPolicy};
 use broker_proto::{LogRecord, RetryBackoff, RetryDefaults};
 #[cfg(feature = "slate")]
 use broker_storage::{open_object_store_from_env, slate_db_path};
@@ -18,12 +18,14 @@ use broker_storage::{
     StorageMode, StoredMessage,
 };
 use chrono::Utc;
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 pub const DEFAULT_TENANT: &str = "default";
@@ -93,6 +95,8 @@ pub enum BrokerError {
     InvalidName(#[from] broker_proto::PathSegmentError),
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+    #[error("idempotency key {0} is in flight on another request; retry shortly")]
+    IdempotencyInFlight(String),
 }
 
 /// Returns `Some(generation)` when this node is leader for the shard (Slate fence).
@@ -108,6 +112,10 @@ pub struct DestinationSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishRequest {
+    /// Routing identity for keyless requests, preserved across internal forwarding.
+    /// Does not enable FIFO delivery or replace the message's routing key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_id: Option<Uuid>,
     /// Queue name (omit when `queue_id` or direct `url` is set).
     #[serde(default)]
     pub topic: String,
@@ -163,6 +171,30 @@ pub struct PublishRequest {
     pub request: Option<crate::http_delivery::HttpDeliveryInput>,
 }
 
+impl PublishRequest {
+    /// Select once, before choosing a leader. Repeated forwarding preserves it.
+    pub fn ensure_routing_id(&mut self) {
+        if self.routing_key.trim().is_empty() && self.routing_id.is_none() {
+            self.routing_id = Some(
+                self.idempotency_key
+                    .as_ref()
+                    .map_or_else(Uuid::new_v4, |key| {
+                        Uuid::new_v5(&Uuid::NAMESPACE_OID, key.as_bytes())
+                    }),
+            );
+        }
+    }
+
+    pub fn shard_routing_key(&self) -> String {
+        let key = self.routing_key.trim();
+        if key.is_empty() {
+            self.routing_id.map(|id| id.to_string()).unwrap_or_default()
+        } else {
+            key.to_string()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -189,23 +221,80 @@ pub struct ScheduledInfo {
     pub deliver_at_ms: i64,
 }
 
+/// Identity of one physical log on this node: `(topic, partition)` in layout
+/// V1, `("__physical", shard)` in V2.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LogId {
+    pub namespace: String,
+    pub partition: u32,
+}
+
+impl std::fmt::Display for LogId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}/{}", self.namespace, self.partition)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReservationKey {
     tenant_id: String,
     idempotency_key: String,
 }
 
+/// How long an async publish waits for another request holding the same
+/// idempotency key before giving up with [`BrokerError::IdempotencyInFlight`].
+pub const DEDUP_IN_FLIGHT_WAIT: Duration = Duration::from_secs(10);
+
+/// In-flight idempotency keys. Each entry owns a `watch` sender that is never
+/// written; dropping it on release wakes every async waiter. Nothing here
+/// blocks a thread, so waiters cannot starve the runtime that must poll the
+/// reservation holder.
 #[derive(Default)]
 struct DedupReservations {
-    pending: Mutex<HashSet<ReservationKey>>,
-    changed: Condvar,
+    pending: Mutex<HashMap<ReservationKey, watch::Sender<()>>>,
 }
 
 impl DedupReservations {
-    fn release(&self, key: &ReservationKey) {
-        if self.pending.lock().remove(key) {
-            self.changed.notify_all();
+    fn try_acquire(
+        self: &Arc<Self>,
+        key: ReservationKey,
+    ) -> Result<ReservationToken, DedupInFlight> {
+        let mut pending = self.pending.lock();
+        if let Some(sender) = pending.get(&key) {
+            return Err(DedupInFlight {
+                idempotency_key: key.idempotency_key,
+                released: sender.subscribe(),
+            });
         }
+        pending.insert(key.clone(), watch::channel(()).0);
+        Ok(ReservationToken {
+            reservations: Arc::clone(self),
+            key,
+            release_on_drop: true,
+        })
+    }
+
+    fn release(&self, key: &ReservationKey) {
+        // Dropping the sender closes the channel and wakes all waiters.
+        drop(self.pending.lock().remove(key));
+    }
+}
+
+/// Another request currently owns this idempotency key.
+struct DedupInFlight {
+    idempotency_key: String,
+    released: watch::Receiver<()>,
+}
+
+impl DedupInFlight {
+    /// Resolves once the owning request releases the key.
+    async fn released(mut self) {
+        // The sender is never written, so `changed` only returns once it is dropped.
+        let _ = self.released.changed().await;
+    }
+
+    fn into_error(self) -> BrokerError {
+        BrokerError::IdempotencyInFlight(self.idempotency_key)
     }
 }
 
@@ -233,6 +322,26 @@ impl Drop for ReservationToken {
 enum ReservationOutcome {
     Existing(DedupEntry),
     Acquired(ReservationToken),
+}
+
+/// Idempotency reservations kept past the local append until replication
+/// quorum resolves. [`Broker::commit_publish_dedup`] records the mappings and
+/// releases the keys; dropping it releases the keys without recording them, so
+/// a retry after a failed quorum appends again.
+#[must_use = "dropping PendingDedup releases idempotency keys without recording them"]
+#[derive(Default)]
+pub struct PendingDedup {
+    entries: Vec<(ReservationToken, DedupEntry)>,
+}
+
+impl PendingDedup {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -293,11 +402,17 @@ enum PreparedSlot {
 pub struct PreparedPublishBatch {
     slots: Vec<PreparedSlot>,
     shard_batches: Vec<PreparedShardBatch>,
+    deferred_dedup: PendingDedup,
 }
 
 impl PreparedPublishBatch {
     pub fn take_shard_batches(&mut self) -> Vec<PreparedShardBatch> {
         std::mem::take(&mut self.shard_batches)
+    }
+
+    /// Reservations retained by `finalize_prepared_batch(.., commit_dedup = false)`.
+    pub fn take_pending_dedup(&mut self) -> PendingDedup {
+        std::mem::take(&mut self.deferred_dedup)
     }
 
     pub fn len(&self) -> usize {
@@ -340,6 +455,11 @@ pub struct AppendedRecordRef<'a> {
     pub partition: u32,
     pub offset: u64,
     pub replication_frame: &'a [u8],
+}
+
+pub struct TopicMessagePage {
+    pub messages: Vec<StoredMessage>,
+    pub next: Option<(u32, u64)>,
 }
 
 impl AppendedShardBatch {
@@ -408,6 +528,8 @@ pub struct Broker {
     inner: Arc<BrokerInner>,
 }
 
+type ShardOpenLocks = HashMap<(String, u32), Arc<Mutex<()>>>;
+
 struct BrokerInner {
     config: BrokerConfig,
     metadata: MetadataStore,
@@ -415,15 +537,163 @@ struct BrokerInner {
     flows: FlowProfileRegistry,
     groups: GroupRegistry,
     blob_store: BlobStore,
+    payload_policy: RwLock<PayloadPolicy>,
+    retention: crate::retention::RetentionStore,
     layout: ShardLayout,
     shards: RwLock<HashMap<String, HashMap<u32, Arc<ShardHandle>>>>,
+    // Serialize opens of the same backend without blocking unrelated shards.
+    shard_open_locks: Mutex<ShardOpenLocks>,
     dedup_reservations: Arc<DedupReservations>,
     shard_leader_check: Mutex<Option<ShardFenceFn>>,
+    /// Gate dispatch on the quorum watermark (multi-node local-WAL cells).
+    quorum_gating: std::sync::atomic::AtomicBool,
+    quorum: RwLock<HashMap<(String, u32), Arc<crate::quorum::QuorumWatermark>>>,
     #[cfg(feature = "slate")]
     slate: Option<SlateEnv>,
 }
 
+/// Quorum watermark of one log namespace (observability).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct QuorumStatus {
+    pub namespace: String,
+    pub partition: u32,
+    pub quorum_hwm: u64,
+    pub committed_hwm: u64,
+    /// Committed records not yet proven on a replication quorum.
+    pub lag: u64,
+    /// Quorum-proven epochs waiting for an unproven gap below them.
+    pub pending_ranges: usize,
+}
+
 impl Broker {
+    /// Only the standalone server invokes this. Cells seed/adopt through Raft.
+    pub fn import_legacy_shared_catalog(&self) -> Result<(), BrokerError> {
+        crate::catalog_import::import(
+            &self.inner.config.data_dir,
+            &self.inner.flows,
+            &self.inner.subscriptions,
+            &self.inner.groups,
+        )
+    }
+    /// Pure preparation: reads existing identity but never publishes a catalog change.
+    pub fn prepare_subscription(
+        &self,
+        req: CreateSubscriptionRequest,
+        id: Uuid,
+    ) -> Result<Subscription, BrokerError> {
+        broker_proto::validate_queue_name(&req.topic)?;
+        let existing = self.get_queue(&req.topic)?;
+        Ok(Subscription {
+            id: existing.as_ref().map_or(id, |s| s.id),
+            tenant_id: self.tenant(),
+            topic: req.topic,
+            url: req.url,
+            secret: req.secret,
+            paused: existing.as_ref().is_some_and(|s| s.paused),
+            parallelism: req
+                .parallelism
+                .filter(|p| *p > 0)
+                .or(existing.as_ref().and_then(|s| s.parallelism)),
+            default_max_retries: req
+                .default_max_retries
+                .or(existing.as_ref().and_then(|s| s.default_max_retries)),
+            retry_backoff: req.retry_backoff.or(existing.and_then(|s| s.retry_backoff)),
+            updated_at_ms: Utc::now().timestamp_millis(),
+        })
+    }
+
+    pub fn prepare_flow(
+        &self,
+        key: String,
+        parallelism: u32,
+        rate: u32,
+        period_secs: u64,
+        id: Uuid,
+    ) -> Result<crate::FlowProfile, BrokerError> {
+        broker_proto::validate_flow_key(&key)?;
+        if parallelism == 0 || period_secs == 0 {
+            return Err(BrokerError::InvalidConfig(
+                "parallelism and period_secs must be positive".into(),
+            ));
+        }
+        Ok(crate::FlowProfile {
+            id,
+            tenant_id: self.tenant(),
+            key,
+            parallelism,
+            rate,
+            period_secs,
+            updated_at_ms: Utc::now().timestamp_millis(),
+        })
+    }
+
+    pub fn validate_catalog_group(&self, group: &crate::DispatchGroup) -> Result<(), BrokerError> {
+        if group.name.trim().is_empty() {
+            return Err(BrokerError::InvalidConfig("group name required".into()));
+        }
+        Ok(())
+    }
+    pub fn validate_catalog_member(&self, member: &crate::GroupMember) -> Result<(), BrokerError> {
+        if member.name.trim().is_empty() || member.parallelism == 0 || member.period_secs == 0 {
+            return Err(BrokerError::InvalidConfig(
+                "member name and positive limits required".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn catalog_flows(&self) -> Result<Vec<crate::FlowProfile>, BrokerError> {
+        Ok(self.inner.flows.catalog_all()?)
+    }
+    pub fn catalog_queues(&self) -> Result<Vec<Subscription>, BrokerError> {
+        Ok(self.inner.subscriptions.catalog_all()?)
+    }
+    pub fn catalog_groups(
+        &self,
+    ) -> Result<(Vec<crate::DispatchGroup>, Vec<crate::GroupMember>), BrokerError> {
+        Ok(self.inner.groups.catalog_all()?)
+    }
+    pub fn apply_flow_authoritative(
+        &self,
+        tenant: &str,
+        id: Uuid,
+        value: Option<crate::FlowProfile>,
+    ) -> Result<(), BrokerError> {
+        Ok(self.inner.flows.apply_authoritative(tenant, id, value)?)
+    }
+    pub fn apply_queue_authoritative(
+        &self,
+        tenant: &str,
+        id: Uuid,
+        value: Option<Subscription>,
+    ) -> Result<(), BrokerError> {
+        Ok(self
+            .inner
+            .subscriptions
+            .apply_authoritative(tenant, id, value)?)
+    }
+    pub fn apply_group_authoritative(
+        &self,
+        tenant: &str,
+        id: Uuid,
+        value: Option<crate::DispatchGroup>,
+    ) -> Result<(), BrokerError> {
+        Ok(self
+            .inner
+            .groups
+            .apply_group_authoritative(tenant, id, value)?)
+    }
+    pub fn apply_member_authoritative(
+        &self,
+        tenant: &str,
+        id: Uuid,
+        value: Option<crate::GroupMember>,
+    ) -> Result<(), BrokerError> {
+        Ok(self
+            .inner
+            .groups
+            .apply_member_authoritative(tenant, id, value)?)
+    }
     /// Active tenant for this call (request-scoped in cloud, else config default).
     pub fn tenant(&self) -> String {
         crate::tenant_scope::effective_tenant(&self.inner.config.tenant_id).into_owned()
@@ -463,6 +733,9 @@ impl Broker {
         }
         let layout = ShardLayout::load_or_create(&config.data_dir, config.partitions)
             .map_err(|e| BrokerError::InvalidConfig(format!("shard layout: {e}")))?;
+        layout
+            .validate_storage(config.storage)
+            .map_err(|error| BrokerError::InvalidConfig(error.to_string()))?;
         let mut config = config;
         config.partitions = layout.shard_count;
         let rocks_path = config.data_dir.join("rocksdb");
@@ -498,7 +771,7 @@ impl Broker {
             #[cfg(feature = "slate")]
             {
                 if let Some(ref env) = slate {
-                    MetadataStore::open_slate(Arc::clone(&env.object_store), &env.cache_root)?
+                    MetadataStore::open_slate(Arc::clone(&env.object_store), &config.data_dir)?
                 } else {
                     MetadataStore::open(rocks_path)?
                 }
@@ -514,8 +787,9 @@ impl Broker {
         let flows = FlowProfileRegistry::open(&config.data_dir)?;
         let groups = GroupRegistry::open(&config.data_dir)?;
         let blob_store = crate::blob::open_blob_store(&config.data_dir, config.storage)?;
+        let retention = crate::retention::RetentionStore::open(&config.data_dir)?;
 
-        Ok(Self {
+        let broker = Self {
             inner: Arc::new(BrokerInner {
                 config,
                 metadata,
@@ -523,14 +797,106 @@ impl Broker {
                 flows,
                 groups,
                 blob_store,
+                payload_policy: RwLock::new(PayloadPolicy::External),
+                retention,
                 layout,
                 shards: RwLock::new(HashMap::new()),
+                shard_open_locks: Mutex::new(HashMap::new()),
                 dedup_reservations: Arc::new(DedupReservations::default()),
                 shard_leader_check: Mutex::new(None),
+                quorum_gating: std::sync::atomic::AtomicBool::new(false),
+                quorum: RwLock::new(HashMap::new()),
                 #[cfg(feature = "slate")]
                 slate,
             }),
-        })
+        };
+        broker.initialize_dlq_counts()?;
+        Ok(broker)
+    }
+
+    /// Recover ephemeral counters once at shard open, never on a count request.
+    fn initialize_dlq_counts(&self) -> Result<(), BrokerError> {
+        if self.inner.config.storage != StorageMode::Local {
+            return Ok(());
+        }
+        if self.layout().is_physical() {
+            for partition in 0..self.shard_count() {
+                if self
+                    .layout()
+                    .physical_shard_dir(&self.inner.config.data_dir, partition)
+                    .exists()
+                {
+                    self.shard_handle("__physical", partition)?;
+                }
+            }
+        } else {
+            for topic in self.list_dlq_topics_on_disk()? {
+                for partition in 0..self.shard_count() {
+                    if partition_dir(
+                        &self.inner.config.data_dir,
+                        &self.tenant(),
+                        &topic,
+                        partition,
+                    )?
+                    .exists()
+                    {
+                        self.shard_handle(&topic, partition)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Node-local retained DLQ counts, plus recovery completeness. No WAL reads.
+    pub fn dlq_counts(&self) -> (HashMap<String, usize>, bool) {
+        let tenant = self.tenant();
+        let mut counts = HashMap::new();
+        let mut ready = self.inner.config.storage == StorageMode::Local;
+        for handle in self
+            .inner
+            .shards
+            .read()
+            .values()
+            .flat_map(|partitions| partitions.values())
+        {
+            match handle.dlq_counts() {
+                Some(shard_counts) => {
+                    for ((record_tenant, topic), count) in shard_counts {
+                        if record_tenant == tenant {
+                            *counts.entry(topic).or_insert(0) += count;
+                        }
+                    }
+                }
+                None => ready = false,
+            }
+        }
+        (counts, ready)
+    }
+
+    /// Where message bodies live. Local-WAL multi-node cells must use
+    /// [`PayloadPolicy::InlineOnly`] (set once at startup, before writes):
+    /// a node-local blob would exist only on the accepting node.
+    pub fn set_payload_policy(&self, policy: PayloadPolicy) {
+        *self.inner.payload_policy.write() = policy;
+    }
+
+    pub fn payload_policy(&self) -> PayloadPolicy {
+        *self.inner.payload_policy.read()
+    }
+
+    /// Reject a body the payload policy cannot store, before any append,
+    /// blob write or idempotency reservation.
+    pub fn check_publish_body(&self, req: &PublishRequest) -> Result<(), BrokerError> {
+        self.check_body(&req.payload, req.payload_encoding.as_deref())
+    }
+
+    /// [`Broker::check_publish_body`] for a body that is not yet a request
+    /// (schedules, crons, fan-out commands).
+    pub fn check_body(&self, payload: &str, encoding: Option<&str>) -> Result<(), BrokerError> {
+        Ok(self
+            .payload_policy()
+            .check(decoded_body_len(payload, encoding))?)
     }
 
     /// Slate + cluster: only the elected shard leader may append; generation is the fence token.
@@ -540,6 +906,7 @@ impl Broker {
 
     /// Returns fence generation when this node may append (cluster).
     fn require_shard_fence(&self, partition: u32) -> Result<Option<u64>, BrokerError> {
+        self.inner.metadata.check_ready()?;
         if let Some(check) = self.inner.shard_leader_check.lock().as_ref() {
             match check(partition) {
                 Some(gen) => Ok(Some(gen)),
@@ -555,10 +922,18 @@ impl Broker {
         if self.inner.config.storage == StorageMode::Slate && !partitions.is_empty() {
             #[cfg(feature = "slate")]
             {
-                let mut shards = self.inner.shards.write();
-                for topic_shards in shards.values_mut() {
-                    for &p in partitions {
-                        topic_shards.remove(&p);
+                let opening: Vec<_> = self
+                    .inner
+                    .shard_open_locks
+                    .lock()
+                    .iter()
+                    .filter(|((_, partition), _)| partitions.contains(partition))
+                    .map(|(key, gate)| (key.clone(), gate.clone()))
+                    .collect();
+                for ((namespace, partition), gate) in opening {
+                    let _opening = gate.lock();
+                    if let Some(topic_shards) = self.inner.shards.write().get_mut(&namespace) {
+                        topic_shards.remove(&partition);
                     }
                 }
             }
@@ -606,6 +981,23 @@ impl Broker {
             .inner
             .flows
             .ensure_by_key(&self.tenant(), key, parallelism, rate, period_secs)?)
+    }
+
+    pub fn ensure_flow_profile_by_key_with_change(
+        &self,
+        key: String,
+        parallelism: u32,
+        rate: u32,
+        period_secs: u64,
+    ) -> Result<(crate::flows::FlowProfile, bool), BrokerError> {
+        broker_proto::validate_flow_key(&key)?;
+        Ok(self.inner.flows.ensure_by_key_with_change(
+            &self.tenant(),
+            key,
+            parallelism,
+            rate,
+            period_secs,
+        )?)
     }
 
     pub fn get_flow_profile_by_key(
@@ -697,6 +1089,260 @@ impl Broker {
     pub fn committed_hwm(&self, topic: &str, partition: u32) -> Result<u64, BrokerError> {
         let handle = self.shard_handle(topic, partition)?;
         Ok(handle.committed_hwm())
+    }
+
+    /// Gate dispatch on the quorum watermark. Called once at startup for a
+    /// multi-node cell on local WAL storage; single node and Slate keep the
+    /// local committed watermark (their durability is local / shared storage).
+    pub fn enable_quorum_gating(&self) {
+        self.inner
+            .quorum_gating
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn quorum_gating(&self) -> bool {
+        self.inner
+            .quorum_gating
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn quorum_watermark(
+        &self,
+        topic: &str,
+        partition: u32,
+    ) -> Result<Arc<crate::quorum::QuorumWatermark>, BrokerError> {
+        let namespace = self.inner.layout.storage_namespace(topic).to_string();
+        let key = (namespace, partition);
+        if let Some(existing) = self.inner.quorum.read().get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+        let mut map = self.inner.quorum.write();
+        if let Some(existing) = map.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+        let dir = if self.inner.layout.is_physical() {
+            self.inner
+                .layout
+                .physical_shard_dir(&self.inner.config.data_dir, partition)
+        } else {
+            partition_dir(
+                &self.inner.config.data_dir,
+                &self.tenant(),
+                topic,
+                partition,
+            )?
+        };
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| BrokerError::Storage(broker_storage::LogError::Io(error)))?;
+        let watermark = Arc::new(
+            crate::quorum::QuorumWatermark::open(&dir)
+                .map_err(|error| BrokerError::Storage(broker_storage::LogError::Io(error)))?,
+        );
+        map.insert(key, Arc::clone(&watermark));
+        Ok(watermark)
+    }
+
+    /// Exclusive end of the prefix dispatch may deliver: the committed
+    /// watermark, capped by the quorum watermark when quorum gating is on.
+    pub fn dispatch_hwm(&self, topic: &str, partition: u32) -> Result<u64, BrokerError> {
+        let committed = self.committed_hwm(topic, partition)?;
+        if !self.quorum_gating() {
+            return Ok(committed);
+        }
+        Ok(committed.min(self.quorum_watermark(topic, partition)?.get()))
+    }
+
+    /// Quorum watermark (the committed watermark when gating is off).
+    pub fn quorum_hwm(&self, topic: &str, partition: u32) -> Result<u64, BrokerError> {
+        if !self.quorum_gating() {
+            return self.committed_hwm(topic, partition);
+        }
+        Ok(self.quorum_watermark(topic, partition)?.get())
+    }
+
+    /// Record that `[start, end)` of this log is durable on a replication
+    /// quorum; persists and returns the contiguous quorum watermark.
+    pub fn record_quorum_commit(
+        &self,
+        topic: &str,
+        partition: u32,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, BrokerError> {
+        self.quorum_watermark(topic, partition)?
+            .record(start, end)
+            .map_err(|error| BrokerError::Storage(broker_storage::LogError::Io(error)))
+    }
+
+    /// Identity-less completion markers count only below this offset: above
+    /// it the offset may hold a different record than the one completed.
+    pub fn legacy_completion_trusted_below(
+        &self,
+        topic: &str,
+        partition: u32,
+    ) -> Result<u64, BrokerError> {
+        if !self.quorum_gating() {
+            return Ok(u64::MAX);
+        }
+        Ok(self
+            .quorum_watermark(topic, partition)?
+            .trusted_legacy_below())
+    }
+
+    /// Pin the legacy-marker trust point at the current quorum watermark
+    /// (on taking over a shard, before its tail is re-verified).
+    pub fn freeze_legacy_completion_trust(
+        &self,
+        topic: &str,
+        partition: u32,
+    ) -> Result<(), BrokerError> {
+        if self.quorum_gating() {
+            self.quorum_watermark(topic, partition)?
+                .freeze_legacy_trust();
+        }
+        Ok(())
+    }
+
+    /// Quorum watermarks loaded so far, with their lag behind the local
+    /// committed watermark.
+    pub fn quorum_status(&self) -> Vec<QuorumStatus> {
+        if !self.quorum_gating() {
+            return Vec::new();
+        }
+        let loaded: Vec<_> = self
+            .inner
+            .quorum
+            .read()
+            .iter()
+            .map(|((namespace, partition), wm)| (namespace.clone(), *partition, Arc::clone(wm)))
+            .collect();
+        let mut out: Vec<QuorumStatus> = loaded
+            .into_iter()
+            .map(|(namespace, partition, wm)| {
+                let quorum_hwm = wm.get();
+                let committed_hwm = self
+                    .committed_hwm(&namespace, partition)
+                    .unwrap_or(quorum_hwm);
+                QuorumStatus {
+                    lag: committed_hwm.saturating_sub(quorum_hwm),
+                    namespace,
+                    partition,
+                    quorum_hwm,
+                    committed_hwm,
+                    pending_ranges: wm.pending_ranges(),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.namespace, a.partition).cmp(&(&b.namespace, b.partition)));
+        out
+    }
+
+    /// Mark `offset` complete for the delivery of `message_id`.
+    pub fn mark_dispatch_complete_for(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
+    ) -> Result<(), BrokerError> {
+        self.inner.metadata.mark_dispatch_complete_for(
+            tenant_id,
+            subscription_id,
+            partition,
+            offset,
+            message_id,
+        )?;
+        Ok(())
+    }
+
+    /// Whether the record `message_id` at `offset` of `topic` was delivered or
+    /// dead-lettered. Identity-aware: a completion marker for a different
+    /// message (offset reused after failover) is dropped and reports false; an
+    /// identity-less legacy marker counts only below the legacy trust point.
+    /// Offsets below the lane cursor are complete (cursors never pass the
+    /// quorum watermark, whose prefix has a stable identity).
+    pub fn is_delivery_complete(
+        &self,
+        topic: &str,
+        tenant_id: &str,
+        subscription_id: &str,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
+    ) -> Result<bool, BrokerError> {
+        if offset < self.dispatch_offset(tenant_id, subscription_id, partition)? {
+            return Ok(true);
+        }
+        Ok(
+            match self.inner.metadata.dispatch_completion(
+                tenant_id,
+                subscription_id,
+                partition,
+                offset,
+            )? {
+                broker_storage::DispatchCompletion::Missing => false,
+                broker_storage::DispatchCompletion::Message(id) if id == message_id => true,
+                broker_storage::DispatchCompletion::Message(_) => {
+                    self.inner.metadata.clear_dispatch_complete(
+                        tenant_id,
+                        subscription_id,
+                        partition,
+                        offset,
+                    )?;
+                    false
+                }
+                broker_storage::DispatchCompletion::Legacy => {
+                    offset < self.legacy_completion_trusted_below(topic, partition)?
+                }
+            },
+        )
+    }
+
+    /// All lane cursors of `partition` as `(tenant, lane, next_offset)`.
+    pub fn dispatch_offsets_for_partition(
+        &self,
+        partition: u32,
+    ) -> Result<Vec<(String, String, u64)>, BrokerError> {
+        Ok(self
+            .inner
+            .metadata
+            .dispatch_offsets_for_partition(partition)?)
+    }
+
+    /// Every lane cursor as `(tenant, lane, partition, next_offset)`.
+    pub fn all_dispatch_offsets(&self) -> Result<Vec<(String, String, u32, u64)>, BrokerError> {
+        Ok(self.inner.metadata.dispatch_offsets()?)
+    }
+
+    /// Encoded frames of every record in the log namespace of `topic` from
+    /// `from_offset`, for quorum (re-)verification. In V2 this covers every
+    /// topic of the physical shard. Stops at `max_records` or `max_bytes`
+    /// (at least one frame).
+    pub fn namespace_replication_frames(
+        &self,
+        topic: &str,
+        partition: u32,
+        from_offset: u64,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>, BrokerError> {
+        let batch = self.shard_handle(topic, partition)?.read_range(
+            partition,
+            from_offset,
+            max_records.max(1),
+        )?;
+        let mut out = Vec::with_capacity(batch.len());
+        let mut bytes = 0usize;
+        for msg in batch {
+            let frame = encode_replication_frame(&msg)?;
+            bytes = bytes.saturating_add(frame.len());
+            if !out.is_empty() && bytes > max_bytes {
+                break;
+            }
+            out.push((msg.offset, frame));
+        }
+        Ok(out)
     }
 
     /// Block until `offset` is on the shard's committed high watermark.
@@ -794,6 +1440,28 @@ impl Broker {
         &self.inner.config
     }
 
+    /// Explicit promotion/admin rewind. The caller must fence dispatch first;
+    /// normal cursor writes never regress. Clears completion gaps atomically.
+    pub fn reset_dispatch_offset(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        partition: u32,
+        next_offset: u64,
+    ) -> Result<(), BrokerError> {
+        self.inner.metadata.reset_dispatch_offset(
+            tenant_id,
+            subscription_id,
+            partition,
+            next_offset,
+        )?;
+        Ok(())
+    }
+
+    pub fn metadata_ready(&self) -> bool {
+        self.inner.metadata.is_ready()
+    }
+
     /// Force a WAL group flush on every open shard (shutdown / tests).
     pub fn flush_wal(&self) -> Result<(), BrokerError> {
         let handles: Vec<Arc<ShardHandle>> = {
@@ -807,17 +1475,111 @@ impl Broker {
         Ok(())
     }
 
-    /// Physically delete sealed segments at or below the durable GC watermark.
-    pub fn gc_sealed_below(&self, shard: u32, watermark: u64) -> Result<usize, BrokerError> {
-        let topic = if self.inner.layout.is_physical() {
-            "__physical"
-        } else {
-            return Ok(0);
+    /// The physical log holding `topic` on `partition`.
+    pub fn log_id(&self, topic: &str, partition: u32) -> LogId {
+        LogId {
+            namespace: self.inner.layout.storage_namespace(topic).to_string(),
+            partition,
+        }
+    }
+
+    /// Local logs that exist on disk (opened lazily otherwise). V2 lists the
+    /// physical shards, V1 every `topic/pN` directory of this tenant.
+    pub fn retained_logs(&self) -> Vec<LogId> {
+        if self.inner.config.storage != StorageMode::Local {
+            return Vec::new();
+        }
+        let layout = &self.inner.layout;
+        let data_dir = &self.inner.config.data_dir;
+        if layout.is_physical() {
+            return (0..layout.shard_count)
+                .filter(|shard| layout.physical_shard_dir(data_dir, *shard).exists())
+                .map(|partition| LogId {
+                    namespace: layout.storage_namespace("").to_string(),
+                    partition,
+                })
+                .collect();
+        }
+        let mut logs = Vec::new();
+        let tenant_dir = data_dir.join("partitions").join(self.tenant());
+        let Ok(topics) = std::fs::read_dir(tenant_dir) else {
+            return logs;
         };
-        let handle = self.shard_handle(topic, shard)?;
-        handle
-            .gc_sealed_below(watermark)
-            .map_err(BrokerError::Storage)
+        for topic in topics.flatten() {
+            let namespace = topic.file_name().to_string_lossy().into_owned();
+            let Ok(partitions) = std::fs::read_dir(topic.path()) else {
+                continue;
+            };
+            for partition in partitions.flatten() {
+                let name = partition.file_name();
+                let Some(partition) = name
+                    .to_str()
+                    .and_then(|name| name.strip_prefix('p'))
+                    .and_then(|index| index.parse::<u32>().ok())
+                    .filter(|index| *index < layout.shard_count)
+                else {
+                    continue;
+                };
+                logs.push(LogId {
+                    namespace: namespace.clone(),
+                    partition,
+                });
+            }
+        }
+        logs.sort();
+        logs
+    }
+
+    pub fn log_committed_hwm(&self, log: &LogId) -> Result<u64, BrokerError> {
+        Ok(self
+            .shard_handle(&log.namespace, log.partition)?
+            .committed_hwm())
+    }
+
+    /// Records of one physical log from `from` (inclusive), every topic.
+    pub fn read_log(
+        &self,
+        log: &LogId,
+        from: u64,
+        max: usize,
+    ) -> Result<Vec<StoredMessage>, BrokerError> {
+        Ok(self
+            .shard_handle(&log.namespace, log.partition)?
+            .read_range(log.partition, from, max)?)
+    }
+
+    pub fn log_retention_status(
+        &self,
+        log: &LogId,
+        watermark: u64,
+    ) -> Result<crate::shard::LogRetentionStatus, BrokerError> {
+        Ok(self
+            .shard_handle(&log.namespace, log.partition)?
+            .retention_status(watermark)?)
+    }
+
+    /// Delete the whole sealed segments of `log` below `boundary`. Use
+    /// [`crate::RetentionStore::collect`], which tombstones their payload
+    /// blobs first and never passes an unsafe boundary.
+    pub(crate) fn gc_log(&self, log: &LogId, boundary: u64) -> Result<usize, BrokerError> {
+        Ok(self
+            .shard_handle(&log.namespace, log.partition)?
+            .gc_sealed_below(boundary)?)
+    }
+
+    /// Continue an empty or fully-collected local log at `base`.
+    pub fn reset_log_base(&self, log: &LogId, base: u64) -> Result<(), BrokerError> {
+        Ok(self
+            .shard_handle(&log.namespace, log.partition)?
+            .reset_base(base)?)
+    }
+
+    pub fn blob_store(&self) -> &BlobStore {
+        &self.inner.blob_store
+    }
+
+    pub fn retention(&self) -> &crate::retention::RetentionStore {
+        &self.inner.retention
     }
 
     /// Group-commit timer: flush shards whose interval has elapsed.
@@ -834,11 +1596,90 @@ impl Broker {
 
     /// Normalize an engine-facing batch without appending. Existing and
     /// within-batch duplicates retain their input slots.
+    ///
+    /// Never blocks: if another request holds one of the batch's idempotency
+    /// keys, every reservation taken so far is released and
+    /// [`BrokerError::IdempotencyInFlight`] is returned. Async callers should
+    /// use [`Broker::prepare_publish_batch_waiting`].
     pub fn prepare_publish_batch(
         &self,
         requests: Vec<PublishRequest>,
     ) -> Result<PreparedPublishBatch, BrokerError> {
+        self.prepare_publish_batch_on(requests, None)
+    }
+
+    fn prepare_publish_batch_on(
+        &self,
+        requests: Vec<PublishRequest>,
+        forced_partition: Option<u32>,
+    ) -> Result<PreparedPublishBatch, BrokerError> {
         let tenant_id = self.tenant();
+        let reservations = self
+            .try_reserve_batch_dedup(&tenant_id, &requests)?
+            .map_err(DedupInFlight::into_error)?;
+        self.prepare_reserved_batch(requests, reservations, forced_partition)
+    }
+
+    /// Like [`Broker::prepare_publish_batch`], but waits asynchronously (up to
+    /// [`DEDUP_IN_FLIGHT_WAIT`]) for in-flight requests that own one of the
+    /// batch's idempotency keys, so a retry resolves to the original message.
+    pub async fn prepare_publish_batch_waiting(
+        &self,
+        requests: Vec<PublishRequest>,
+    ) -> Result<PreparedPublishBatch, BrokerError> {
+        let tenant_id = self.tenant();
+        let deadline = tokio::time::Instant::now() + DEDUP_IN_FLIGHT_WAIT;
+        loop {
+            match self.try_reserve_batch_dedup(&tenant_id, &requests)? {
+                Ok(reservations) => {
+                    return self.prepare_reserved_batch(requests, reservations, None)
+                }
+                Err(in_flight) => {
+                    let key = in_flight.idempotency_key.clone();
+                    if tokio::time::timeout_at(deadline, in_flight.released())
+                        .await
+                        .is_err()
+                    {
+                        return Err(BrokerError::IdempotencyInFlight(key));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve every distinct idempotency key of a batch without waiting. On
+    /// conflict the keys acquired so far are released before returning, so a
+    /// batch never holds some keys while waiting for others (no lock-order
+    /// deadlock between `[A, B]` and `[B, A]`).
+    fn try_reserve_batch_dedup(
+        &self,
+        tenant_id: &str,
+        requests: &[PublishRequest],
+    ) -> Result<Result<HashMap<String, ReservationOutcome>, DedupInFlight>, BrokerError> {
+        let mut reservations = HashMap::new();
+        for key in requests
+            .iter()
+            .filter_map(|request| request.idempotency_key.as_ref())
+        {
+            if reservations.contains_key(key) {
+                continue;
+            }
+            match self.try_reserve_dedup(tenant_id, key)? {
+                Ok(outcome) => {
+                    reservations.insert(key.clone(), outcome);
+                }
+                Err(in_flight) => return Ok(Err(in_flight)),
+            }
+        }
+        Ok(Ok(reservations))
+    }
+
+    fn prepare_reserved_batch(
+        &self,
+        requests: Vec<PublishRequest>,
+        mut reservations: HashMap<String, ReservationOutcome>,
+        forced_partition: Option<u32>,
+    ) -> Result<PreparedPublishBatch, BrokerError> {
         let mut slots = Vec::with_capacity(requests.len());
         let mut groups: Vec<PreparedShardBatch> = Vec::new();
         let mut group_indexes: HashMap<PreparedShardKey, usize> = HashMap::new();
@@ -857,27 +1698,32 @@ impl Broker {
                     });
                     continue;
                 }
-                match self.reserve_dedup(&tenant_id, key)? {
-                    ReservationOutcome::Existing(entry) => {
-                        slots.push(PreparedSlot::Existing(PublishResponse {
-                            message_id: Some(entry.message_id),
-                            topic: original_topic,
-                            partition: Some(entry.partition),
-                            offset: Some(entry.offset),
-                            duplicate: true,
-                            scheduled: None,
-                            commit_epoch: None,
-                            replication_frame: None,
-                        }));
-                        continue;
+                if let Some(ReservationOutcome::Existing(entry)) = reservations.get(key) {
+                    slots.push(PreparedSlot::Existing(PublishResponse {
+                        message_id: Some(entry.message_id),
+                        topic: original_topic,
+                        partition: Some(entry.partition),
+                        offset: Some(entry.offset),
+                        duplicate: true,
+                        scheduled: None,
+                        commit_epoch: None,
+                        replication_frame: None,
+                    }));
+                    continue;
+                }
+                match reservations.remove(key) {
+                    Some(ReservationOutcome::Acquired(token)) => Some(token),
+                    _ => {
+                        return Err(BrokerError::InvalidConfig(format!(
+                            "idempotency key {key} was not reserved for this batch"
+                        )))
                     }
-                    ReservationOutcome::Acquired(token) => Some(token),
                 }
             } else {
                 None
             };
 
-            let record = self.prepare_record(request, payload, reservation)?;
+            let record = self.prepare_record(request, payload, reservation, forced_partition)?;
             let message_id = record.header.id;
             if let Some(key) = record.header.idempotency_key.as_ref() {
                 local_owners.insert(key.clone(), message_id);
@@ -914,6 +1760,7 @@ impl Broker {
         Ok(PreparedPublishBatch {
             slots,
             shard_batches: groups,
+            deferred_dedup: PendingDedup::default(),
         })
     }
 
@@ -922,6 +1769,7 @@ impl Broker {
         &self,
         batch: PreparedShardBatch,
     ) -> Result<AppendedShardBatch, BrokerError> {
+        self.inner.metadata.check_ready()?;
         if batch.records.is_empty() {
             return Ok(AppendedShardBatch {
                 appended: Vec::new(),
@@ -956,12 +1804,17 @@ impl Broker {
 
     /// Finalize one appended shard group and atomically publish all dedup
     /// mappings for that group in one RocksDB WriteBatch.
+    ///
+    /// With `commit_dedup = false` nothing is recorded and the reservations
+    /// stay held; collect them with [`PreparedPublishBatch::take_pending_dedup`]
+    /// and pass them to [`Broker::commit_publish_dedup`] after quorum.
     pub fn finalize_prepared_batch(
         &self,
         prepared: &mut PreparedPublishBatch,
         mut batch: AppendedShardBatch,
         commit_dedup: bool,
     ) -> Result<(), BrokerError> {
+        self.inner.metadata.check_ready()?;
         if batch.appended.len() != batch.records.len() {
             return Err(BrokerError::InvalidConfig(
                 "appended batch result count mismatch".into(),
@@ -981,6 +1834,24 @@ impl Broker {
         }
 
         if commit_dedup {
+            // The HTTP path already waited for local/quorum commit. Synchronous
+            // Broker callers must establish the same local durability ordering
+            // before publishing a mapping and releasing its reservation, or a
+            // concurrent retry would correctly reject that not-yet-visible hit.
+            // Keyless records publish no mapping, so they keep the configured
+            // fsync policy (group commit stays asynchronous).
+            let has_mapping = batch
+                .records
+                .iter()
+                .any(|record| record.idempotency_key.is_some());
+            if let (true, Some(last), Some(first)) =
+                (has_mapping, batch.last_offset(), batch.records.first())
+            {
+                let shard = self.shard_handle(&first.topic, first.partition)?;
+                if shard.committed_hwm() <= last {
+                    shard.flush_durable()?;
+                }
+            }
             let tenant_id = self.tenant();
             let mut metadata = MetadataWriteBatch::default();
             for (record, (stored, _)) in batch.records.iter().zip(&batch.appended) {
@@ -988,11 +1859,12 @@ impl Broker {
                     metadata.put_dedup(
                         tenant_id.clone(),
                         key,
-                        DedupEntry {
-                            message_id: stored.id,
-                            offset: stored.offset,
-                            partition: stored.partition,
-                        },
+                        DedupEntry::new(
+                            stored.id,
+                            stored.offset,
+                            stored.partition,
+                            stored.topic.clone(),
+                        ),
                     );
                 }
             }
@@ -1001,12 +1873,22 @@ impl Broker {
 
         let mut responses = HashMap::with_capacity(batch.appended.len());
         for (record, (stored, frame)) in batch.records.iter_mut().zip(batch.appended) {
-            if commit_dedup {
-                if let Some(reservation) = record.reservation.take() {
+            if let Some(reservation) = record.reservation.take() {
+                if commit_dedup {
                     reservation.release();
+                } else {
+                    // Keep the key reserved until replication quorum resolves;
+                    // releasing here would let a retry append a second copy.
+                    prepared.deferred_dedup.entries.push((
+                        reservation,
+                        DedupEntry::new(
+                            stored.id,
+                            stored.offset,
+                            stored.partition,
+                            record.topic.clone(),
+                        ),
+                    ));
                 }
-            } else if let Some(reservation) = record.reservation.take() {
-                reservation.release();
             }
             responses.insert(
                 record.message_id,
@@ -1087,29 +1969,80 @@ impl Broker {
             .map_err(BrokerError::Payload)
     }
 
+    /// Publish one record. Never blocks on another request's idempotency
+    /// reservation: a concurrent same-key publish fails fast with
+    /// [`BrokerError::IdempotencyInFlight`]. Async callers that want to wait
+    /// for the owner and receive its result should use [`Broker::publish_async`].
     pub fn publish(&self, req: PublishRequest) -> Result<PublishResponse, BrokerError> {
-        self.publish_inner(req, true)
+        let prepared = self.prepare_publish_batch(vec![req])?;
+        let (response, _) = self.publish_prepared(prepared, true)?;
+        Ok(response)
+    }
+
+    /// [`Broker::publish`] that waits asynchronously for an in-flight request
+    /// holding the same idempotency key, then returns its duplicate result.
+    pub async fn publish_async(&self, req: PublishRequest) -> Result<PublishResponse, BrokerError> {
+        let prepared = self.prepare_publish_batch_waiting(vec![req]).await?;
+        let (response, _) = self.publish_prepared(prepared, true)?;
+        Ok(response)
     }
 
     /// Append without recording idempotency until replication quorum succeeds.
-    pub fn publish_defer_dedup(&self, req: PublishRequest) -> Result<PublishResponse, BrokerError> {
-        self.publish_inner(req, false)
+    /// Append a dead-letter record to `partition` — the shard of the source
+    /// message, which this node leads while it dead-letters — instead of the
+    /// hash placement, so the DLQ write depends only on the source shard's own
+    /// leadership fence and quorum. Internal: only DLQ topics, partition
+    /// bounds and the leadership fence are checked. Idempotency stays reserved
+    /// in the returned [`PendingDedup`]: pass it to
+    /// [`Broker::commit_publish_dedup`] once the record is durable on a quorum.
+    /// A concurrent request holding the same key fails fast.
+    pub fn publish_to_shard(
+        &self,
+        mut req: PublishRequest,
+        partition: u32,
+    ) -> Result<(PublishResponse, PendingDedup), BrokerError> {
+        if !is_dlq_topic(&req.topic) {
+            return Err(BrokerError::InvalidConfig(format!(
+                "publish_to_shard is only for dead-letter topics, not {}",
+                req.topic
+            )));
+        }
+        if partition >= self.inner.layout.shard_count {
+            return Err(BrokerError::InvalidConfig(format!(
+                "unknown shard {partition}; layout has {} shards",
+                self.inner.layout.shard_count
+            )));
+        }
+        req.delay_ms = None;
+        let prepared = self.prepare_publish_batch_on(vec![req], Some(partition))?;
+        self.publish_prepared(prepared, false)
     }
 
-    fn publish_inner(
+    /// The key stays reserved in the returned [`PendingDedup`] so a retry
+    /// during replication waits for this request instead of appending again.
+    pub async fn publish_defer_dedup(
         &self,
         req: PublishRequest,
+    ) -> Result<(PublishResponse, PendingDedup), BrokerError> {
+        let prepared = self.prepare_publish_batch_waiting(vec![req]).await?;
+        self.publish_prepared(prepared, false)
+    }
+
+    fn publish_prepared(
+        &self,
+        mut prepared: PreparedPublishBatch,
         commit_dedup: bool,
-    ) -> Result<PublishResponse, BrokerError> {
-        let mut prepared = self.prepare_publish_batch(vec![req])?;
+    ) -> Result<(PublishResponse, PendingDedup), BrokerError> {
         for shard_batch in prepared.take_shard_batches() {
             let appended = self.append_prepared_batch(shard_batch)?;
             self.finalize_prepared_batch(&mut prepared, appended, commit_dedup)?;
         }
-        prepared
+        let pending = prepared.take_pending_dedup();
+        let response = prepared
             .finish()?
             .pop()
-            .ok_or_else(|| BrokerError::InvalidConfig("empty single publish result".into()))
+            .ok_or_else(|| BrokerError::InvalidConfig("empty single publish result".into()))?;
+        Ok((response, pending))
     }
 
     fn prepare_record(
@@ -1117,12 +2050,20 @@ impl Broker {
         mut req: PublishRequest,
         payload: Vec<u8>,
         reservation: Option<ReservationToken>,
+        forced_partition: Option<u32>,
     ) -> Result<PreparedRecord, BrokerError> {
         let tenant_id = self.tenant();
         let message_id = Uuid::new_v4();
-        // Large payloads may write a blob before append; crash orphans are GC'd later.
-        let (log_payload, payload_ref_json) =
-            prepare_for_log(&self.inner.blob_store, &tenant_id, message_id, payload)?;
+        // Large payloads write their blob before the append. Retention deletes
+        // blobs of collected or purged records; a blob orphaned by a failed
+        // append or a crash before it is not reclaimed.
+        let (log_payload, payload_ref_json) = prepare_for_log_with(
+            &self.inner.blob_store,
+            self.payload_policy(),
+            &tenant_id,
+            message_id,
+            payload,
+        )?;
 
         let _ = req.delay_ms.take();
 
@@ -1130,13 +2071,13 @@ impl Broker {
         let (topic, queue_id, destination_url, destination_secret) = if is_dlq_topic(&req.topic) {
             (req.topic.clone(), None, None, None)
         } else if let Some(dest) = req.destination.take() {
-            let topic = dest
-                .queue_id
-                .and_then(|id| self.get_queue_by_id(id).ok().flatten().map(|q| q.topic))
-                .unwrap_or_else(|| DIRECT_TOPIC.to_string());
             if let Some(id) = dest.queue_id {
                 queue_sub = self.get_queue_by_id(id)?;
             }
+            let topic = queue_sub
+                .as_ref()
+                .map(|queue| queue.topic.clone())
+                .unwrap_or_else(|| DIRECT_TOPIC.to_string());
             (topic, dest.queue_id, Some(dest.url), Some(dest.secret))
         } else if let (Some(url), Some(secret)) = (req.url.take(), req.secret.take()) {
             (DIRECT_TOPIC.to_string(), None, Some(url), Some(secret))
@@ -1170,18 +2111,16 @@ impl Broker {
         let (max_retries, retry_backoff) =
             resolve_delivery_retry(&req, queue_sub.as_ref(), &self.inner.config.retry_defaults);
 
-        let partition_key = {
-            let rk = req.routing_key.trim();
-            if !rk.is_empty() {
-                rk.to_string()
-            } else {
-                message_id.to_string()
-            }
-        };
-        let partition = self
-            .inner
-            .layout
-            .assign(&tenant_id, &req.topic, &partition_key);
+        // API-selected identity must survive leader selection and forwarding.
+        if req.routing_key.trim().is_empty() && req.routing_id.is_none() {
+            req.routing_id = Some(message_id);
+        }
+        let partition_key = req.shard_routing_key();
+        let partition = forced_partition.unwrap_or_else(|| {
+            self.inner
+                .layout
+                .assign(&tenant_id, &req.topic, &partition_key)
+        });
         let fence_gen = self.require_shard_fence(partition)?;
 
         let http = HttpDeliverySpec::merge(
@@ -1246,84 +2185,150 @@ impl Broker {
         Ok(())
     }
 
-    fn reserve_dedup(
+    /// Take the in-memory reservation first, then consult the dedup index.
+    /// Dedup rows are only written by a reservation holder, so reading the
+    /// index while holding the key cannot race with a concurrent commit.
+    fn try_reserve_dedup(
         &self,
         tenant_id: &str,
         idempotency_key: &str,
-    ) -> Result<ReservationOutcome, BrokerError> {
+    ) -> Result<Result<ReservationOutcome, DedupInFlight>, BrokerError> {
         let key = ReservationKey {
             tenant_id: tenant_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
         };
-        loop {
-            {
-                let mut pending = self.inner.dedup_reservations.pending.lock();
-                while pending.contains(&key) {
-                    self.inner.dedup_reservations.changed.wait(&mut pending);
+        let token = match self.inner.dedup_reservations.try_acquire(key) {
+            Ok(token) => token,
+            Err(in_flight) => return Ok(Err(in_flight)),
+        };
+        if let Some(entry) = self.inner.metadata.get_dedup(tenant_id, idempotency_key)? {
+            if let Some(topic) = self.verify_dedup_hit(tenant_id, &entry)? {
+                if entry.topic.is_empty() && !topic.is_empty() {
+                    let mut migrated = entry.clone();
+                    migrated.topic = topic;
+                    self.inner
+                        .metadata
+                        .put_dedup(tenant_id, idempotency_key, &migrated)?;
                 }
+                token.release();
+                return Ok(Ok(ReservationOutcome::Existing(entry)));
             }
-            if let Some(entry) = self.inner.metadata.get_dedup(tenant_id, idempotency_key)? {
-                return Ok(ReservationOutcome::Existing(entry));
-            }
-            let mut pending = self.inner.dedup_reservations.pending.lock();
-            if pending.insert(key.clone()) {
-                return Ok(ReservationOutcome::Acquired(ReservationToken {
-                    reservations: Arc::clone(&self.inner.dedup_reservations),
-                    key,
-                    release_on_drop: true,
-                }));
-            }
+            // Provably stale (its record is absent or belongs to another
+            // message): drop it and publish as new under the held key.
+            self.inner
+                .metadata
+                .delete_dedup(tenant_id, idempotency_key)?;
         }
+        Ok(Ok(ReservationOutcome::Acquired(token)))
     }
 
-    /// Record idempotency after replication quorum (or immediately on a single node).
-    pub fn commit_publish_dedup(
+    /// End of the prefix a dedup hit may point into: the persisted quorum
+    /// watermark in quorum-gated cells (D2), else the local durable HWM.
+    fn dedup_visible_hwm(&self, topic: &str, partition: u32) -> Result<u64, BrokerError> {
+        self.dispatch_hwm(topic, partition)
+    }
+
+    fn verify_dedup_hit(
         &self,
-        idempotency_key: &str,
-        entry: DedupEntry,
-    ) -> Result<(), BrokerError> {
-        let tenant_id = self.tenant();
-        let mut batch = MetadataWriteBatch::default();
-        batch.put_dedup(tenant_id.clone(), idempotency_key, entry);
-        self.inner.metadata.write_batch(batch)?;
-        self.inner.dedup_reservations.release(&ReservationKey {
-            tenant_id,
-            idempotency_key: idempotency_key.to_string(),
-        });
-        Ok(())
+        tenant: &str,
+        entry: &DedupEntry,
+    ) -> Result<Option<String>, BrokerError> {
+        let legacy_topic_unknown = entry.topic.is_empty() && !self.inner.layout.is_physical();
+        let topics = if !entry.topic.is_empty() {
+            vec![entry.topic.clone()]
+        } else if self.inner.layout.is_physical() {
+            vec![DIRECT_TOPIC.to_string()]
+        } else {
+            #[cfg(feature = "slate")]
+            if let Some(slate) = &self.inner.slate {
+                broker_storage::slate_topics(slate.object_store.clone(), tenant)?
+            } else {
+                self.local_dedup_topics(tenant)?
+            }
+            #[cfg(not(feature = "slate"))]
+            self.local_dedup_topics(tenant)?
+        };
+        let mut ambiguous_reclaimed_topic = false;
+        for topic in topics {
+            let shard = self.shard_handle(&topic, entry.partition)?;
+            // D4's safe retained base proves a reclaimed record was committed
+            // and dispatched. Keep its durable mapping throughout the TTL.
+            if entry.offset < shard.base_offset()? {
+                if legacy_topic_unknown {
+                    ambiguous_reclaimed_topic = true;
+                    continue;
+                }
+                return Ok(Some(topic));
+            }
+            if entry.offset >= self.dedup_visible_hwm(&topic, entry.partition)? {
+                continue;
+            }
+            match shard.read_range(entry.partition, entry.offset, 1) {
+                Ok(messages)
+                    if messages.iter().any(|message| {
+                        message.offset == entry.offset && message.id == entry.message_id
+                    }) =>
+                {
+                    return Ok(Some(topic))
+                }
+                Ok(_) | Err(broker_storage::LogError::OffsetNotFound(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if ambiguous_reclaimed_topic {
+            // Keep pre-upgrade behavior when retention makes a topic-less
+            // legacy mapping unverifiable. Do not invent a topic to migrate.
+            broker_storage::record_legacy_unverifiable_dedup_hit();
+            return Ok(Some(String::new()));
+        }
+        Ok(None)
     }
 
-    pub fn commit_publish_dedup_batch(
-        &self,
-        entries: impl IntoIterator<Item = (String, DedupEntry)>,
-    ) -> Result<(), BrokerError> {
-        let tenant_id = self.tenant();
-        let mut batch = MetadataWriteBatch::default();
-        let mut keys = Vec::new();
-        for (key, entry) in entries {
-            batch.put_dedup(tenant_id.clone(), key.clone(), entry);
-            keys.push(key);
+    fn local_dedup_topics(&self, tenant: &str) -> Result<Vec<String>, BrokerError> {
+        let tenant = broker_proto::sanitize_path_segment(tenant)?;
+        let path = self.inner.config.data_dir.join("partitions").join(tenant);
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(broker_storage::LogError::Io(error).into()),
+        };
+        let mut topics = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(broker_storage::LogError::Io)?;
+            if entry
+                .file_type()
+                .map_err(broker_storage::LogError::Io)?
+                .is_dir()
+            {
+                topics.push(
+                    entry.file_name().into_string().map_err(|_| {
+                        BrokerError::InvalidConfig("non-UTF8 topic directory".into())
+                    })?,
+                );
+            }
         }
-        self.inner.metadata.write_batch(batch)?;
-        for key in keys {
-            self.inner.dedup_reservations.release(&ReservationKey {
-                tenant_id: tenant_id.clone(),
-                idempotency_key: key,
-            });
-        }
-        Ok(())
+        topics.sort();
+        Ok(topics)
     }
 
-    /// Remove an idempotency mapping (used when replication quorum fails after local append).
-    pub fn clear_publish_dedup(&self, idempotency_key: &str) -> Result<(), BrokerError> {
-        let tenant_id = self.tenant();
-        self.inner
-            .metadata
-            .delete_dedup(&tenant_id, idempotency_key)?;
-        self.inner.dedup_reservations.release(&ReservationKey {
-            tenant_id,
-            idempotency_key: idempotency_key.to_string(),
-        });
+    /// Record deferred idempotency mappings after replication quorum, then
+    /// release their keys. On error the keys are released unrecorded.
+    pub fn commit_publish_dedup(&self, pending: PendingDedup) -> Result<(), BrokerError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut batch = MetadataWriteBatch::default();
+        for (token, entry) in &pending.entries {
+            batch.put_dedup(
+                token.key.tenant_id.clone(),
+                token.key.idempotency_key.clone(),
+                entry.clone(),
+            );
+        }
+        self.inner.metadata.write_batch(batch)?;
+        for (token, _) in pending.entries {
+            token.release();
+        }
         Ok(())
     }
 
@@ -1414,6 +2419,88 @@ impl Broker {
         Ok(self.inner.config.partitions)
     }
 
+    /// Scan at most 512 records across partitions. An empty page can still have
+    /// a continuation when a shared shard contains only other logical topics.
+    pub fn list_topic_messages_page(
+        &self,
+        topic: &str,
+        start: (u32, u64),
+        limit: usize,
+    ) -> Result<TopicMessagePage, BrokerError> {
+        let (mut partition, mut offset) = start;
+        if partition >= self.shard_count() {
+            return Err(BrokerError::InvalidConfig(
+                "invalid listing partition".into(),
+            ));
+        }
+        let limit = limit.clamp(1, 1000);
+        let mut scanned = 0;
+        let mut messages = Vec::new();
+        let mut payload_bytes = 0usize;
+        while partition < self.shard_count() && scanned < 512 && messages.len() < limit {
+            if self.inner.config.storage == StorageMode::Local {
+                let path = if self.layout().is_physical() {
+                    self.layout()
+                        .physical_shard_dir(&self.inner.config.data_dir, partition)
+                } else {
+                    partition_dir(
+                        &self.inner.config.data_dir,
+                        &self.tenant(),
+                        topic,
+                        partition,
+                    )?
+                };
+                if !path.exists() {
+                    partition += 1;
+                    offset = 0;
+                    continue;
+                }
+            }
+            let handle = self.shard_handle(topic, partition)?;
+            let batch = handle.read_range(partition, offset, 4.min(512 - scanned))?;
+            if batch.is_empty() {
+                partition += 1;
+                offset = 0;
+                continue;
+            }
+            for message in batch {
+                offset = message.offset.saturating_add(1);
+                scanned += 1;
+                if message.topic == topic {
+                    payload_bytes = payload_bytes.saturating_add(message.payload.len());
+                    messages.push(message);
+                }
+                if messages.len() >= limit || payload_bytes >= 8 * 1024 * 1024 {
+                    break;
+                }
+            }
+            if offset >= handle.high_watermark()? {
+                partition += 1;
+                offset = 0;
+            }
+            if payload_bytes >= 8 * 1024 * 1024 {
+                break;
+            }
+        }
+        Ok(TopicMessagePage {
+            messages,
+            next: (partition < self.shard_count()).then_some((partition, offset)),
+        })
+    }
+
+    pub fn get_topic_message(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<Option<StoredMessage>, BrokerError> {
+        Ok(self
+            .shard_handle(topic, partition)?
+            .read_range(partition, offset, 1)?
+            .into_iter()
+            .find(|message| message.offset == offset && message.topic == topic))
+    }
+
     /// Page messages for one partition starting at `from_offset` (inclusive).
     pub fn list_topic_messages_from(
         &self,
@@ -1426,6 +2513,9 @@ impl Broker {
             return Ok(Vec::new());
         }
         let handle = self.shard_handle(topic, partition)?;
+        // An empty topic on a physical (V2) shard reads the whole shard log,
+        // which is what replica repair needs.
+        let whole_shard = topic.is_empty() && self.inner.layout.is_physical();
         let mut cursor = from_offset;
         let mut out = Vec::with_capacity(max_messages.min(256));
         while out.len() < max_messages {
@@ -1439,7 +2529,7 @@ impl Broker {
             out.extend(
                 batch
                     .into_iter()
-                    .filter(|message| message.topic == topic)
+                    .filter(|message| whole_shard || message.topic == topic)
                     .take(remaining),
             );
             if cursor >= handle.high_watermark()? {
@@ -1447,6 +2537,38 @@ impl Broker {
             }
         }
         Ok(out)
+    }
+
+    /// Read at most `max_records` shard records from `from_offset` (inclusive)
+    /// and keep those belonging to `topic`. Unlike [`Broker::list_topic_messages_from`]
+    /// the work is bounded by records read, not by matches, so a scan over a
+    /// shared V2 shard cannot read the whole shard to find a few matches.
+    /// Returns the matches and the offset to resume from (`from_offset` when
+    /// nothing was read).
+    pub fn scan_topic_messages(
+        &self,
+        topic: &str,
+        partition: u32,
+        from_offset: u64,
+        max_records: usize,
+    ) -> Result<(Vec<StoredMessage>, u64), BrokerError> {
+        if max_records == 0 {
+            return Ok((Vec::new(), from_offset));
+        }
+        let batch =
+            self.shard_handle(topic, partition)?
+                .read_range(partition, from_offset, max_records)?;
+        let next = batch
+            .last()
+            .map(|message| message.offset.saturating_add(1))
+            .unwrap_or(from_offset);
+        Ok((
+            batch
+                .into_iter()
+                .filter(|message| message.topic == topic)
+                .collect(),
+            next,
+        ))
     }
 
     /// Encoded frames from `from_offset` (inclusive) for follower catch-up.
@@ -1457,39 +2579,65 @@ impl Broker {
         from_offset: u64,
         max_messages: usize,
     ) -> Result<Vec<(u64, Vec<u8>)>, BrokerError> {
-        let msgs = self.list_topic_messages_from(topic, partition, from_offset, max_messages)?;
-        let mut out = Vec::with_capacity(msgs.len());
-        for msg in msgs {
-            let header = LogRecord {
-                id: msg.id,
-                tenant_id: msg.tenant_id.clone(),
-                topic: msg.topic.clone(),
-                routing_key: msg.routing_key.clone(),
-                idempotency_key: None,
-                published_at_ms: msg.published_at_ms,
-                priority: msg.priority,
-                flow_parallelism: msg.flow_parallelism,
-                flow_key: msg.flow_key.clone(),
-                flow_rate: msg.flow_rate,
-                flow_period_secs: msg.flow_period_secs,
-                queue_id: msg.queue_id,
-                group_id: msg.group_id,
-                group_member_id: msg.group_member_id,
-                flow_profile_id: msg.flow_profile_id,
-                destination_url: msg.destination_url.clone(),
-                destination_secret: msg.destination_secret.clone(),
-                max_retries: msg.max_retries,
-                retry_backoff: msg.retry_backoff.clone(),
-                http_method: msg.http_method.clone(),
-                http_headers_json: msg.http_headers_json.clone(),
-                http_sign: msg.http_sign,
-                payload_ref_json: msg.payload_ref_json.clone(),
+        self.replication_frames_bounded(topic, partition, from_offset, max_messages, usize::MAX)
+    }
+
+    /// [`Broker::replication_frames`] that also stops before `max_bytes` of
+    /// frames, always returning at least one frame when any is available, so
+    /// catch-up of large inline bodies advances page by page.
+    pub fn replication_frames_bounded(
+        &self,
+        topic: &str,
+        partition: u32,
+        from_offset: u64,
+        max_messages: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>, BrokerError> {
+        let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut bytes = 0usize;
+        let mut cursor = from_offset;
+        while out.len() < max_messages {
+            let page = (max_messages - out.len()).min(64);
+            let msgs = self.list_topic_messages_from(topic, partition, cursor, page)?;
+            let Some(last) = msgs.last().map(|message| message.offset) else {
+                break;
             };
-            let frame = broker_proto::encode_frame_vec(&header, &msg.payload)
-                .map_err(|e| BrokerError::Storage(broker_storage::LogError::Record(e)))?;
-            out.push((msg.offset, frame));
+            cursor = last.saturating_add(1);
+            for msg in msgs {
+                let frame = encode_replication_frame(&msg)?;
+                if !out.is_empty() && bytes.saturating_add(frame.len()) > max_bytes {
+                    return Ok(out);
+                }
+                bytes = bytes.saturating_add(frame.len());
+                out.push((msg.offset, frame));
+                if out.len() >= max_messages {
+                    break;
+                }
+            }
         }
         Ok(out)
+    }
+
+    /// Follower reconciliation: drop this replica's records at or above
+    /// `offset`, keeping the cut bytes in a sidecar (see
+    /// `PartitionLog::truncate_to`). Returns the new log end.
+    pub fn truncate_replica_log(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        generation: u64,
+    ) -> Result<u64, BrokerError> {
+        if self.inner.config.storage == StorageMode::Slate {
+            return Err(BrokerError::Storage(
+                broker_storage::LogError::TruncateUnsupported(
+                    "slate mode: frame replication disabled".into(),
+                ),
+            ));
+        }
+        let handle = self.shard_handle(topic, partition)?;
+        handle.truncate_to(offset, generation)?;
+        Ok(handle.high_watermark()?)
     }
 
     /// Drop a primary-queue record from the partition log (not used for `*. __dlq` topics).
@@ -1502,8 +2650,7 @@ impl Broker {
         if is_dlq_topic(topic) {
             return Ok(false);
         }
-        let removed = self.shard_handle(topic, partition)?.purge_offset(offset)?;
-        Ok(removed)
+        self.purge_offset_and_blob(topic, partition, offset)
     }
 
     /// Remove a dead-letter record (operator cleanup from the panel / API).
@@ -1516,7 +2663,29 @@ impl Broker {
         if !is_dlq_topic(topic) {
             return Ok(false);
         }
-        let removed = self.shard_handle(topic, partition)?.purge_offset(offset)?;
+        self.purge_offset_and_blob(topic, partition, offset)
+    }
+
+    /// Tombstone one record and queue its payload blob (if any) for deletion:
+    /// retention never sees purged records again.
+    fn purge_offset_and_blob(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<bool, BrokerError> {
+        let handle = self.shard_handle(topic, partition)?;
+        let reference = handle
+            .read_range(partition, offset, 1)?
+            .into_iter()
+            .find(|message| message.offset == offset)
+            .and_then(|message| crate::retention::payload_reference(&message));
+        let removed = handle.purge_offset(offset)?;
+        if removed {
+            if let Some(reference) = reference {
+                self.inner.retention.tombstone_blobs(vec![reference])?;
+            }
+        }
         Ok(removed)
     }
 
@@ -1531,38 +2700,54 @@ impl Broker {
             return Ok(0);
         }
         let mut deleted = 0usize;
-        let partitions = self.partition_count(topic)?;
-        for partition in 0..partitions {
-            let mut from = 0u64;
-            loop {
-                let batch = self.list_topic_messages_from(topic, partition, from, 256)?;
-                let Some(last) = batch.last().map(|message| message.offset) else {
-                    break;
+        let mut next = Some((0, 0));
+        while let Some(position) = next {
+            let page = self.list_topic_messages_page(topic, position, 256)?;
+            next = page.next;
+            // One durable tombstone write per partition per page, not per record.
+            let mut eligible: std::collections::BTreeMap<u32, Vec<u64>> =
+                std::collections::BTreeMap::new();
+            for msg in page.messages {
+                let keep = match older_than_ms {
+                    None => true,
+                    Some(cutoff) => msg.published_at_ms > 0 && msg.published_at_ms <= cutoff,
                 };
-                from = last.saturating_add(1);
-                for msg in batch {
-                    let eligible = match older_than_ms {
-                        None => true,
-                        Some(cutoff) => msg.published_at_ms > 0 && msg.published_at_ms <= cutoff,
-                    };
-                    if eligible && self.purge_dlq_message(topic, msg.partition, msg.offset)? {
-                        deleted += 1;
-                    }
+                if keep {
+                    eligible.entry(msg.partition).or_default().push(msg.offset);
                 }
+            }
+            for (partition, offsets) in eligible {
+                deleted += self
+                    .shard_handle(topic, partition)?
+                    .purge_offsets(offsets)?;
             }
         }
         Ok(deleted)
     }
 
-    /// Delivery no longer physically purges; GC is sealed-segment retention.
-    /// Kept so callers compile; always returns false.
-    pub fn try_purge_message(
-        &self,
-        _topic: &str,
-        _partition: u32,
-        _offset: u64,
-    ) -> Result<bool, BrokerError> {
-        Ok(false)
+    /// Resolve the routing identity and storage topic before choosing a leader.
+    pub fn canonicalize_routing(&self, req: &mut PublishRequest) -> Result<(), BrokerError> {
+        req.ensure_routing_id();
+        if is_dlq_topic(&req.topic) {
+            return Ok(());
+        }
+        if let Some(destination) = &req.destination {
+            req.topic = match destination.queue_id {
+                Some(id) => self
+                    .get_queue_by_id(id)?
+                    .map(|queue| queue.topic)
+                    .unwrap_or_else(|| DIRECT_TOPIC.into()),
+                None => DIRECT_TOPIC.into(),
+            };
+        } else if req.url.is_some() && req.secret.is_some() {
+            req.topic = DIRECT_TOPIC.into();
+        } else if let Some(id) = req.queue_id {
+            req.topic = self
+                .get_queue_by_id(id)?
+                .ok_or_else(|| BrokerError::QueueNotFound(id.to_string()))?
+                .topic;
+        }
+        Ok(())
     }
 
     /// Freeze flow limits and queue destination from this broker's catalog before forwarding to a shard leader.
@@ -1715,6 +2900,7 @@ impl Broker {
             .as_ref()
             .map(|k| format!("{k}:{}", member.id));
         PublishRequest {
+            routing_id: None,
             topic: group_topic(group_id),
             queue_id: None,
             group_id: Some(group_id),
@@ -1788,8 +2974,18 @@ impl Broker {
             return Ok(handle);
         }
 
-        let mut shards = self.inner.shards.write();
-        if let Some(handle) = shards
+        let gate = self
+            .inner
+            .shard_open_locks
+            .lock()
+            .entry((namespace.clone(), partition))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _opening = gate.lock();
+        if let Some(handle) = self
+            .inner
+            .shards
+            .read()
             .get(&namespace)
             .and_then(|partitions| partitions.get(&partition))
             .cloned()
@@ -1855,7 +3051,9 @@ impl Broker {
             }
         };
         let handle = ShardHandle::new(backend);
-        shards
+        self.inner
+            .shards
+            .write()
             .entry(namespace)
             .or_default()
             .insert(partition, Arc::clone(&handle));
@@ -1865,6 +3063,58 @@ impl Broker {
     pub fn assign_shard(&self, topic: &str, routing_key: &str) -> u32 {
         self.inner.layout.assign(&self.tenant(), topic, routing_key)
     }
+}
+
+/// Body size after `payload_encoding` is applied, without decoding.
+pub fn decoded_payload_len(req: &PublishRequest) -> usize {
+    decoded_body_len(&req.payload, req.payload_encoding.as_deref())
+}
+
+/// Decoded length of a (possibly base64) body, without decoding it.
+pub fn decoded_body_len(payload: &str, encoding: Option<&str>) -> usize {
+    match encoding {
+        Some("base64") => {
+            let encoded = payload.trim_end();
+            let padding = encoded
+                .bytes()
+                .rev()
+                .take_while(|byte| *byte == b'=')
+                .count();
+            (encoded.len() / 4 * 3 + encoded.len() % 4 * 3 / 4).saturating_sub(padding)
+        }
+        _ => payload.len(),
+    }
+}
+
+/// Re-encode a stored record as the frame followers append.
+fn encode_replication_frame(msg: &StoredMessage) -> Result<Vec<u8>, BrokerError> {
+    let header = LogRecord {
+        id: msg.id,
+        tenant_id: msg.tenant_id.clone(),
+        topic: msg.topic.clone(),
+        routing_key: msg.routing_key.clone(),
+        idempotency_key: None,
+        published_at_ms: msg.published_at_ms,
+        priority: msg.priority,
+        flow_parallelism: msg.flow_parallelism,
+        flow_key: msg.flow_key.clone(),
+        flow_rate: msg.flow_rate,
+        flow_period_secs: msg.flow_period_secs,
+        queue_id: msg.queue_id,
+        group_id: msg.group_id,
+        group_member_id: msg.group_member_id,
+        flow_profile_id: msg.flow_profile_id,
+        destination_url: msg.destination_url.clone(),
+        destination_secret: msg.destination_secret.clone(),
+        max_retries: msg.max_retries,
+        retry_backoff: msg.retry_backoff.clone(),
+        http_method: msg.http_method.clone(),
+        http_headers_json: msg.http_headers_json.clone(),
+        http_sign: msg.http_sign,
+        payload_ref_json: msg.payload_ref_json.clone(),
+    };
+    broker_proto::encode_frame_vec(&header, &msg.payload)
+        .map_err(|e| BrokerError::Storage(broker_storage::LogError::Record(e)))
 }
 
 fn decode_payload(req: &PublishRequest) -> Result<Vec<u8>, BrokerError> {
@@ -1889,6 +3139,38 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn opening_one_shard_does_not_hold_the_global_map_lock() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let namespace = broker.inner.layout.storage_namespace("orders").to_string();
+        let gate = Arc::new(Mutex::new(()));
+        broker
+            .inner
+            .shard_open_locks
+            .lock()
+            .insert((namespace, 0), gate.clone());
+        let blocked = gate.lock();
+        let other = broker.clone();
+        let (started, waiting) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            other.partition_high_watermark("orders", 0).unwrap()
+        });
+        waiting.recv().unwrap();
+        let other = broker.clone();
+        let (done, completion) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            done.send(other.partition_high_watermark("orders", 1))
+                .unwrap();
+        });
+        let result = completion.recv_timeout(std::time::Duration::from_secs(5));
+        drop(blocked);
+        assert_eq!(first.join().unwrap(), 0);
+        second.join().unwrap();
+        assert_eq!(result.unwrap().unwrap(), 0);
+    }
+
+    #[test]
     fn publish_stores_readable_message() {
         let dir = tempdir().unwrap();
         let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
@@ -1906,6 +3188,7 @@ mod tests {
 
         let published = broker
             .publish(PublishRequest {
+                routing_id: None,
                 topic: "orders".into(),
                 queue_id: None,
                 group_id: None,
@@ -1958,6 +3241,7 @@ mod tests {
 
         let keyed = broker
             .publish(PublishRequest {
+                routing_id: None,
                 topic: "jobs".into(),
                 queue_id: None,
                 group_id: None,
@@ -1991,6 +3275,7 @@ mod tests {
 
         let plain = broker
             .publish(PublishRequest {
+                routing_id: None,
                 topic: "jobs".into(),
                 queue_id: None,
                 group_id: None,
@@ -2041,6 +3326,7 @@ mod tests {
         let body = "x".repeat(2048);
         let published = broker
             .publish(PublishRequest {
+                routing_id: None,
                 topic: "big".into(),
                 queue_id: None,
                 group_id: None,
@@ -2102,6 +3388,7 @@ mod tests {
             .unwrap();
 
         let req = PublishRequest {
+            routing_id: None,
             topic: "t".into(),
             queue_id: None,
             group_id: None,
@@ -2154,6 +3441,7 @@ mod tests {
                     for n in 0..25 {
                         broker
                             .publish(PublishRequest {
+                                routing_id: None,
                                 topic: "orders".into(),
                                 queue_id: None,
                                 group_id: None,
@@ -2198,6 +3486,7 @@ mod tests {
         idempotency_key: Option<String>,
     ) -> PublishRequest {
         PublishRequest {
+            routing_id: None,
             topic: String::new(),
             queue_id: None,
             group_id: None,
@@ -2246,6 +3535,49 @@ mod tests {
         Broker::open(BrokerConfig::new(path.to_path_buf())).unwrap()
     }
 
+    #[test]
+    fn dlq_pages_bound_shared_shard_scans_and_counts_survive_reopen() {
+        let dir = tempdir().unwrap();
+        let broker = open_v2_broker(dir.path(), 1);
+        execute_prepared(
+            &broker,
+            (0..600).map(|_| direct_request("normal", None)).collect(),
+        );
+        let topic = "jobs.__dlq";
+        broker.publish(queue_request(topic, "dead letter")).unwrap();
+        let first = broker
+            .list_topic_messages_page(topic, (0, 0), usize::MAX)
+            .unwrap();
+        assert!(first.messages.is_empty());
+        assert_eq!(first.next, Some((0, 512)));
+        let second = broker
+            .list_topic_messages_page(topic, first.next.unwrap(), 100)
+            .unwrap();
+        assert_eq!(second.messages.len(), 1);
+        assert_eq!(second.next, None);
+        assert_eq!(
+            broker.dlq_counts(),
+            (HashMap::from([(topic.to_string(), 1)]), true)
+        );
+        broker.flush_wal().unwrap();
+        drop(broker);
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let message = broker
+            .list_topic_messages_page(topic, (0, 600), 1)
+            .unwrap()
+            .messages
+            .pop()
+            .unwrap();
+        assert_eq!(
+            broker.dlq_counts(),
+            (HashMap::from([(topic.to_string(), 1)]), true)
+        );
+        assert_eq!(message.offset, 600);
+        assert_eq!(broker.purge_dlq_topic(topic, None).unwrap(), 1);
+        assert_eq!(broker.dlq_counts().0[topic], 0);
+        assert!(broker.list_topic_messages_page(topic, (1, 0), 1).is_err());
+    }
+
     fn execute_prepared(broker: &Broker, requests: Vec<PublishRequest>) -> Vec<PublishResponse> {
         let mut prepared = broker.prepare_publish_batch(requests).unwrap();
         for shard_batch in prepared.take_shard_batches() {
@@ -2255,6 +3587,221 @@ mod tests {
                 .unwrap();
         }
         prepared.finish().unwrap()
+    }
+
+    #[test]
+    fn stale_dedup_identity_and_missing_or_uncommitted_records_are_misses() {
+        let dir = tempdir().unwrap();
+        let broker = open_v2_broker(dir.path(), 1);
+        let original = broker.publish(direct_request("original", None)).unwrap();
+        broker.flush_wal().unwrap();
+        for (key, message_id, offset) in [
+            ("wrong-id", Uuid::new_v4(), original.offset.unwrap()),
+            ("missing", Uuid::new_v4(), 500),
+        ] {
+            broker
+                .inner
+                .metadata
+                .put_dedup(
+                    &broker.tenant(),
+                    key,
+                    &DedupEntry::new(message_id, offset, 0, DIRECT_TOPIC.into()),
+                )
+                .unwrap();
+            let retry = broker
+                .publish(direct_request("retry", Some(key.into())))
+                .unwrap();
+            assert!(!retry.duplicate);
+            assert_ne!(retry.message_id, Some(message_id));
+        }
+    }
+
+    #[test]
+    fn legacy_topic_discovery_preserves_tenant_wide_cross_topic_retry() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        for topic in ["orders", "invoices"] {
+            broker
+                .create_subscription(CreateSubscriptionRequest {
+                    topic: topic.into(),
+                    url: "http://127.0.0.1:9/hook".into(),
+                    secret: "s".into(),
+                    parallelism: None,
+                    default_max_retries: None,
+                    retry_backoff: None,
+                })
+                .unwrap();
+        }
+        let mut request = queue_request("orders", "body");
+        request.idempotency_key = Some("tenant-key".into());
+        let original = broker.publish(request).unwrap();
+        broker.flush_wal().unwrap();
+        let mut legacy = broker
+            .inner
+            .metadata
+            .get_dedup(&broker.tenant(), "tenant-key")
+            .unwrap()
+            .unwrap();
+        legacy.topic.clear();
+        broker
+            .inner
+            .metadata
+            .put_dedup(&broker.tenant(), "tenant-key", &legacy)
+            .unwrap();
+        let mut retry = queue_request("invoices", "different-body");
+        retry.idempotency_key = Some("tenant-key".into());
+        let response = broker.publish(retry).unwrap();
+        assert!(response.duplicate);
+        assert_eq!(response.message_id, original.message_id);
+        assert_eq!(
+            broker
+                .inner
+                .metadata
+                .get_dedup(&broker.tenant(), "tenant-key")
+                .unwrap()
+                .unwrap()
+                .topic,
+            "orders"
+        );
+    }
+
+    #[test]
+    fn wal_retention_keeps_dedup_until_its_retry_window_expires() {
+        let dir = tempdir().unwrap();
+        let layout = ShardLayout {
+            version: LAYOUT_V2,
+            shard_count: 1,
+            route_hash_version: broker_proto::HASH_VERSION_V2,
+        };
+        broker_storage::atomic_write_file(
+            &ShardLayout::path(dir.path()),
+            &serde_json::to_vec(&layout).unwrap(),
+        )
+        .unwrap();
+        let mut config = BrokerConfig::new(dir.path().to_path_buf());
+        config.log.segment_max_bytes = 1;
+        config.log.fsync = broker_storage::FsyncMode::Always;
+        let broker = Broker::open(config).unwrap();
+        let original = broker
+            .publish(direct_request("body", Some("retained-key".into())))
+            .unwrap();
+        broker.publish(direct_request("later", None)).unwrap();
+        broker.flush_wal().unwrap();
+        let shard = broker.shard_handle(DIRECT_TOPIC, 0).unwrap();
+        assert!(shard.gc_sealed_below(2).unwrap() > 0);
+        assert!(shard.base_offset().unwrap() > original.offset.unwrap());
+        let response = broker
+            .publish(direct_request("retry", Some("retained-key".into())))
+            .unwrap();
+        assert!(response.duplicate);
+        assert_eq!(response.message_id, original.message_id);
+    }
+
+    #[test]
+    fn legacy_unverifiable_reclaimed_hit_keeps_pre_upgrade_duplicate_behavior() {
+        let dir = tempdir().unwrap();
+        let mut config = BrokerConfig::new(dir.path().to_path_buf());
+        config.log.segment_max_bytes = 1;
+        config.log.fsync = broker_storage::FsyncMode::Always;
+        let broker = Broker::open(config).unwrap();
+        let original = broker
+            .publish(direct_request("body", Some("legacy-gc".into())))
+            .unwrap();
+        let partition = original.partition.unwrap();
+        let shard = broker.shard_handle(DIRECT_TOPIC, partition).unwrap();
+        assert!(shard.gc_sealed_below(original.offset.unwrap() + 1).unwrap() > 0);
+        let mut entry = broker
+            .inner
+            .metadata
+            .get_dedup(&broker.tenant(), "legacy-gc")
+            .unwrap()
+            .unwrap();
+        entry.topic.clear();
+        broker
+            .inner
+            .metadata
+            .put_dedup(&broker.tenant(), "legacy-gc", &entry)
+            .unwrap();
+        let before = broker_storage::shared_metadata_telemetry().legacy_unverifiable_dedup_hits;
+        let response = broker
+            .publish(direct_request("retry", Some("legacy-gc".into())))
+            .unwrap();
+        assert!(response.duplicate);
+        assert_eq!(response.message_id, original.message_id);
+        assert!(
+            broker_storage::shared_metadata_telemetry().legacy_unverifiable_dedup_hits > before
+        );
+        assert!(broker
+            .inner
+            .metadata
+            .get_dedup(&broker.tenant(), "legacy-gc")
+            .unwrap()
+            .unwrap()
+            .topic
+            .is_empty());
+    }
+
+    #[test]
+    fn shared_dedup_survives_process_exit_before_reply() {
+        const CHILD: &str = "BETTERMQ_TEST_BROKER_SHARED_CRASH_DIR";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let broker = Broker::open(BrokerConfig::new(std::path::PathBuf::from(dir))).unwrap();
+            broker
+                .publish(direct_request("body", Some("crash-key".into())))
+                .unwrap();
+            broker.flush_wal().unwrap();
+            // The durable batch succeeded; omit the reply and all destructors.
+            std::process::exit(73);
+        }
+        let dir = tempdir().unwrap();
+        let shared = tempdir().unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "broker::tests::shared_dedup_survives_process_exit_before_reply",
+            ])
+            .env(CHILD, dir.path())
+            .env("BETTERMQ_SHARED_META_DIR", shared.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(73),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        // Reopen in an isolated child to avoid changing process-wide env while
+        // unrelated unit tests open their local stores.
+        let retry = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "broker::tests::shared_dedup_retry_worker"])
+            .env(CHILD, dir.path())
+            .env("BETTERMQ_SHARED_META_DIR", shared.path())
+            .output()
+            .unwrap();
+        assert!(
+            retry.status.success(),
+            "{}",
+            String::from_utf8_lossy(&retry.stderr)
+        );
+    }
+
+    #[test]
+    fn shared_dedup_retry_worker() {
+        let Some(dir) = std::env::var_os("BETTERMQ_TEST_BROKER_SHARED_CRASH_DIR") else {
+            return;
+        };
+        let broker = Broker::open(BrokerConfig::new(std::path::PathBuf::from(dir))).unwrap();
+        let old = broker
+            .inner
+            .metadata
+            .get_dedup(&broker.tenant(), "crash-key")
+            .unwrap()
+            .unwrap();
+        let response = broker
+            .publish(direct_request("retry", Some("crash-key".into())))
+            .unwrap();
+        assert!(response.duplicate);
+        assert_eq!(response.message_id, Some(old.message_id));
     }
 
     #[test]
@@ -2369,31 +3916,30 @@ mod tests {
         assert_eq!(responses[1].offset, responses[3].offset);
     }
 
-    #[test]
-    fn concurrent_same_key_reservation_allows_one_append() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_key_reservation_allows_one_append() {
         let dir = tempdir().unwrap();
         let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
-        let barrier = Arc::new(std::sync::Barrier::new(16));
-        let responses = std::thread::scope(|scope| {
-            let mut threads = Vec::new();
-            for index in 0..16 {
-                let broker = broker.clone();
-                let barrier = Arc::clone(&barrier);
-                threads.push(scope.spawn(move || {
-                    barrier.wait();
-                    broker
-                        .publish(direct_request(
-                            format!("candidate-{index}"),
-                            Some("race-key".into()),
-                        ))
-                        .unwrap()
-                }));
-            }
-            threads
-                .into_iter()
-                .map(|thread| thread.join().unwrap())
-                .collect::<Vec<_>>()
-        });
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let mut tasks = Vec::new();
+        for index in 0..16 {
+            let broker = broker.clone();
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                broker
+                    .publish_async(direct_request(
+                        format!("candidate-{index}"),
+                        Some("race-key".into()),
+                    ))
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut responses = Vec::new();
+        for task in tasks {
+            responses.push(task.await.unwrap());
+        }
         assert_eq!(
             responses
                 .iter()
@@ -2469,6 +4015,274 @@ mod tests {
     }
 
     #[test]
+    fn sync_publish_fails_fast_on_in_flight_key() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let held = broker
+            .prepare_publish_batch(vec![direct_request("owner", Some("busy".into()))])
+            .unwrap();
+        let error = broker
+            .publish(direct_request("retry", Some("busy".into())))
+            .unwrap_err();
+        assert!(matches!(error, BrokerError::IdempotencyInFlight(ref key) if key == "busy"));
+        drop(held);
+        assert!(
+            !broker
+                .publish(direct_request("retry", Some("busy".into())))
+                .unwrap()
+                .duplicate
+        );
+    }
+
+    /// A single runtime worker must keep polling the reservation owner while
+    /// same-key waiters are parked (the old Condvar wait deadlocked here).
+    #[test]
+    fn waiters_do_not_block_the_reservation_owner_on_one_worker() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut prepared = broker
+                .prepare_publish_batch(vec![direct_request("owner", Some("slow".into()))])
+                .unwrap();
+            let waiters: Vec<_> = (0..8)
+                .map(|index| {
+                    let broker = broker.clone();
+                    tokio::spawn(async move {
+                        broker
+                            .publish_async(direct_request(
+                                format!("retry-{index}"),
+                                Some("slow".into()),
+                            ))
+                            .await
+                            .unwrap()
+                    })
+                })
+                .collect();
+            // Let every waiter run up to its await point.
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            for shard_batch in prepared.take_shard_batches() {
+                let appended = broker.append_prepared_batch(shard_batch).unwrap();
+                broker
+                    .finalize_prepared_batch(&mut prepared, appended, true)
+                    .unwrap();
+            }
+            let owner = prepared.finish().unwrap().pop().unwrap();
+            for waiter in waiters {
+                let response = waiter.await.unwrap();
+                assert!(response.duplicate);
+                assert_eq!(response.message_id, owner.message_id);
+                assert_eq!(response.offset, owner.offset);
+            }
+        });
+    }
+
+    #[test]
+    fn opposite_key_order_batches_do_not_hold_partial_reservations() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let held = broker
+            .prepare_publish_batch(vec![
+                direct_request("a", Some("A".into())),
+                direct_request("b", Some("B".into())),
+            ])
+            .unwrap();
+        // [C, B] acquires C, conflicts on B and must roll C back.
+        let error = match broker.prepare_publish_batch(vec![
+            direct_request("c", Some("C".into())),
+            direct_request("b2", Some("B".into())),
+        ]) {
+            Err(error) => error,
+            Ok(_) => panic!("conflicting batch unexpectedly prepared"),
+        };
+        assert!(matches!(error, BrokerError::IdempotencyInFlight(ref key) if key == "B"));
+        assert!(
+            !broker
+                .publish(direct_request("c", Some("C".into())))
+                .unwrap()
+                .duplicate
+        );
+        drop(held);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let prepared = runtime
+            .block_on(broker.prepare_publish_batch_waiting(vec![
+                direct_request("b", Some("B".into())),
+                direct_request("a", Some("A".into())),
+            ]))
+            .unwrap();
+        assert_eq!(prepared.len(), 2);
+    }
+
+    #[test]
+    fn deferred_dedup_holds_key_until_commit() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (first, pending) = runtime
+            .block_on(broker.publish_defer_dedup(direct_request("one", Some("ha".into()))))
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        // Replication is still in flight: a retry must not append a second copy.
+        assert!(matches!(
+            broker.publish(direct_request("two", Some("ha".into()))),
+            Err(BrokerError::IdempotencyInFlight(_))
+        ));
+        // Callers record dedup only once the record is committed; a row above
+        // the visible HWM is treated as stale.
+        runtime
+            .block_on(broker.wait_committed(
+                &first.topic,
+                first.partition.unwrap(),
+                first.offset.unwrap(),
+            ))
+            .unwrap();
+        broker.commit_publish_dedup(pending).unwrap();
+        let retry = broker
+            .publish(direct_request("two", Some("ha".into())))
+            .unwrap();
+        assert!(retry.duplicate);
+        assert_eq!(retry.message_id, first.message_id);
+        assert_eq!(retry.offset, first.offset);
+    }
+
+    #[test]
+    fn deferred_dedup_dropped_after_failed_quorum_releases_unrecorded() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (first, pending) = runtime
+            .block_on(broker.publish_defer_dedup(direct_request("one", Some("lost".into()))))
+            .unwrap();
+        drop(pending);
+        let retry = broker
+            .publish(direct_request("two", Some("lost".into())))
+            .unwrap();
+        assert!(!retry.duplicate);
+        assert_ne!(retry.message_id, first.message_id);
+    }
+
+    #[test]
+    fn inline_only_cell_policy_keeps_bodies_in_the_frame_and_rejects_before_append() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let limit = broker_payload::inline_max_bytes() * 2;
+        broker.set_payload_policy(PayloadPolicy::InlineOnly { max_body: limit });
+        let at_limit = "a".repeat(limit);
+        let published = broker
+            .publish(direct_request(at_limit.clone(), Some("fits".into())))
+            .unwrap();
+        let message = broker
+            .read_message(
+                DIRECT_TOPIC,
+                published.partition.unwrap(),
+                published.offset.unwrap(),
+            )
+            .unwrap();
+        assert!(message.payload_ref_json.is_none());
+        assert_eq!(message.payload, at_limit.as_bytes());
+        // The replicated frame carries the whole body.
+        let frame = published.replication_frame.unwrap();
+        let (_, payload) = broker_proto::decode_frame(std::io::Cursor::new(&frame)).unwrap();
+        assert_eq!(payload.len(), limit);
+
+        let partition = published.partition.unwrap();
+        let hwm = broker
+            .partition_high_watermark(DIRECT_TOPIC, partition)
+            .unwrap();
+        let error = broker
+            .publish(direct_request(
+                "b".repeat(limit + 1),
+                Some("too-big".into()),
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BrokerError::Payload(broker_payload::PayloadError::TooLargeForCell { size, limit: l })
+                if size == limit as u64 + 1 && l == limit as u64
+        ));
+        assert!(broker
+            .check_publish_body(&direct_request("c".repeat(limit + 1), None))
+            .is_err());
+        // Base64 bodies are measured decoded.
+        let mut encoded = direct_request(
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, vec![0u8; limit]),
+            None,
+        );
+        encoded.payload_encoding = Some("base64".into());
+        assert_eq!(decoded_payload_len(&encoded), limit);
+        broker.check_publish_body(&encoded).unwrap();
+        // Nothing appended, nothing written, and the key is not reserved.
+        assert_eq!(
+            broker
+                .partition_high_watermark(DIRECT_TOPIC, partition)
+                .unwrap(),
+            hwm
+        );
+        let blobs = dir.path().join("payload-blobs");
+        assert!(std::fs::read_dir(&blobs).map_or(true, |mut entries| entries.next().is_none()));
+        assert!(
+            !broker
+                .publish(direct_request("small", Some("too-big".into())))
+                .unwrap()
+                .duplicate
+        );
+    }
+
+    #[test]
+    fn catch_up_frames_are_byte_bounded_but_always_advance() {
+        let dir = tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        broker.set_payload_policy(PayloadPolicy::InlineOnly {
+            max_body: 2 * 1024 * 1024,
+        });
+        let body = "m".repeat(1024 * 1024);
+        let mut partition = 0;
+        for _ in 0..6 {
+            partition = broker
+                .publish(direct_request(body.clone(), None))
+                .unwrap()
+                .partition
+                .unwrap();
+        }
+        let page = broker
+            .replication_frames_bounded(DIRECT_TOPIC, partition, 0, 4096, 3 * 1024 * 1024 + 1024)
+            .unwrap();
+        assert_eq!(page.len(), 3);
+        assert!(page.iter().map(|(_, frame)| frame.len()).sum::<usize>() <= 3 * 1024 * 1024 + 1024);
+        // A single frame larger than the budget still comes back alone.
+        let tiny = broker
+            .replication_frames_bounded(DIRECT_TOPIC, partition, page[2].0 + 1, 4096, 10)
+            .unwrap();
+        assert_eq!(tiny.len(), 1);
+        // Paging converges on every record.
+        let mut from = 0;
+        let mut seen = 0;
+        loop {
+            let page = broker
+                .replication_frames_bounded(DIRECT_TOPIC, partition, from, 4096, 2 * 1024 * 1024)
+                .unwrap();
+            let Some((last, _)) = page.last() else { break };
+            from = last + 1;
+            seen += page.len();
+        }
+        assert_eq!(seen, 6);
+    }
+
+    #[test]
     fn purge_dlq_topic_deletes_all_or_only_older_than_cutoff() {
         let dir = tempdir().unwrap();
         let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
@@ -2476,6 +4290,7 @@ mod tests {
         for key in ["a", "b"] {
             broker
                 .publish(PublishRequest {
+                    routing_id: None,
                     topic: topic.into(),
                     queue_id: None,
                     group_id: None,

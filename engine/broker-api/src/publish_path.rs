@@ -92,6 +92,7 @@ pub async fn publish_get(
     };
     let url = decode_destination_path(&destination)?;
     let mut req = PublishRequest {
+        routing_id: None,
         topic: broker_partition::DIRECT_TOPIC.to_string(),
         queue_id: None,
         group_id: None,

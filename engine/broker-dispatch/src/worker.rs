@@ -8,18 +8,18 @@ use crate::memory_guard::{MemoryGuard, MemoryGuardConfig};
 use crate::outbound::{apply_to_reqwest, build_outbound};
 use crate::retry_state::{RetryKey, RetryRecord, RetryState};
 use broker_partition::{dlq_topic, group_member_dlq_topic};
-use broker_partition::{Broker, PublishRequest, DIRECT_TOPIC};
+use broker_partition::{Broker, PublishRequest, PublishResponse, DIRECT_TOPIC};
 use broker_proto::RetryDefaults;
 use broker_storage::StoredMessage;
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Cap concurrent in-flight delivery tasks (HA M1). Override with BETTERMQ_DISPATCH_MAX_IN_FLIGHT.
@@ -40,6 +40,34 @@ fn dispatch_queue_cap() -> usize {
 }
 
 const WEBHOOK_RESPONSE_BODY_CAP: usize = 64 * 1024;
+
+#[derive(Default)]
+struct PressureLogs {
+    last_log_ms: AtomicU64,
+    events: [AtomicU64; 4],
+}
+
+impl PressureLogs {
+    fn record(&self, event: usize, now_ms: u64) -> Option<[u64; 4]> {
+        self.events[event].fetch_add(1, Ordering::Relaxed);
+        let last = self.last_log_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < 30_000
+            || self
+                .last_log_ms
+                .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return None;
+        }
+        Some(std::array::from_fn(|index| {
+            self.events[index].swap(0, Ordering::Relaxed)
+        }))
+    }
+}
+
+fn redacted_destination(url: &str) -> String {
+    HostBlocker::host_key(url).unwrap_or_else(|| "<invalid destination>".into())
+}
 
 #[derive(Debug, Clone)]
 pub struct DispatchConfig {
@@ -133,11 +161,51 @@ pub enum DispatchError {
     RetryExhausted(String),
     #[error("delivery retry deferred for {retry_after_ms} ms: {reason}")]
     RetryDeferred { retry_after_ms: u64, reason: String },
+    #[error("message body is stored externally and was not loaded")]
+    PayloadUnresolved,
     #[error("{0}")]
     Failed(String),
 }
 
+/// Makes a freshly appended DLQ record durable before the source message
+/// completes: local fsync on a single node, replication quorum in a cell
+/// (implemented in broker-api, which owns replication). An error leaves the
+/// DLQ transition `Prepared` and the source cursor where it was.
+pub trait DlqDurability: Send + Sync {
+    fn make_durable<'a>(
+        &'a self,
+        response: &'a mut PublishResponse,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), DispatchError>>;
+}
+
+struct LocalDlqDurability(Broker);
+
+impl DlqDurability for LocalDlqDurability {
+    fn make_durable<'a>(
+        &'a self,
+        response: &'a mut PublishResponse,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), DispatchError>> {
+        Box::pin(async move {
+            if let (Some(partition), Some(offset)) = (response.partition, response.offset) {
+                self.0
+                    .wait_committed(&response.topic, partition, offset)
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Outcome of [`DispatchEngine::fail_leased_delivery`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeasedFailure {
+    RetryScheduled { attempts: u32, delay_ms: u64 },
+    DeadLettered,
+}
+
 type ShardLeaderFn = Arc<dyn Fn(u32) -> bool + Send + Sync>;
+/// `(topic, committed watermark at takeover)` logs to verify before unfencing.
+type RecoveryTargets = Vec<(String, u64)>;
 type InFlightSet = Arc<parking_lot::Mutex<HashSet<(String, u32, u64)>>>;
 
 #[derive(Debug)]
@@ -174,6 +242,20 @@ struct LeaseDrop {
     leases: Option<crate::lease::LeaseTable>,
     lease_id: Option<Uuid>,
     holder: String,
+}
+
+pub(crate) struct DeliveryOwnership {
+    key: (String, u32, u64),
+    jobs: InFlightSet,
+    notify: Arc<Notify>,
+    lease: Option<LeaseDrop>,
+}
+
+impl Drop for DeliveryOwnership {
+    fn drop(&mut self) {
+        self.jobs.lock().remove(&self.key);
+        self.notify.notify_waiters();
+    }
 }
 
 struct ActiveHttpGuard {
@@ -223,7 +305,18 @@ pub struct DispatchEngine {
     retry_state: RetryState,
     lifecycle: LifecycleStore,
     telemetry: Arc<crate::telemetry::DispatchTelemetry>,
+    pressure_logs: Arc<PressureLogs>,
     background: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
+    scan: crate::scan::DispatchScan,
+    backfill_rotation: Arc<AtomicUsize>,
+    claim_rates: crate::lease::ClaimRates,
+    /// Striped per-lane locks around cursor advancement (see `commit_dispatch_offset`).
+    cursor_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
+    /// Partitions taken over but not yet verified: dispatch is fenced until
+    /// each `(topic, target)` log is quorum-verified up to `target` (`None`
+    /// while the local log is still being caught up).
+    recovering: Arc<parking_lot::Mutex<HashMap<u32, Option<RecoveryTargets>>>>,
+    dlq_durability: Arc<std::sync::OnceLock<Arc<dyn DlqDurability>>>,
 }
 
 impl DispatchEngine {
@@ -251,6 +344,7 @@ impl DispatchEngine {
             RetryState::open(&broker.config().data_dir).expect("open durable dispatch retry state");
         let lifecycle = LifecycleStore::open(&broker.config().data_dir)
             .expect("open durable dispatch lifecycle state");
+        let scan = crate::scan::DispatchScan::open(Some(&broker.config().data_dir));
         let engine = Self {
             broker,
             config,
@@ -258,12 +352,16 @@ impl DispatchEngine {
                 .connect_timeout(Duration::from_secs(2))
                 .timeout(Duration::from_secs(config_clone.http_timeout_secs))
                 .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(Arc::new(crate::egress::PolicyResolver))
+                .no_proxy()
                 .build()
                 .expect("reqwest short client"),
             long_client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(2))
                 .timeout(Duration::from_secs(long_secs))
                 .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(Arc::new(crate::egress::PolicyResolver))
+                .no_proxy()
                 .build()
                 .expect("reqwest long client"),
             high_tx,
@@ -286,16 +384,31 @@ impl DispatchEngine {
             retry_state,
             lifecycle,
             telemetry: Arc::new(crate::telemetry::DispatchTelemetry::new()),
+            pressure_logs: Arc::new(PressureLogs::default()),
             background: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            scan,
+            backfill_rotation: Arc::new(AtomicUsize::new(0)),
+            claim_rates: crate::lease::ClaimRates::default(),
+            cursor_locks: Arc::new(
+                (0..CURSOR_LOCK_STRIPES)
+                    .map(|_| tokio::sync::Mutex::new(()))
+                    .collect(),
+            ),
+            recovering: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            dlq_durability: Arc::new(std::sync::OnceLock::new()),
         };
         if let Some(handle) = engine.memory_guard.spawn_monitor() {
             engine.background.lock().push(handle);
         }
+        engine.finish_committed_dlq_transitions();
         if workers_enabled {
             engine.spawn_workers(high_rx);
             engine.spawn_defer_scheduler(defer_rx);
             engine.replay_lifecycle_state();
             engine.replay_retry_state();
+        } else {
+            // Fleet brokers still need a durable backlog baseline after restart.
+            engine.backfill_pending();
         }
         engine
     }
@@ -307,6 +420,10 @@ impl DispatchEngine {
 
     pub fn workers_enabled(&self) -> bool {
         self.workers_enabled
+    }
+
+    pub fn process_id(&self) -> &str {
+        &self.local_holder
     }
 
     pub fn is_draining(&self) -> bool {
@@ -361,6 +478,7 @@ impl DispatchEngine {
         for handle in handles {
             let _ = handle.await;
         }
+        self.flow.discard_pending().await;
     }
 
     fn active_http_guard(&self) -> ActiveHttpGuard {
@@ -384,6 +502,68 @@ impl DispatchEngine {
         self.memory_guard.clone()
     }
 
+    pub(crate) fn record_flow_rejected(&self) {
+        self.telemetry.record_queue_rejected();
+    }
+
+    /// WAL records that log retention must keep: pending retries, DLQ
+    /// transitions not yet finalized, and fleet leases, as
+    /// `(topic, partition, offset)`.
+    pub fn retention_pins(&self) -> Vec<(String, u32, u64)> {
+        let mut pins: Vec<_> = self
+            .retry_state
+            .pending()
+            .into_iter()
+            .map(|record| record.key)
+            .chain(
+                self.lifecycle
+                    .pending()
+                    .into_iter()
+                    .map(|transition| transition.source),
+            )
+            .map(|key| (key.topic, key.partition, key.offset))
+            .collect();
+        if let Some(leases) = &self.leases {
+            pins.extend(
+                leases
+                    .snapshot_for_status()
+                    .into_iter()
+                    .map(|job| (job.topic, job.partition, job.offset)),
+            );
+        }
+        pins
+    }
+
+    /// Drop retry and DLQ-transition records for offsets that retention has
+    /// already collected (`offset < base` in the log `in_log` selects). The
+    /// committed GC watermark proves those records were fully handled, and a
+    /// stale entry would otherwise block its lane and pin retention forever.
+    pub fn forget_collected(
+        &self,
+        in_log: impl Fn(&str, u32) -> bool,
+        base: u64,
+    ) -> Result<usize, DispatchError> {
+        let mut dropped = 0usize;
+        for record in self.retry_state.pending() {
+            if record.key.offset < base && in_log(&record.key.topic, record.key.partition) {
+                self.retry_state
+                    .clear(&record.key)
+                    .map_err(|error| DispatchError::Failed(error.to_string()))?;
+                dropped += 1;
+            }
+        }
+        for transition in self.lifecycle.pending() {
+            let source = &transition.source;
+            if source.offset < base && in_log(&source.topic, source.partition) {
+                self.lifecycle
+                    .clear(source)
+                    .map_err(|error| DispatchError::Failed(error.to_string()))?;
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
     pub fn telemetry_snapshot(&self) -> crate::telemetry::DispatchTelemetrySnapshot {
         let counters = self.telemetry.snapshot();
         let now = chrono::Utc::now().timestamp_millis();
@@ -402,10 +582,13 @@ impl DispatchEngine {
             .filter(|transition| transition.phase == DlqPhase::DlqCommitted)
             .count() as u64;
         crate::telemetry::DispatchTelemetrySnapshot {
+            delivery: counters.delivery,
             committed_ready_ranges: counters.committed_ready_ranges,
             committed_ready_records: counters.committed_ready_records,
             queue_depth: counters.queue_depth,
             queue_rejected: counters.queue_rejected,
+            deferred_jobs: counters.deferred_jobs,
+            defer_rejected: counters.defer_rejected,
             in_flight_deliveries: self.in_flight_jobs.lock().len() as u64,
             active_http_deliveries: self.active_http.load(Ordering::Acquire),
             retries_pending: retries.len() as u64,
@@ -436,10 +619,101 @@ impl DispatchEngine {
     }
 
     fn shard_leader(&self, partition: u32) -> bool {
-        self.is_shard_leader
-            .as_ref()
-            .map(|f| f(partition))
-            .unwrap_or(true)
+        !self.is_fenced(partition)
+            && self
+                .is_shard_leader
+                .as_ref()
+                .map(|f| f(partition))
+                .unwrap_or(true)
+    }
+
+    /// Stop dispatch for `partition` (this node is taking it over). It stays
+    /// fenced until [`DispatchEngine::set_recovery_targets`] names the logs
+    /// to verify and [`DispatchEngine::complete_recovery`] reconciles cursors.
+    pub fn fence_partition(&self, partition: u32) {
+        self.recovering.lock().entry(partition).or_insert(None);
+    }
+
+    /// After catch-up: dispatch stays fenced until every `(topic, target)` log
+    /// is quorum-verified up to `target` (its committed watermark now).
+    /// Identity-less completion markers above the current quorum watermark
+    /// stop counting from here on.
+    pub fn set_recovery_targets(&self, partition: u32, targets: Vec<(String, u64)>) {
+        for (topic, _) in &targets {
+            if let Err(error) = self.broker.freeze_legacy_completion_trust(topic, partition) {
+                warn!(%error, %topic, partition, "freeze legacy completion trust failed");
+            }
+        }
+        self.recovering.lock().insert(partition, Some(targets));
+    }
+
+    pub fn is_fenced(&self, partition: u32) -> bool {
+        self.recovering.lock().contains_key(&partition)
+    }
+
+    /// Fenced partitions whose catch-up finished, with their targets.
+    pub fn recovery_targets(&self) -> Vec<(u32, Vec<(String, u64)>)> {
+        let mut out: Vec<_> = self
+            .recovering
+            .lock()
+            .iter()
+            .filter_map(|(partition, targets)| {
+                targets
+                    .as_ref()
+                    .map(|targets| (*partition, targets.clone()))
+            })
+            .collect();
+        out.sort_by_key(|(partition, _)| *partition);
+        out
+    }
+
+    /// Finish a takeover once its targets are quorum-verified: clamp every
+    /// lane cursor of `partition` to the quorum watermark of its log (a cursor
+    /// above it could skip an offset that now holds a different record),
+    /// rescan, and lift the fence. Returns how many cursors were clamped.
+    pub fn complete_recovery(&self, partition: u32) -> Result<usize, DispatchError> {
+        let Some(Some(targets)) = self.recovering.lock().get(&partition).cloned() else {
+            return Ok(0);
+        };
+        for (topic, target) in &targets {
+            let quorum = self.broker.quorum_hwm(topic, partition)?;
+            if quorum < *target {
+                return Err(DispatchError::Failed(format!(
+                    "{topic}/{partition}: quorum watermark {quorum} below takeover target {target}"
+                )));
+            }
+        }
+        let mut clamped = 0;
+        for (tenant, lane, cursor) in self.broker.dispatch_offsets_for_partition(partition)? {
+            let topic = self.lane_topic(&lane);
+            let quorum = self.broker.quorum_hwm(&topic, partition)?;
+            if cursor > quorum {
+                self.broker
+                    .reset_dispatch_offset(&tenant, &lane, partition, quorum)?;
+                clamped += 1;
+            }
+        }
+        self.scan.reset_partitions(&[partition]);
+        self.recovering.lock().remove(&partition);
+        info!(
+            partition,
+            clamped, "dispatch recovery complete; partition unfenced"
+        );
+        Ok(clamped)
+    }
+
+    /// Topic whose log a lane cursor counts offsets in.
+    fn lane_topic(&self, lane: &str) -> String {
+        let Ok(id) = Uuid::parse_str(lane) else {
+            return DIRECT_TOPIC.to_string();
+        };
+        if let Ok(Some(queue)) = self.broker.get_queue_by_id(id) {
+            return queue.topic;
+        }
+        if let Ok(Some(member)) = self.broker.get_group_member(id) {
+            return broker_partition::group_topic(member.group_id);
+        }
+        DIRECT_TOPIC.to_string()
     }
 
     pub fn enqueue(&self, job: DeliveryJob) {
@@ -466,7 +740,7 @@ impl DispatchEngine {
                 self.in_flight_jobs
                     .lock()
                     .remove(&(job.topic, job.partition, job.offset));
-                warn!("dispatch queue full; message will be retried on backfill");
+                self.record_pressure(0);
             }
             Err(mpsc::error::TrySendError::Closed(job)) => {
                 self.telemetry.record_queue_rejected();
@@ -492,6 +766,9 @@ impl DispatchEngine {
         self.telemetry
             .record_committed_range(to_offset.saturating_sub(from_offset));
         for offset in from_offset..to_offset {
+            if let Ok(msg) = self.broker.read_message(topic, partition, offset) {
+                self.observe_pending(&msg, to_offset);
+            }
             self.enqueue(DeliveryJob::live(
                 topic.to_string(),
                 partition,
@@ -501,17 +778,16 @@ impl DispatchEngine {
         }
     }
 
-    /// Re-enqueue undelivered messages after restart (CP2.5 / CP7a).
-    /// Pages per partition from cursor → high-water mark (no global 50k cliff).
-    pub fn backfill_pending(&self) {
-        if !self.workers_enabled {
-            return;
-        }
-        if self.memory_guard.is_critical() {
-            info!("dispatch backfill skipped: memory critical");
-            return;
-        }
-        let tenant_id = self.broker.config().tenant_id.clone();
+    pub(crate) fn broker(&self) -> &Broker {
+        &self.broker
+    }
+
+    pub(crate) fn scan(&self) -> &crate::scan::DispatchScan {
+        &self.scan
+    }
+
+    /// Topics that carry push deliveries (direct publishes and queues), sorted.
+    pub(crate) fn dispatch_topics(&self) -> Vec<String> {
         let mut topics: HashSet<String> = HashSet::new();
         topics.insert(DIRECT_TOPIC.to_string());
         if let Ok(queues) = self.broker.list_endpoints() {
@@ -519,88 +795,177 @@ impl DispatchEngine {
                 topics.insert(q.topic);
             }
         }
+        let mut topics: Vec<String> = topics
+            .into_iter()
+            .filter(|topic| !broker_partition::is_dlq_topic(topic))
+            .collect();
+        topics.sort();
+        topics
+    }
 
+    /// Forget scan progress for `partitions`, e.g. after this node gained their
+    /// leadership and caught its log up from peers. The next pass rescans them.
+    pub fn reset_dispatch_scan(&self, partitions: &[u32]) {
+        self.scan.reset_partitions(partitions);
+    }
+
+    /// Re-enqueue undelivered messages (restart, dropped live work, leadership gain).
+    ///
+    /// Each pass reads only records added since the previous pass (see
+    /// [`crate::scan`]) and stops after a time budget, rotating where the next
+    /// pass starts. Returns true when work remains, so the caller should run
+    /// the next pass soon instead of waiting for the regular interval. This is
+    /// blocking storage work: call it from a blocking thread.
+    pub fn backfill_pending(&self) -> bool {
+        if self.memory_guard.is_critical() {
+            info!("dispatch backfill skipped: memory critical");
+            return false;
+        }
+        let Ok(partition_count) = self.broker.partition_count(DIRECT_TOPIC) else {
+            return false;
+        };
+        let targets: Vec<(String, u32)> = self
+            .dispatch_topics()
+            .into_iter()
+            .flat_map(|topic| (0..partition_count).map(move |p| (topic.clone(), p)))
+            .filter(|(_, partition)| self.shard_leader(*partition))
+            .collect();
+        if targets.is_empty() {
+            return false;
+        }
+        let deadline = Instant::now() + BACKFILL_PASS_BUDGET;
+        let start = self.backfill_rotation.load(Ordering::Relaxed) % targets.len();
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let mut enqueued = 0u64;
-        const PAGE: usize = 500;
-        for topic in topics {
-            if broker_partition::is_dlq_topic(&topic) {
-                continue;
+        let mut more = false;
+        'targets: for step in 0..targets.len() {
+            let index = (start + step) % targets.len();
+            if Instant::now() >= deadline {
+                self.backfill_rotation.store(index, Ordering::Relaxed);
+                more = true;
+                break;
             }
-            let Ok(partition_count) = self.broker.partition_count(&topic) else {
-                continue;
-            };
-            for partition in 0..partition_count {
-                if !self.shard_leader(partition) {
+            let (topic, partition) = &targets[index];
+            let view =
+                match self
+                    .scan
+                    .refresh(&self.broker, topic, *partition, BACKFILL_RECORD_BUDGET)
+                {
+                    Ok(view) => view,
+                    Err(error) => {
+                        warn!(%error, %topic, partition, "dispatch backfill scan failed");
+                        continue;
+                    }
+                };
+            more |= !view.caught_up;
+            let hwm = self.broker.committed_hwm(topic, *partition).unwrap_or(0);
+            for entry in view.entries {
+                // Backlog telemetry also on broker-only (fleet) brokers, which
+                // deliver nothing themselves and so never enqueue.
+                self.observe_pending_entry(&entry, hwm);
+                if !self.workers_enabled {
                     continue;
                 }
-                // Walk messages in pages; broker list API may still cap — use offset cursor.
-                let mut from_offset = 0u64;
-                while let Ok(messages) =
-                    self.broker
-                        .list_topic_messages_from(&topic, partition, from_offset, PAGE)
+                // A due-later retry is owned by the defer scheduler; re-enqueueing
+                // it (or offsets fenced behind it) would only churn the queue.
+                if self
+                    .blocking_entry_retry(&entry)
+                    .is_some_and(|record| record.due_at_ms > now_ms)
                 {
-                    if messages.is_empty() {
-                        break;
-                    }
-                    let mut advanced = false;
-                    for msg in &messages {
-                        from_offset = from_offset.max(msg.offset.saturating_add(1));
-                        advanced = true;
-                        if msg
-                            .destination_url
-                            .as_ref()
-                            .map(|u| u.is_empty())
-                            .unwrap_or(true)
-                        {
-                            continue;
-                        }
-                        let lane_owner = broker_partition::flow_lane_owner(msg);
-                        let cursor = self
-                            .broker
-                            .dispatch_offset(&tenant_id, &lane_owner.to_string(), msg.partition)
-                            .unwrap_or(0);
-                        if msg.offset < cursor {
-                            continue;
-                        }
-                        if self
-                            .broker
-                            .is_dispatch_complete(
-                                &tenant_id,
-                                &lane_owner.to_string(),
-                                msg.partition,
-                                msg.offset,
-                            )
-                            .unwrap_or(false)
-                        {
-                            continue;
-                        }
-                        let hwm = self.broker.committed_hwm(&topic, partition).unwrap_or(0);
-                        if msg.offset >= hwm {
-                            continue;
-                        }
-                        self.enqueue(DeliveryJob::live(
-                            msg.topic.clone(),
-                            msg.partition,
-                            msg.offset,
-                            msg.id,
-                        ));
-                        enqueued += 1;
-                    }
-                    if !advanced || messages.len() < PAGE {
-                        break;
-                    }
+                    continue;
                 }
+                if self.high_tx.capacity() == 0 {
+                    self.backfill_rotation.store(index, Ordering::Relaxed);
+                    more = true;
+                    break 'targets;
+                }
+                self.enqueue(DeliveryJob::live(
+                    entry.topic,
+                    entry.partition,
+                    entry.offset,
+                    entry.message_id,
+                ));
+                enqueued += 1;
             }
         }
         if enqueued > 0 {
-            info!(enqueued, "dispatch backfill enqueued pending messages");
+            info!(
+                enqueued,
+                more, "dispatch backfill enqueued pending messages"
+            );
+        }
+        more
+    }
+
+    fn observe_pending_entry(&self, entry: &crate::scan::PendingEntry, hwm: u64) {
+        let cursor = self
+            .broker
+            .dispatch_offset(&entry.tenant_id, &entry.cursor_key, entry.partition)
+            .unwrap_or(0);
+        self.telemetry
+            .record_pending(entry.partition, &entry.cursor_key, cursor, hwm);
+        self.telemetry.record_pending_age(
+            entry.partition,
+            &entry.cursor_key,
+            entry.offset,
+            entry.published_at_ms,
+        );
+    }
+
+    fn observe_pending(&self, msg: &StoredMessage, hwm: u64) {
+        if msg
+            .destination_url
+            .as_ref()
+            .is_none_or(|url| url.is_empty())
+        {
+            return;
+        }
+        let lane = broker_partition::flow_lane_owner(msg).to_string();
+        let tenant = if msg.tenant_id.is_empty() {
+            self.broker.tenant()
+        } else {
+            msg.tenant_id.clone()
+        };
+        let cursor = self
+            .broker
+            .dispatch_offset(&tenant, &lane, msg.partition)
+            .unwrap_or(0);
+        self.telemetry
+            .record_pending(msg.partition, &lane, cursor, hwm);
+        self.telemetry
+            .record_pending_age(msg.partition, &lane, msg.offset, msg.published_at_ms);
+    }
+
+    fn record_pressure(&self, event: usize) {
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        if let Some([queue_rejected, deferred, defer_rejected, delivery_failures]) =
+            self.pressure_logs.record(event, now)
+        {
+            warn!(
+                queue_rejected,
+                deferred,
+                defer_rejected,
+                delivery_failures,
+                "dispatch pressure summary (at most once per 30 seconds; totals are in metrics)"
+            );
         }
     }
 }
 
+/// Lock stripes for per-lane cursor advancement.
+const CURSOR_LOCK_STRIPES: usize = 256;
+
+/// Wall-clock budget of one backfill pass.
+const BACKFILL_PASS_BUDGET: Duration = Duration::from_secs(2);
+/// New log records one backfill pass reads per `(topic, partition)`.
+const BACKFILL_RECORD_BUDGET: usize = 16_384;
+
 impl DispatchEngine {
     fn spawn_workers(&self, mut high_rx: mpsc::Receiver<DeliveryJob>) {
         let this = self.clone();
+        // Bound hydration/admission separately from outbound HTTP. Flow handoff
+        // releases this permit, but not the HTTP permit taken by delivery itself.
+        let admission = Arc::new(Semaphore::new(dispatch_max_in_flight()));
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -612,7 +977,7 @@ impl DispatchEngine {
                             break;
                         }
                         let engine = this.clone();
-                        let permit = match engine.in_flight.clone().acquire_owned().await {
+                        let permit = match admission.clone().acquire_owned().await {
                             Ok(p) => p,
                             Err(_) => {
                                 warn!("dispatch semaphore closed");
@@ -622,11 +987,12 @@ impl DispatchEngine {
                         tokio::spawn(async move {
                             let _permit = permit;
                             let key = (job.topic.clone(), job.partition, job.offset);
-                            let result = engine.deliver_job(job).await;
-                            engine.in_flight_jobs.lock().remove(&key);
-                            engine.drain_notify.notify_waiters();
+                            let ownership = DeliveryOwnership { key,
+                                jobs: engine.in_flight_jobs.clone(), notify: engine.drain_notify.clone(), lease: None };
+                            let result = engine.deliver_job(job, ownership).await;
                             if let Err(e) = result {
-                                warn!(error = %e, "delivery job failed");
+                                engine.record_pressure(3);
+                                debug!(error = %e, "delivery job failed");
                             }
                         });
                     }
@@ -678,7 +1044,22 @@ impl DispatchEngine {
 
     fn replay_retry_state(&self) {
         let now_ms = chrono::Utc::now().timestamp_millis();
-        for record in self.retry_state.pending() {
+        for mut record in self.retry_state.pending() {
+            // Upgrade legacy retry records using the immutable delivery metadata.
+            if record.fifo_key.is_none() {
+                if let Ok(msg) = self.broker.read_message(
+                    &record.key.topic,
+                    record.key.partition,
+                    record.key.offset,
+                ) {
+                    record.fifo_key = Self::fifo_retry_key(&msg);
+                    if record.fifo_key.is_some() {
+                        if let Err(error) = self.retry_state.schedule(record.clone()) {
+                            warn!(%error, "could not upgrade FIFO retry index");
+                        }
+                    }
+                }
+            }
             let delay_ms = record.due_at_ms.saturating_sub(now_ms).max(0) as u64;
             self.defer_job(
                 DeliveryJob::live(
@@ -691,6 +1072,50 @@ impl DispatchEngine {
                 "durable_retry_replay",
             );
         }
+    }
+
+    /// Finish DLQ moves that crashed after the DLQ record became durable:
+    /// drop the retry record (it would pin the lane behind a retry fence) and
+    /// complete the source. Runs at startup in every mode, before replay and
+    /// backfill, so a dead-lettered message is not delivered again.
+    fn finish_committed_dlq_transitions(&self) {
+        for transition in self.lifecycle.pending() {
+            if transition.phase != DlqPhase::DlqCommitted {
+                continue;
+            }
+            let source = &transition.source;
+            let finished = (|| -> Result<(), DispatchError> {
+                self.clear_retry_key(source)?;
+                if let Ok(msg) =
+                    self.broker
+                        .read_message(&source.topic, source.partition, source.offset)
+                {
+                    if msg.id == source.message_id {
+                        let tenant = crate::scan::dispatch_tenant(&self.broker, &msg);
+                        self.advance_cursor_locked(
+                            &tenant,
+                            &source.topic,
+                            &transition.cursor_key,
+                            source.partition,
+                            source.offset,
+                            source.message_id,
+                        )?;
+                    }
+                }
+                self.lifecycle
+                    .clear(source)
+                    .map_err(|error| DispatchError::Failed(error.to_string()))
+            })();
+            if let Err(error) = finished {
+                warn!(%error, offset = source.offset, "finishing committed DLQ move failed");
+            }
+        }
+    }
+
+    fn clear_retry_key(&self, key: &RetryKey) -> Result<(), DispatchError> {
+        self.retry_state
+            .clear(key)
+            .map_err(|error| DispatchError::Failed(error.to_string()))
     }
 
     fn replay_lifecycle_state(&self) {
@@ -720,6 +1145,53 @@ impl DispatchEngine {
             offset: msg.offset,
             message_id: msg.id,
         }
+    }
+
+    pub(crate) fn fifo_retry_key(msg: &StoredMessage) -> Option<String> {
+        if !broker_partition::delivery_uses_flow_control(msg) {
+            return None;
+        }
+        let flow = broker_partition::ResolvedFlow::for_delivery(&msg.routing_key, msg);
+        (flow.parallelism == 1).then_some(flow.key)
+    }
+
+    fn blocking_delivery_retry(&self, msg: &StoredMessage) -> Option<RetryRecord> {
+        Self::fifo_retry_key(msg)
+            .and_then(|flow| {
+                self.retry_state.blocking_retry(
+                    &broker_partition::flow_lane_owner(msg).to_string(),
+                    &flow,
+                    msg.partition,
+                    msg.offset,
+                )
+            })
+            .or_else(|| self.retry_state.get(&Self::retry_key(msg)))
+    }
+
+    /// [`Self::blocking_delivery_retry`] for a scanned entry.
+    pub(crate) fn blocking_entry_retry(
+        &self,
+        entry: &crate::scan::PendingEntry,
+    ) -> Option<RetryRecord> {
+        entry
+            .fifo_key
+            .as_deref()
+            .and_then(|flow| {
+                self.retry_state.blocking_retry(
+                    &entry.cursor_key,
+                    flow,
+                    entry.partition,
+                    entry.offset,
+                )
+            })
+            .or_else(|| {
+                self.retry_state.get(&RetryKey {
+                    topic: entry.topic.clone(),
+                    partition: entry.partition,
+                    offset: entry.offset,
+                    message_id: entry.message_id,
+                })
+            })
     }
 
     fn clear_retry(&self, msg: &StoredMessage) -> Result<(), DispatchError> {
@@ -761,6 +1233,7 @@ impl DispatchEngine {
             .schedule(RetryRecord {
                 key: Self::retry_key(msg),
                 cursor_key: broker_partition::flow_lane_owner(msg).to_string(),
+                fifo_key: Self::fifo_retry_key(msg),
                 attempts,
                 due_at_ms,
                 last_error: reason,
@@ -771,7 +1244,9 @@ impl DispatchEngine {
 
     /// Re-enqueue after a delay without advancing the dispatch cursor (pause / host block).
     fn defer_job(&self, job: DeliveryJob, delay: Duration, reason: &'static str) {
-        info!(
+        self.telemetry.record_deferred();
+        self.record_pressure(1);
+        debug!(
             topic = %job.topic,
             partition = job.partition,
             offset = job.offset,
@@ -787,7 +1262,9 @@ impl DispatchEngine {
         match self.defer_tx.try_send(deferred) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(job)) => {
-                warn!(
+                self.telemetry.record_defer_rejected();
+                self.record_pressure(2);
+                debug!(
                     topic = %job.job.topic,
                     offset = job.job.offset,
                     reason,
@@ -798,7 +1275,11 @@ impl DispatchEngine {
         }
     }
 
-    async fn deliver_job(&self, job: DeliveryJob) -> Result<(), DispatchError> {
+    async fn deliver_job(
+        &self,
+        job: DeliveryJob,
+        mut ownership: DeliveryOwnership,
+    ) -> Result<(), DispatchError> {
         if !self.shard_leader(job.partition) {
             return Ok(());
         }
@@ -825,16 +1306,15 @@ impl DispatchEngine {
                 return Ok(());
             }
         };
-        let committed_hwm = self.broker.committed_hwm(&job.topic, job.partition)?;
+        // Quorum-gated in a cell: never deliver a record before it is known
+        // to survive failover.
+        let committed_hwm = self.broker.dispatch_hwm(&job.topic, job.partition)?;
         if job.offset >= committed_hwm {
             self.defer_job(job, Duration::from_millis(250), "awaiting_commit");
             return Ok(());
         }
         let lane_key = broker_partition::flow_lane_owner(&msg).to_string();
-        if let Some(blocking) =
-            self.retry_state
-                .blocking_retry(&lane_key, msg.partition, msg.offset)
-        {
+        if let Some(blocking) = self.blocking_delivery_retry(&msg) {
             let is_retry = blocking.key == Self::retry_key(&msg);
             let wait_ms = blocking
                 .due_at_ms
@@ -860,22 +1340,23 @@ impl DispatchEngine {
                 message_id: job.message_id,
                 expires_at_ms: chrono::Utc::now().timestamp_millis() + 60_000,
                 generation: 0,
+                attempts: 0,
                 committed_hwm,
                 cursor_key: lane_key,
                 message: None,
             };
-            if !leases.try_insert(self.local_holder.clone(), claimed) {
+            if !leases.try_insert_held(self.local_holder.clone(), claimed) {
                 return Ok(());
             }
             Some(id)
         } else {
             None
         };
-        let _lease_guard = LeaseDrop {
+        ownership.lease = Some(LeaseDrop {
             leases: self.leases.clone(),
             lease_id,
             holder: self.local_holder.clone(),
-        };
+        });
 
         if msg
             .destination_url
@@ -912,18 +1393,26 @@ impl DispatchEngine {
         let limits = broker_partition::ResolvedFlow::for_delivery(&msg.routing_key, &msg);
         let lane_owner = broker_partition::flow_lane_owner(&msg);
         self.flow
-            .submit(self.clone(), lane_owner, msg.clone(), limits, false)
+            .submit_owned(
+                self.clone(),
+                lane_owner,
+                msg.clone(),
+                limits,
+                Some(ownership),
+            )
             .await;
         Ok(())
     }
 
     pub(crate) async fn deliver_message(&self, msg: &StoredMessage) -> Result<(), DispatchError> {
+        let _permit = self
+            .in_flight
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| DispatchError::Failed("dispatch semaphore closed".into()))?;
         let _active_http = self.active_http_guard();
-        let lane_key = broker_partition::flow_lane_owner(msg).to_string();
-        if let Some(blocking) =
-            self.retry_state
-                .blocking_retry(&lane_key, msg.partition, msg.offset)
-        {
+        if let Some(blocking) = self.blocking_delivery_retry(msg) {
             let is_retry = blocking.key == Self::retry_key(msg);
             let wait_ms = blocking
                 .due_at_ms
@@ -939,7 +1428,7 @@ impl DispatchEngine {
             }
         }
         self.memory_guard.wait_below_limit().await;
-        let committed_hwm = self.broker.committed_hwm(&msg.topic, msg.partition)?;
+        let committed_hwm = self.broker.dispatch_hwm(&msg.topic, msg.partition)?;
         if msg.offset >= committed_hwm {
             return Err(DispatchError::Uncommitted);
         }
@@ -950,7 +1439,7 @@ impl DispatchEngine {
             .filter(|u| !u.is_empty())
             .ok_or(DispatchError::NoDestination)?;
 
-        if self.host_blocker.is_blocked(url) {
+        if self.host_blocker.is_blocked_async(url).await {
             let job = DeliveryJob::live(msg.topic.clone(), msg.partition, msg.offset, msg.id);
             self.defer_job(job, Duration::from_secs(30), "host_blocked");
             return Ok(());
@@ -976,11 +1465,13 @@ impl DispatchEngine {
         }
         if self
             .broker
-            .is_dispatch_complete(
+            .is_delivery_complete(
+                &msg.topic,
                 &tenant_id,
                 &lane_owner.to_string(),
                 msg.partition,
                 msg.offset,
+                msg.id,
             )
             .unwrap_or(false)
         {
@@ -990,19 +1481,18 @@ impl DispatchEngine {
                 &lane_owner.to_string(),
                 msg.partition,
                 msg.offset,
+                msg.id,
             )
             .await?;
             self.lifecycle
                 .clear(&Self::retry_key(msg))
                 .map_err(|error| DispatchError::Failed(error.to_string()))?;
-            let _ = self
-                .broker
-                .try_purge_message(&msg.topic, msg.partition, msg.offset);
             return Ok(());
         }
         let mut delivery_msg = msg.clone();
         if let Err(e) = self.broker.hydrate_message_payload(&mut delivery_msg) {
-            warn!(
+            self.record_pressure(3);
+            debug!(
                 error = %e,
                 message_id = %msg.id,
                 "delivery deferred: could not load payload blob"
@@ -1028,44 +1518,27 @@ impl DispatchEngine {
 
         {
             let long = delivery_msg.payload.len() >= self.config.long_payload_threshold_bytes;
-            let timeout = Duration::from_secs(if long {
-                self.config.long_http_timeout_secs
-            } else {
-                self.config.http_timeout_secs
-            });
-            let pin = match crate::egress::pin_destination_addr(url).await {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(destination = %url, error = %e, "delivery blocked by egress pin — moving to DLQ");
-                    self.finalize_dead_letter(
-                        msg,
-                        format!("destination blocked by egress policy: {e}"),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
-            let pinned_client;
-            let http = if let Some((host, addr)) = pin {
-                pinned_client = reqwest::Client::builder()
-                    .connect_timeout(Duration::from_secs(2))
-                    .timeout(timeout)
-                    .redirect(reqwest::redirect::Policy::none())
-                    .resolve(&host, addr)
-                    .build()
-                    .map_err(|e| DispatchError::Failed(e.to_string()))?;
-                &pinned_client
-            } else if long {
+            if let Err(error) = crate::egress::validate_destination_url(url) {
+                self.telemetry.record_http_outcome(5, Duration::ZERO);
+                self.finalize_dead_letter(
+                    msg,
+                    format!("destination blocked by egress policy: {error}"),
+                )
+                .await?;
+                return Ok(());
+            }
+            let http = if long {
                 &self.long_client
             } else {
                 &self.client
             };
             let response = apply_to_reqwest(http, url, outbound.clone()).send().await;
+            self.record_http_result(&response, started.elapsed());
             let mut requested_retry_after_ms = None;
 
             match response {
                 Ok(resp) if resp.status().is_success() => {
-                    self.host_blocker.record_success(url);
+                    self.host_blocker.record_success_async(url).await;
                     discard_body_capped(resp).await;
                     self.clear_retry(msg)?;
                     self.commit_dispatch_offset(
@@ -1074,15 +1547,13 @@ impl DispatchEngine {
                         &lane_owner.to_string(),
                         msg.partition,
                         msg.offset,
+                        msg.id,
                     )
                     .await?;
-                    let _ = self
-                        .broker
-                        .try_purge_message(&msg.topic, msg.partition, msg.offset);
                     info!(
                         lane_owner = %lane_owner,
                         queue = %msg.topic,
-                        destination = %url,
+                        destination = %redacted_destination(url),
                         partition = msg.partition,
                         offset = msg.offset,
                         routing_key = %msg.routing_key,
@@ -1096,10 +1567,11 @@ impl DispatchEngine {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     last_failure = format!("HTTP {status} from destination");
-                    warn!(
+                    self.record_pressure(3);
+                    debug!(
                         status = %resp.status(),
                         lane_owner = %lane_owner,
-                        destination = %url,
+                        destination = %redacted_destination(url),
                         attempt,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "webhook non-success"
@@ -1126,13 +1598,20 @@ impl DispatchEngine {
                     }
                     requested_retry_after_ms = retry_after_ms;
                 }
+                Err(e) if crate::egress::is_policy_failure(&e) => {
+                    self.finalize_dead_letter(msg, "destination blocked by egress policy")
+                        .await?;
+                    return Ok(());
+                }
                 Err(e) => {
-                    self.host_blocker.record_transport_failure(url);
+                    let e = e.without_url();
+                    self.host_blocker.record_transport_failure_async(url).await;
                     last_failure = format!("transport error: {e}");
-                    warn!(
+                    self.record_pressure(3);
+                    debug!(
                         error = %e,
                         lane_owner = %lane_owner,
-                        destination = %url,
+                        destination = %redacted_destination(url),
                         attempt,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "webhook request failed"
@@ -1140,35 +1619,47 @@ impl DispatchEngine {
                 }
             }
 
-            let attempt = attempt.saturating_add(1);
-            let max_retries = msg.max_retries;
-            if attempt > max_retries {
-                self.telemetry.record_retry_exhausted();
-                let attempts = max_retries.saturating_add(1);
-                let detail = last_failure.as_str();
-                self.finalize_dead_letter(
+            self.retry_local_failure(msg, attempt, requested_retry_after_ms, last_failure)
+                .await
+        }
+    }
+
+    async fn retry_local_failure(
+        &self,
+        msg: &StoredMessage,
+        attempt: u32,
+        requested_retry_after_ms: Option<u64>,
+        last_failure: String,
+    ) -> Result<(), DispatchError> {
+        let attempt = attempt.saturating_add(1);
+        let max_retries = msg.max_retries;
+        if attempt > max_retries {
+            self.telemetry.record_retry_exhausted();
+            let attempts = max_retries.saturating_add(1);
+            let detail = last_failure.as_str();
+            self.finalize_dead_letter(
                     msg,
                     format!(
                         "{detail} — exhausted {attempts} delivery attempt(s) (max_retries={max_retries})"
                     ),
                 )
                 .await?;
-                return Ok(());
-            }
-
-            let backoff_cfg = msg
-                .retry_backoff
-                .as_ref()
-                .unwrap_or(&self.config.retry_defaults.backoff);
-            let backoff = backoff_cfg.delay_ms(attempt);
-            let delay_ms = requested_retry_after_ms
-                .unwrap_or(backoff)
-                .min(backoff_cfg.max_ms);
-            self.schedule_retry(msg, attempt, delay_ms, last_failure)?;
-            Ok(())
+            return Ok(());
         }
+
+        let backoff_cfg = msg
+            .retry_backoff
+            .as_ref()
+            .unwrap_or(&self.config.retry_defaults.backoff);
+        let backoff = backoff_cfg.delay_ms(attempt);
+        let delay_ms = requested_retry_after_ms
+            .unwrap_or(backoff)
+            .min(backoff_cfg.max_ms);
+        self.schedule_retry(msg, attempt, delay_ms, last_failure)?;
+        Ok(())
     }
 
+    /// Complete the delivery of `message_id` at `offset` and advance the lane cursor.
     pub async fn commit_cursor(
         &self,
         tenant_id: &str,
@@ -1176,9 +1667,26 @@ impl DispatchEngine {
         cursor_key: &str,
         partition: u32,
         offset: u64,
+        message_id: Uuid,
     ) -> Result<(), DispatchError> {
-        self.commit_dispatch_offset(tenant_id, topic, cursor_key, partition, offset)
-            .await
+        self.commit_dispatch_offset(tenant_id, topic, cursor_key, partition, offset, message_id)
+            .await?;
+        self.retry_state
+            .clear_offset(topic, partition, offset)
+            .map_err(|error| DispatchError::Failed(error.to_string()))
+    }
+
+    async fn cursor_lock(
+        &self,
+        tenant_id: &str,
+        cursor_key: &str,
+        partition: u32,
+    ) -> tokio::sync::MutexGuard<'_, ()> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (tenant_id, cursor_key, partition).hash(&mut hasher);
+        let stripe = (hasher.finish() as usize) % self.cursor_locks.len();
+        self.cursor_locks[stripe].lock().await
     }
 
     async fn commit_dispatch_offset(
@@ -1188,21 +1696,43 @@ impl DispatchEngine {
         cursor_key: &str,
         partition: u32,
         offset: u64,
+        message_id: Uuid,
+    ) -> Result<(), DispatchError> {
+        // Completions of one lane run concurrently; serialise the
+        // read-compute-write so a slower task cannot write a cursor computed
+        // from an older read over a newer one.
+        let _lane = self.cursor_lock(tenant_id, cursor_key, partition).await;
+        self.advance_cursor_locked(tenant_id, topic, cursor_key, partition, offset, message_id)
+    }
+
+    /// Body of [`Self::commit_dispatch_offset`]; the caller holds the lane lock
+    /// (or, at startup, nothing else can touch the lane yet).
+    fn advance_cursor_locked(
+        &self,
+        tenant_id: &str,
+        topic: &str,
+        cursor_key: &str,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
     ) -> Result<(), DispatchError> {
         let cursor = self
             .broker
             .dispatch_offset(tenant_id, cursor_key, partition)?;
         if offset < cursor {
+            self.scan.mark_done(topic, partition, offset);
             return Ok(());
         }
         let newly_completed = !self
             .broker
-            .is_dispatch_complete(tenant_id, cursor_key, partition, offset)?;
-        // Persist completion first. Reconstruct the contiguous cursor entirely
-        // from durable completion keys so restart does not lose gap state.
+            .is_delivery_complete(topic, tenant_id, cursor_key, partition, offset, message_id)?;
+        // Persist completion first, with the message identity, so a marker can
+        // never be mistaken for a different record reusing this offset.
         self.broker
-            .mark_dispatch_complete(tenant_id, cursor_key, partition, offset)?;
-        let hwm = self.broker.committed_hwm(topic, partition)?;
+            .mark_dispatch_complete_for(tenant_id, cursor_key, partition, offset, message_id)?;
+        // The cursor never passes the quorum watermark: its prefix has a
+        // stable identity, so a cursor skip is always safe.
+        let hwm = self.broker.dispatch_hwm(topic, partition)?;
         let mut next = cursor;
         const PAGE: usize = 256;
         'scan: while next < hwm {
@@ -1215,14 +1745,17 @@ impl DispatchEngine {
             }
             let count = messages.len();
             for msg in messages {
+                if msg.offset >= hwm {
+                    next = hwm;
+                    break 'scan;
+                }
                 next = msg.offset.saturating_add(1);
                 if broker_partition::flow_lane_owner(&msg).to_string() != cursor_key {
                     continue;
                 }
-                if !self
-                    .broker
-                    .is_dispatch_complete(tenant_id, cursor_key, partition, msg.offset)?
-                {
+                if !self.broker.is_delivery_complete(
+                    topic, tenant_id, cursor_key, partition, msg.offset, msg.id,
+                )? {
                     next = msg.offset;
                     break 'scan;
                 }
@@ -1232,12 +1765,23 @@ impl DispatchEngine {
                 break;
             }
         }
-        if next != cursor {
+        if next > cursor {
             self.broker
                 .set_dispatch_offset(tenant_id, cursor_key, partition, next)?;
         }
+        self.scan.mark_done(topic, partition, offset);
         self.telemetry
             .record_completion(partition, cursor_key, cursor, next, hwm, newly_completed);
+        let next_head = if next < hwm {
+            self.broker
+                .read_message(topic, partition, next)
+                .ok()
+                .map(|msg| (msg.offset, msg.published_at_ms))
+        } else {
+            None
+        };
+        self.telemetry
+            .advance_pending_head(partition, cursor_key, next, next_head);
         Ok(())
     }
 
@@ -1273,15 +1817,21 @@ impl DispatchEngine {
         } else {
             msg.tenant_id.clone()
         };
-        self.commit_dispatch_offset(&tenant, &msg.topic, &cursor_key, msg.partition, msg.offset)
-            .await?;
+        // DLQ record durable → clear the retry → advance the cursor. A crash
+        // in between is finished at startup from the committed transition.
         self.clear_retry(msg)?;
+        self.commit_dispatch_offset(
+            &tenant,
+            &msg.topic,
+            &cursor_key,
+            msg.partition,
+            msg.offset,
+            msg.id,
+        )
+        .await?;
         self.lifecycle
             .clear(&source)
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
-        let _ = self
-            .broker
-            .try_purge_message(&msg.topic, msg.partition, msg.offset);
         Ok(())
     }
 
@@ -1299,23 +1849,21 @@ impl DispatchEngine {
             _ => dlq_topic(&msg.topic),
         };
         let reason = reason.into();
-        let payload = serde_json::json!({
-            "source_queue": msg.topic,
-            "message_id": msg.id,
-            "destination_url": msg.destination_url,
-            "method": msg.http_method,
-            "reason": reason,
-            "body": String::from_utf8_lossy(&msg.payload),
-        });
-        let dlq_response = self.broker.publish_immediate(PublishRequest {
+        let record = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(dlq_record(&msg, &reason))
+        };
+        let key = format!(
+            "dlq:{}:{}:{}:{}",
+            msg.topic, msg.partition, msg.offset, msg.id
+        );
+        let request = PublishRequest {
+            routing_id: None,
             topic: dlq,
             routing_key: msg.id.to_string(),
-            payload: payload.to_string(),
-            payload_encoding: None,
-            idempotency_key: Some(format!(
-                "dlq:{}:{}:{}:{}",
-                msg.topic, msg.partition, msg.offset, msg.id
-            )),
+            payload: record,
+            payload_encoding: Some("base64".into()),
+            idempotency_key: Some(key.clone()),
             delay_ms: None,
             priority: None,
             parallelism: None,
@@ -1333,13 +1881,30 @@ impl DispatchEngine {
             headers: None,
             sign: None,
             request: None,
-        })?;
-        if let (Some(partition), Some(offset)) = (dlq_response.partition, dlq_response.offset) {
-            self.broker
-                .wait_committed(&dlq_response.topic, partition, offset)
-                .await?;
+        };
+        // Pinned to the source shard, which this node leads while it
+        // dead-letters, so the move depends only on that shard's quorum.
+        let (mut response, mut pending) = self
+            .broker
+            .publish_to_shard(request.clone(), msg.partition)?;
+        if response.duplicate {
+            if self.dlq_record_durable(&response)? {
+                warn!(queue = %msg.topic, message_id = %msg.id, "message already in DLQ");
+                return Ok(());
+            }
+            // Dedup hits are verified below the quorum watermark, so this is a
+            // safety net: append again without the key (a duplicate DLQ record
+            // beats a lost one); the key keeps pointing at the old record.
+            let mut again = request;
+            again.idempotency_key = None;
+            (response, pending) = self.broker.publish_to_shard(again, msg.partition)?;
         }
-        warn!(
+        let durability = self.dlq_durability();
+        durability.make_durable(&mut response).await?;
+        // Record the key only once the DLQ record is quorum-durable; dropping
+        // `pending` on an error above releases it unrecorded.
+        self.broker.commit_publish_dedup(pending)?;
+        debug!(
             queue = %msg.topic,
             message_id = %msg.id,
             "message moved to DLQ"
@@ -1347,119 +1912,108 @@ impl DispatchEngine {
         Ok(())
     }
 
-    /// Fleet push: HTTP only (no local cursor). Caller completes/fails the lease on the broker.
-    pub async fn push_http_only(
+    fn record_http_result(
         &self,
-        msg: &StoredMessage,
-        committed_hwm: u64,
-    ) -> Result<(), DispatchError> {
-        let _active_http = self.active_http_guard();
-        self.memory_guard.wait_below_limit().await;
-        if msg.offset >= committed_hwm {
-            return Err(DispatchError::Uncommitted);
-        }
-        let url = msg
-            .destination_url
-            .as_deref()
-            .filter(|u| !u.is_empty())
-            .ok_or(DispatchError::NoDestination)?;
-        if self.host_blocker.is_blocked(url) {
-            return Err(DispatchError::HostBlocked);
-        }
-        let outbound = build_outbound(msg);
-        let long = msg.payload.len() >= self.config.long_payload_threshold_bytes;
-        let timeout = Duration::from_secs(if long {
-            self.config.long_http_timeout_secs
-        } else {
-            self.config.http_timeout_secs
-        });
-        let retry_key = Self::retry_key(msg);
-        let prior = self.retry_state.get(&retry_key);
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        if let Some(record) = &prior {
-            if record.due_at_ms > now_ms {
-                return Err(DispatchError::RetryDeferred {
-                    retry_after_ms: record.due_at_ms.saturating_sub(now_ms) as u64,
-                    reason: record.last_error.clone(),
-                });
-            }
-            self.telemetry.record_retry_due();
-        }
-        let pin = crate::egress::pin_destination_addr(url)
-            .await
-            .map_err(|e| DispatchError::Egress(e.to_string()))?;
-        let pinned_client;
-        let http = if let Some((host, addr)) = pin {
-            pinned_client = reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(2))
-                .timeout(timeout)
-                .redirect(reqwest::redirect::Policy::none())
-                .resolve(&host, addr)
-                .build()
-                .map_err(|e| DispatchError::Failed(e.to_string()))?;
-            &pinned_client
-        } else if long {
-            &self.long_client
-        } else {
-            &self.client
+        response: &Result<reqwest::Response, reqwest::Error>,
+        elapsed: Duration,
+    ) {
+        record_http_result(&self.telemetry, response, elapsed);
+    }
+
+    pub(crate) fn record_flow_error(&self) {
+        self.telemetry.record_flow_error();
+    }
+
+    /// A deduplicated DLQ record counts only when it is quorum-durable and is
+    /// the record the dedup entry names.
+    fn dlq_record_durable(&self, response: &PublishResponse) -> Result<bool, DispatchError> {
+        let (Some(partition), Some(offset), Some(message_id)) =
+            (response.partition, response.offset, response.message_id)
+        else {
+            return Ok(false);
         };
-        let response = apply_to_reqwest(http, url, outbound).send().await;
-        let retry_after_ms;
-        let failure = match response {
-            Ok(response) if response.status().is_success() => {
-                self.host_blocker.record_success(url);
-                discard_body_capped(response).await;
-                self.clear_retry(msg)?;
-                return Ok(());
-            }
-            Ok(response) => {
-                let code = response.status().as_u16();
-                retry_after_ms = response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|secs| secs.saturating_mul(1000));
-                discard_body_capped(response).await;
-                if self.config.non_retry_status_codes.contains(&code) {
-                    self.clear_retry(msg)?;
-                    return Err(DispatchError::NonRetryable(format!("HTTP {code}")));
-                }
-                self.host_blocker.record_transport_failure(url);
-                format!("HTTP {code}")
-            }
-            Err(error) => {
-                retry_after_ms = None;
-                self.host_blocker.record_transport_failure(url);
-                format!("transport error: {error}")
-            }
-        };
-        let attempts = prior
+        if offset >= self.broker.quorum_hwm(&response.topic, partition)? {
+            return Ok(false);
+        }
+        Ok(self
+            .broker
+            .read_message(&response.topic, partition, offset)
+            .is_ok_and(|record| record.id == message_id && record.topic == response.topic))
+    }
+
+    fn dlq_durability(&self) -> Arc<dyn DlqDurability> {
+        self.dlq_durability
+            .get()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(LocalDlqDurability(self.broker.clone())))
+    }
+
+    /// Install the cluster-aware DLQ durability step (replication quorum).
+    /// Without it a DLQ record only waits for local fsync (single node).
+    pub fn set_dlq_durability(&self, durability: Arc<dyn DlqDurability>) {
+        let _ = self.dlq_durability.set(durability);
+    }
+
+    /// Broker side of a failed fleet delivery: count the attempt in the
+    /// durable retry state and either schedule the next attempt (the claim
+    /// path keeps the offset, and later offsets of its lane, back until it is
+    /// due) or dead-letter the message once its retry budget is spent. The
+    /// budget is therefore shared by every fleet worker and survives fleet
+    /// restarts.
+    pub async fn fail_leased_delivery(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        reason: &str,
+        retry_after_ms: u64,
+    ) -> Result<LeasedFailure, DispatchError> {
+        let msg = self.broker.read_message(topic, partition, offset)?;
+        let attempts = self
+            .retry_state
+            .get(&Self::retry_key(&msg))
             .map(|record| record.attempts)
             .unwrap_or(0)
             .saturating_add(1);
         if attempts > msg.max_retries {
             self.telemetry.record_retry_exhausted();
-            self.clear_retry(msg)?;
-            return Err(DispatchError::RetryExhausted(format!(
-                "{failure}; exhausted {} delivery attempt(s)",
-                msg.max_retries.saturating_add(1)
-            )));
+            let max_retries = msg.max_retries;
+            self.finalize_dead_letter(
+                &msg,
+                format!(
+                    "{reason} — exhausted {attempts} delivery attempt(s) (max_retries={max_retries})"
+                ),
+            )
+            .await?;
+            return Ok(LeasedFailure::DeadLettered);
         }
-        let backoff_cfg = msg
-            .retry_backoff
-            .as_ref()
-            .unwrap_or(&self.config.retry_defaults.backoff);
-        let wait_ms = retry_after_ms
-            .unwrap_or_else(|| backoff_cfg.delay_ms(attempts))
-            .min(backoff_cfg.max_ms)
-            .max(1);
-        self.persist_retry(msg, attempts, wait_ms, failure.clone())?;
+        let delay_ms = retry_after_ms.max(1);
+        self.persist_retry(&msg, attempts, delay_ms, reason.to_string())?;
         self.telemetry.record_retry_scheduled();
-        Err(DispatchError::RetryDeferred {
-            retry_after_ms: wait_ms,
-            reason: failure,
-        })
+        Ok(LeasedFailure::RetryScheduled { attempts, delay_ms })
+    }
+
+    /// Delivery attempts already spent on a message (broker-side retry state).
+    pub(crate) fn prior_attempts(
+        &self,
+        msg_topic: &str,
+        partition: u32,
+        offset: u64,
+        id: Uuid,
+    ) -> u32 {
+        self.retry_state
+            .get(&RetryKey {
+                topic: msg_topic.to_string(),
+                partition,
+                offset,
+                message_id: id,
+            })
+            .map(|record| record.attempts)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn claim_rates(&self) -> &crate::lease::ClaimRates {
+        &self.claim_rates
     }
 
     /// Move a leased offset to the DLQ and advance the gap-aware cursor.
@@ -1482,7 +2036,128 @@ impl DispatchEngine {
     }
 }
 
-async fn discard_body_capped(resp: reqwest::Response) {
+/// Prefix of a DLQ record: `MAGIC`, one line of JSON metadata, then the
+/// original body bytes verbatim (binary-safe, never re-encoded or escaped).
+pub const DLQ_RECORD_MAGIC: &[u8] = b"BMQDLQ1\n";
+
+/// Bytes a DLQ record may add on top of the original body. Ingest limits
+/// reserve this much (decision D3), so a message accepted at the limit can
+/// always be dead-lettered and replicated. Oversized metadata (headers, URL,
+/// reason, keys) is truncated to fit; the body never is. Defined once, with
+/// the cell body limits it is carved out of.
+pub use broker_replication::DLQ_ENVELOPE_ALLOWANCE;
+
+/// Webhook outcome class for telemetry (2xx..5xx, transport, egress policy).
+pub(crate) fn record_http_result(
+    telemetry: &crate::telemetry::DispatchTelemetry,
+    response: &Result<reqwest::Response, reqwest::Error>,
+    elapsed: Duration,
+) {
+    let class = match response {
+        Ok(response) => match response.status().as_u16() / 100 {
+            2 => 0,
+            3 => 1,
+            4 => 2,
+            5 => 3,
+            _ => 6,
+        },
+        Err(error) if crate::egress::is_policy_failure(error) => 5,
+        Err(_) => 4,
+    };
+    telemetry.record_http_outcome(class, elapsed);
+}
+
+fn truncate_utf8(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &value[..end])
+}
+
+/// Metadata needed to reproduce the original request (never the signing secret).
+fn dlq_metadata(msg: &StoredMessage, reason: &str, compact: bool) -> serde_json::Value {
+    let limit = |value: &str, max: usize| {
+        if compact {
+            truncate_utf8(value, max)
+        } else {
+            value.to_string()
+        }
+    };
+    let headers = if compact {
+        None
+    } else {
+        msg.http_headers_json.as_deref().map(|raw| {
+            serde_json::from_str::<serde_json::Value>(raw)
+                .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+        })
+    };
+    serde_json::json!({
+        "source_queue": limit(&msg.topic, 1024),
+        "source_partition": msg.partition,
+        "source_offset": msg.offset,
+        "message_id": msg.id,
+        "routing_key": limit(&msg.routing_key, 1024),
+        "published_at_ms": msg.published_at_ms,
+        "priority": msg.priority,
+        "queue_id": msg.queue_id,
+        "group_id": msg.group_id,
+        "group_member_id": msg.group_member_id,
+        "flow_profile_id": msg.flow_profile_id,
+        "flow": {
+            "key": msg.flow_key.as_deref().map(|key| limit(key, 1024)),
+            "parallelism": msg.flow_parallelism,
+            "rate": msg.flow_rate,
+            "period_secs": msg.flow_period_secs,
+        },
+        "destination_url": msg.destination_url.as_deref().map(|url| limit(url, 8 * 1024)),
+        "method": msg.http_method,
+        "headers": headers,
+        "headers_truncated": compact && msg.http_headers_json.is_some(),
+        "sign": msg.http_sign,
+        "max_retries": msg.max_retries,
+        "retry_backoff": msg.retry_backoff,
+        "reason": limit(reason, 8 * 1024),
+        "body_bytes": msg.payload.len(),
+    })
+}
+
+/// A DLQ record: everything needed to reproduce the original request, with
+/// the body stored byte for byte. Adds at most [`DLQ_ENVELOPE_ALLOWANCE`]
+/// bytes over the body.
+fn dlq_record(msg: &StoredMessage, reason: &str) -> Vec<u8> {
+    let fits = |meta: &serde_json::Value| {
+        let bytes = meta.to_string().into_bytes();
+        (DLQ_RECORD_MAGIC.len() + bytes.len() < DLQ_ENVELOPE_ALLOWANCE).then_some(bytes)
+    };
+    let meta = fits(&dlq_metadata(msg, reason, false))
+        .or_else(|| fits(&dlq_metadata(msg, reason, true)))
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "source_queue": truncate_utf8(&msg.topic, 1024),
+                "source_partition": msg.partition,
+                "source_offset": msg.offset,
+                "message_id": msg.id,
+                "reason": truncate_utf8(reason, 1024),
+                "metadata_truncated": true,
+                "body_bytes": msg.payload.len(),
+            })
+            .to_string()
+            .into_bytes()
+        });
+    let mut record =
+        Vec::with_capacity(DLQ_RECORD_MAGIC.len() + meta.len() + 1 + msg.payload.len());
+    record.extend_from_slice(DLQ_RECORD_MAGIC);
+    record.extend_from_slice(&meta);
+    record.push(b'\n');
+    record.extend_from_slice(&msg.payload);
+    record
+}
+
+pub(crate) async fn discard_body_capped(resp: reqwest::Response) {
     use futures_util::StreamExt;
     if let Some(len) = resp.content_length() {
         if len > WEBHOOK_RESPONSE_BODY_CAP as u64 {
@@ -1506,6 +2181,402 @@ mod tests {
     use super::*;
     use broker_partition::BrokerConfig;
 
+    #[test]
+    fn pressure_logs_are_aggregated_and_destination_credentials_are_redacted() {
+        let logs = PressureLogs::default();
+        assert_eq!(logs.record(0, 30_000), Some([1, 0, 0, 0]));
+        for _ in 0..10_000 {
+            assert!(logs.record(1, 30_001).is_none());
+        }
+        assert_eq!(logs.record(2, 60_000), Some([0, 10_000, 1, 0]));
+        assert_eq!(
+            redacted_destination("https://user:password@example.com/secret/path?token=abc#private"),
+            "https://example.com:443"
+        );
+        assert_eq!(
+            redacted_destination("not a URL with a secret"),
+            "<invalid destination>"
+        );
+    }
+
+    fn publish_test_message(broker: &Broker, url: &str) -> StoredMessage {
+        let request = serde_json::from_value(serde_json::json!({
+            "url": url, "secret": "secret", "payload": "test", "routing_key": "lane"
+        }))
+        .unwrap();
+        let response = broker.publish(request).unwrap();
+        broker.flush_wal().unwrap();
+        broker
+            .read_message(
+                &response.topic,
+                response.partition.unwrap(),
+                response.offset.unwrap(),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn webhook_client_reuses_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for _ in 0..2 {
+                let mut request = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let engine = DispatchEngine::new_broker_only(broker, DispatchConfig::default());
+        for _ in 0..2 {
+            engine
+                .client
+                .get(format!("http://{address}/hook"))
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn dns_failure_is_durable_retry_not_dead_letter() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let msg = publish_test_message(&broker, "https://destination.invalid/hook");
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        tokio::time::timeout(Duration::from_secs(5), engine.deliver_message(&msg))
+            .await
+            .unwrap()
+            .unwrap();
+        let key = DispatchEngine::retry_key(&msg);
+        assert_eq!(engine.retry_state.get(&key).unwrap().attempts, 1);
+        assert!(engine.lifecycle.pending().is_empty());
+        assert!(!broker
+            .is_dispatch_complete(
+                &broker.tenant(),
+                &broker_partition::flow_lane_owner(&msg).to_string(),
+                msg.partition,
+                msg.offset
+            )
+            .unwrap());
+        engine.clear_retry(&msg).unwrap();
+        let fleet = crate::FleetDelivery::new(DispatchConfig::default());
+        assert!(matches!(
+            fleet.push(&msg, msg.offset + 1, 0).await,
+            Err(DispatchError::RetryDeferred { .. })
+        ));
+        // Fleet pushes keep no retry state; the broker counts lease failures.
+        assert!(engine.retry_state.get(&key).is_none());
+        fleet.shutdown();
+        engine.shutdown_background().await;
+        assert_eq!(engine.telemetry_snapshot().delivery.outcomes[4], 1);
+    }
+
+    #[tokio::test]
+    async fn retries_fence_only_the_actual_strict_fifo_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let mut first = publish_test_message(&broker, "https://example.com/a");
+        let engine = DispatchEngine::new_broker_only(broker, DispatchConfig::default());
+        first.queue_id = Some(Uuid::new_v4());
+        first.flow_parallelism = Some(1);
+        first.flow_key = Some("a".into());
+        engine
+            .persist_retry(&first, 1, 60_000, "HTTP 503".into())
+            .unwrap();
+        let mut later = first.clone();
+        later.offset += 1;
+        later.id = Uuid::new_v4();
+        assert!(engine.blocking_delivery_retry(&later).is_some());
+        later.flow_key = Some("b".into());
+        assert!(engine.blocking_delivery_retry(&later).is_none());
+        later.flow_key = Some("a".into());
+        later.flow_parallelism = Some(2);
+        assert!(engine.blocking_delivery_retry(&later).is_none());
+        let mut direct = first.clone();
+        direct.queue_id = None;
+        direct.flow_key = None;
+        direct.flow_parallelism = None;
+        engine
+            .persist_retry(&direct, 1, 60_000, "HTTP 503".into())
+            .unwrap();
+        assert!(
+            engine.blocking_delivery_retry(&direct).is_some(),
+            "own deadline is retained"
+        );
+        direct.offset += 1;
+        direct.id = Uuid::new_v4();
+        direct.destination_url = Some("https://example.net/other".into());
+        assert!(engine.blocking_delivery_retry(&direct).is_none());
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn backfill_cannot_duplicate_work_waiting_in_a_flow_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let request = serde_json::from_value(serde_json::json!({
+            "url": "https://example.com/hook", "secret": "secret", "payload": "test",
+            "routing_key": "lane", "flow": { "key": "a", "parallelism": 1, "rate": 1, "period_secs": 3600 }
+        })).unwrap();
+        let response = broker.publish(request).unwrap();
+        broker.flush_wal().unwrap();
+        let msg = broker
+            .read_message(
+                &response.topic,
+                response.partition.unwrap(),
+                response.offset.unwrap(),
+            )
+            .unwrap();
+        let owner = broker_partition::flow_lane_owner(&msg);
+        let engine = DispatchEngine::new(broker, DispatchConfig::default());
+        let limits = broker_partition::ResolvedFlow::for_delivery(&msg.routing_key, &msg);
+        engine.flow.ensure_lane(owner, "a", limits.clone()).await;
+        engine.flow.pause(owner, "a").await;
+        engine.enqueue(DeliveryJob::live(
+            &msg.topic,
+            msg.partition,
+            msg.offset,
+            msg.id,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.flow.get(owner, "a").await.unwrap().wait_list_size != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..5 {
+            engine.backfill_pending();
+            engine
+                .flow
+                .submit(engine.clone(), owner, msg.clone(), limits.clone(), true)
+                .await;
+        }
+        assert_eq!(engine.flow.get(owner, "a").await.unwrap().wait_list_size, 1);
+        assert_eq!(engine.in_flight_jobs.lock().len(), 1);
+        engine.shutdown_background().await;
+        assert!(engine.in_flight_jobs.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn flow_delivery_waits_for_http_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let msg = publish_test_message(&broker, "https://example.com/hook");
+        let mut engine = DispatchEngine::new_broker_only(broker, DispatchConfig::default());
+        engine.in_flight = Arc::new(Semaphore::new(1));
+        let permit = engine.in_flight.clone().acquire_owned().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), engine.deliver_message(&msg))
+                .await
+                .is_err()
+        );
+        assert_eq!(engine.active_http.load(Ordering::Acquire), 0);
+        drop(permit);
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn global_capacity_release_wakes_another_lane() {
+        global_capacity_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn lane_paused_while_waiting_for_global_capacity_does_not_start() {
+        global_capacity_case(true).await;
+    }
+
+    async fn global_capacity_case(pause_waiter: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let mut first = publish_test_message(&broker, "https://example.com/one");
+        let mut second = publish_test_message(&broker, "https://example.com/two");
+        first.destination_url = Some("http://169.254.169.254/".into());
+        second.destination_url = first.destination_url.clone();
+        let mut engine = DispatchEngine::new_broker_only(broker, DispatchConfig::default());
+        engine.in_flight = Arc::new(Semaphore::new(0));
+        engine.flow = FlowController::new(Some(1), engine.memory_guard.clone());
+        let first_owner = Uuid::new_v4();
+        let second_owner = Uuid::new_v4();
+        for (owner, key, msg) in [(first_owner, "a", first), (second_owner, "b", second)] {
+            engine
+                .flow
+                .submit(
+                    engine.clone(),
+                    owner,
+                    msg,
+                    broker_partition::ResolvedFlow {
+                        key: key.into(),
+                        parallelism: 1,
+                        rate: 0,
+                        period_secs: 1,
+                    },
+                    false,
+                )
+                .await;
+            if key == "a" {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while engine.flow.global_parallelism().await.parallelism_count != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while engine.flow.global_parallelism().await.parallelism_count != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::task::yield_now().await;
+        if pause_waiter {
+            engine.flow.pause(second_owner, "b").await;
+        }
+        engine.in_flight.add_permits(1);
+        if pause_waiter {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while engine.telemetry_snapshot().dlq_committed < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(engine.telemetry_snapshot().dlq_committed, 1);
+            assert_eq!(
+                engine
+                    .flow
+                    .get(second_owner, "b")
+                    .await
+                    .unwrap()
+                    .wait_list_size,
+                1
+            );
+            engine.flow.resume(second_owner, "b").await;
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.telemetry_snapshot().dlq_committed < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the other lane must wake without resubmission");
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn broker_only_telemetry_seeds_backlog_without_completions() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let first = publish_test_message(&broker, "https://example.com/hook");
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        assert!(engine
+            .telemetry_snapshot()
+            .shards
+            .iter()
+            .any(|shard| shard.completion_gap_records > 0));
+        let second = publish_test_message(&broker, "https://example.com/hook");
+        engine.notify_committed_range(
+            &second.topic,
+            second.partition,
+            second.offset,
+            second.offset + 1,
+            second.id,
+        );
+        let gap = engine
+            .telemetry_snapshot()
+            .shards
+            .iter()
+            .map(|shard| shard.completion_gap_records)
+            .sum::<u64>();
+        assert!(gap >= 2);
+        assert_eq!(first.partition, second.partition);
+        engine.shutdown_background().await;
+    }
+
+    #[test]
+    fn retention_pins_report_and_forget_collected_dispatch_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let engine = DispatchEngine::new_broker_only(broker, DispatchConfig::default());
+        let key = |topic: &str, offset| RetryKey {
+            topic: topic.into(),
+            partition: 0,
+            offset,
+            message_id: Uuid::new_v4(),
+        };
+        for (topic, offset) in [("jobs", 3), ("jobs", 9), ("other", 1)] {
+            engine
+                .retry_state
+                .schedule(RetryRecord {
+                    key: key(topic, offset),
+                    cursor_key: "lane".into(),
+                    fifo_key: None,
+                    attempts: 1,
+                    due_at_ms: 0,
+                    last_error: "503".into(),
+                })
+                .unwrap();
+        }
+        engine
+            .lifecycle
+            .prepare(DlqTransition {
+                source: key("jobs", 5),
+                cursor_key: "lane".into(),
+                reason: "exhausted".into(),
+                phase: DlqPhase::Prepared,
+                updated_at_ms: 0,
+            })
+            .unwrap();
+        let mut pins = engine.retention_pins();
+        pins.sort();
+        assert_eq!(
+            pins,
+            vec![
+                ("jobs".to_string(), 0, 3),
+                ("jobs".to_string(), 0, 5),
+                ("jobs".to_string(), 0, 9),
+                ("other".to_string(), 0, 1),
+            ]
+        );
+
+        let dropped = engine
+            .forget_collected(|topic, partition| topic == "jobs" && partition == 0, 6)
+            .unwrap();
+        assert_eq!(dropped, 2);
+        let mut pins = engine.retention_pins();
+        pins.sort();
+        assert_eq!(
+            pins,
+            vec![("jobs".to_string(), 0, 9), ("other".to_string(), 0, 1)]
+        );
+    }
+
     #[tokio::test]
     async fn commit_cursor_reconstructs_completed_gap_after_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -1513,6 +2584,7 @@ mod tests {
         let publish = |body: &str| {
             broker
                 .publish(PublishRequest {
+                    routing_id: None,
                     topic: String::new(),
                     queue_id: None,
                     group_id: None,
@@ -1553,7 +2625,14 @@ mod tests {
         let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
         let tenant = broker.tenant();
         engine
-            .commit_cursor(&tenant, &topic, &lane, partition, second.offset.unwrap())
+            .commit_cursor(
+                &tenant,
+                &topic,
+                &lane,
+                partition,
+                second.offset.unwrap(),
+                second.message_id.unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1572,7 +2651,14 @@ mod tests {
 
         let restarted = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
         restarted
-            .commit_cursor(&tenant, &topic, &lane, partition, first.offset.unwrap())
+            .commit_cursor(
+                &tenant,
+                &topic,
+                &lane,
+                partition,
+                first.offset.unwrap(),
+                first.message_id.unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1590,12 +2676,248 @@ mod tests {
         assert_eq!(shard.completion_gap_records, 0);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_completions_never_move_the_cursor_backwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let mut offsets = Vec::new();
+        for i in 0..64 {
+            let response = broker
+                .publish(PublishRequest {
+                    topic: String::new(),
+                    queue_id: None,
+                    group_id: None,
+                    group_member_id: None,
+                    routing_key: "lane".into(),
+                    payload: format!("m{i}"),
+                    routing_id: None,
+                    payload_encoding: None,
+                    idempotency_key: None,
+                    delay_ms: None,
+                    priority: None,
+                    flow_id: None,
+                    url: Some("https://example.com/hook".into()),
+                    secret: Some("secret".into()),
+                    destination: None,
+                    flow: None,
+                    parallelism: None,
+                    max_retries: None,
+                    retry_backoff: None,
+                    method: None,
+                    headers: None,
+                    sign: None,
+                    request: None,
+                })
+                .unwrap();
+            offsets.push((
+                response.topic,
+                response.partition.unwrap(),
+                response.offset.unwrap(),
+                response.message_id.unwrap(),
+            ));
+        }
+        broker.flush_wal().unwrap();
+        let (topic, partition, first, _) = offsets[0].clone();
+        let last = offsets.last().unwrap().2;
+        let lane = broker_partition::flow_lane_owner(
+            &broker.read_message(&topic, partition, first).unwrap(),
+        )
+        .to_string();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let tenant = broker.tenant();
+        let tasks: Vec<_> = offsets
+            .iter()
+            .rev()
+            .map(|(topic, partition, offset, id)| {
+                let engine = engine.clone();
+                let (topic, lane, tenant) = (topic.clone(), lane.clone(), tenant.clone());
+                let (partition, offset, id) = (*partition, *offset, *id);
+                tokio::spawn(async move {
+                    engine
+                        .commit_cursor(&tenant, &topic, &lane, partition, offset, id)
+                        .await
+                        .unwrap();
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(
+            broker.dispatch_offset(&tenant, &lane, partition).unwrap(),
+            last + 1,
+            "every offset completed, so the cursor covers them all"
+        );
+    }
+
+    fn sample_message(payload: Vec<u8>, headers: Option<String>) -> StoredMessage {
+        StoredMessage {
+            id: Uuid::new_v4(),
+            tenant_id: "t".into(),
+            topic: "orders".into(),
+            partition: 3,
+            offset: 9,
+            routing_key: "rk".into(),
+            payload,
+            published_at_ms: 1,
+            priority: 4,
+            flow_parallelism: Some(1),
+            flow_key: Some("rk".into()),
+            flow_rate: None,
+            flow_period_secs: None,
+            queue_id: None,
+            group_id: None,
+            group_member_id: None,
+            flow_profile_id: None,
+            destination_url: Some("https://example.com/hook".into()),
+            destination_secret: Some("secret".into()),
+            max_retries: 5,
+            retry_backoff: None,
+            http_method: Some("PUT".into()),
+            http_headers_json: headers,
+            http_sign: Some(false),
+            payload_ref_json: None,
+        }
+    }
+
+    fn split_record(record: &[u8]) -> (serde_json::Value, &[u8]) {
+        let rest = record.strip_prefix(DLQ_RECORD_MAGIC).unwrap();
+        let newline = rest.iter().position(|b| *b == b'\n').unwrap();
+        (
+            serde_json::from_slice(&rest[..newline]).unwrap(),
+            &rest[newline + 1..],
+        )
+    }
+
+    #[test]
+    fn dlq_record_keeps_binary_body_and_delivery_metadata() {
+        let body: Vec<u8> = vec![0xff, 0x00, 0xfe, b'a', 0x80, b'\n'];
+        let msg = sample_message(body.clone(), Some(r#"{"x-tenant":"acme"}"#.into()));
+        let record = dlq_record(&msg, "HTTP 400");
+        let (meta, stored_body) = split_record(&record);
+        assert_eq!(
+            stored_body,
+            body.as_slice(),
+            "the body is stored byte for byte"
+        );
+        assert_eq!(meta["headers"]["x-tenant"], "acme");
+        assert_eq!(meta["sign"], false);
+        assert_eq!(meta["method"], "PUT");
+        assert_eq!(meta["max_retries"], 5);
+        assert_eq!(meta["source_offset"], 9);
+        assert_eq!(meta["body_bytes"], body.len());
+        assert!(
+            meta.get("destination_secret").is_none(),
+            "the signing secret never lands in the DLQ"
+        );
+    }
+
+    #[test]
+    fn dlq_record_overhead_is_bounded_without_touching_the_body() {
+        // Control characters: JSON escaping would grow them 6x, base64 by a
+        // third; the record stores them raw, so only bounded metadata is added.
+        let body: Vec<u8> = (0..4 * 1024 * 1024u32).map(|i| (i % 0x20) as u8).collect();
+        let huge_headers = serde_json::json!({ "x-big": "h".repeat(512 * 1024) }).to_string();
+        let mut msg = sample_message(body.clone(), Some(huge_headers));
+        msg.destination_url = Some(format!("https://example.com/{}", "p".repeat(100 * 1024)));
+        let record = dlq_record(&msg, &"r".repeat(200 * 1024));
+        assert!(
+            record.len() - body.len() <= DLQ_ENVELOPE_ALLOWANCE,
+            "envelope added {} bytes",
+            record.len() - body.len()
+        );
+        let (meta, stored_body) = split_record(&record);
+        assert_eq!(stored_body, body.as_slice());
+        assert_eq!(meta["headers_truncated"], true);
+        assert_eq!(meta["message_id"], msg.id.to_string());
+    }
+
+    #[tokio::test]
+    async fn crash_after_dlq_commit_drops_the_retry_and_completes_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let response = broker
+            .publish(PublishRequest {
+                topic: String::new(),
+                queue_id: None,
+                group_id: None,
+                group_member_id: None,
+                routing_key: "crash".into(),
+                payload: "body".into(),
+                routing_id: None,
+                payload_encoding: None,
+                idempotency_key: None,
+                delay_ms: None,
+                priority: None,
+                flow_id: None,
+                url: Some("https://example.com/hook".into()),
+                secret: Some("secret".into()),
+                destination: None,
+                flow: None,
+                parallelism: None,
+                max_retries: Some(3),
+                retry_backoff: None,
+                method: None,
+                headers: None,
+                sign: None,
+                request: None,
+            })
+            .unwrap();
+        broker.flush_wal().unwrap();
+        let partition = response.partition.unwrap();
+        let offset = response.offset.unwrap();
+        let message = broker
+            .read_message(&response.topic, partition, offset)
+            .unwrap();
+        let source = DispatchEngine::retry_key(&message);
+        let lane = broker_partition::flow_lane_owner(&message).to_string();
+        // Crash window: the DLQ record is durable and the transition committed,
+        // but the retry record and the source cursor were not finished.
+        let retries = RetryState::open(&broker.config().data_dir).unwrap();
+        retries
+            .schedule(RetryRecord {
+                key: source.clone(),
+                cursor_key: lane.clone(),
+                fifo_key: None,
+                attempts: 2,
+                due_at_ms: chrono::Utc::now().timestamp_millis() + 3_600_000,
+                last_error: "HTTP 503".into(),
+            })
+            .unwrap();
+        drop(retries);
+        let lifecycle = LifecycleStore::open(&broker.config().data_dir).unwrap();
+        lifecycle
+            .prepare(DlqTransition {
+                source: source.clone(),
+                cursor_key: lane.clone(),
+                reason: "exhausted".into(),
+                phase: DlqPhase::Prepared,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+        lifecycle.mark_dlq_committed(&source).unwrap();
+        drop(lifecycle);
+
+        // Broker-only (fleet) brokers finish the move too.
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        assert!(engine.retry_state.get(&source).is_none());
+        assert!(engine.retry_state.pending().is_empty());
+        assert_eq!(
+            broker
+                .dispatch_offset(&broker.tenant(), &lane, partition)
+                .unwrap(),
+            offset + 1
+        );
+        assert!(engine.lifecycle.pending().is_empty());
+    }
+
     #[tokio::test]
     async fn dlq_committed_boundary_repairs_source_cursor_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
         let response = broker
             .publish(PublishRequest {
+                routing_id: None,
                 topic: String::new(),
                 queue_id: None,
                 group_id: None,

@@ -10,6 +10,7 @@ use axum::{
     Json, Router,
 };
 use broker_partition::{BrokerError, DispatchGroup, GroupMember};
+use broker_raft_meta::catalog::CatalogKind;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -165,8 +166,30 @@ async fn create_group(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateGroupRequest>,
 ) -> Result<(StatusCode, Json<GroupResponse>), GroupApiError> {
-    let group = state.broker.create_group(req.name)?;
-    crate::cluster::replicate_group_catalog(&state, group.clone()).await;
+    let group = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let group = DispatchGroup {
+            id: mutation.id(&state.broker.tenant(), CatalogKind::Group),
+            tenant_id: state.broker.tenant(),
+            name: req.name.trim().into(),
+            paused: false,
+            updated_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        state.broker.validate_catalog_group(&group)?;
+        mutation
+            .commit(
+                &state,
+                group.tenant_id.clone(),
+                CatalogKind::Group,
+                group.id,
+                &group,
+                false,
+            )
+            .await?;
+        group
+    } else {
+        state.broker.create_group(req.name)?
+    };
     Ok((StatusCode::CREATED, Json(to_group_response(group))))
 }
 
@@ -190,6 +213,7 @@ async fn update_group(
     Path(group_id): Path<Uuid>,
     Json(req): Json<UpdateGroupRequest>,
 ) -> Result<Json<GroupResponse>, GroupApiError> {
+    let mutation = crate::catalog_applier::begin(&state)?;
     let mut group = state
         .broker
         .get_group(group_id)?
@@ -205,8 +229,21 @@ async fn update_group(
         group.paused = paused;
     }
     group.updated_at_ms = chrono::Utc::now().timestamp_millis();
-    state.broker.upsert_group_catalog(group.clone())?;
-    crate::cluster::replicate_group_catalog(&state, group.clone()).await;
+    state.broker.validate_catalog_group(&group)?;
+    if state.cluster.is_some() {
+        mutation
+            .commit(
+                &state,
+                group.tenant_id.clone(),
+                CatalogKind::Group,
+                group.id,
+                &group,
+                false,
+            )
+            .await?;
+    } else {
+        state.broker.upsert_group_catalog(group.clone())?;
+    }
     Ok(Json(to_group_response(group)))
 }
 
@@ -214,12 +251,26 @@ async fn delete_group_handler(
     State(state): State<Arc<AppState>>,
     Path(group_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<GroupResponse>), GroupApiError> {
-    let members = state.broker.list_group_members(group_id)?;
-    let removed = state.broker.delete_group(group_id)?;
-    crate::cluster::replicate_group_delete(&state, group_id).await;
-    for member in members {
-        crate::cluster::replicate_group_member_delete(&state, member.id).await;
-    }
+    let removed = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let group = state
+            .broker
+            .get_group(group_id)?
+            .ok_or(GroupApiError::GroupNotFound(group_id))?;
+        mutation
+            .commit(
+                &state,
+                group.tenant_id.clone(),
+                CatalogKind::Group,
+                group_id,
+                &group,
+                true,
+            )
+            .await?;
+        group
+    } else {
+        state.broker.delete_group(group_id)?
+    };
     Ok((StatusCode::OK, Json(to_group_response(removed))))
 }
 
@@ -247,17 +298,49 @@ async fn add_member(
 ) -> Result<(StatusCode, Json<MemberResponse>), GroupApiError> {
     broker_dispatch::validate_destination_url(&req.url)
         .map_err(|e| GroupApiError::Invalid(e.to_string()))?;
-    let member = state.broker.add_group_member(
-        group_id,
-        req.name,
-        req.url,
-        req.secret,
-        req.parallelism,
-        req.rate,
-        req.period_secs,
-        req.flow_key,
-    )?;
-    crate::cluster::replicate_group_member_catalog(&state, member.clone()).await;
+    let member = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        if state.broker.get_group(group_id)?.is_none() {
+            return Err(GroupApiError::GroupNotFound(group_id));
+        }
+        let member = GroupMember {
+            id: mutation.id(&state.broker.tenant(), CatalogKind::GroupMember),
+            group_id,
+            tenant_id: state.broker.tenant(),
+            name: req.name.trim().into(),
+            url: req.url,
+            secret: req.secret,
+            paused: false,
+            parallelism: req.parallelism,
+            rate: req.rate,
+            period_secs: req.period_secs,
+            flow_key: req.flow_key,
+            updated_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        state.broker.validate_catalog_member(&member)?;
+        mutation
+            .commit(
+                &state,
+                member.tenant_id.clone(),
+                CatalogKind::GroupMember,
+                member.id,
+                &member,
+                false,
+            )
+            .await?;
+        member
+    } else {
+        state.broker.add_group_member(
+            group_id,
+            req.name,
+            req.url,
+            req.secret,
+            req.parallelism,
+            req.rate,
+            req.period_secs,
+            req.flow_key,
+        )?
+    };
     Ok((StatusCode::CREATED, Json(to_member_response(member))))
 }
 
@@ -266,6 +349,7 @@ async fn update_member(
     Path((group_id, member_id)): Path<(Uuid, Uuid)>,
     Json(req): Json<UpdateMemberRequest>,
 ) -> Result<Json<MemberResponse>, GroupApiError> {
+    let mutation = crate::catalog_applier::begin(&state)?;
     let mut member = state
         .broker
         .get_group_member(member_id)?
@@ -300,8 +384,21 @@ async fn update_member(
         member.paused = paused;
     }
     member.updated_at_ms = chrono::Utc::now().timestamp_millis();
-    state.broker.upsert_group_member_catalog(member.clone())?;
-    crate::cluster::replicate_group_member_catalog(&state, member.clone()).await;
+    state.broker.validate_catalog_member(&member)?;
+    if state.cluster.is_some() {
+        mutation
+            .commit(
+                &state,
+                member.tenant_id.clone(),
+                CatalogKind::GroupMember,
+                member.id,
+                &member,
+                false,
+            )
+            .await?;
+    } else {
+        state.broker.upsert_group_member_catalog(member.clone())?;
+    }
     Ok(Json(to_member_response(member)))
 }
 
@@ -309,6 +406,7 @@ async fn delete_member_handler(
     State(state): State<Arc<AppState>>,
     Path((group_id, member_id)): Path<(Uuid, Uuid)>,
 ) -> Result<(StatusCode, Json<MemberResponse>), GroupApiError> {
+    let mutation = crate::catalog_applier::begin(&state)?;
     let member = state
         .broker
         .get_group_member(member_id)?
@@ -316,8 +414,21 @@ async fn delete_member_handler(
     if member.group_id != group_id {
         return Err(GroupApiError::MemberNotFound(member_id));
     }
-    let removed = state.broker.delete_group_member(member_id)?;
-    crate::cluster::replicate_group_member_delete(&state, member_id).await;
+    let removed = if state.cluster.is_some() {
+        mutation
+            .commit(
+                &state,
+                member.tenant_id.clone(),
+                CatalogKind::GroupMember,
+                member_id,
+                &member,
+                true,
+            )
+            .await?;
+        member
+    } else {
+        state.broker.delete_group_member(member_id)?
+    };
     Ok((StatusCode::OK, Json(to_member_response(removed))))
 }
 
@@ -329,6 +440,12 @@ enum GroupApiError {
     DuplicateName(String),
     Invalid(String),
     Publish(ApiError),
+}
+
+impl From<ApiError> for GroupApiError {
+    fn from(error: ApiError) -> Self {
+        Self::Publish(error)
+    }
 }
 
 impl From<BrokerError> for GroupApiError {

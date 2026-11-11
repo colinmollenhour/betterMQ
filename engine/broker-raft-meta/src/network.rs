@@ -1,6 +1,6 @@
 //! Persistent HTTP transport for OpenRaft protocol RPCs.
 
-use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError};
+use openraft::error::{InstallSnapshotError, NetworkError, PayloadTooLarge, RPCError, RaftError};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -9,15 +9,27 @@ use openraft::raft::{
 use openraft::BasicNode;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::error::Error;
 use std::io;
 use std::time::Duration;
 
 use crate::controller::{NodeId, TypeConfig};
 
+/// Serialized size above which an append request is split. Well below the
+/// internal HTTP body limit, so a lagging follower can always be caught up.
+const MAX_APPEND_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+/// Entry count to retry with when an append request is over the byte budget,
+/// or `None` when it should be sent as is (a single entry is never split).
+fn append_split_hint(entries: usize, bytes: usize) -> Option<u64> {
+    (entries > 1 && bytes > MAX_APPEND_REQUEST_BYTES).then(|| (entries / 2).max(1) as u64)
+}
+
 #[derive(Clone)]
 pub struct HttpNetworkFactory {
     client: reqwest::Client,
+    private_peers: HashMap<NodeId, String>,
 }
 
 impl HttpNetworkFactory {
@@ -27,7 +39,23 @@ impl HttpNetworkFactory {
                 .pool_idle_timeout(Duration::from_secs(90))
                 .timeout(Duration::from_secs(5))
                 .build()?,
+            private_peers: HashMap::new(),
         })
+    }
+
+    pub fn with_config(mut self, config: &crate::ClusterConfig) -> Self {
+        self.private_peers = config
+            .nodes
+            .iter()
+            .filter(|node| node.internal_url.is_some())
+            .map(|node| {
+                (
+                    crate::controller::raft_id(node.id),
+                    node.internal_base().to_owned(),
+                )
+            })
+            .collect();
+        self
     }
 }
 
@@ -43,7 +71,11 @@ impl RaftNetworkFactory<TypeConfig> for HttpNetworkFactory {
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Self::Network {
         HttpNetworkConnection {
             target,
-            addr: node.addr.trim_end_matches('/').to_string(),
+            addr: self
+                .private_peers
+                .get(&target)
+                .cloned()
+                .unwrap_or_else(|| node.addr.trim_end_matches('/').to_string()),
             client: self.client.clone(),
         }
     }
@@ -69,10 +101,25 @@ impl HttpNetworkConnection {
         R: DeserializeOwned,
         E: Error,
     {
+        let body = serde_json::to_vec(body)
+            .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
+        self.post_bytes(path, body).await
+    }
+
+    async fn post_bytes<R, E>(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+    ) -> Result<R, RPCError<NodeId, BasicNode, RaftError<NodeId, E>>>
+    where
+        R: DeserializeOwned,
+        E: Error,
+    {
         let url = format!("{}{}", self.addr, path);
         let response = self
             .authenticate(self.client.post(&url))
-            .json(body)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
             .send()
             .await
             .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
@@ -98,7 +145,14 @@ impl RaftNetwork<TypeConfig> for HttpNetworkConnection {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        self.post("/internal/v1/controller/raft/append", &rpc).await
+        let body = serde_json::to_vec(&rpc)
+            .map_err(|error| RPCError::Network(NetworkError::new(&error)))?;
+        if let Some(entries_hint) = append_split_hint(rpc.entries.len(), body.len()) {
+            // OpenRaft retries with at most `entries_hint` entries.
+            return Err(PayloadTooLarge::new_entries_hint(entries_hint).into());
+        }
+        self.post_bytes("/internal/v1/controller/raft/append", body)
+            .await
     }
 
     async fn install_snapshot(
@@ -119,5 +173,21 @@ impl RaftNetwork<TypeConfig> for HttpNetworkConnection {
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         self.post("/internal/v1/controller/raft/vote", &rpc).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_append_requests_are_split_but_single_entries_are_sent() {
+        assert_eq!(append_split_hint(64, 1024), None);
+        assert_eq!(
+            append_split_hint(64, MAX_APPEND_REQUEST_BYTES + 1),
+            Some(32)
+        );
+        assert_eq!(append_split_hint(3, MAX_APPEND_REQUEST_BYTES + 1), Some(1));
+        assert_eq!(append_split_hint(1, MAX_APPEND_REQUEST_BYTES * 4), None);
     }
 }

@@ -6,7 +6,7 @@ use axum::{
     body::{Body, Bytes},
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     Json,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -17,8 +17,9 @@ use broker_partition::{
 };
 use broker_raft_meta::ClusterRuntime;
 use broker_replication::{
-    CatchUpFrame, ReplicaProgress, ReplicateAppendRequest, ReplicateBatchAck,
-    ReplicateBatchRequest, ReplicateCatchUpRange, ReplicateCatchUpRequest, ReplicationClient,
+    CatchUpFrame, ReplicaPositionConflict, ReplicaProgress, ReplicateAppendRequest,
+    ReplicateBatchAck, ReplicateBatchRequest, ReplicateCatchUpRange, ReplicateCatchUpRequest,
+    ReplicateTruncateRequest, ReplicateTruncateResponse, ReplicationClient,
 };
 use broker_schedule::CronJob;
 use broker_storage::StorageMode;
@@ -26,7 +27,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -181,12 +182,63 @@ pub struct ClusterGossipResponse {
 
 #[derive(Clone)]
 pub struct ClusterHandle {
+    pub(crate) catalog_apply: Arc<crate::catalog_applier::ApplyState>,
     pub runtime: ClusterRuntime,
     pub replication: ReplicationClient,
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
+    catalog_peers: Arc<parking_lot::Mutex<Option<CatalogPeerCache>>>,
+}
+
+struct CatalogPeerCache {
+    at: Instant,
+    peers: Vec<String>,
 }
 
 impl ClusterHandle {
+    pub fn catalog_ready(&self) -> bool {
+        self.runtime
+            .controller()
+            .is_none_or(|controller| self.catalog_apply.ready(controller.catalog_revision()))
+    }
+
+    /// Let the leader repair lagging followers from the local log, and persist
+    /// this node's follower truncation fence under `data_dir`.
+    pub fn attach_local_log(
+        &self,
+        broker: broker_partition::Broker,
+        data_dir: &std::path::Path,
+    ) -> std::io::Result<()> {
+        self.replication
+            .set_log_source(Arc::new(crate::replica_source::BrokerLogSource::new(
+                broker,
+            )));
+        self.replication.follower_fence().open_dir(data_dir)
+    }
+
+    /// Leader recovery: cut this node's own uncommitted tail of `stream` on
+    /// `shard` back to `to_offset` (the committed prefix proven by the
+    /// replicas). The cut bytes are kept in a `truncated.<generation>.<ts>`
+    /// sidecar. `stream` is the V1 topic, or empty for a V2 physical shard.
+    /// Returns the new local log end. Fails with
+    /// `LogError::TruncateUnsupported` (and changes nothing) when the cut lies
+    /// in a sealed segment or inside a V2 epoch; the shard must stay fenced.
+    pub fn reconcile_local_tail(
+        &self,
+        broker: &broker_partition::Broker,
+        stream: &str,
+        shard: u32,
+        to_offset: u64,
+    ) -> Result<u64, broker_partition::BrokerError> {
+        let generation = self.runtime.shard_generation(shard);
+        broker.truncate_replica_log(stream, shard, to_offset, generation)
+    }
+
+    /// Track replication progress per physical shard (V2 layouts).
+    pub fn with_physical_shards(mut self, physical: bool) -> Self {
+        self.replication = self.replication.with_physical_shards(physical);
+        self
+    }
+
     pub fn new(runtime: ClusterRuntime) -> Self {
         let replication =
             ReplicationClient::new(runtime.config().clone()).with_runtime(runtime.clone());
@@ -195,15 +247,19 @@ impl ClusterHandle {
             .build()
             .expect("cluster HTTP client");
         Self {
+            catalog_apply: Arc::new(crate::catalog_applier::ApplyState::default()),
             runtime,
             replication,
             http,
+            catalog_peers: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 }
 
 fn shard_for_request(state: &AppState, req: &PublishRequest) -> u32 {
-    state.broker.assign_shard(&req.topic, &req.routing_key)
+    state
+        .broker
+        .assign_shard(&req.topic, &req.shard_routing_key())
 }
 
 /// Enqueue push dispatch when this broker leads the message shard.
@@ -276,11 +332,71 @@ async fn replicate_if_needed(
         })
         .await
     {
-        Ok(outcome) => Ok(outcome.committed_hwm),
+        Ok(outcome) => {
+            // Expose the record to dispatch only once it is quorum-durable,
+            // and only after the watermark is persisted.
+            state
+                .broker
+                .record_quorum_commit(&resp.topic, partition, offset, offset.saturating_add(1))
+                .map_err(|e| {
+                    ApiError::ReplicationFailed(format!("persist quorum watermark: {e}"))
+                })?;
+            Ok(outcome.committed_hwm)
+        }
         Err(e) => {
             warn!(error = %e, "replication durable quorum failed");
             Err(ApiError::ReplicationFailed(e.to_string()))
         }
+    }
+}
+
+/// DLQ durability for dispatch: a dead-letter record appended to the source
+/// shard is replicated to a quorum (and the quorum watermark advanced) before
+/// the source message completes. Single node and Slate wait for local fsync.
+pub struct ClusterDlqDurability {
+    state: std::sync::Weak<AppState>,
+}
+
+impl ClusterDlqDurability {
+    pub fn new(state: &Arc<AppState>) -> Self {
+        Self {
+            state: Arc::downgrade(state),
+        }
+    }
+}
+
+impl broker_dispatch::DlqDurability for ClusterDlqDurability {
+    fn make_durable<'a>(
+        &'a self,
+        response: &'a mut PublishResponse,
+    ) -> futures_util::future::BoxFuture<'a, Result<(), broker_dispatch::DispatchError>> {
+        Box::pin(async move {
+            let state = self.state.upgrade().ok_or_else(|| {
+                broker_dispatch::DispatchError::Failed("broker is shutting down".into())
+            })?;
+            let local = {
+                let broker = state.broker.clone();
+                let topic = response.topic.clone();
+                let (partition, offset) = (response.partition, response.offset);
+                async move {
+                    match (partition, offset) {
+                        (Some(partition), Some(offset)) => broker
+                            .wait_committed(&topic, partition, offset)
+                            .await
+                            .map_err(ApiError::from),
+                        _ => Ok(0),
+                    }
+                }
+            };
+            replicate_if_needed(&state, response, local)
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    broker_dispatch::DispatchError::Failed(format!(
+                        "DLQ record not durable on a quorum: {error}"
+                    ))
+                })
+        })
     }
 }
 
@@ -292,16 +408,20 @@ async fn publish_on_leader(
     let body_bytes = meter
         .map(|m| m.body_bytes)
         .unwrap_or_else(|| req.payload.len() as u64);
-    let idempotency_key = req.idempotency_key.clone();
-    let mut resp = if state
+    // In a replicated cell the idempotency key stays reserved until quorum, so
+    // a same-key retry waits for this request instead of appending a copy.
+    let (mut resp, pending_dedup) = if state
         .cluster
         .as_ref()
         .is_some_and(|c| c.runtime.config().node_count() > 1)
         && state.broker.config().storage != StorageMode::Slate
     {
-        state.broker.publish_defer_dedup(req)?
+        state.broker.publish_defer_dedup(req).await?
     } else {
-        state.broker.publish(req)?
+        (
+            state.broker.publish_async(req).await?,
+            broker_partition::PendingDedup::default(),
+        )
     };
     let topic = resp.topic.clone();
     let wait = {
@@ -321,20 +441,7 @@ async fn publish_on_leader(
     };
     let epoch = replicate_if_needed(state, &mut resp, wait).await?;
     resp.commit_epoch = Some(epoch);
-    if let (Some(key), false) = (idempotency_key.as_deref(), resp.duplicate) {
-        if let (Some(message_id), Some(offset), Some(partition)) =
-            (resp.message_id, resp.offset, resp.partition)
-        {
-            state.broker.commit_publish_dedup(
-                key,
-                broker_partition::DedupEntry {
-                    message_id,
-                    offset,
-                    partition,
-                },
-            )?;
-        }
-    }
+    state.broker.commit_publish_dedup(pending_dedup)?;
     if let Some(m) = meter {
         if !resp.duplicate {
             crate::metering::record_ingest(state, m.tenant_id, body_bytes).await;
@@ -348,29 +455,171 @@ async fn forward_publish_to_leader(
     shard: u32,
     req: &PublishRequest,
 ) -> Result<PublishResponse, ApiError> {
-    let leader = cluster
-        .runtime
-        .leader_http_base_for_shard(shard)
-        .ok_or_else(|| ApiError::BadRequest("no leader for shard".into()))?;
-    let url = format!(
-        "{}/internal/v1/cluster/publish",
-        leader.trim_end_matches('/')
-    );
-    let resp = crate::cluster_auth::apply_cluster_secret(cluster.http.post(&url))
-        .json(req)
-        .send()
-        .await
-        .map_err(|e| ApiError::BadRequest(format!("forward to shard leader failed: {e}")))?;
-    if !resp.status().is_success() {
+    for attempt in 0..=1 {
+        let leader = cluster
+            .runtime
+            .leader_http_base_for_shard(shard)
+            .ok_or_else(|| ApiError::Unavailable(format!("no leader for shard {shard}")))?;
+        let url = format!(
+            "{}/internal/v1/cluster/publish",
+            leader.trim_end_matches('/')
+        );
+        let resp = crate::cluster_auth::apply_cluster_secret(cluster.http.post(&url))
+            .json(req)
+            .send()
+            .await
+            .map_err(|e| {
+                ApiError::Unavailable(format!(
+                "forward to shard leader failed: {e}; outcome unknown, retry with idempotency_key"
+            ))
+            })?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(ApiError::BadRequest(format!(
-            "shard leader returned {status}: {body}"
-        )));
+        if status.is_success() {
+            return resp.json().await.map_err(|e| {
+                ApiError::Unavailable(format!(
+                    "invalid leader response: {e}; outcome unknown, retry with idempotency_key"
+                ))
+            });
+        }
+        let retry_after = resp.headers().get("retry-after").cloned();
+        let body = resp.bytes().await.map_err(|e| {
+            ApiError::Unavailable(format!(
+                "cannot read leader response: {e}; retry with idempotency_key"
+            ))
+        })?;
+        let stale = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .is_some_and(|value| value["code"] == "not_shard_leader");
+        if attempt == 0 && stale {
+            continue;
+        }
+        return Err(ApiError::Upstream {
+            status,
+            retry_after,
+            body,
+        });
     }
-    resp.json()
-        .await
-        .map_err(|e| ApiError::BadRequest(format!("invalid leader response: {e}")))
+    Err(ApiError::Unavailable(format!(
+        "stale leader retry exhausted for shard {shard}"
+    )))
+}
+
+#[cfg(test)]
+mod forwarding_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn cluster(base: String) -> ClusterHandle {
+        let id = Uuid::new_v4();
+        let runtime = ClusterRuntime::from_config_only(broker_raft_meta::ClusterConfig {
+            cluster_id: Uuid::new_v4(),
+            node_id: id,
+            generation: 1,
+            hash_version: 1,
+            nodes: vec![broker_raft_meta::NodeConfig {
+                id,
+                addr: base,
+                internal_url: None,
+            }],
+        });
+        runtime.record_self_alive(Utc::now().timestamp_millis());
+        ClusterHandle::new(runtime)
+    }
+
+    #[tokio::test]
+    async fn forwarding_retries_stale_leader_and_preserves_backpressure() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = attempts.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/internal/v1/cluster/publish",
+            axum::routing::post(move || {
+                let count = count.clone();
+                async move {
+                    let code = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        "not_shard_leader"
+                    } else {
+                        "saturated"
+                    };
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [("retry-after", "7")],
+                        Json(serde_json::json!({"error": "try later", "code": code})),
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let req = serde_json::from_value(serde_json::json!({"payload":"x"})).unwrap();
+        let error = forward_publish_to_leader(&cluster(base), 0, &req)
+            .await
+            .unwrap_err();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let failure = error.failure();
+        assert_eq!(failure.code, "saturated");
+        assert!(failure.retryable);
+        assert_eq!(failure.retry_after_ms, Some(7_000));
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "7");
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["code"],
+            "saturated"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn forwarding_without_a_known_leader_is_retryable() {
+        let ids: Vec<_> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let runtime = ClusterRuntime::from_config_only(broker_raft_meta::ClusterConfig {
+            cluster_id: Uuid::new_v4(),
+            node_id: ids[0],
+            generation: 1,
+            hash_version: 1,
+            nodes: ids
+                .iter()
+                .map(|id| broker_raft_meta::NodeConfig {
+                    id: *id,
+                    addr: "http://127.0.0.1:1".into(),
+                    internal_url: None,
+                })
+                .collect(),
+        });
+        let req = serde_json::from_value(serde_json::json!({"payload":"x"})).unwrap();
+        let error = forward_publish_to_leader(&ClusterHandle::new(runtime), 0, &req)
+            .await
+            .unwrap_err();
+        let failure = error.failure();
+        assert_eq!(failure.code, "unavailable");
+        assert!(failure.retryable);
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_transport_failure_is_retryable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let req = serde_json::from_value(serde_json::json!({"payload":"x"})).unwrap();
+        let error = forward_publish_to_leader(&cluster(base), 0, &req)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }
 
 pub async fn publish_with_cluster(
@@ -378,6 +627,7 @@ pub async fn publish_with_cluster(
     mut req: PublishRequest,
     meter: Option<crate::metering::IngestMeter>,
 ) -> Result<PublishResponse, ApiError> {
+    state.broker.canonicalize_routing(&mut req)?;
     if let Some(cluster) = &state.cluster {
         if cluster.runtime.config().node_count() > 1 {
             let shard = shard_for_request(state, &req);
@@ -413,7 +663,7 @@ pub async fn publish_with_cluster(
     publish_on_leader(state, req, meter).await
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CatalogSnapshot {
     pub flows: Vec<FlowProfile>,
     pub queues: Vec<Subscription>,
@@ -533,16 +783,33 @@ pub fn peer_fanout_urls(public_url: &str) -> Vec<String> {
 /// Peer broker base URLs for catalog fan-out. Uses saved `bettermq.json` so joins and
 /// registrations propagate before restart (in-memory cluster runtime can be stale).
 pub fn catalog_peer_urls(state: &AppState) -> Vec<String> {
+    if let Some(cluster) = &state.cluster {
+        let mut cache = cluster.catalog_peers.lock();
+        if let Some(entry) = cache.as_ref() {
+            if entry.at.elapsed() < Duration::from_secs(1) {
+                return entry.peers.clone();
+            }
+        }
+        let peers = catalog_peer_urls_uncached(state);
+        *cache = Some(CatalogPeerCache {
+            at: Instant::now(),
+            peers: peers.clone(),
+        });
+        return peers;
+    }
+    catalog_peer_urls_uncached(state)
+}
+
+fn catalog_peer_urls_uncached(state: &AppState) -> Vec<String> {
     let dir = state.broker.config().data_dir.clone();
     if let Ok(Some(cfg)) = load_managed_config(&dir) {
         if cfg.cluster_enabled() {
             if let Some(cluster) = &cfg.cluster {
-                let self_norm = normalize_peer_url(&cfg.node.public_url);
                 return cluster
                     .nodes
                     .iter()
-                    .map(|n| n.public_url.trim().trim_end_matches('/').to_string())
-                    .filter(|u| normalize_peer_url(u) != self_norm)
+                    .filter(|n| n.name != cfg.node.name)
+                    .map(|n| n.internal_base().to_owned())
                     .collect();
             }
         }
@@ -555,13 +822,13 @@ pub fn catalog_peer_urls(state: &AppState) -> Vec<String> {
             .nodes
             .iter()
             .filter(|n| n.id != self_id)
-            .map(|n| n.addr.trim().trim_end_matches('/').to_string())
+            .map(|n| n.internal_base().to_owned())
             .collect();
     }
     Vec::new()
 }
 
-/// `(node_id, public_url)` for every peer in the saved cluster config.
+/// `(node_id, internal_url)` for every peer in the saved cluster config.
 pub fn catalog_peer_targets(state: &AppState) -> Vec<(Uuid, String)> {
     let dir = state.broker.config().data_dir.clone();
     if let Ok(Some(cfg)) = load_managed_config(&dir) {
@@ -572,12 +839,7 @@ pub fn catalog_peer_targets(state: &AppState) -> Vec<(Uuid, String)> {
                     .nodes
                     .iter()
                     .filter(|n| normalize_peer_url(&n.public_url) != self_norm)
-                    .map(|n| {
-                        (
-                            stable_node_id(&n.name),
-                            n.public_url.trim().trim_end_matches('/').to_string(),
-                        )
-                    })
+                    .map(|n| (stable_node_id(&n.name), n.internal_base().to_owned()))
                     .collect();
             }
         }
@@ -590,7 +852,7 @@ pub fn catalog_peer_targets(state: &AppState) -> Vec<(Uuid, String)> {
             .nodes
             .iter()
             .filter(|n| n.id != self_id)
-            .map(|n| (n.id, n.addr.trim().trim_end_matches('/').to_string()))
+            .map(|n| (n.id, n.internal_base().to_owned()))
             .collect();
     }
     Vec::new()
@@ -598,6 +860,17 @@ pub fn catalog_peer_targets(state: &AppState) -> Vec<(Uuid, String)> {
 
 /// Union-merge catalog from all peers into this node (best-effort).
 pub async fn sync_catalog_from_peers(state: &Arc<AppState>) {
+    if state
+        .cluster
+        .as_ref()
+        .and_then(|c| c.runtime.controller())
+        .is_some()
+    {
+        if let Err(error) = crate::catalog_applier::materialize(state) {
+            warn!(%error, "catalog apply failed");
+        }
+        return;
+    }
     let peers = catalog_peer_urls(state);
     if peers.is_empty() {
         return;
@@ -626,158 +899,86 @@ pub fn spawn_cluster_catalog_sync(state: Arc<AppState>) -> Option<tokio::task::J
 
 /// Push local catalog to a peer that just came back online.
 pub async fn push_catalog_to_recovered_peer(peer_base: &str, state: &AppState) -> bool {
-    let snap = catalog_snapshot(state);
-    if snap.flows.is_empty() && snap.queues.is_empty() && snap.crons.is_empty() {
+    if state
+        .cluster
+        .as_ref()
+        .and_then(|c| c.runtime.controller())
+        .is_some()
+    {
         return true;
     }
-    push_catalog_to_peer(peer_base, &snap).await
-}
-
-async fn propagate_catalog_to_peers<T: Serialize>(
-    peer_bases: &[String],
-    path: &str,
-    body: &T,
-) -> usize {
-    if peer_bases.is_empty() {
-        return 0;
-    }
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "catalog fan-out: http client build failed");
-            return 0;
-        }
+    let Ok(snap) = catalog_snapshot(state) else {
+        return false;
     };
-    let mut notified = 0usize;
-    for peer in peer_bases {
-        let mut delivered = false;
-        for base in peer_fanout_urls(peer) {
-            let url = format!("{}{}", base.trim_end_matches('/'), path);
-            match crate::cluster_auth::apply_cluster_secret(client.post(&url))
-                .json(body)
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    notified += 1;
-                    delivered = true;
-                    break;
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let detail = resp.text().await.unwrap_or_default();
-                    warn!(peer = %peer, base = %base, %status, body = %detail, "catalog fan-out rejected");
-                }
-                Err(e) => warn!(peer = %peer, base = %base, error = %e, "catalog fan-out failed"),
-            }
-        }
-        if !delivered {
-            warn!(peer = %peer, "catalog fan-out exhausted peer URLs");
-        }
-    }
-    notified
+    push_catalog_to_peer(peer_base, &snap).await
 }
 
 fn persist_catalog_tombstone(
     state: &AppState,
     id: Uuid,
     kind: crate::catalog_tombstones::CatalogKind,
-) {
-    if let Err(e) = state.catalog_tombstones.record(id, kind) {
-        warn!(error = %e, %id, "catalog tombstone persist failed");
-    }
+) -> Result<(), ApiError> {
+    state
+        .catalog_tombstones
+        .record(id, kind)
+        .map_err(crate::catalog_applier::unavailable)
 }
 
-async fn fanout_catalog<T: Serialize>(state: &AppState, path: &str, body: &T, what: &'static str) {
-    let peers = catalog_peer_urls(state);
-    let notified = propagate_catalog_to_peers(&peers, path, body).await;
-    if !peers.is_empty() && notified == 0 {
-        warn!(
-            peers = peers.len(),
-            what, "catalog propagate did not reach any peer"
-        );
-    }
-}
-
-async fn advance_catalog_controller(state: &AppState) {
-    if let Some(cluster) = &state.cluster {
-        if let Err(error) = cluster.runtime.advance_catalog_epoch().await {
-            warn!(%error, "catalog mutation rejected by OpenRaft controller");
-        }
-    }
-}
-
-async fn put_authoritative_catalog(
-    state: &AppState,
-    kind: &str,
-    key: &str,
-    payload: &impl serde::Serialize,
-    tombstone: bool,
-) {
-    let Some(cluster) = &state.cluster else {
-        return;
-    };
-    let payload_json = match serde_json::to_string(payload) {
-        Ok(json) => json,
-        Err(error) => {
-            warn!(%error, kind, key, "catalog record serialize failed");
-            return;
-        }
-    };
-    if let Err(error) = cluster
-        .runtime
-        .put_catalog_record(kind.into(), key.into(), payload_json, tombstone)
-        .await
-    {
-        warn!(%error, kind, key, "authoritative catalog write rejected");
-    }
-}
-
-pub fn catalog_snapshot(state: &AppState) -> CatalogSnapshot {
-    let members = state
-        .broker
-        .list_groups()
-        .ok()
-        .map(|groups| {
-            groups
-                .iter()
-                .flat_map(|g| state.broker.list_group_members(g.id).unwrap_or_default())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+pub fn catalog_snapshot(state: &AppState) -> Result<CatalogSnapshot, ApiError> {
+    let (groups, members) = state.broker.catalog_groups()?;
     // Cluster catalog sync still needs secrets for followers to deliver webhooks.
     // Exposure is gated by BETTERMQ_CLUSTER_SECRET (fail-closed). Operators must
     // keep /internal/v1/* off the public internet.
-    CatalogSnapshot {
-        flows: state.broker.list_flow_profiles().unwrap_or_default(),
-        queues: state.broker.list_queues().unwrap_or_default(),
-        groups: state.broker.list_groups().unwrap_or_default(),
+    Ok(CatalogSnapshot {
+        flows: state.broker.catalog_flows()?,
+        queues: state.broker.catalog_queues()?,
+        groups,
         group_members: members,
         crons: state.crons.list(),
-        tombstones: state.catalog_tombstones.snapshot(),
-    }
+        tombstones: state
+            .catalog_tombstones
+            .snapshot()
+            .map_err(crate::catalog_applier::unavailable)?,
+    })
 }
 
-fn catalog_item_alive(id: Uuid, updated_at_ms: i64, tombstones: &HashMap<Uuid, i64>) -> bool {
-    tombstones
-        .get(&id)
-        .map(|deleted_at| updated_at_ms > *deleted_at)
-        .unwrap_or(true)
+fn catalog_item_alive(id: Uuid, _updated_at_ms: i64, tombstones: &HashMap<Uuid, i64>) -> bool {
+    !tombstones.contains_key(&id)
 }
 
 pub fn apply_catalog_snapshot(state: &AppState, snap: &CatalogSnapshot) -> Result<(), ApiError> {
+    crate::catalog_applier::legacy_write_allowed(state)?;
+    crate::catalog_applier::additive_no_overwrite(state, snap)?;
     state
         .catalog_tombstones
         .merge_remote(&snap.tombstones)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let tombstones = state.catalog_tombstones.snapshot();
+    let tombstones = state
+        .catalog_tombstones
+        .snapshot()
+        .map_err(crate::catalog_applier::unavailable)?;
+    // UUID tombstones apply to every local kind, including tombstone-only repair.
+    for id in tombstones.keys() {
+        state.broker.apply_flow_authoritative("*", *id, None)?;
+        state.broker.apply_queue_authoritative("*", *id, None)?;
+        state.broker.apply_group_authoritative("*", *id, None)?;
+        state.broker.apply_member_authoritative("*", *id, None)?;
+        state
+            .crons
+            .apply_authoritative(*id, None)
+            .map_err(crate::catalog_applier::unavailable)?;
+    }
     for profile in &snap.flows {
         if !catalog_item_alive(profile.id, profile.updated_at_ms, &tombstones) {
             continue;
         }
+        state.broker.prepare_flow(
+            profile.key.clone(),
+            profile.parallelism,
+            profile.rate,
+            profile.period_secs,
+            profile.id,
+        )?;
         state
             .broker
             .upsert_flow_profile(profile.clone())
@@ -797,6 +998,7 @@ pub fn apply_catalog_snapshot(state: &AppState, snap: &CatalogSnapshot) -> Resul
         if !catalog_item_alive(group.id, group.updated_at_ms, &tombstones) {
             continue;
         }
+        state.broker.validate_catalog_group(group)?;
         state
             .broker
             .upsert_group_catalog(group.clone())
@@ -806,13 +1008,21 @@ pub fn apply_catalog_snapshot(state: &AppState, snap: &CatalogSnapshot) -> Resul
         if !catalog_item_alive(member.id, member.updated_at_ms, &tombstones) {
             continue;
         }
+        state.broker.validate_catalog_member(member)?;
         crate::routes::validate_destination_url_str_pub(&member.url)?;
         state
             .broker
             .upsert_group_member_catalog(member.clone())
             .map_err(ApiError::Broker)?;
     }
-    for job in &snap.crons {
+    // Catalog sync must not create or change crons in a cell (they are
+    // node-local there); deletes still arrive through tombstones.
+    let crons = if state.cluster.is_some() {
+        &[][..]
+    } else {
+        &snap.crons[..]
+    };
+    for job in crons {
         if !catalog_item_alive(job.id, job.updated_at_ms, &tombstones) {
             continue;
         }
@@ -969,10 +1179,13 @@ pub async fn merge_catalog_from_peers(
     let mut groups: HashMap<Uuid, DispatchGroup> = HashMap::new();
     let mut group_members: HashMap<Uuid, GroupMember> = HashMap::new();
     let mut crons: HashMap<Uuid, CronJob> = HashMap::new();
-    let mut tombstones: HashMap<Uuid, i64> = state.catalog_tombstones.snapshot();
+    let mut tombstones: HashMap<Uuid, i64> = state
+        .catalog_tombstones
+        .snapshot()
+        .map_err(crate::catalog_applier::unavailable)?;
     let mut fetched = 0usize;
 
-    let local = catalog_snapshot(state);
+    let local = catalog_snapshot(state)?;
     merge_tombstones_lww(&mut tombstones, &local.tombstones);
     for f in local.flows {
         merge_flow_lww(&mut flows, f);
@@ -1076,8 +1289,8 @@ pub async fn push_catalog_to_peer(peer_base: &str, snap: &CatalogSnapshot) -> bo
 
 pub async fn internal_catalog_snapshot(
     State(state): State<Arc<AppState>>,
-) -> Json<CatalogSnapshot> {
-    Json(catalog_snapshot(&state))
+) -> Result<Json<CatalogSnapshot>, ApiError> {
+    Ok(Json(catalog_snapshot(&state)?))
 }
 
 pub async fn internal_catalog_apply(
@@ -1093,171 +1306,87 @@ pub async fn internal_catalog_apply(
     Ok(StatusCode::OK)
 }
 
-pub async fn replicate_flow_catalog(state: &AppState, profile: FlowProfile) {
-    advance_catalog_controller(state).await;
-    put_authoritative_catalog(state, "flow", &profile.id.to_string(), &profile, false).await;
-    let peers = catalog_peer_urls(state);
-    let notified = propagate_catalog_to_peers(
-        &peers,
-        "/internal/v1/cluster/catalog/flow",
-        &CatalogFlowUpsert { profile },
-    )
-    .await;
-    if !peers.is_empty() && notified == 0 {
-        warn!(
-            peers = peers.len(),
-            "flow catalog create did not reach any peer"
-        );
-    }
+/// Per-peer outcome of pushing local-auth credentials (setup or rotation).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AuthPropagation {
+    pub peers: usize,
+    pub applied: usize,
+    pub failed: Vec<AuthPropagationFailure>,
 }
 
-pub async fn replicate_queue_catalog(state: &AppState, subscription: Subscription) {
-    advance_catalog_controller(state).await;
-    put_authoritative_catalog(
-        state,
-        "queue",
-        &subscription.id.to_string(),
-        &subscription,
-        false,
-    )
-    .await;
-    let peers = catalog_peer_urls(state);
-    let notified = propagate_catalog_to_peers(
-        &peers,
-        "/internal/v1/cluster/catalog/queue",
-        &CatalogQueueUpsert { subscription },
-    )
-    .await;
-    if !peers.is_empty() && notified == 0 {
-        warn!(
-            peers = peers.len(),
-            "queue catalog create did not reach any peer"
-        );
-    }
+#[derive(Debug, Clone, Serialize)]
+pub struct AuthPropagationFailure {
+    pub peer: String,
+    pub error: String,
 }
 
-pub async fn replicate_flow_delete(state: &AppState, flow_id: Uuid) {
-    advance_catalog_controller(state).await;
-    persist_catalog_tombstone(state, flow_id, crate::catalog_tombstones::CatalogKind::Flow);
-    fanout_catalog(
-        state,
-        "/internal/v1/cluster/catalog/flow/delete",
-        &CatalogFlowDelete { flow_id },
-        "flow delete",
-    )
-    .await;
-}
-
-pub async fn replicate_queue_delete(state: &AppState, queue_id: Uuid) {
-    advance_catalog_controller(state).await;
-    persist_catalog_tombstone(
-        state,
-        queue_id,
-        crate::catalog_tombstones::CatalogKind::Queue,
-    );
-    fanout_catalog(
-        state,
-        "/internal/v1/cluster/catalog/queue/delete",
-        &CatalogQueueDelete { queue_id },
-        "queue delete",
-    )
-    .await;
-}
-
-pub async fn replicate_group_catalog(state: &AppState, group: DispatchGroup) {
-    advance_catalog_controller(state).await;
-    let peers = catalog_peer_urls(state);
-    let notified = propagate_catalog_to_peers(
-        &peers,
-        "/internal/v1/cluster/catalog/group",
-        &CatalogGroupUpsert { group },
-    )
-    .await;
-    if !peers.is_empty() && notified == 0 {
-        warn!(
-            peers = peers.len(),
-            "group catalog create did not reach any peer"
-        );
-    }
-}
-
-pub async fn replicate_group_member_catalog(state: &AppState, member: GroupMember) {
-    advance_catalog_controller(state).await;
-    let peers = catalog_peer_urls(state);
-    let notified = propagate_catalog_to_peers(
-        &peers,
-        "/internal/v1/cluster/catalog/group-member",
-        &CatalogGroupMemberUpsert { member },
-    )
-    .await;
-    if !peers.is_empty() && notified == 0 {
-        warn!(
-            peers = peers.len(),
-            "group member catalog create did not reach any peer"
-        );
-    }
-}
-
-pub async fn replicate_group_delete(state: &AppState, group_id: Uuid) {
-    advance_catalog_controller(state).await;
-    persist_catalog_tombstone(
-        state,
-        group_id,
-        crate::catalog_tombstones::CatalogKind::Group,
-    );
-    fanout_catalog(
-        state,
-        "/internal/v1/cluster/catalog/group/delete",
-        &CatalogGroupDelete { group_id },
-        "group delete",
-    )
-    .await;
-}
-
-pub async fn replicate_group_member_delete(state: &AppState, member_id: Uuid) {
-    advance_catalog_controller(state).await;
-    persist_catalog_tombstone(
-        state,
-        member_id,
-        crate::catalog_tombstones::CatalogKind::GroupMember,
-    );
-    fanout_catalog(
-        state,
-        "/internal/v1/cluster/catalog/group-member/delete",
-        &CatalogGroupMemberDelete { member_id },
-        "group member delete",
-    )
-    .await;
-}
-
-pub async fn replicate_cron_catalog(state: &AppState, job: CronJob) {
-    advance_catalog_controller(state).await;
-    let peers = catalog_peer_urls(state);
-    let notified = propagate_catalog_to_peers(
-        &peers,
-        "/internal/v1/cluster/catalog/cron",
-        &CatalogCronUpsert { job },
-    )
-    .await;
-    if !peers.is_empty() && notified == 0 {
-        warn!(
-            peers = peers.len(),
-            "cron catalog create did not reach any peer"
-        );
-    }
-}
-
+/// Push credentials to every peer and report which ones applied them, so a
+/// rotation that left peers on the old token is visible to the caller.
 pub async fn replicate_auth_credentials(
     state: &AppState,
     creds: broker_local_auth::AuthCredentials,
-) {
-    fanout_catalog(
-        state,
-        "/internal/v1/cluster/auth/apply",
-        &ClusterAuthSnapshot { credentials: creds },
-        "auth credentials",
-    )
-    .await;
+) -> AuthPropagation {
+    let peers = catalog_peer_urls(state);
+    let mut report = AuthPropagation {
+        peers: peers.len(),
+        ..AuthPropagation::default()
+    };
+    if peers.is_empty() {
+        return report;
+    }
+    let body = ClusterAuthSnapshot { credentials: creds };
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            report.failed = peers
+                .into_iter()
+                .map(|peer| AuthPropagationFailure {
+                    peer,
+                    error: format!("http client: {e}"),
+                })
+                .collect();
+            return report;
+        }
+    };
+    for peer in peers {
+        let mut last_error = String::from("no peer URL attempted");
+        let mut delivered = false;
+        for base in peer_fanout_urls(&peer) {
+            let url = format!(
+                "{}/internal/v1/cluster/auth/apply",
+                base.trim_end_matches('/')
+            );
+            match crate::cluster_auth::apply_cluster_secret(client.post(&url))
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    delivered = true;
+                    break;
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let detail = resp.text().await.unwrap_or_default();
+                    last_error = format!("HTTP {status}: {detail}");
+                }
+                Err(e) => last_error = e.to_string(),
+            }
+        }
+        if delivered {
+            report.applied += 1;
+        } else {
+            warn!(peer = %peer, error = %last_error, "auth credential propagation failed");
+            report.failed.push(AuthPropagationFailure {
+                peer,
+                error: last_error,
+            });
+        }
+    }
+    report
 }
 
 pub async fn pull_auth_from_seed(state: &Arc<AppState>, seed_base: &str) -> Result<(), ApiError> {
@@ -1321,30 +1450,26 @@ pub async fn internal_cluster_auth_apply(
     };
     local
         .apply_credentials(&body.credentials)
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        .map_err(|e| match e {
+            broker_local_auth::LocalAuthError::AlreadyConfigured => ApiError::Conflict(
+                "peer holds different credentials of the same or a newer version".into(),
+            ),
+            other => ApiError::BadRequest(other.to_string()),
+        })?;
     Ok(StatusCode::OK)
-}
-
-pub async fn replicate_cron_delete(state: &AppState, cron_id: Uuid) {
-    advance_catalog_controller(state).await;
-    persist_catalog_tombstone(state, cron_id, crate::catalog_tombstones::CatalogKind::Cron);
-    fanout_catalog(
-        state,
-        "/internal/v1/cluster/catalog/cron/delete",
-        &CatalogCronDelete { cron_id },
-        "cron delete",
-    )
-    .await;
 }
 
 pub async fn internal_catalog_flow(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogFlowUpsert>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .broker
-        .upsert_flow_profile(body.profile)
-        .map_err(ApiError::Broker)?;
+    apply_catalog_snapshot(
+        &state,
+        &CatalogSnapshot {
+            flows: vec![body.profile],
+            ..Default::default()
+        },
+    )?;
     Ok(StatusCode::OK)
 }
 
@@ -1352,10 +1477,13 @@ pub async fn internal_catalog_queue(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogQueueUpsert>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .broker
-        .upsert_subscription_catalog(body.subscription)
-        .map_err(ApiError::Broker)?;
+    apply_catalog_snapshot(
+        &state,
+        &CatalogSnapshot {
+            queues: vec![body.subscription],
+            ..Default::default()
+        },
+    )?;
     Ok(StatusCode::OK)
 }
 
@@ -1363,11 +1491,12 @@ pub async fn internal_catalog_delete_flow(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogFlowDelete>,
 ) -> Result<StatusCode, ApiError> {
+    crate::catalog_applier::legacy_write_allowed(&state)?;
     persist_catalog_tombstone(
         &state,
         body.flow_id,
         crate::catalog_tombstones::CatalogKind::Flow,
-    );
+    )?;
     if state
         .broker
         .get_flow_profile(body.flow_id)
@@ -1382,14 +1511,27 @@ pub async fn internal_catalog_delete_flow(
     Ok(StatusCode::OK)
 }
 
+pub(crate) const CRON_MUTATION_UNSUPPORTED_IN_CELL: &str =
+    "creating or changing crons is not supported in multi-node cells in this release";
+
 pub async fn internal_catalog_cron(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogCronUpsert>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .crons
-        .upsert(body.job)
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    // Peer pushes (e.g. from a node still on an older release) must not
+    // bypass the public create/update gate.
+    if state.cluster.is_some() {
+        return Err(ApiError::NotImplemented(
+            CRON_MUTATION_UNSUPPORTED_IN_CELL.into(),
+        ));
+    }
+    apply_catalog_snapshot(
+        &state,
+        &CatalogSnapshot {
+            crons: vec![body.job],
+            ..Default::default()
+        },
+    )?;
     Ok(StatusCode::OK)
 }
 
@@ -1397,11 +1539,12 @@ pub async fn internal_catalog_delete_cron(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogCronDelete>,
 ) -> Result<StatusCode, ApiError> {
+    crate::catalog_applier::legacy_write_allowed(&state)?;
     persist_catalog_tombstone(
         &state,
         body.cron_id,
         crate::catalog_tombstones::CatalogKind::Cron,
-    );
+    )?;
     if state.crons.get(body.cron_id).is_ok() {
         state
             .crons
@@ -1415,11 +1558,12 @@ pub async fn internal_catalog_delete_queue(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogQueueDelete>,
 ) -> Result<StatusCode, ApiError> {
+    crate::catalog_applier::legacy_write_allowed(&state)?;
     persist_catalog_tombstone(
         &state,
         body.queue_id,
         crate::catalog_tombstones::CatalogKind::Queue,
-    );
+    )?;
     if state
         .broker
         .get_queue_by_id(body.queue_id)
@@ -1438,10 +1582,13 @@ pub async fn internal_catalog_group(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogGroupUpsert>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .broker
-        .upsert_group_catalog(body.group)
-        .map_err(ApiError::Broker)?;
+    apply_catalog_snapshot(
+        &state,
+        &CatalogSnapshot {
+            groups: vec![body.group],
+            ..Default::default()
+        },
+    )?;
     Ok(StatusCode::OK)
 }
 
@@ -1449,11 +1596,12 @@ pub async fn internal_catalog_delete_group(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogGroupDelete>,
 ) -> Result<StatusCode, ApiError> {
+    crate::catalog_applier::legacy_write_allowed(&state)?;
     persist_catalog_tombstone(
         &state,
         body.group_id,
         crate::catalog_tombstones::CatalogKind::Group,
-    );
+    )?;
     if state
         .broker
         .get_group(body.group_id)
@@ -1472,10 +1620,13 @@ pub async fn internal_catalog_group_member(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogGroupMemberUpsert>,
 ) -> Result<StatusCode, ApiError> {
-    state
-        .broker
-        .upsert_group_member_catalog(body.member)
-        .map_err(ApiError::Broker)?;
+    apply_catalog_snapshot(
+        &state,
+        &CatalogSnapshot {
+            group_members: vec![body.member],
+            ..Default::default()
+        },
+    )?;
     Ok(StatusCode::OK)
 }
 
@@ -1483,11 +1634,12 @@ pub async fn internal_catalog_delete_group_member(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CatalogGroupMemberDelete>,
 ) -> Result<StatusCode, ApiError> {
+    crate::catalog_applier::legacy_write_allowed(&state)?;
     persist_catalog_tombstone(
         &state,
         body.member_id,
         crate::catalog_tombstones::CatalogKind::GroupMember,
-    );
+    )?;
     if state
         .broker
         .get_group_member(body.member_id)
@@ -1513,7 +1665,7 @@ pub async fn internal_cluster_publish(
         .ok_or_else(|| ApiError::BadRequest("cluster mode not enabled".into()))?;
     let shard = shard_for_request(&state, &req);
     if !cluster.runtime.is_leader_for_shard(shard) {
-        return Err(ApiError::BadRequest(format!(
+        return Err(ApiError::Unavailable(format!(
             "this node is not leader for shard {shard}"
         )));
     }
@@ -1584,34 +1736,45 @@ fn validate_replication_epoch(
     runtime: &ClusterRuntime,
     body: &ReplicateBatchRequest,
 ) -> Result<(), ApiError> {
-    let elected = runtime.elect_leader_for_shard(body.partition);
-    if elected != Some(body.leader_id) {
+    validate_leader_epoch(runtime, body.partition, body.leader_id, body.leader_epoch)
+}
+
+/// Reject requests from a node that is not the committed shard leader, or
+/// from an older leader epoch; adopt the next epoch when it is newer by one.
+fn validate_leader_epoch(
+    runtime: &ClusterRuntime,
+    partition: u32,
+    leader_id: Uuid,
+    leader_epoch: u64,
+) -> Result<(), ApiError> {
+    let elected = runtime.elect_leader_for_shard(partition);
+    if elected != Some(leader_id) {
         return Err(ApiError::BadRequest(format!(
             "replication leader {} is not elected for shard {}",
-            body.leader_id, body.partition
+            leader_id, partition
         )));
     }
-    let expected = runtime.shard_generation(body.partition);
-    if body.leader_epoch < expected {
+    let expected = runtime.shard_generation(partition);
+    if leader_epoch < expected {
         return Err(ApiError::BadRequest(format!(
             "stale leader_epoch {} < {}",
-            body.leader_epoch, expected
+            leader_epoch, expected
         )));
     }
-    if body.leader_epoch > expected {
-        if body.leader_epoch != expected.saturating_add(1) {
+    if leader_epoch > expected {
+        if leader_epoch != expected.saturating_add(1) {
             return Err(ApiError::BadRequest(format!(
                 "leader_epoch jump {} -> {} is not allowed",
-                expected, body.leader_epoch
+                expected, leader_epoch
             )));
         }
         let observed = runtime
-            .try_observe_shard_generation(body.partition, body.leader_epoch)
+            .try_observe_shard_generation(partition, leader_epoch)
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        if observed != body.leader_epoch {
+        if observed != leader_epoch {
             return Err(ApiError::BadRequest(format!(
                 "failed to durably adopt leader_epoch {}",
-                body.leader_epoch
+                leader_epoch
             )));
         }
     }
@@ -1622,7 +1785,7 @@ pub async fn internal_replicate_batch(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<ReplicateBatchAck>, ApiError> {
+) -> Result<Response, ApiError> {
     if state.broker.config().storage == StorageMode::Slate {
         return Err(ApiError::BadRequest(
             "slate mode: frame replication disabled".into(),
@@ -1668,30 +1831,190 @@ pub async fn internal_replicate_batch(
         frame_topics.push(header.topic);
     }
 
-    let mut last_offset = body.first_offset;
-    for (i, (frame, topic)) in body.frames.iter().zip(&frame_topics).enumerate() {
-        let offset = body.first_offset + i as u64;
-        last_offset = offset;
-        state
-            .broker
-            .append_replicated_frame(topic, body.partition, frame, Some(offset))?;
-    }
-    let commit_topic = frame_topics.first().cloned().unwrap_or_default();
-    let durable_hwm = state
-        .broker
-        .wait_committed(&commit_topic, body.partition, last_offset)
-        .await?;
     let node_id = state
         .cluster
         .as_ref()
         .map(|cluster| cluster.runtime.config().node_id)
         .ok_or_else(|| ApiError::BadRequest("cluster mode not enabled".into()))?;
+    let commit_topic = frame_topics.first().cloned().unwrap_or_default();
+    // Concurrent leader pushes can arrive out of order. Give an earlier epoch a
+    // moment to land before rejecting this one as a gap.
+    let deadline = std::time::Instant::now() + REORDER_WAIT;
+    while state
+        .broker
+        .partition_high_watermark(&commit_topic, body.partition)?
+        < body.first_offset
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let mut last_offset = body.first_offset;
+    for (i, (frame, topic)) in body.frames.iter().zip(&frame_topics).enumerate() {
+        let offset = body.first_offset + i as u64;
+        last_offset = offset;
+        match state
+            .broker
+            .append_replicated_frame(topic, body.partition, frame, Some(offset))
+        {
+            Ok(_) => {}
+            Err(broker_partition::BrokerError::Storage(
+                broker_storage::LogError::OffsetMismatch { have, want },
+            )) => {
+                // Structured position so the leader can repair from our log end.
+                return Ok((
+                    StatusCode::CONFLICT,
+                    Json(ReplicaPositionConflict {
+                        node_id,
+                        partition: body.partition,
+                        leader_epoch: body.leader_epoch,
+                        log_end: have,
+                        want,
+                    }),
+                )
+                    .into_response());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let durable_hwm = state
+        .broker
+        .wait_committed(&commit_topic, body.partition, last_offset)
+        .await?;
+    if let Some(cluster) = &state.cluster {
+        let stream = cluster.replication.progress_stream(&body.topic);
+        if let Err(error) = cluster.replication.follower_fence().record_ack(
+            &stream,
+            body.partition,
+            body.leader_epoch,
+            durable_hwm,
+        ) {
+            return Err(ApiError::Unavailable(format!(
+                "could not persist replica fence: {error}"
+            )));
+        }
+    }
     Ok(Json(ReplicateBatchAck {
         node_id,
         partition: body.partition,
         leader_epoch: body.leader_epoch,
         durable_hwm,
-    }))
+    })
+    .into_response())
+}
+
+/// How long a follower holds an epoch that starts beyond its log end.
+const REORDER_WAIT: Duration = Duration::from_millis(500);
+
+/// Leader-requested truncation of a divergent follower tail. Fenced by the
+/// leader epoch and by what this follower has already acknowledged; the cut
+/// bytes are kept in a sidecar file next to the log.
+pub async fn internal_replicate_truncate(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<ReplicateTruncateRequest>,
+) -> Result<Response, ApiError> {
+    if state.broker.config().storage == StorageMode::Slate {
+        return Err(ApiError::BadRequest(
+            "slate mode: frame replication disabled".into(),
+        ));
+    }
+    let cluster = state
+        .cluster
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("cluster mode not enabled".into()))?;
+    if !body.tenant_id.is_empty() && body.tenant_id != state.broker.tenant() {
+        return Err(ApiError::BadRequest("truncate tenant mismatch".into()));
+    }
+    validate_leader_epoch(
+        &cluster.runtime,
+        body.partition,
+        body.leader_id,
+        body.leader_epoch,
+    )?;
+    let local_end = state.broker.committed_hwm(&body.topic, body.partition)?;
+    let stream = cluster.replication.progress_stream(&body.topic);
+    cluster
+        .replication
+        .follower_fence()
+        .check_truncate(
+            &stream,
+            body.partition,
+            body.leader_epoch,
+            body.to_offset,
+            local_end,
+        )
+        .map_err(ApiError::Conflict)?;
+    let log_end = match state.broker.truncate_replica_log(
+        &body.topic,
+        body.partition,
+        body.to_offset,
+        body.leader_epoch,
+    ) {
+        Ok(end) => end,
+        Err(broker_partition::BrokerError::Storage(
+            broker_storage::LogError::TruncateUnsupported(reason),
+        )) => {
+            tracing::error!(
+                partition = body.partition,
+                topic = %body.topic,
+                to_offset = body.to_offset,
+                %reason,
+                "divergent replica tail cannot be truncated; replica stays out of sync"
+            );
+            return Ok((StatusCode::NOT_IMPLEMENTED, reason).into_response());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Json(ReplicateTruncateResponse {
+        node_id: cluster.runtime.config().node_id,
+        partition: body.partition,
+        log_end,
+    })
+    .into_response())
+}
+
+/// Lane cursors a shard leader shares with its peers, so a node taking over
+/// a shard in a cell without shared metadata does not redeliver everything the
+/// previous leader already delivered.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchCursorCheckpoint {
+    pub leader_id: Uuid,
+    pub cursors: Vec<DispatchCursorEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DispatchCursorEntry {
+    pub tenant_id: String,
+    pub lane: String,
+    pub partition: u32,
+    pub next_offset: u64,
+}
+
+/// Apply a peer's cursor checkpoint. Only cursors of shards the sender leads
+/// (and this node does not) are taken, and only forwards: the setter is
+/// monotonic, and a takeover clamps cursors to the verified quorum prefix.
+pub async fn internal_dispatch_cursors(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<DispatchCursorCheckpoint>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(cluster) = &state.cluster else {
+        return Err(ApiError::BadRequest("cluster mode not enabled".into()));
+    };
+    let mut applied = 0usize;
+    for entry in body.cursors {
+        if cluster.runtime.elect_leader_for_shard(entry.partition) != Some(body.leader_id)
+            || cluster.runtime.is_leader_for_shard(entry.partition)
+        {
+            continue;
+        }
+        state.broker.set_dispatch_offset(
+            &entry.tenant_id,
+            &entry.lane,
+            entry.partition,
+            entry.next_offset,
+        )?;
+        applied += 1;
+    }
+    Ok(Json(serde_json::json!({ "applied": applied })))
 }
 
 pub async fn internal_replicate_catch_up(
@@ -1704,11 +2027,12 @@ pub async fn internal_replicate_catch_up(
     let frames = if max_records == 0 {
         Vec::new()
     } else {
-        state.broker.replication_frames(
+        state.broker.replication_frames_bounded(
             &body.topic,
             body.partition,
             body.from_offset,
             max_records,
+            broker_replication::max_catchup_page_bytes(),
         )?
     };
     let leader_generation = state
@@ -1720,11 +2044,16 @@ pub async fn internal_replicate_catch_up(
         .into_iter()
         .map(|(offset, bytes)| CatchUpFrame { offset, bytes })
         .collect();
+    let base_offset = state
+        .broker
+        .log_retention_status(&state.broker.log_id(&body.topic, body.partition), 0)?
+        .base_offset;
     let encoded = ReplicateCatchUpRange {
         partition: body.partition,
         leader_generation,
         frames,
         committed_hwm,
+        base_offset,
     }
     .encode_binary()
     .map_err(|error| ApiError::BadRequest(error.to_string()))?;
@@ -1805,18 +2134,22 @@ pub async fn internal_controller_snapshot(
 
 pub async fn internal_controller_command(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(command): Json<broker_raft_meta::ControllerCommand>,
 ) -> Result<Json<broker_raft_meta::ControllerCommandResponse>, ApiError> {
     let controller = state
         .cluster
         .as_ref()
         .and_then(|cluster| cluster.runtime.controller())
-        .ok_or_else(|| ApiError::BadRequest("OpenRaft controller is not enabled".into()))?;
-    let state = controller
-        .submit(command)
+        .ok_or_else(|| ApiError::Unavailable("OpenRaft controller is not enabled".into()))?;
+    let applied_index_only = headers
+        .get(broker_raft_meta::CONTROLLER_RESPONSE_HEADER)
+        .is_some_and(|value| value == broker_raft_meta::CONTROLLER_RESPONSE_APPLIED_INDEX);
+    controller
+        .serve_forwarded(command, applied_index_only)
         .await
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-    Ok(Json(broker_raft_meta::ControllerCommandResponse { state }))
+        .map(Json)
+        .map_err(crate::catalog_applier::controller_error)
 }
 
 /// Merge peer health observations from another cluster member (CP7b gossip).
@@ -1886,10 +2219,12 @@ mod tests {
             cluster_id: Uuid::new_v4(),
             nodes: vec![
                 NodeConfig {
+                    internal_url: None,
                     id: leader,
                     addr: "http://leader".into(),
                 },
                 NodeConfig {
+                    internal_url: None,
                     id: follower,
                     addr: "http://follower".into(),
                 },

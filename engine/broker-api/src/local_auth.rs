@@ -14,23 +14,135 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
+const AUTH_ATTEMPTS_PER_WINDOW: u32 = 5;
+const AUTH_RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Concurrent Argon2 operations (each ~19 MiB and tens of ms of CPU).
+const ARGON2_CONCURRENCY: usize = 2;
+const ARGON2_QUEUE_WAIT: Duration = Duration::from_secs(10);
+
 fn auth_rate_limiter() -> &'static RateLimiter {
     static LIM: OnceLock<RateLimiter> = OnceLock::new();
-    LIM.get_or_init(|| RateLimiter::new(5, Duration::from_secs(60)))
+    LIM.get_or_init(|| RateLimiter::new(AUTH_ATTEMPTS_PER_WINDOW, AUTH_RATE_WINDOW))
+}
+
+fn argon2_slots() -> &'static tokio::sync::Semaphore {
+    static SLOTS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(ARGON2_CONCURRENCY))
+}
+
+/// Socket peer address, when the server was started with connect info.
+pub(crate) struct PeerIp(pub Option<std::net::IpAddr>);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|info| info.0.ip()),
+        ))
+    }
+}
+
+/// Run a password-hashing operation off the async workers, bounded so a
+/// burst of attempts cannot exhaust CPU or memory.
+async fn run_argon2<T, F>(op: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, LocalAuthError> + Send + 'static,
+{
+    let _permit = tokio::time::timeout(ARGON2_QUEUE_WAIT, argon2_slots().acquire())
+        .await
+        .map_err(|_| ApiError::TooManyRequests {
+            retry_after_ms: 1_000,
+            message: "auth service busy — try again shortly".into(),
+        })?
+        .map_err(|_| ApiError::BadRequest("password processing unavailable".into()))?;
+    tokio::task::spawn_blocking(op)
+        .await
+        .map_err(|_| ApiError::BadRequest("password processing failed".into()))?
+        .map_err(map_local_err)
 }
 
 /// First-boot claim window. `None` means locked (unless env overrides).
 static SETUP_WINDOW_UNTIL: Mutex<Option<SystemTime>> = Mutex::new(None);
+/// One-time code that must accompany setup while the window is open. Kept in
+/// memory only and printed to the process log, so only someone who can read
+/// the operator's console or logs can claim the broker.
+static SETUP_CODE: Mutex<Option<String>> = Mutex::new(None);
 
-/// Open panel password setup until `now + duration` (no token). Restarting the
-/// process starts a new window. Used instead of writing a secret into the data dir.
-pub fn open_setup_window(duration: Duration) {
+const SETUP_CODE_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// Open panel password setup until `now + duration` and return the setup code
+/// the caller must print. `BETTERMQ_SETUP_CODE` presets the code (for scripted
+/// installs); otherwise a random 80-bit code is generated. Restarting the
+/// process starts a new window and a new code.
+pub fn open_setup_window(duration: Duration) -> String {
+    let code = std::env::var("BETTERMQ_SETUP_CODE")
+        .ok()
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(generate_setup_code);
+    *SETUP_CODE.lock().unwrap() = Some(code.clone());
     *SETUP_WINDOW_UNTIL.lock().unwrap() = Some(SystemTime::now() + duration);
+    code
 }
 
 /// Lock setup unless `BETTERMQ_ALLOW_OPEN_SETUP` is set.
 pub fn close_setup_window() {
     *SETUP_WINDOW_UNTIL.lock().unwrap() = None;
+    *SETUP_CODE.lock().unwrap() = None;
+}
+
+/// `XXXX-XXXX-XXXX-XXXX` in Crockford base32 (no I, L, O, U).
+fn generate_setup_code() -> String {
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    let mut bits: u128 = u128::from_be_bytes(bytes);
+    let mut out = String::with_capacity(19);
+    for i in 0..16 {
+        if i > 0 && i % 4 == 0 {
+            out.push('-');
+        }
+        out.push(SETUP_CODE_ALPHABET[(bits & 31) as usize] as char);
+        bits >>= 5;
+    }
+    out
+}
+
+fn normalize_setup_code(code: &str) -> String {
+    code.chars()
+        .filter(|c| !matches!(c, '-' | ' '))
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+fn check_setup_code(provided: Option<&str>) -> Result<(), ApiError> {
+    if env_flag("BETTERMQ_ALLOW_OPEN_SETUP") {
+        return Ok(());
+    }
+    let expected = SETUP_CODE.lock().unwrap().clone();
+    let Some(expected) = expected else {
+        return Err(ApiError::Unauthorized(
+            "setup window closed — restart BetterMQ, then set a password".into(),
+        ));
+    };
+    let ok = provided.is_some_and(|got| {
+        use subtle::ConstantTimeEq;
+        let got = normalize_setup_code(got);
+        let expected = normalize_setup_code(&expected);
+        got.len() == expected.len() && bool::from(got.as_bytes().ct_eq(expected.as_bytes()))
+    });
+    if !ok {
+        return Err(ApiError::Unauthorized(
+            "setup code missing or wrong — copy it from the BetterMQ startup log".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn env_flag(name: &str) -> bool {
@@ -99,6 +211,8 @@ pub struct AuthConfigResponse {
     /// Seconds left on the first-boot window. Omitted when not applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub setup_closes_in_secs: Option<u64>,
+    /// Setup needs the one-time code printed in the startup log.
+    pub setup_code_required: bool,
 }
 
 #[derive(Serialize)]
@@ -111,11 +225,23 @@ struct PasswordBody {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct SetupBody {
+    password: String,
+    /// One-time code from the startup log (not needed with BETTERMQ_ALLOW_OPEN_SETUP).
+    #[serde(default)]
+    setup_code: Option<String>,
+}
+
 #[derive(Serialize)]
 struct TokenResponse {
     token: String,
     #[serde(rename = "show_once")]
     show_once: bool,
+    /// Cluster peers the new credentials were pushed to. Peers listed in
+    /// `failed` still accept the previous token (rotation) or none (setup).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    propagation: Option<crate::cluster::AuthPropagation>,
 }
 
 fn auth_config_body(mode: &'static str, configured: bool) -> AuthConfigResponse {
@@ -125,6 +251,7 @@ fn auth_config_body(mode: &'static str, configured: bool) -> AuthConfigResponse 
             configured: true,
             setup_open: false,
             setup_closes_in_secs: None,
+            setup_code_required: false,
         };
     }
     let access = setup_access();
@@ -133,6 +260,7 @@ fn auth_config_body(mode: &'static str, configured: bool) -> AuthConfigResponse 
         configured: false,
         setup_open: access.open,
         setup_closes_in_secs: access.closes_in_secs,
+        setup_code_required: access.open && !env_flag("BETTERMQ_ALLOW_OPEN_SETUP"),
     }
 }
 
@@ -157,56 +285,72 @@ async fn local_status(
     }))
 }
 
-async fn propagate_local_auth(state: &AppState) {
-    let Some(local) = &state.local_auth else {
-        return;
-    };
+async fn propagate_local_auth(state: &AppState) -> Option<crate::cluster::AuthPropagation> {
+    let local = state.local_auth.as_ref()?;
     if crate::cluster::catalog_peer_urls(state).is_empty() {
-        return;
+        return None;
     }
-    if let Ok(Some(creds)) = local.export_credentials() {
-        crate::cluster::replicate_auth_credentials(state, creds).await;
+    match local.export_credentials() {
+        Ok(Some(creds)) => Some(crate::cluster::replicate_auth_credentials(state, creds).await),
+        Ok(None) => None,
+        Err(error) => Some(crate::cluster::AuthPropagation {
+            peers: crate::cluster::catalog_peer_urls(state).len(),
+            applied: 0,
+            failed: vec![crate::cluster::AuthPropagationFailure {
+                peer: "local".into(),
+                error: format!("could not read local credentials: {error}"),
+            }],
+        }),
     }
 }
 
-fn enforce_auth_rate(headers: &HeaderMap) -> Result<(), ApiError> {
-    let key = client_ip_key(headers, None);
+fn enforce_auth_rate(headers: &HeaderMap, peer: Option<std::net::IpAddr>) -> Result<(), ApiError> {
+    let key = client_ip_key(headers, peer);
     if !auth_rate_limiter().check(&format!("local-auth:{key}")) {
-        return Err(ApiError::BadRequest(
-            "too many auth attempts — try again later".into(),
-        ));
+        return Err(ApiError::TooManyRequests {
+            retry_after_ms: AUTH_RATE_WINDOW.as_millis() as u64,
+            message: "too many auth attempts — try again later".into(),
+        });
     }
     Ok(())
 }
 
 async fn local_setup(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer): PeerIp,
     headers: HeaderMap,
-    Json(body): Json<PasswordBody>,
+    Json(body): Json<SetupBody>,
 ) -> Result<Json<TokenResponse>, ApiError> {
-    enforce_auth_rate(&headers)?;
+    enforce_auth_rate(&headers, peer)?;
     setup_unlocked()?;
-    let store = local_store(&state)?;
-    let token = store.setup(&body.password).map_err(map_local_err)?;
-    propagate_local_auth(&state).await;
+    check_setup_code(body.setup_code.as_deref())?;
+    let store = local_store(&state)?.clone();
+    let password = body.password;
+    let token = run_argon2(move || store.setup(&password)).await?;
+    *SETUP_CODE.lock().unwrap() = None;
+    let propagation = propagate_local_auth(&state).await;
     Ok(Json(TokenResponse {
         token,
         show_once: true,
+        propagation,
     }))
 }
 
 async fn local_regenerate(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer): PeerIp,
     headers: HeaderMap,
     Json(body): Json<PasswordBody>,
 ) -> Result<Json<TokenResponse>, ApiError> {
-    enforce_auth_rate(&headers)?;
-    let store = local_store(&state)?;
-    let token = store.regenerate(&body.password).map_err(map_local_err)?;
-    propagate_local_auth(&state).await;
+    enforce_auth_rate(&headers, peer)?;
+    let store = local_store(&state)?.clone();
+    let password = body.password;
+    let token = run_argon2(move || store.regenerate(&password)).await?;
+    let propagation = propagate_local_auth(&state).await;
     Ok(Json(TokenResponse {
         token,
         show_once: true,
+        propagation,
     }))
 }
 

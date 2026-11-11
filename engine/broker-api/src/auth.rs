@@ -12,36 +12,7 @@ use axum::{
 use axum::{http::StatusCode, response::IntoResponse, Json};
 #[cfg(feature = "cloud")]
 use http::header::CONTENT_LENGTH;
-use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
-
-fn token_cache() -> &'static Mutex<HashMap<String, (Instant, bool)>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, bool)>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn cached_local_token(
-    local: &broker_local_auth::LocalAuthStore,
-    token: &str,
-) -> Result<bool, ApiError> {
-    let now = Instant::now();
-    {
-        let cache = token_cache().lock();
-        if let Some((until, ok)) = cache.get(token) {
-            if *until > now {
-                return Ok(*ok);
-            }
-        }
-    }
-    let ok = local.verify_token(token).map_err(local_auth_to_api)?;
-    token_cache()
-        .lock()
-        .insert(token.to_string(), (now + Duration::from_secs(5), ok));
-    Ok(ok)
-}
 
 pub async fn require_api_key(
     State(state): State<Arc<AppState>>,
@@ -80,7 +51,9 @@ pub async fn require_api_key(
         }
         let token = bearer_token(&req)
             .ok_or_else(|| ApiError::Unauthorized("missing Authorization: Bearer token".into()))?;
-        if !cached_local_token(local, token)? {
+        // In-memory hash compare (LocalAuthStore keeps the stored hash loaded);
+        // no per-token cache, so presented tokens are never retained.
+        if !local.verify_token(token).map_err(local_auth_to_api)? {
             return Err(ApiError::Unauthorized("invalid API token".into()));
         }
         return Ok(next.run(req).await);

@@ -66,6 +66,7 @@ async fn fifo_parallelism_one_ignores_priority() {
     for (payload, priority) in [("a", Some(1u8)), ("b", Some(9)), ("c", Some(5))] {
         let resp = broker
             .publish(PublishRequest {
+                routing_id: None,
                 topic: "fc".into(),
                 queue_id: None,
                 group_id: None,

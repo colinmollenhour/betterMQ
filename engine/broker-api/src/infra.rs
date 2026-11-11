@@ -22,6 +22,35 @@ use uuid::Uuid;
 
 const JOIN_TOKEN_TTL_MS: i64 = 60 * 60 * 1000;
 
+fn check_slate_membership(
+    active: StorageMode,
+    cfg: &BetterMqConfig,
+    nodes: usize,
+) -> Result<(), ApiError> {
+    if nodes > 1
+        && (active == StorageMode::Slate || matches!(cfg.storage, StorageConfig::Slate { .. }))
+    {
+        return Err(ApiError::BadRequest(
+            broker_storage::SLATE_SINGLE_BROKER.into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod slate_gate_tests {
+    use super::*;
+    #[test]
+    fn saved_or_active_slate_rejects_growth() {
+        let local = BetterMqConfig::template_single_local();
+        let slate = BetterMqConfig::template_single_slate();
+        assert!(check_slate_membership(StorageMode::Local, &slate, 2).is_err());
+        assert!(check_slate_membership(StorageMode::Slate, &local, 2).is_err());
+        assert!(check_slate_membership(StorageMode::Slate, &slate, 1).is_ok());
+        assert!(check_slate_membership(StorageMode::Local, &local, 3).is_ok());
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct InfraStatusResponse {
     pub managed_config: bool,
@@ -59,8 +88,10 @@ pub struct ApplyMembershipResponse {
 pub struct NodeUpdateRequest {
     pub name: String,
     pub public_url: String,
-    #[serde(default = "default_listen")]
-    pub listen: String,
+    #[serde(default)]
+    pub internal_url: Option<String>,
+    #[serde(default)]
+    pub listen: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,10 +110,8 @@ pub struct ClusterMembershipResponse {
 pub struct ClusterNodeUpdateRequest {
     pub node_name: String,
     pub public_url: String,
-}
-
-fn default_listen() -> String {
-    "0.0.0.0:8080".into()
+    #[serde(default)]
+    pub internal_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,7 +163,12 @@ pub struct ClusterJoinRequest {
     pub seed_url: String,
     pub join_token: String,
     pub public_url: String,
+    #[serde(default)]
+    pub internal_url: Option<String>,
     pub node_name: String,
+    /// Replace an existing cluster membership on this node.
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,6 +183,8 @@ pub struct ClusterJoinResponse {
 pub struct ClusterRegisterRequest {
     pub join_token: String,
     pub public_url: String,
+    #[serde(default)]
+    pub internal_url: Option<String>,
     pub node_name: String,
 }
 
@@ -163,6 +199,8 @@ pub struct ClusterRegisterResponse {
 pub struct ClusterNodeInfo {
     pub name: String,
     pub public_url: String,
+    #[serde(default)]
+    pub internal_url: Option<String>,
     pub id: Uuid,
 }
 
@@ -227,6 +265,29 @@ fn pending_storage_label(cfg: &BetterMqConfig, active: StorageMode) -> Option<&'
     }
 }
 
+// An emptiness check is insufficient: new writes may arrive before restart.
+// A live API must never point the next process at a different message store.
+fn ensure_same_storage_location(
+    previous: &StorageConfig,
+    next: &StorageConfig,
+    active: StorageMode,
+) -> Result<(), ApiError> {
+    let unchanged = match (previous, next, active) {
+        (StorageConfig::Local, StorageConfig::Local, StorageMode::Local) => true,
+        (StorageConfig::Slate { s3: a }, StorageConfig::Slate { s3: b }, StorageMode::Slate) => {
+            a.endpoint == b.endpoint
+                && a.bucket == b.bucket
+                && a.payload_bucket == b.payload_bucket
+                && a.region == b.region
+        }
+        _ => false,
+    };
+    if !unchanged {
+        return Err(ApiError::Conflict("Live storage backend/location changes are disabled. Stop ingestion and perform a verified offline migration, or start a new deployment; no messages are migrated by this API.".into()));
+    }
+    Ok(())
+}
+
 /// Keep `cluster.nodes` in sync when the operator changes this node's public URL in the panel.
 fn patch_cluster_node_entry(cfg: &mut BetterMqConfig, previous_name: &str) {
     let Some(cluster) = cfg.cluster.as_mut() else {
@@ -241,6 +302,11 @@ fn patch_cluster_node_entry(cfg: &mut BetterMqConfig, previous_name: &str) {
         if n.name == previous_name || n.name == name {
             n.name = name;
             n.public_url = url;
+            n.internal_url = cfg
+                .node
+                .internal_url
+                .clone()
+                .or_else(|| n.internal_url.clone());
             return;
         }
     }
@@ -274,9 +340,11 @@ fn resolve_cluster_membership(
                 if !urls_match(&n.public_url, &peer.addr) {
                     n.public_url = peer.addr.clone();
                 }
+                n.internal_url = n.internal_url.clone().or_else(|| peer.internal_url.clone());
                 continue;
             }
             nodes.push(ClusterNode {
+                internal_url: peer.internal_url.clone(),
                 name: peer.addr.clone(),
                 public_url: peer.addr.clone(),
             });
@@ -360,7 +428,7 @@ async fn propagate_membership_to_peers(
             continue;
         }
         let mut delivered = false;
-        for base in crate::cluster::peer_fanout_urls(&peer.public_url) {
+        for base in crate::cluster::peer_fanout_urls(peer.internal_base()) {
             let url = format!(
                 "{}/internal/v1/cluster/apply-membership",
                 base.trim_end_matches('/')
@@ -401,7 +469,7 @@ async fn push_node_url_to_seed(cfg: &BetterMqConfig) -> Result<(), String> {
     if seed.name == cfg.node.name {
         return Ok(());
     }
-    let seed_url = seed.public_url.trim().trim_end_matches('/');
+    let seed_url = seed.internal_base();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
@@ -412,6 +480,7 @@ async fn push_node_url_to_seed(cfg: &BetterMqConfig) -> Result<(), String> {
     .json(&ClusterNodeUpdateRequest {
         node_name: cfg.node.name.clone(),
         public_url: cfg.node.public_url.clone(),
+        internal_url: cfg.node.internal_url.clone(),
     })
     .send()
     .await
@@ -427,6 +496,7 @@ fn load_or_default_config(state: &AppState) -> Result<BetterMqConfig, ApiError> 
         return Ok(cfg);
     }
     let mut cfg = BetterMqConfig::template_single_local();
+    broker_config::apply_node_env_overrides(&mut cfg);
     cfg.data_dir = dir;
     Ok(cfg)
 }
@@ -515,7 +585,12 @@ pub async fn infra_update_node(
     let previous_name = cfg.node.name.clone();
     cfg.node.name = body.name.trim().to_string();
     cfg.node.public_url = body.public_url.trim().trim_end_matches('/').to_string();
-    cfg.node.listen = body.listen;
+    if body.internal_url.is_some() {
+        cfg.node.internal_url = body.internal_url;
+    }
+    if let Some(listen) = body.listen {
+        cfg.node.listen = listen;
+    }
     patch_cluster_node_entry(&mut cfg, &previous_name);
     cfg.validate()
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -556,14 +631,20 @@ pub async fn infra_update_storage(
         _ => None,
     };
 
-    cfg.storage = match body.mode.to_lowercase().as_str() {
+    let next_storage = match body.mode.to_lowercase().as_str() {
         "local" => StorageConfig::Local,
         "slate" | "s3" => {
+            state
+                .broker
+                .layout()
+                .validate_storage(broker_storage::StorageMode::Slate)
+                .map_err(|error| ApiError::BadRequest(error.to_string()))?;
             let s3 = body
                 .s3
                 .ok_or_else(|| ApiError::BadRequest("s3 config required for slate mode".into()))?;
             StorageConfig::Slate {
-                s3: merge_s3_update(existing_s3.as_ref(), s3),
+                s3: merge_s3_update(existing_s3.as_ref(), s3)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?,
             }
         }
         other => {
@@ -572,17 +653,36 @@ pub async fn infra_update_storage(
             )))
         }
     };
+    let active = active_storage_mode(&state);
+    ensure_same_storage_location(&cfg.storage, &next_storage, active)?;
+    let credentials_changed = match (&cfg.storage, &next_storage) {
+        (StorageConfig::Slate { s3: a }, StorageConfig::Slate { s3: b }) => {
+            a.access_key != b.access_key || a.secret_key != b.secret_key
+        }
+        _ => false,
+    };
+    cfg.storage = next_storage;
+    let nodes = cfg
+        .cluster
+        .as_ref()
+        .map_or(0, |cluster| cluster.nodes.len())
+        .max(
+            state
+                .cluster
+                .as_ref()
+                .map_or(0, |cluster| cluster.runtime.config().nodes.len()),
+        );
+    check_slate_membership(active_storage_mode(&state), &cfg, nodes)?;
     cfg.validate()
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     save_managed_config(&dir, &cfg).map_err(io_err)?;
 
-    let active = active_storage_mode(&state);
-    let needs_restart = pending_storage_label(&cfg, active).is_some();
+    let needs_restart = credentials_changed;
     Ok(Json(StorageUpdateResponse {
         saved: true,
         needs_restart,
         message: if needs_restart {
-            "Storage saved. Restart this broker (docker compose restart) to apply.".into()
+            "Storage credentials saved. Restart this broker to apply.".into()
         } else {
             "Storage settings saved.".into()
         },
@@ -632,6 +732,24 @@ pub async fn infra_cluster_create(
     let dir = data_dir(&state);
     let mut cfg = load_or_default_config(&state)?;
     let cluster_id = Uuid::new_v4();
+    if state.cluster.is_some()
+        || cfg
+            .cluster
+            .as_ref()
+            .is_some_and(|c| c.id.is_some() || !c.nodes.is_empty())
+        || dir.join("cluster-config.json").exists()
+    {
+        return Err(ApiError::Conflict(
+            "cluster membership already exists; create cannot replace it".into(),
+        ));
+    }
+    check_slate_membership(
+        active_storage_mode(&state),
+        &cfg,
+        cfg.cluster
+            .as_ref()
+            .map_or(1, |cluster| cluster.nodes.len()),
+    )?;
     let token = format!("join_{}", Uuid::new_v4().simple());
     let expires = Utc::now().timestamp_millis() + JOIN_TOKEN_TTL_MS;
 
@@ -639,6 +757,7 @@ pub async fn infra_cluster_create(
         enabled: true,
         id: Some(cluster_id.to_string()),
         nodes: vec![ClusterNode {
+            internal_url: cfg.node.internal_url.clone(),
             name: cfg.node.name.clone(),
             public_url: cfg.node.public_url.clone(),
         }],
@@ -712,7 +831,7 @@ pub async fn infra_join_bootstrap(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
     Query(q): Query<BootstrapQuery>,
-) -> Result<Json<BootstrapResponse>, ApiError> {
+) -> Result<(axum::http::HeaderMap, Json<BootstrapResponse>), ApiError> {
     let dir = data_dir(&state);
     let Some(file) = read_join_token(&dir)? else {
         return Err(ApiError::BadRequest(
@@ -734,17 +853,37 @@ pub async fn infra_join_bootstrap(
         .map(|n| ClusterNodeInfo {
             name: n.name.clone(),
             public_url: n.public_url.clone(),
+            internal_url: n.internal_url.clone(),
             id: stable_node_id(&n.name),
         })
         .collect();
     let generation = ClusterRuntime::load_config(&dir)
         .map(|c| c.generation)
         .unwrap_or(1);
-    Ok(Json(BootstrapResponse {
-        cluster_id: file.cluster_id,
-        generation,
-        nodes,
-    }))
+    // Answer the joiner's challenge so it can verify this seed holds the cluster
+    // secret before sending that secret here. Only after a valid join token, so
+    // the endpoint is not an HMAC oracle.
+    let mut response_headers = axum::http::HeaderMap::new();
+    if let (Some(secret), Some(challenge)) = (
+        crate::cluster_auth::cluster_secret(),
+        headers
+            .get(crate::cluster_auth::CLUSTER_CHALLENGE_HEADER)
+            .and_then(|v| v.to_str().ok()),
+    ) {
+        if let Some(proof) = crate::cluster_auth::seed_proof(&secret, challenge)
+            .and_then(|p| axum::http::HeaderValue::from_str(&p).ok())
+        {
+            response_headers.insert(crate::cluster_auth::CLUSTER_PROOF_HEADER, proof);
+        }
+    }
+    Ok((
+        response_headers,
+        Json(BootstrapResponse {
+            cluster_id: file.cluster_id,
+            generation,
+            nodes,
+        }),
+    ))
 }
 
 pub async fn infra_cluster_register(
@@ -760,6 +899,13 @@ pub async fn infra_cluster_register(
     }
     let mut cfg = load_or_default_config(&state)?;
     let url = body.public_url.trim().trim_end_matches('/').to_string();
+    check_slate_membership(
+        active_storage_mode(&state),
+        &cfg,
+        cfg.cluster
+            .as_ref()
+            .map_or(2, |cluster| cluster.nodes.len() + 1),
+    )?;
     let node_name = body.node_name.trim().to_string();
     {
         let cluster = cfg
@@ -774,6 +920,7 @@ pub async fn infra_cluster_register(
             return Err(ApiError::BadRequest("node already registered".into()));
         }
         cluster.nodes.push(ClusterNode {
+            internal_url: body.internal_url.clone(),
             name: node_name.clone(),
             public_url: url,
         });
@@ -789,6 +936,7 @@ pub async fn infra_cluster_register(
                 .map(|n| ClusterNodeInfo {
                     name: n.name.clone(),
                     public_url: n.public_url.clone(),
+                    internal_url: n.internal_url.clone(),
                     id: stable_node_id(&n.name),
                 })
                 .collect()
@@ -826,31 +974,63 @@ pub async fn infra_cluster_join(
         ));
     }
     let dir = data_dir(&state);
+    if !body.force && already_in_cluster(&load_or_default_config(&state)?) {
+        return Err(ApiError::Conflict(
+            "this node is already in a cluster; remove it from that cluster first or pass force=true"
+                .into(),
+        ));
+    }
+    let local_config = load_or_default_config(&state)?;
+    check_slate_membership(active_storage_mode(&state), &local_config, 2)?;
     let seed = body.seed_url.trim().trim_end_matches('/');
     // Prefer header over query string so join tokens are not written to access logs.
     let bootstrap_url = format!("{seed}/v1/infra/join/bootstrap");
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let bootstrap: BootstrapResponse = client
+    let secret = crate::cluster_auth::cluster_secret();
+    let challenge = crate::cluster_auth::new_challenge();
+    let bootstrap_resp = client
         .get(&bootstrap_url)
         .header("x-bettermq-join-token", &body.join_token)
+        .header(crate::cluster_auth::CLUSTER_CHALLENGE_HEADER, &challenge)
         .send()
         .await
         .map_err(|e| ApiError::BadRequest(format!("cannot reach seed: {e}")))?
         .error_for_status()
-        .map_err(|e| ApiError::BadRequest(format!("seed rejected bootstrap: {e}")))?
+        .map_err(|e| ApiError::BadRequest(format!("seed rejected bootstrap: {e}")))?;
+    // The seed is caller-supplied. Before this node sends it the cluster secret
+    // (auth and catalog pulls) or adopts its membership, the seed must prove it
+    // already holds that secret.
+    if let Some(secret) = secret.as_deref() {
+        let proven = bootstrap_resp
+            .headers()
+            .get(crate::cluster_auth::CLUSTER_PROOF_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|proof| crate::cluster_auth::verify_seed_proof(secret, &challenge, proof));
+        if !proven {
+            return Err(ApiError::BadRequest(
+                "seed did not prove it holds this node's BETTERMQ_CLUSTER_SECRET; check the seed URL and that every node uses the same secret"
+                    .into(),
+            ));
+        }
+    }
+    let bootstrap: BootstrapResponse = bootstrap_resp
         .json()
         .await
         .map_err(|e| ApiError::BadRequest(format!("invalid bootstrap response: {e}")))?;
 
     let public_url = body.public_url.trim().trim_end_matches('/').to_string();
+    let local_cfg = load_or_default_config(&state)?;
+    let internal_url = body.internal_url.clone().or(local_cfg.node.internal_url);
     let node_name = body.node_name.trim().to_string();
     let register_url = format!("{seed}/v1/infra/cluster/register");
     let registered: ClusterRegisterResponse = client
         .post(&register_url)
         .json(&ClusterRegisterRequest {
+            internal_url: internal_url.clone(),
             join_token: body.join_token,
             public_url: public_url.clone(),
             node_name: node_name.clone(),
@@ -868,6 +1048,7 @@ pub async fn infra_cluster_join(
         .nodes
         .iter()
         .map(|n| ClusterNode {
+            internal_url: n.internal_url.clone(),
             name: n.name.clone(),
             public_url: n.public_url.clone(),
         })
@@ -876,6 +1057,7 @@ pub async fn infra_cluster_join(
     let mut cfg = load_or_default_config(&state)?;
     cfg.node.name = node_name;
     cfg.node.public_url = public_url;
+    cfg.node.internal_url = internal_url;
     cfg.cluster = Some(ClusterConfigSection {
         enabled: true,
         id: Some(bootstrap.cluster_id.to_string()),
@@ -889,8 +1071,12 @@ pub async fn infra_cluster_join(
     save_managed_config(&dir, &cfg).map_err(io_err)?;
     ensure_cluster_config(&cfg, &dir).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    let peer_bases: Vec<String> = nodes.iter().map(|n| n.public_url.clone()).collect();
-    if let Err(e) = crate::cluster::pull_auth_from_seed(&state, seed).await {
+    let peer_bases: Vec<String> = nodes.iter().map(|n| n.internal_base().to_owned()).collect();
+    let seed_internal = nodes
+        .first()
+        .map(ClusterNode::internal_base)
+        .unwrap_or(seed);
+    if let Err(e) = crate::cluster::pull_auth_from_seed(&state, seed_internal).await {
         tracing::warn!(error = ?e, "auth pull from seed failed during join");
     }
     let catalog_note = match crate::cluster::merge_catalog_from_peers(&state, &peer_bases).await {
@@ -916,18 +1102,70 @@ pub async fn infra_cluster_join(
     }))
 }
 
-/// Same as join, but authenticated by the seed join token (public). Used by the
-/// panel attach proxy so a fresh broker does not need its own API token.
+fn already_in_cluster(cfg: &BetterMqConfig) -> bool {
+    cfg.cluster
+        .as_ref()
+        .is_some_and(|c| c.enabled && !c.nodes.is_empty())
+}
+
+/// Same as join, on the public router so the panel attach proxy can enroll a
+/// fresh broker that has no API token yet. The caller must prove itself:
+/// a configured node needs its own API token; an unconfigured node needs an
+/// [`ENROLL_PROOF_HEADER`](crate::cluster_auth::ENROLL_PROOF_HEADER) signed
+/// with the shared cluster secret.
 pub async fn infra_cluster_enroll(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<ClusterJoinRequest>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
 ) -> Result<Json<ClusterJoinResponse>, ApiError> {
     if state.dispatch_fleet {
         return Err(ApiError::BadRequest(
             "enroll is not supported on dispatch fleet or WAL-less processes".into(),
         ));
     }
-    infra_cluster_join(State(state), Json(body)).await
+    authorize_enroll(&state, &headers, &body)?;
+    let request: ClusterJoinRequest = serde_json::from_slice(&body)
+        .map_err(|e| ApiError::BadRequest(format!("invalid enroll body: {e}")))?;
+    infra_cluster_join(State(state), Json(request)).await
+}
+
+fn authorize_enroll(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<(), ApiError> {
+    if crate::auth::insecure_no_auth() {
+        return Ok(());
+    }
+    if let Some(store) = state.local_auth.as_ref().filter(|s| s.is_configured()) {
+        let token = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if token.is_some_and(|t| store.authorize_admin(t)) {
+            return Ok(());
+        }
+        return Err(ApiError::Unauthorized(
+            "enroll on a node with local auth configured requires its API token".into(),
+        ));
+    }
+    let Some(secret) = crate::cluster_auth::cluster_secret() else {
+        return Err(ApiError::Unauthorized(
+            "enroll requires BETTERMQ_CLUSTER_SECRET on this node".into(),
+        ));
+    };
+    let proven = headers
+        .get(crate::cluster_auth::ENROLL_PROOF_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|proof| {
+            crate::cluster_auth::verify_enroll(&secret, Utc::now().timestamp_millis(), proof, body)
+        });
+    if !proven {
+        return Err(ApiError::Unauthorized(
+            "enroll requires a proof signed with the cluster secret".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn infra_cluster_remove_node(
@@ -1025,10 +1263,14 @@ pub async fn infra_cluster_sync(
     let seed_url = cluster
         .nodes
         .first()
-        .map(|n| n.public_url.clone())
+        .map(|n| n.internal_base().to_owned())
         .ok_or_else(|| ApiError::BadRequest("no seed node".into()))?;
     let seed_base = seed_url.trim().trim_end_matches('/');
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let mut nodes: Vec<ClusterNode> = match crate::cluster_auth::apply_cluster_secret(
         client.get(format!("{seed_base}/internal/v1/cluster/membership")),
     )
@@ -1063,6 +1305,7 @@ pub async fn infra_cluster_sync(
                         .map(|c| c.name.clone())
                         .unwrap_or_else(|| n.addr.clone());
                     ClusterNode {
+                        internal_url: n.internal_url.clone(),
                         name,
                         public_url: n.addr.clone(),
                     }
@@ -1075,13 +1318,21 @@ pub async fn infra_cluster_sync(
         if n.name == cfg.node.name {
             n.name = cfg.node.name.clone();
             n.public_url = cfg.node.public_url.clone();
+            n.internal_url = cfg
+                .node
+                .internal_url
+                .clone()
+                .or_else(|| n.internal_url.clone());
         }
     }
 
+    check_slate_membership(active_storage_mode(&state), &cfg, nodes.len())?;
     let mut cfg = cfg;
     if let Some(c) = cfg.cluster.as_mut() {
         c.nodes = nodes.clone();
     }
+    cfg.validate()
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     save_managed_config(&dir, &cfg).map_err(io_err)?;
     ensure_cluster_config(&cfg, &dir).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
@@ -1090,6 +1341,7 @@ pub async fn infra_cluster_sync(
         .map(|n| ClusterNodeInfo {
             name: n.name.clone(),
             public_url: n.public_url.clone(),
+            internal_url: n.internal_url.clone(),
             id: stable_node_id(&n.name),
         })
         .collect();
@@ -1097,7 +1349,7 @@ pub async fn infra_cluster_sync(
     let runtime =
         ClusterRuntime::load_config(&dir).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    let peer_bases: Vec<String> = nodes.iter().map(|n| n.public_url.clone()).collect();
+    let peer_bases: Vec<String> = nodes.iter().map(|n| n.internal_base().to_owned()).collect();
     if let Err(e) = crate::cluster::pull_auth_from_seed(&state, seed_base).await {
         tracing::warn!(error = ?e, "auth pull from seed failed during sync");
     }
@@ -1133,6 +1385,7 @@ pub async fn internal_cluster_apply_membership(
 ) -> Result<Json<ApplyMembershipResponse>, ApiError> {
     let dir = data_dir(&state);
     let mut cfg = load_or_default_config(&state)?;
+    check_slate_membership(active_storage_mode(&state), &cfg, body.nodes.len())?;
     let Some(cluster) = cfg.cluster.as_mut() else {
         return Err(ApiError::BadRequest("not in a cluster".into()));
     };
@@ -1162,7 +1415,12 @@ pub async fn internal_cluster_apply_membership(
     let peer_bases: Vec<String> = cfg
         .cluster
         .as_ref()
-        .map(|c| c.nodes.iter().map(|n| n.public_url.clone()).collect())
+        .map(|c| {
+            c.nodes
+                .iter()
+                .map(|n| n.internal_base().to_owned())
+                .collect()
+        })
         .unwrap_or_default();
     if !peer_bases.is_empty() {
         if let Err(e) = crate::cluster::merge_catalog_from_peers(&state, &peer_bases).await {
@@ -1201,6 +1459,9 @@ pub async fn internal_cluster_update_node(
         )));
     };
     entry.public_url = public_url.to_string();
+    if let Some(internal_url) = body.internal_url {
+        entry.internal_url = Some(internal_url);
+    }
     cfg.validate()
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     save_managed_config(&dir, &cfg).map_err(io_err)?;
@@ -1321,4 +1582,53 @@ pub fn protected_infra_routes() -> axum::Router<std::sync::Arc<AppState>> {
             "/v1/infra/cluster/remove-node",
             post(infra_cluster_remove_node),
         )
+}
+
+#[cfg(test)]
+mod storage_location_tests {
+    use super::*;
+
+    #[test]
+    fn only_same_store_credential_changes_are_allowed() {
+        let s3 = broker_config::S3Config {
+            endpoint: "https://s3.example.com".into(),
+            bucket: "wal".into(),
+            payload_bucket: Some("payload".into()),
+            region: "auto".into(),
+            access_key: "old-access".into(),
+            secret_key: "old-secret".into(),
+        };
+        let previous = StorageConfig::Slate { s3: s3.clone() };
+        let mut credentials = s3.clone();
+        credentials.access_key = "new-access".into();
+        credentials.secret_key = "new-secret".into();
+        assert!(ensure_same_storage_location(
+            &previous,
+            &StorageConfig::Slate { s3: credentials },
+            StorageMode::Slate
+        )
+        .is_ok());
+        for field in ["endpoint", "bucket", "payload", "region"] {
+            let mut changed = s3.clone();
+            match field {
+                "endpoint" => changed.endpoint = "https://other.example.com".into(),
+                "bucket" => changed.bucket = "other".into(),
+                "payload" => changed.payload_bucket = Some("other".into()),
+                _ => changed.region = "other".into(),
+            }
+            assert!(matches!(
+                ensure_same_storage_location(
+                    &previous,
+                    &StorageConfig::Slate { s3: changed },
+                    StorageMode::Slate
+                ),
+                Err(ApiError::Conflict(_))
+            ));
+        }
+        assert!(
+            ensure_same_storage_location(&previous, &StorageConfig::Local, StorageMode::Slate)
+                .is_err()
+        );
+        assert!(ensure_same_storage_location(&previous, &previous, StorageMode::Local).is_err());
+    }
 }

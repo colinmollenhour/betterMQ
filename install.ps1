@@ -1,12 +1,12 @@
 # betterMQ installer for Windows (PowerShell).
 #
-#   powershell -ExecutionPolicy Bypass -c "irm https://bettermq.com/install.ps1 | iex"
+#   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/colinmollenhour/betterMQ/main/install.ps1 | iex"
 #
 # macOS / Linux / WSL / Git Bash:
-#   curl -fsSL https://bettermq.com/install | bash
+#   curl -fsSL https://raw.githubusercontent.com/colinmollenhour/betterMQ/main/install.sh | bash
 #
 # Downloads the latest bettermq-windows-amd64 binary from GitHub Releases,
-# verifies sha256 (when checksums.txt is published for the release), installs
+# requires a matching sha256 entry in checksums.txt before installing
 # to %USERPROFILE%\.bettermq\bin and adds it to your user PATH.
 #
 # Optional env vars:
@@ -16,7 +16,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$Repo = "betterMQ/betterMQ"
+$Repo = if ($env:BETTERMQ_REPO) { $env:BETTERMQ_REPO } else { "colinmollenhour/betterMQ" }
 $Asset = "bettermq-windows-amd64.exe"
 $InstallDir = if ($env:BETTERMQ_INSTALL_DIR) { $env:BETTERMQ_INSTALL_DIR } else { Join-Path $env:USERPROFILE ".bettermq" }
 $BinDir = Join-Path $InstallDir "bin"
@@ -86,23 +86,18 @@ try {
     Info "Downloading $Asset.zip..."
     Invoke-WebRequest -Uri "$AssetBase/$Asset.zip" -OutFile $ZipPath -UseBasicParsing
 
-    # checksums.txt is published from v0.4+ — verify when available.
+    # Fail closed: checksum metadata and an exact asset entry are mandatory.
     $ChecksumsPath = Join-Path $Tmp "checksums.txt"
-    $Expected = $null
-    try {
-        Invoke-WebRequest -Uri "$AssetBase/checksums.txt" -OutFile $ChecksumsPath -UseBasicParsing
-        $line = Select-String -Path $ChecksumsPath -Pattern ([regex]::Escape("$Asset.zip")) | Select-Object -First 1
-        if ($line) { $Expected = ($line.Line -split '\s+')[0] }
-    } catch {
-        Info "No checksums.txt for $Tag - skipping verification."
+    Invoke-WebRequest -Uri "$AssetBase/checksums.txt" -OutFile $ChecksumsPath -UseBasicParsing
+    $Pattern = '^([0-9a-fA-F]{64})  ' + [regex]::Escape("$Asset.zip") + '$'
+    $Lines = @(Select-String -Path $ChecksumsPath -Pattern $Pattern)
+    if ($Lines.Count -ne 1) { throw "Expected exactly one checksum entry for $Asset.zip" }
+    $Expected = $Lines[0].Matches[0].Groups[1].Value
+    $Actual = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLower()
+    if ($Actual -ne $Expected.ToLower()) {
+        throw "Checksum mismatch for $Asset.zip (expected $Expected, got $Actual)"
     }
-    if ($Expected) {
-        $Actual = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLower()
-        if ($Actual -ne $Expected.ToLower()) {
-            throw "Checksum mismatch for $Asset.zip (expected $Expected, got $Actual)"
-        }
-        Ok "Verified sha256"
-    }
+    Ok "Verified sha256"
 
     Expand-Archive -Path $ZipPath -DestinationPath $Tmp -Force
     $Extracted = Join-Path $Tmp $Asset

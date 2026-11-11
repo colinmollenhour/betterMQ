@@ -4,6 +4,7 @@
 //! in-memory [`ComponentSet`] as an explicit V2 `profile: "all"` document.
 
 use crate::types::{BetterMqConfig, ConfigError};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
@@ -66,7 +67,7 @@ impl ComponentProfile {
             "broker" => Ok(Self::Broker),
             "dispatch" => Ok(Self::Dispatch),
             "gateway" => Ok(Self::Gateway),
-            "controller" => Ok(Self::Controller),
+            "controller" => Err(ConfigError::Invalid("controller-only profile is not implemented; use profile broker (controller + ingest, without local delivery)".into())),
             "panel" => Ok(Self::Panel),
             other => Err(ConfigError::Invalid(format!(
                 "unknown profile '{other}' (use all, broker, dispatch, gateway, controller, panel)"
@@ -81,6 +82,7 @@ impl ComponentProfile {
                 Component::Broker,
                 Component::Controller,
                 Component::Admin,
+                Component::Panel,
             ]),
             Self::Dispatch => ComponentSet::from_slice(&[Component::Dispatch]),
             Self::Gateway => ComponentSet::from_slice(&[Component::Gateway, Component::Admin]),
@@ -92,8 +94,8 @@ impl ComponentProfile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ComponentSpec {
     #[serde(default)]
     pub profile: Option<String>,
@@ -125,8 +127,8 @@ impl PanelMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PanelSection {
     #[serde(default)]
     pub mode: Option<String>,
@@ -136,8 +138,8 @@ pub struct PanelSection {
     pub controller: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ListenerSection {
     #[serde(default)]
     pub public: Option<String>,
@@ -147,8 +149,8 @@ pub struct ListenerSection {
     pub internal: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReplicationPolicyConfig {
     #[serde(default = "default_rf")]
     pub factor: u32,
@@ -244,11 +246,10 @@ impl ComponentSet {
                 "panel requires the admin component".into(),
             ));
         }
-        if self.contains(Component::Dispatch)
-            && !self.contains(Component::Broker)
-            && !self.contains(Component::Gateway)
-        {
-            // Fleet dispatch talks to remote brokers; local WAL is not required.
+        if self.contains(Component::Controller) && !self.contains(Component::Broker) {
+            return Err(ConfigError::Invalid(
+                "controller without broker is not implemented; use profile broker".into(),
+            ));
         }
         Ok(())
     }
@@ -318,11 +319,7 @@ pub fn resolve_component_set(
     }
 
     if broker_only {
-        return Ok(ComponentSet::from_slice(&[
-            Component::Broker,
-            Component::Controller,
-            Component::Admin,
-        ]));
+        return Ok(ComponentProfile::Broker.components());
     }
     if gateway_only {
         return Ok(ComponentSet::from_slice(&[
@@ -348,7 +345,10 @@ pub fn resolve_component_set(
         return Ok(set);
     }
 
-    Ok(ComponentSet::all())
+    let mut set = ComponentSet::all();
+    apply_include(&mut set, include_override)?;
+    set.validate_dependencies()?;
+    Ok(set)
 }
 
 fn apply_include(set: &mut ComponentSet, include: &[String]) -> Result<(), ConfigError> {
@@ -389,17 +389,11 @@ pub fn resolve_listeners(
     admin: Option<SocketAddr>,
     internal: Option<SocketAddr>,
     panel_listen: Option<SocketAddr>,
-    panel_mode: PanelMode,
+    _panel_mode: PanelMode,
 ) -> ResolvedListeners {
     let admin = admin.or(panel_listen).unwrap_or(public);
     let internal = internal.unwrap_or(public);
-    let collapsed =
-        admin == public && internal == public && panel_mode != PanelMode::SeparateListener;
-    let admin = if panel_mode == PanelMode::SeparateListener {
-        panel_listen.or(Some(admin)).unwrap_or(public)
-    } else {
-        admin
-    };
+    let collapsed = admin == public && internal == public;
     ResolvedListeners {
         public,
         admin,
@@ -427,6 +421,7 @@ mod tests {
         let set = resolve_component_set(&cfg, None, &[], true, false, false, false).unwrap();
         assert!(set.contains(Component::Broker));
         assert!(!set.contains(Component::Dispatch));
+        assert!(set.contains(Component::Panel));
         assert!(set.requires_local_storage());
     }
 
@@ -448,5 +443,19 @@ mod tests {
         set.validate_dependencies().unwrap_err();
         set.insert(Component::Admin);
         set.validate_dependencies().unwrap();
+    }
+
+    #[test]
+    fn controller_only_is_rejected_before_runtime_startup() {
+        let cfg = BetterMqConfig::template_single_local();
+        assert!(
+            resolve_component_set(&cfg, Some("controller"), &[], false, false, false, false)
+                .is_err()
+        );
+        assert!(
+            ComponentSet::from_slice(&[Component::Controller, Component::Admin])
+                .validate_dependencies()
+                .is_err()
+        );
     }
 }

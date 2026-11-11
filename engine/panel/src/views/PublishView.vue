@@ -10,6 +10,8 @@ import Field from "@/components/form/Field.vue";
 import ActionMessage from "@/components/form/ActionMessage.vue";
 import AppSelect from "@/components/form/AppSelect.vue";
 import RetryFields from "@/components/form/RetryFields.vue";
+import SecretInput from "@/components/form/SecretInput.vue";
+import { prepareDestination } from "@/lib/destination";
 import { useActionStatus } from "@/composables/useActionStatus";
 import { apiPost, publicUrl } from "@/lib/api";
 import { catalog, flowId, groupId, refreshFlows, refreshGroups } from "@/lib/catalog";
@@ -17,8 +19,8 @@ import { defaultRetry, mergeOutbound, mergeRetry, parseBody } from "@/lib/payloa
 
 const form = reactive({
   mode: "url",
-  secret: "whsec_demo",
-  url: "https://webhook.site",
+  secret: "",
+  url: "",
   groupId: "",
   key: "user-1",
   priority: 5,
@@ -46,12 +48,16 @@ const selectedFlow = computed(() => catalog.flows.find((f) => flowId(f) === form
 const hideRoutingKey = computed(() => form.mode !== "group" && form.pacing === "profile");
 
 onMounted(() => {
-  void refreshGroups();
-  void refreshFlows();
+  void refreshGroups().catch(() => {});
+  void refreshFlows().catch(() => {});
 });
 
 async function publish() {
   status.reset();
+  if (form.mode !== "group") {
+    const error = prepareDestination(form);
+    if (error) { status.fail(error); return; }
+  }
   let key = form.key.trim();
   if (form.mode !== "group" && form.pacing === "profile") {
     if (!form.flowId) {
@@ -146,10 +152,10 @@ async function publish() {
           />
         </Field>
         <Field v-if="form.mode !== 'group'" label="Secret">
-          <Input v-model="form.secret" class="font-mono" />
+          <SecretInput v-model="form.secret" />
         </Field>
         <Field v-if="form.mode !== 'group'" label="URL" class="sm:col-span-2">
-          <Input v-model="form.url" class="font-mono text-xs" />
+          <Input v-model="form.url" placeholder="https://example.com/webhook" class="font-mono text-xs" />
         </Field>
         <Field v-else label="Group" class="sm:col-span-2">
           <AppSelect

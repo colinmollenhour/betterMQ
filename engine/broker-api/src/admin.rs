@@ -1,20 +1,23 @@
 //! Versioned `/admin/v1` management API shared by embedded and standalone panel.
 
 use crate::auth;
-use crate::ops::{self, MetricsResponse, ReadyResponse};
+use crate::ops;
 use crate::AppState;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    middleware::Next,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use broker_config::stable_node_id;
 use broker_raft_meta::{replication_policy, ControllerCommand, DataNodeRecord};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 const ADMIN_API_VERSION: &str = "v1";
@@ -26,6 +29,14 @@ pub struct AdminState {
     pub cell_registry: Arc<parking_lot::RwLock<CellRegistry>>,
     pub cluster_secret: Option<String>,
     pub registry_path: Option<PathBuf>,
+    pub audit: Arc<crate::admin_audit::AdminAuditLog>,
+}
+
+/// `admin-audit.jsonl` beside the cell registry (or the broker data dir).
+fn audit_log_path(registry_path: Option<&PathBuf>, local: Option<&AppState>) -> Option<PathBuf> {
+    registry_path
+        .and_then(|path| path.parent().map(|dir| dir.join("admin-audit.jsonl")))
+        .or_else(|| local.map(|state| state.broker.config().data_dir.join("admin-audit.jsonl")))
 }
 
 impl AdminState {
@@ -38,43 +49,69 @@ impl AdminState {
         registry_path: Option<PathBuf>,
         controller_url: Option<String>,
     ) -> Self {
-        let mut registry = registry_path
-            .as_ref()
-            .map(|path| CellRegistry::load(path))
-            .unwrap_or_default();
+        let (mut registry, registry_path) = match registry_path {
+            Some(path) => {
+                let (registry, persist) = CellRegistry::load_for_startup(&path);
+                (registry, persist.then_some(path))
+            }
+            None => (CellRegistry::default(), None),
+        };
         if let Some(url) = controller_url.as_deref() {
             ensure_local_cell(&mut registry, &state, url);
         }
         if let Some(path) = registry_path.as_ref() {
-            let _ = registry.save(path);
+            if let Err(error) = registry.save(path) {
+                tracing::warn!(%error, path = %path.display(), "cell registry save failed");
+            }
         }
+        let audit = Arc::new(crate::admin_audit::AdminAuditLog::open(audit_log_path(
+            registry_path.as_ref(),
+            Some(&state),
+        )));
         Self {
             local: Some(state),
             remote_controller: None,
             cell_registry: Arc::new(parking_lot::RwLock::new(registry)),
-            cluster_secret: std::env::var("BETTERMQ_CLUSTER_SECRET").ok(),
+            cluster_secret: crate::cluster_auth::cluster_secret(),
             registry_path,
+            audit,
         }
     }
 
     pub fn remote(controller: String, registry: CellRegistry) -> Self {
-        Self::remote_with_path(controller, registry, None)
+        Self::remote_with_path(Some(controller), registry, None)
     }
 
+    /// Standalone panel. Direct `/admin/v1` reads and mutations are proxied to
+    /// `controller` (registered as the default cell; its `adminToken` is the
+    /// credential used). Without a controller they return 503.
     pub fn remote_with_path(
-        controller: String,
-        registry: CellRegistry,
+        controller: Option<String>,
+        mut registry: CellRegistry,
         registry_path: Option<PathBuf>,
     ) -> Self {
-        if let Some(path) = registry_path.as_ref() {
-            let _ = registry.save(path);
+        let controller = controller
+            .map(|c| c.trim().trim_end_matches('/').to_string())
+            .filter(|c| !c.is_empty());
+        if let Some(url) = controller.as_deref() {
+            ensure_controller_cell(&mut registry, url);
         }
+        if let Some(path) = registry_path.as_ref() {
+            if let Err(error) = registry.save(path) {
+                tracing::warn!(%error, path = %path.display(), "cell registry save failed");
+            }
+        }
+        let audit = Arc::new(crate::admin_audit::AdminAuditLog::open(audit_log_path(
+            registry_path.as_ref(),
+            None,
+        )));
         Self {
             local: None,
-            remote_controller: Some(controller),
+            remote_controller: controller,
             cell_registry: Arc::new(parking_lot::RwLock::new(registry)),
-            cluster_secret: std::env::var("BETTERMQ_CLUSTER_SECRET").ok(),
+            cluster_secret: crate::cluster_auth::cluster_secret(),
             registry_path,
+            audit,
         }
     }
 
@@ -103,6 +140,47 @@ pub struct CellRecord {
     pub controller_url: String,
     #[serde(default)]
     pub label: Option<String>,
+    /// The cell's own `sk_local_` admin token, used for federated admin calls
+    /// to `controller_url`. Persisted (secret file mode), never returned by the API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_token: Option<String>,
+}
+
+/// API view of a [`CellRecord`]: the admin token is replaced by a flag.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CellView {
+    pub id: String,
+    pub region: String,
+    pub controller_url: String,
+    pub label: Option<String>,
+    pub admin_token_configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CellRegistryView {
+    pub cells: Vec<CellView>,
+    pub members: Vec<CellMember>,
+}
+
+impl From<&CellRegistry> for CellRegistryView {
+    fn from(registry: &CellRegistry) -> Self {
+        Self {
+            cells: registry
+                .cells
+                .iter()
+                .map(|c| CellView {
+                    id: c.id.clone(),
+                    region: c.region.clone(),
+                    controller_url: c.controller_url.clone(),
+                    label: c.label.clone(),
+                    admin_token_configured: c.admin_token.is_some(),
+                })
+                .collect(),
+            members: registry.members.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,18 +194,93 @@ pub struct CellMember {
 }
 
 impl CellRegistry {
-    pub fn load(path: &std::path::Path) -> Self {
-        std::fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+    /// Strict load: a missing file is an empty registry; an unreadable or
+    /// unparsable file is an error.
+    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e),
+        }
     }
 
-    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    /// Startup load that never destroys a damaged registry. A corrupt or
+    /// unreadable file is moved aside to `<file>.corrupt-<unix ms>` and an
+    /// empty registry is used. If it cannot be moved aside, the registry runs
+    /// in memory only (`false`): nothing is written over the original.
+    pub fn load_for_startup(path: &std::path::Path) -> (Self, bool) {
+        let error = match Self::load(path) {
+            Ok(registry) => return (registry, true),
+            Err(error) => error,
+        };
+        let mut quarantine = path.as_os_str().to_os_string();
+        quarantine.push(format!(
+            ".corrupt-{}",
+            chrono::Utc::now().timestamp_millis()
+        ));
+        let quarantine = PathBuf::from(quarantine);
+        match std::fs::rename(path, &quarantine) {
+            Ok(()) => {
+                tracing::error!(
+                    %error,
+                    path = %path.display(),
+                    saved_as = %quarantine.display(),
+                    "cell registry unreadable; moved aside and starting with an empty registry"
+                );
+                (Self::default(), true)
+            }
+            Err(rename_error) => {
+                tracing::error!(
+                    %error,
+                    %rename_error,
+                    path = %path.display(),
+                    "cell registry unreadable and could not be moved aside; registry changes will not be saved"
+                );
+                (Self::default(), false)
+            }
         }
-        std::fs::write(path, serde_json::to_vec_pretty(self)?)
+    }
+
+    /// Durable replace: unique 0600 temp file → fsync → rename → dir fsync, so
+    /// a crash or full disk never leaves a truncated registry (it holds
+    /// per-cell admin tokens, hence the mode).
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let bytes = serde_json::to_vec_pretty(self)?;
+        let tmp = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        let written = (|| {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&tmp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, path)
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return written;
+        }
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
     }
 
     pub fn upsert_member(&mut self, member: CellMember) {
@@ -142,6 +295,32 @@ impl CellRegistry {
             self.members.push(member);
         }
     }
+}
+
+fn same_url(a: &str, b: &str) -> bool {
+    a.trim().trim_end_matches('/') == b.trim().trim_end_matches('/')
+}
+
+fn ensure_controller_cell(registry: &mut CellRegistry, controller_url: &str) {
+    if registry
+        .cells
+        .iter()
+        .any(|c| same_url(&c.controller_url, controller_url))
+    {
+        return;
+    }
+    let id = if registry.cells.iter().any(|c| c.id == "default") {
+        format!("default-{}", registry.cells.len())
+    } else {
+        "default".into()
+    };
+    registry.cells.push(CellRecord {
+        id,
+        region: std::env::var("BETTERMQ_CELL_REGION").unwrap_or_else(|_| "default".into()),
+        controller_url: controller_url.to_string(),
+        label: Some(std::env::var("BETTERMQ_CELL_LABEL").unwrap_or_else(|_| "controller".into())),
+        admin_token: None,
+    });
 }
 
 fn ensure_local_cell(registry: &mut CellRegistry, local: &AppState, controller_url: &str) {
@@ -162,6 +341,7 @@ fn ensure_local_cell(registry: &mut CellRegistry, local: &AppState, controller_u
         region: std::env::var("BETTERMQ_CELL_REGION").unwrap_or_else(|_| "local".into()),
         controller_url: controller_url.trim_end_matches('/').to_string(),
         label: Some(std::env::var("BETTERMQ_CELL_LABEL").unwrap_or_else(|_| "local".into())),
+        admin_token: None,
     });
 }
 
@@ -209,13 +389,14 @@ pub struct CellFailure {
 #[derive(Debug, Deserialize)]
 pub struct AuditQuery {
     #[serde(default)]
-    #[allow(dead_code)]
     pub limit: Option<usize>,
 }
 
 pub fn router(state: AdminState) -> Router {
-    Router::new()
-        .route("/admin/v1/health", get(admin_health))
+    let audit = Arc::clone(&state.audit);
+    // Every route except health sits behind `admin_auth`, so a new route cannot
+    // forget the check.
+    let protected = Router::new()
         .route("/admin/v1/cluster", get(cluster_overview))
         .route("/admin/v1/nodes", get(list_nodes))
         .route("/admin/v1/shards", get(list_shards))
@@ -233,42 +414,66 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/v1/nodes/drain", post(drain_node))
         .route("/admin/v1/controller/voters", post(controller_voter))
         .route("/admin/v1/gc/{shard}", post(advance_gc))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admin_auth,
+        ));
+    Router::new()
+        .route("/admin/v1/health", get(admin_health))
+        .merge(protected)
         .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(
+            audit,
+            crate::admin_audit::audit_admin_mutations,
+        ))
 }
 
-async fn require_admin(
+async fn admin_auth(
+    State(state): State<AdminState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<AdminErrorBody>)> {
+    require_admin(req.headers(), &state)?;
+    Ok(next.run(req).await)
+}
+
+/// Fail closed: a caller is an admin only when it presents a credential that
+/// was affirmatively configured. Embedded nodes accept the local API token;
+/// every mode accepts the cluster secret (it already controls `/internal/v1`).
+/// An unconfigured node or a standalone panel without a secret rejects
+/// everyone; only `/v1/local-auth/setup` is reachable before setup.
+fn require_admin(
     headers: &HeaderMap,
     state: &AdminState,
 ) -> Result<(), (StatusCode, Json<AdminErrorBody>)> {
-    if let Some(local) = &state.local {
-        if auth::insecure_no_auth() {
-            return Ok(());
-        }
-        if local.uses_cloud_auth() {
-            return Ok(());
-        }
-        if let Some(store) = &local.local_auth {
-            if !store.is_configured() {
-                return Ok(());
-            }
-            let token = bearer(headers);
-            if token.is_some_and(|t| store.authorize_admin(t)) {
-                return Ok(());
-            }
-            return Err(deny("admin authentication required", "unauthorized"));
-        }
-        return Ok(());
-    }
     if auth::insecure_no_auth() {
         return Ok(());
     }
-    let expected = state.cluster_secret.as_deref().unwrap_or("");
-    if expected.is_empty() {
-        return Ok(());
+    let token = bearer(headers);
+    if let (Some(token), Some(secret)) = (token, state.cluster_secret.as_deref()) {
+        if subtle_eq(token, secret) {
+            return Ok(());
+        }
     }
-    let token = bearer(headers).unwrap_or("");
-    if subtle_eq(token, expected) {
-        return Ok(());
+    if let Some(local) = &state.local {
+        if let Some(store) = &local.local_auth {
+            if !store.is_configured() {
+                return Err(deny(
+                    "local auth not configured — set a panel password at /panel/ first",
+                    "auth_not_configured",
+                ));
+            }
+            if token.is_some_and(|t| store.authorize_admin(t)) {
+                return Ok(());
+            }
+        }
+        return Err(deny("admin authentication required", "unauthorized"));
+    }
+    if state.cluster_secret.is_none() {
+        return Err(deny(
+            "standalone panel requires BETTERMQ_CLUSTER_SECRET",
+            "auth_not_configured",
+        ));
     }
     Err(deny("admin authentication required", "unauthorized"))
 }
@@ -306,9 +511,7 @@ async fn admin_health(State(state): State<AdminState>) -> impl IntoResponse {
 
 async fn cluster_overview(
     State(state): State<AdminState>,
-    headers: HeaderMap,
-) -> Result<Json<ClusterOverview>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
     if let Some(local) = &state.local {
         let ready = ops::ready_snapshot(local);
         let (node_count, catalog_epoch, rf, min_isr) = match &local.cluster {
@@ -332,7 +535,7 @@ async fn cluster_overview(
             }
             None => (1, 0, 1, 1),
         };
-        return Ok(Json(ClusterOverview {
+        return Ok(Json(to_json(ClusterOverview {
             api_version: ADMIN_API_VERSION,
             ready: ready.ready,
             cluster_healthy: ready.cluster_healthy,
@@ -341,47 +544,149 @@ async fn cluster_overview(
             min_isr,
             catalog_epoch,
             local: true,
-        }));
+        })));
     }
-    Ok(Json(ClusterOverview {
-        api_version: ADMIN_API_VERSION,
-        ready: true,
-        cluster_healthy: true,
-        node_count: 0,
-        replication_factor: 3,
-        min_isr: 2,
-        catalog_epoch: 0,
-        local: false,
-    }))
+    let mut overview = proxy_controller(&state, reqwest::Method::GET, "cluster", None).await?;
+    if let Some(map) = overview.as_object_mut() {
+        map.insert("local".into(), serde_json::Value::Bool(false));
+    }
+    Ok(Json(overview))
+}
+
+fn to_json<T: Serialize>(value: T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
+}
+
+fn admin_error(
+    status: StatusCode,
+    code: &'static str,
+    error: impl Into<String>,
+) -> (StatusCode, Json<AdminErrorBody>) {
+    (
+        status,
+        Json(AdminErrorBody {
+            error: error.into(),
+            code,
+        }),
+    )
+}
+
+#[cfg(not(test))]
+const CONTROLLER_MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const CONTROLLER_MUTATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Standalone panel: forward an `/admin/v1/{path}` call to the configured
+/// controller with the controller cell's `adminToken`. Fails explicitly
+/// (503/502) instead of inventing a healthy, empty answer.
+async fn proxy_controller(
+    state: &AdminState,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, (StatusCode, Json<AdminErrorBody>)> {
+    let Some(controller) = state.remote_controller.as_deref() else {
+        return Err(admin_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_controller",
+            "no controller configured — start the panel with --controller <cell admin URL>",
+        ));
+    };
+    let token = state
+        .cell_registry
+        .read()
+        .cells
+        .iter()
+        .find(|c| same_url(&c.controller_url, controller))
+        .and_then(|c| c.admin_token.clone());
+    let Some(token) = token else {
+        return Err(admin_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cell_credential_missing",
+            format!("cell credential not configured for controller {controller} — set its adminToken in Cells"),
+        ));
+    };
+    let timeout = if method == reqwest::Method::GET {
+        FEDERATION_TIMEOUT
+    } else {
+        CONTROLLER_MUTATION_TIMEOUT
+    };
+    let client = reqwest::Client::builder()
+        .connect_timeout(FEDERATION_CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| admin_error(StatusCode::BAD_GATEWAY, "client", e.to_string()))?;
+    let mut request = client
+        .request(method, format!("{controller}/admin/v1/{path}"))
+        .bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let resp = request.send().await.map_err(|e| {
+        admin_error(
+            StatusCode::BAD_GATEWAY,
+            "upstream_unavailable",
+            format!("controller {controller} unreachable: {e}"),
+        )
+    })?;
+    let status = resp.status();
+    let value: Option<serde_json::Value> = resp.json().await.ok();
+    if status.is_success() {
+        return value.ok_or_else(|| {
+            admin_error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_invalid",
+                format!("controller {controller} returned a non-JSON body"),
+            )
+        });
+    }
+    let message = value
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("controller returned {status}"));
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        // Not the panel user's credential that failed: do not answer 401.
+        return Err(admin_error(
+            StatusCode::BAD_GATEWAY,
+            "upstream_unauthorized",
+            format!("controller rejected the cell credential: {message}"),
+        ));
+    }
+    Err(admin_error(
+        StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+        "upstream_rejected",
+        message,
+    ))
 }
 
 async fn list_nodes(
     State(state): State<AdminState>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     if let Some(local) = &state.local {
         return Ok(Json(nodes_from_local(local)));
     }
-    Ok(Json(serde_json::json!({ "nodes": [] })))
+    proxy_controller(&state, reqwest::Method::GET, "nodes", None)
+        .await
+        .map(Json)
 }
 
 async fn list_shards(
     State(state): State<AdminState>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     if let Some(local) = &state.local {
         return Ok(Json(shards_from_local(local)));
     }
-    Ok(Json(serde_json::json!({ "shards": [] })))
+    proxy_controller(&state, reqwest::Method::GET, "shards", None)
+        .await
+        .map(Json)
 }
 
 async fn catalog_snapshot(
     State(state): State<AdminState>,
-    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     if let Some(local) = &state.local {
         if let Some(cluster) = &local.cluster {
             if let Some(controller) = cluster.runtime.controller() {
@@ -399,67 +704,53 @@ async fn catalog_snapshot(
             "authoritative": false,
         })));
     }
-    Ok(Json(serde_json::json!({
-        "epoch": 0,
-        "records": {},
-        "authoritative": false,
-    })))
+    proxy_controller(&state, reqwest::Method::GET, "catalog", None)
+        .await
+        .map(Json)
 }
 
 async fn admin_metrics(
     State(state): State<AdminState>,
-    headers: HeaderMap,
-) -> Result<Json<MetricsResponse>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
     if let Some(local) = &state.local {
-        return Ok(Json(ops::metrics_snapshot(local)));
+        return Ok(Json(to_json(ops::metrics_snapshot(local))));
     }
-    Ok(Json(MetricsResponse {
-        blocked_hosts: 0,
-        memory_critical: false,
-        cluster_enabled: false,
-        healthy_peers: 0,
-        ingest_accepted: 0,
-        ingest_duplicate: 0,
-        ingest_rejected: 0,
-        durable_commits: 0,
-        rss_mb: None,
-        memory_limit_mb: None,
-        memory_percent: None,
-        cpu_percent: None,
-    }))
+    proxy_controller(&state, reqwest::Method::GET, "metrics", None)
+        .await
+        .map(Json)
 }
 
 async fn admin_readyz(
     State(state): State<AdminState>,
-    headers: HeaderMap,
-) -> Result<Json<ReadyResponse>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<AdminErrorBody>)> {
     if let Some(local) = &state.local {
-        return Ok(Json(ops::ready_snapshot(local)));
+        let body = ops::ready_snapshot(local);
+        let status = if body.ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        return Ok((status, Json(to_json(body))));
     }
-    Ok(Json(ReadyResponse {
-        ready: true,
-        cluster_healthy: true,
-        auth_configured: true,
-    }))
+    proxy_controller(&state, reqwest::Method::GET, "readyz", None)
+        .await
+        .map(|body| (StatusCode::OK, Json(body)))
 }
 
 async fn audit_log(
     State(state): State<AdminState>,
-    headers: HeaderMap,
-    Query(_q): Query<AuditQuery>,
+    Query(query): Query<AuditQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
-    Ok(Json(serde_json::json!({ "events": [] })))
+    let limit = query.limit.unwrap_or(100).clamp(1, 1_000);
+    Ok(Json(
+        serde_json::json!({ "events": state.audit.recent(limit) }),
+    ))
 }
 
 async fn list_cells(
     State(state): State<AdminState>,
-    headers: HeaderMap,
-) -> Result<Json<CellRegistry>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
-    Ok(Json(state.cell_registry.read().clone()))
+) -> Result<Json<CellRegistryView>, (StatusCode, Json<AdminErrorBody>)> {
+    Ok(Json(CellRegistryView::from(&*state.cell_registry.read())))
 }
 
 #[derive(Debug, Deserialize)]
@@ -469,37 +760,96 @@ struct UpsertCell {
     region: String,
     controller_url: String,
     label: Option<String>,
+    /// Omitted or blank on update keeps the saved token.
+    #[serde(default)]
+    admin_token: Option<String>,
+}
+
+const LOCAL_TOKEN_PREFIX: &str = "sk_local_";
+
+/// Cells served from this process's own state (no credential needed).
+fn is_local_cell(state: &AdminState, id: &str) -> bool {
+    state.local.as_ref().is_some_and(|local| {
+        id == "local"
+            || local
+                .cluster
+                .as_ref()
+                .is_some_and(|c| c.runtime.config().cluster_id.to_string() == id)
+    })
+}
+
+fn bad_cell(error: &str) -> (StatusCode, Json<AdminErrorBody>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(AdminErrorBody {
+            error: error.into(),
+            code: "bad_cell",
+        }),
+    )
 }
 
 async fn upsert_cell(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<UpsertCell>,
-) -> Result<Json<CellRegistry>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
+) -> Result<Json<CellRegistryView>, (StatusCode, Json<AdminErrorBody>)> {
+    let id = body.id.trim().to_string();
+    let region = body.region.trim().to_string();
+    if id.is_empty() || region.is_empty() {
+        return Err(bad_cell("cell id and region are required"));
+    }
+    let admin_token = body
+        .admin_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+    if admin_token
+        .as_deref()
+        .is_some_and(|t| !t.starts_with(LOCAL_TOKEN_PREFIX) || t.len() > 256)
+    {
+        return Err(bad_cell(
+            "adminToken must be the cell's sk_local_… API token",
+        ));
+    }
+    let controller_url = validate_attach_url(&body.controller_url).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(AdminErrorBody {
+                error,
+                code: "bad_url",
+            }),
+        )
+    })?;
     let mut registry = state.cell_registry.write();
-    if let Some(existing) = registry.cells.iter_mut().find(|c| c.id == body.id) {
-        existing.region = body.region;
-        existing.controller_url = body.controller_url;
+    if let Some(existing) = registry.cells.iter_mut().find(|c| c.id == id) {
+        existing.region = region;
+        existing.controller_url = controller_url;
         existing.label = body.label;
+        if admin_token.is_some() {
+            existing.admin_token = admin_token;
+        }
     } else {
+        if admin_token.is_none() && !is_local_cell(&state, &id) {
+            return Err(bad_cell(
+                "adminToken (the cell's sk_local_… API token) is required to register a cell",
+            ));
+        }
         registry.cells.push(CellRecord {
-            id: body.id,
-            region: body.region,
-            controller_url: body.controller_url,
+            id,
+            region,
+            controller_url,
             label: body.label,
+            admin_token,
         });
     }
     state.persist_registry(&registry);
-    Ok(Json(registry.clone()))
+    Ok(Json(CellRegistryView::from(&*registry)))
 }
 
 async fn federated_query(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Path(kind): Path<String>,
 ) -> Result<Json<PartialResult<serde_json::Value>>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     let cells = state.cell_registry.read().cells.clone();
     if cells.is_empty() {
         if let Some(local) = &state.local {
@@ -512,66 +862,116 @@ async fn federated_query(
             }));
         }
     }
-    let client = reqwest::Client::new();
+    let client = federation_client().map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(AdminErrorBody {
+                error: err.to_string(),
+                code: "client",
+            }),
+        )
+    })?;
+    let path = match kind.as_str() {
+        "shards" => "shards",
+        "nodes" => "nodes",
+        "catalog" => "catalog",
+        _ => "cluster",
+    };
+    // Cells are queried concurrently (bounded) and each has its own deadline,
+    // so one slow or hung cell cannot hide the healthy ones.
+    let results: Vec<Result<CellOk<serde_json::Value>, CellFailure>> =
+        futures_util::stream::iter(cells.into_iter().map(|cell| {
+            let client = client.clone();
+            let state = state.clone();
+            let kind = kind.clone();
+            async move { query_cell(&client, &state, cell, &kind, path).await }
+        }))
+        .buffered(FEDERATION_CONCURRENCY)
+        .collect()
+        .await;
     let mut ok = Vec::new();
     let mut failed = Vec::new();
-    let auth_token = bearer(&headers).map(str::to_string).or_else(|| {
-        state
-            .cluster_secret
-            .clone()
-            .filter(|secret| !secret.is_empty())
-    });
-    for cell in cells {
-        if let Some(local) = &state.local {
-            if cell.id == "local"
-                || local
-                    .cluster
-                    .as_ref()
-                    .is_some_and(|c| c.runtime.config().cluster_id.to_string() == cell.id)
-            {
-                ok.push(CellOk {
-                    cell: cell.id,
-                    data: local_kind_data(local, &kind),
-                });
-                continue;
-            }
-        }
-        let url = format!(
-            "{}/admin/v1/{}",
-            cell.controller_url.trim_end_matches('/'),
-            match kind.as_str() {
-                "shards" => "shards",
-                "nodes" => "nodes",
-                "catalog" => "catalog",
-                _ => "cluster",
-            }
-        );
-        let mut req = client.get(url);
-        if let Some(token) = auth_token.as_deref() {
-            req = req.bearer_auth(token);
-        }
-        match req.send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json().await {
-                Ok(data) => ok.push(CellOk {
-                    cell: cell.id,
-                    data,
-                }),
-                Err(err) => failed.push(CellFailure {
-                    cell: cell.id,
-                    error: err.to_string(),
-                }),
-            },
-            Ok(resp) => failed.push(CellFailure {
-                cell: cell.id,
-                error: format!("status {}", resp.status()),
-            }),
-            Err(err) => failed.push(CellFailure {
-                cell: cell.id,
-                error: err.to_string(),
-            }),
+    for result in results {
+        match result {
+            Ok(cell) => ok.push(cell),
+            Err(failure) => failed.push(failure),
         }
     }
     Ok(Json(PartialResult { ok, failed }))
+}
+
+const FEDERATION_CONCURRENCY: usize = 8;
+const FEDERATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(not(test))]
+const FEDERATION_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const FEDERATION_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// HTTP client for calls to registered cells: bounded connect and whole-request
+/// deadlines, and no redirects (a cell must not bounce the request elsewhere).
+fn federation_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(FEDERATION_CONNECT_TIMEOUT)
+        .timeout(FEDERATION_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+async fn query_cell(
+    client: &reqwest::Client,
+    state: &AdminState,
+    cell: CellRecord,
+    kind: &str,
+    path: &str,
+) -> Result<CellOk<serde_json::Value>, CellFailure> {
+    if let Some(local) = state
+        .local
+        .as_ref()
+        .filter(|_| is_local_cell(state, &cell.id))
+    {
+        return Ok(CellOk {
+            cell: cell.id,
+            data: local_kind_data(local, kind),
+        });
+    }
+    // Registry URLs are operator-supplied, not proven peers: authenticate with
+    // the cell's own credential only, never the caller's bearer or the
+    // cluster secret.
+    let Some(token) = cell.admin_token.as_deref() else {
+        return Err(CellFailure {
+            cell: cell.id,
+            error: "cell credential not configured".into(),
+        });
+    };
+    let url = format!(
+        "{}/admin/v1/{path}",
+        cell.controller_url.trim_end_matches('/')
+    );
+    let failure = |error: String| CellFailure {
+        cell: cell.id.clone(),
+        error,
+    };
+    let describe = |err: reqwest::Error| {
+        if err.is_timeout() {
+            format!("timed out after {}s", FEDERATION_TIMEOUT.as_secs_f32())
+        } else {
+            err.to_string()
+        }
+    };
+    let resp = client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| failure(describe(e)))?;
+    if !resp.status().is_success() {
+        return Err(failure(format!("status {}", resp.status())));
+    }
+    let data = resp.json().await.map_err(|e| failure(describe(e)))?;
+    Ok(CellOk {
+        cell: cell.id.clone(),
+        data,
+    })
 }
 
 fn cluster_from_local(local: &AppState) -> serde_json::Value {
@@ -683,7 +1083,7 @@ fn local_kind_data(local: &AppState, kind: &str) -> serde_json::Value {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RebalanceRequest {
     shard: u32,
@@ -693,10 +1093,18 @@ struct RebalanceRequest {
 
 async fn start_rebalance(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<RebalanceRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
+    if state.local.is_none() {
+        return proxy_controller(
+            &state,
+            reqwest::Method::POST,
+            "rebalance",
+            Some(to_json(&body)),
+        )
+        .await
+        .map(Json);
+    }
     if let Some(local) = &state.local {
         if let Some(cluster) = &local.cluster {
             if let Some(controller) = cluster.runtime.controller() {
@@ -734,57 +1142,169 @@ async fn start_rebalance(
     ))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GcRequest {
+    /// Exclusive offset: delete whole sealed segments entirely below it.
     watermark: u64,
+    /// Queue topic; required with shard layout V1 (one log per topic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topic: Option<String>,
 }
 
+type GcError = (StatusCode, Json<serde_json::Value>);
+
+fn gc_error(status: StatusCode, code: &str, error: impl std::fmt::Display) -> GcError {
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string(), "code": code })),
+    )
+}
+
+/// Manual GC: validated against the same safe watermark as automatic
+/// retention (409 with the safe value above it, never silently clamped),
+/// committed through the controller in a replicated cell, applied locally,
+/// and every failure surfaced.
 async fn advance_gc(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Path(shard): Path<u32>,
     Json(body): Json<GcRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
-    if let Some(local) = &state.local {
-        if let Some(cluster) = &local.cluster {
-            if let Some(controller) = cluster.runtime.controller() {
-                let _ = controller
-                    .submit(broker_raft_meta::ControllerCommand::SetGcWatermark {
-                        shard,
-                        watermark: body.watermark,
-                    })
-                    .await
-                    .map_err(|err| {
-                        (
-                            StatusCode::CONFLICT,
-                            Json(AdminErrorBody {
-                                error: err.to_string(),
-                                code: "gc_rejected",
-                            }),
-                        )
-                    })?;
-            }
-        }
-        let deleted = local
-            .broker
-            .gc_sealed_below(shard, body.watermark)
-            .unwrap_or(0);
-        return Ok(Json(serde_json::json!({
-            "shard": shard,
-            "watermark": body.watermark,
-            "deletedSegments": deleted,
-        })));
+) -> Result<Json<serde_json::Value>, GcError> {
+    let Some(local) = state.local.clone() else {
+        // Standalone panel: the controller's broker validates and applies.
+        let path = format!("gc/{shard}");
+        return proxy_controller(&state, reqwest::Method::POST, &path, Some(to_json(&body)))
+            .await
+            .map(Json)
+            .map_err(|(status, Json(error))| {
+                (
+                    status,
+                    Json(serde_json::to_value(error).unwrap_or_default()),
+                )
+            });
+    };
+    let broker = &local.broker;
+    if broker.config().storage != broker_storage::StorageMode::Local {
+        return Err(gc_error(
+            StatusCode::CONFLICT,
+            "gc_unsupported",
+            "segment GC applies to local WAL storage only",
+        ));
     }
+    if shard >= broker.shard_count() {
+        return Err(gc_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_shard",
+            format!("shard {shard} out of range (0..{})", broker.shard_count()),
+        ));
+    }
+    let log = if broker.layout().is_physical() {
+        broker.log_id("", shard)
+    } else {
+        let Some(topic) = body.topic.as_deref().filter(|topic| !topic.is_empty()) else {
+            return Err(gc_error(
+                StatusCode::BAD_REQUEST,
+                "topic_required",
+                "shard layout v1 keeps one log per topic: pass \"topic\"",
+            ));
+        };
+        broker.log_id(topic, shard)
+    };
+    let replicated = local
+        .cluster
+        .as_ref()
+        .filter(|cluster| cluster.runtime.config().node_count() > 1);
+    if let Some(cluster) = replicated {
+        if cluster.runtime.controller().is_none() {
+            return Err(gc_error(
+                StatusCode::CONFLICT,
+                "retention_paused",
+                "replicated cell without an OpenRaft controller cannot agree on GC",
+            ));
+        }
+        if !cluster.runtime.is_leader_for_shard(shard) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("this node does not lead shard {shard}"),
+                    "code": "not_shard_leader",
+                    "leader": cluster.runtime.leader_http_base_for_shard(shard),
+                })),
+            ));
+        }
+    }
+
+    let config = broker_partition::RetentionConfig::from_env();
+    let compute_state = Arc::clone(&local);
+    let compute_log = log.clone();
+    let safe = tokio::task::spawn_blocking(move || {
+        crate::retention::compute_safe_watermark(&compute_state, &compute_log, &config)
+    })
+    .await
+    .map_err(|error| gc_error(StatusCode::INTERNAL_SERVER_ERROR, "gc_failed", error))?
+    .map_err(|error| gc_error(StatusCode::INTERNAL_SERVER_ERROR, "gc_failed", error))?;
+    if body.watermark > safe.safe {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "watermark {} is above the safe watermark {} (limited by {:?})",
+                    body.watermark, safe.safe, safe.limited_by
+                ),
+                "code": "gc_above_safe_watermark",
+                "requested": body.watermark,
+                "safeWatermark": safe.safe,
+                "limitedBy": safe.limited_by,
+            })),
+        ));
+    }
+
+    if let Some(cluster) = replicated {
+        let controller = cluster.runtime.controller().expect("checked above");
+        if body.watermark > controller.state().log_gc_watermark(&log.namespace, shard) {
+            controller
+                .submit(ControllerCommand::SetGcWatermarks {
+                    leader_id: cluster.runtime.config().node_id,
+                    entries: vec![broker_raft_meta::GcWatermarkProposal {
+                        namespace: log.namespace.clone(),
+                        partition: shard,
+                        leader_term: cluster.runtime.shard_generation(shard),
+                        watermark: body.watermark,
+                    }],
+                })
+                .await
+                .map_err(|error| gc_error(StatusCode::CONFLICT, "gc_rejected", error))?;
+        }
+    }
+    let apply_state = Arc::clone(&local);
+    let apply_log = log.clone();
+    let watermark = body.watermark;
+    let report = tokio::task::spawn_blocking(move || {
+        crate::retention::apply_watermark(&apply_state, &apply_log, watermark)
+    })
+    .await
+    .map_err(|error| gc_error(StatusCode::INTERNAL_SERVER_ERROR, "gc_failed", error))?
+    .map_err(|error| gc_error(StatusCode::INTERNAL_SERVER_ERROR, "gc_failed", error))?;
+    tracing::info!(
+        %log,
+        watermark,
+        safe = safe.safe,
+        base_offset = report.base_offset,
+        segments = report.segments_deleted,
+        "manual GC applied"
+    );
     Ok(Json(serde_json::json!({
         "shard": shard,
-        "watermark": body.watermark,
-        "deletedSegments": 0,
+        "log": log.namespace,
+        "watermark": watermark,
+        "safeWatermark": safe.safe,
+        "baseOffset": report.base_offset,
+        "deletedSegments": report.segments_deleted,
+        "blobsTombstoned": report.blobs_tombstoned,
     })))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DrainNodeRequest {
     node_id: Uuid,
@@ -792,10 +1312,18 @@ struct DrainNodeRequest {
 
 async fn drain_node(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<DrainNodeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
+    if state.local.is_none() {
+        return proxy_controller(
+            &state,
+            reqwest::Method::POST,
+            "nodes/drain",
+            Some(to_json(&body)),
+        )
+        .await
+        .map(Json);
+    }
     let Some(local) = &state.local else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -840,7 +1368,7 @@ async fn drain_node(
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ControllerVoterRequest {
     node_id: Uuid,
@@ -849,10 +1377,18 @@ struct ControllerVoterRequest {
 
 async fn controller_voter(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<ControllerVoterRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
+    if state.local.is_none() {
+        return proxy_controller(
+            &state,
+            reqwest::Method::POST,
+            "controller/voters",
+            Some(to_json(&body)),
+        )
+        .await
+        .map(Json);
+    }
     let Some(local) = &state.local else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -928,17 +1464,25 @@ pub fn validate_attach_url(raw: &str) -> Result<String, String> {
         return Err("url must not contain credentials".into());
     }
     if let Some(host) = parsed.host_str() {
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            match ip {
-                std::net::IpAddr::V4(v4) if v4.is_unspecified() || v4.is_link_local() => {
-                    return Err("url host is not allowed".into());
+        let lower = host.to_ascii_lowercase();
+        if lower == "metadata"
+            || lower == "metadata.google.internal"
+            || lower.ends_with(".metadata.google.internal")
+        {
+            return Err("url host is not allowed".into());
+        }
+        if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+            let blocked_v4 = |v4: std::net::Ipv4Addr| v4.is_unspecified() || v4.is_link_local();
+            let blocked = match ip {
+                std::net::IpAddr::V4(v4) => blocked_v4(v4),
+                std::net::IpAddr::V6(v6) => {
+                    v6.is_unspecified()
+                        || (v6.segments()[0] & 0xffc0) == 0xfe80
+                        || v6.to_ipv4_mapped().is_some_and(blocked_v4)
                 }
-                std::net::IpAddr::V6(v6)
-                    if v6.is_unspecified() || (v6.segments()[0] & 0xffc0) == 0xfe80 =>
-                {
-                    return Err("url host is not allowed".into());
-                }
-                _ => {}
+            };
+            if blocked {
+                return Err("url host is not allowed".into());
             }
         }
     } else {
@@ -949,18 +1493,25 @@ pub fn validate_attach_url(raw: &str) -> Result<String, String> {
 
 async fn list_cell_members(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     let registry = state.cell_registry.read().clone();
     let members: Vec<_> = registry
         .members
         .into_iter()
         .filter(|m| m.cell_id == id)
         .collect();
+    let is_controller_cell = registry.cells.iter().any(|c| {
+        c.id == id
+            && state
+                .remote_controller
+                .as_deref()
+                .is_some_and(|url| same_url(&c.controller_url, url))
+    });
     let brokers = if let Some(local) = &state.local {
         nodes_from_local(local)
+    } else if is_controller_cell {
+        proxy_controller(&state, reqwest::Method::GET, "nodes", None).await?
     } else {
         serde_json::json!({ "nodes": [] })
     };
@@ -992,7 +1543,7 @@ struct AttachRequest {
     cell_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExpandRfRequest {
     #[serde(default)]
@@ -1002,11 +1553,8 @@ struct ExpandRfRequest {
 }
 
 async fn probe_node(
-    State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<ProbeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     let reach = validate_attach_url(&body.reach_url).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
@@ -1104,10 +1652,8 @@ async fn probe_reach(reach: &str) -> serde_json::Value {
 
 async fn attach_node(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<AttachRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
     let profile = body.profile.trim().to_ascii_lowercase();
     if !is_known_profile(&profile) {
         return Err((
@@ -1235,15 +1781,35 @@ async fn attach_node(
                     }),
                 )
             })?;
+        let Some(secret) = state.cluster_secret.as_deref() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(AdminErrorBody {
+                    error: "attaching a broker requires BETTERMQ_CLUSTER_SECRET".into(),
+                    code: "cluster_secret_required",
+                }),
+            ));
+        };
+        let enroll_body = serde_json::to_vec(&serde_json::json!({
+            "seed_url": seed,
+            "join_token": token,
+            "public_url": advertise,
+            "node_name": name,
+        }))
+        .unwrap_or_default();
+        // The target proves the caller holds the cluster secret from this HMAC;
+        // the secret itself never goes to the (operator-typed) reach URL.
+        let proof = crate::cluster_auth::sign_enroll(
+            secret,
+            chrono::Utc::now().timestamp_millis(),
+            &enroll_body,
+        );
         let enroll_url = format!("{reach}/v1/infra/cluster/enroll");
         let resp = client
             .post(&enroll_url)
-            .json(&serde_json::json!({
-                "seed_url": seed,
-                "join_token": token,
-                "public_url": advertise,
-                "node_name": name,
-            }))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header(crate::cluster_auth::ENROLL_PROOF_HEADER, proof)
+            .body(enroll_body)
             .send()
             .await
             .map_err(|err| {
@@ -1330,10 +1896,18 @@ async fn attach_node(
 
 async fn expand_rf(
     State(state): State<AdminState>,
-    headers: HeaderMap,
     Json(body): Json<ExpandRfRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<AdminErrorBody>)> {
-    require_admin(&headers, &state).await?;
+    if state.local.is_none() {
+        return proxy_controller(
+            &state,
+            reqwest::Method::POST,
+            "expand-rf",
+            Some(to_json(&body)),
+        )
+        .await
+        .map(Json);
+    }
     let Some(local) = &state.local else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1376,6 +1950,14 @@ async fn expand_replication(
     } else {
         Some(validate_attach_url(advertise_url)?)
     };
+    // Enrollment URLs stay public; controller/data-node transport is private.
+    let addr = broker_config::load_managed_config(&local.broker.config().data_dir)
+        .ok()
+        .flatten()
+        .and_then(|cfg| cfg.cluster)
+        .and_then(|cluster| cluster.nodes.into_iter().find(|n| n.name == node_name))
+        .map(|node| node.internal_base().to_owned())
+        .or(addr);
     if !node_name.is_empty() {
         if let Some(addr) = addr.clone() {
             let id = stable_node_id(node_name);
@@ -1422,6 +2004,8 @@ async fn expand_replication(
                 if placement.replicas.contains(&new_id) {
                     continue;
                 }
+                // The broker joins as a learner. Each shard leader copies its
+                // log and promotes it only once the copy is verified.
                 if !placement.learners.contains(&new_id) {
                     controller
                         .submit(ControllerCommand::BeginRebalance {
@@ -1431,41 +2015,41 @@ async fn expand_replication(
                         })
                         .await
                         .map_err(|e| e.to_string())?;
+                    actions.push(format!("shard_{shard}_learning"));
                 }
-                controller
-                    .submit(ControllerCommand::PromoteLearner {
-                        shard,
-                        node_id: new_id,
-                    })
-                    .await
-                    .map_err(|e| e.to_string())?;
-                controller
-                    .submit(ControllerCommand::CompleteRebalance { shard })
-                    .await
-                    .map_err(|e| e.to_string())?;
-                actions.push(format!("shard_{shard}_add"));
             }
         }
     }
     let snap = controller.state();
+    let mut pending: Vec<u32> = snap
+        .shards
+        .values()
+        .filter(|s| !s.learners.is_empty())
+        .map(|s| s.shard)
+        .collect();
+    pending.sort_unstable();
+    let factor = snap.replication_factor.max(1) as usize;
+    // HA readiness comes from the leaders' measured ISR, not from placement.
     let ha_ready = snap.replication_factor >= 3
+        && pending.is_empty()
         && snap
             .shards
             .values()
-            .all(|s| s.isr.len() >= snap.min_isr.max(2) as usize);
+            .all(|s| s.replicas.len() >= factor && s.isr.len() >= factor);
     Ok(serde_json::json!({
         "ok": true,
         "dataNodes": data_count,
         "replicationFactor": snap.replication_factor,
         "minIsr": snap.min_isr,
         "haReady": ha_ready,
+        "pendingShards": pending,
         "actions": actions,
         "warning": if data_count == 2 {
             Some("RF=2 / minISR=2 — both nodes must be up. Add a third broker for HA.")
         } else if data_count >= 4 && snap.replication_factor == 3 {
             Some("RF stays 3. Extra brokers add shard capacity, not a fourth copy.")
         } else if data_count >= 3 && !ha_ready {
-            Some("Expanding replicas to RF=3…")
+            Some("Copying shards to RF=3. haReady becomes true once every shard leader has verified its replicas in sync; poll this endpoint or GET /admin/v1/shards.")
         } else {
             None
         },
@@ -1475,6 +2059,193 @@ async fn expand_replication(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod manual_gc {
+        use super::*;
+        use axum::body::Body;
+        use axum::http::Request;
+        use broker_dispatch::{DispatchConfig, DispatchEngine, LeaseTable};
+        use broker_partition::{Broker, BrokerConfig, PublishRequest};
+        use broker_schedule::{CronRegistry, ScheduleQueue};
+        use broker_storage::{FsyncMode, PartitionLogConfig};
+        use tower::ServiceExt;
+
+        fn state(dir: &std::path::Path) -> Arc<AppState> {
+            let mut config = BrokerConfig::new(dir.to_path_buf());
+            config.partitions = 1;
+            config.log = PartitionLogConfig {
+                segment_max_bytes: 2048,
+                fsync: FsyncMode::Always,
+                group_interval: std::time::Duration::from_millis(5),
+            };
+            let broker = Broker::open(config).unwrap();
+            Arc::new(AppState {
+                broker: broker.clone(),
+                schedule: ScheduleQueue::open(dir).unwrap(),
+                crons: CronRegistry::open(dir).unwrap(),
+                dispatch: DispatchEngine::new_broker_only(broker, DispatchConfig::default()),
+                leases: LeaseTable::new(),
+                cluster: None,
+                local_auth: None,
+                fair_queue: Arc::new(broker_dispatch::TenantFairQueue::new()),
+                catalog_tombstones: crate::catalog_tombstones::CatalogTombstones::open(dir)
+                    .unwrap(),
+                dispatch_fleet: false,
+                broker_only: false,
+                #[cfg(feature = "cloud")]
+                auth: None,
+                #[cfg(feature = "cloud")]
+                control_plane: None,
+            })
+        }
+
+        fn publish(state: &AppState, count: usize) -> Vec<u64> {
+            (0..count)
+                .map(|index| {
+                    state
+                        .broker
+                        .publish(PublishRequest {
+                            topic: String::new(),
+                            queue_id: None,
+                            group_id: None,
+                            group_member_id: None,
+                            routing_key: "lane".into(),
+                            payload: format!("{index}-{}", "x".repeat(200)),
+                            payload_encoding: None,
+                            idempotency_key: None,
+                            delay_ms: None,
+                            priority: None,
+                            flow_id: None,
+                            url: Some("http://127.0.0.1:9/h".into()),
+                            secret: Some("s".into()),
+                            routing_id: None,
+                            destination: None,
+                            flow: None,
+                            parallelism: None,
+                            max_retries: None,
+                            retry_backoff: None,
+                            method: None,
+                            headers: None,
+                            sign: None,
+                            request: None,
+                        })
+                        .unwrap()
+                        .offset
+                        .unwrap()
+                })
+                .collect()
+        }
+
+        async fn post_gc(app: &Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/admin/v1/gc/0")
+                        .header("content-type", "application/json")
+                        .header("authorization", "Bearer sk_local_secret")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap())
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn manual_gc_rejects_unsafe_watermarks_and_is_audited() {
+            std::env::set_var("BETTERMQ_RETENTION_MIN_AGE_SECS", "0");
+            let dir = tempfile::tempdir().unwrap();
+            let local = state(dir.path());
+            let offsets = publish(&local, 80);
+            let log = local.broker.log_id(broker_partition::DIRECT_TOPIC, 0);
+            for message in local.broker.read_log(&log, 0, 10_000).unwrap() {
+                if message.offset < offsets[50] {
+                    local
+                        .broker
+                        .mark_dispatch_complete(
+                            &message.tenant_id,
+                            &broker_partition::flow_lane_owner(&message).to_string(),
+                            message.partition,
+                            message.offset,
+                        )
+                        .unwrap();
+                }
+            }
+            let mut admin = AdminState::local(Arc::clone(&local));
+            admin.cluster_secret = Some("sk_local_secret".into());
+            let app = router(admin);
+
+            // V1 needs the topic.
+            let (status, body) = post_gc(&app, serde_json::json!({ "watermark": 1 })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["code"], "topic_required");
+
+            // Above the safe watermark: refused with the safe value, nothing deleted.
+            let (status, body) = post_gc(
+                &app,
+                serde_json::json!({ "watermark": offsets[70], "topic": "__direct" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["code"], "gc_above_safe_watermark");
+            assert_eq!(body["safeWatermark"], offsets[50]);
+            assert_eq!(
+                local
+                    .broker
+                    .log_retention_status(&log, 0)
+                    .unwrap()
+                    .base_offset,
+                0
+            );
+
+            // At the safe watermark: applied.
+            let (status, body) = post_gc(
+                &app,
+                serde_json::json!({ "watermark": offsets[50], "topic": "__direct" }),
+            )
+            .await;
+            std::env::remove_var("BETTERMQ_RETENTION_MIN_AGE_SECS");
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert!(body["deletedSegments"].as_u64().unwrap() > 0);
+            let base = local
+                .broker
+                .log_retention_status(&log, 0)
+                .unwrap()
+                .base_offset;
+            assert!(base > 0 && base <= offsets[50]);
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get("/admin/v1/audit")
+                        .header("authorization", "Bearer sk_local_secret")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let audit: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let events = audit["events"].as_array().unwrap();
+            let statuses: Vec<_> = events.iter().map(|event| event["status"].clone()).collect();
+            assert_eq!(statuses, vec![200, 409, 400]);
+            assert_eq!(events[0]["path"], "/admin/v1/gc/0");
+            assert_eq!(events[0]["params"]["watermark"], offsets[50]);
+            let caller = events[0]["caller"].as_str().unwrap();
+            assert!(caller.starts_with("bearer:") && !caller.contains("sk_local"));
+            // Persisted for restarts.
+            let reopened = AdminAuditLog::open(Some(dir.path().join("admin-audit.jsonl")));
+            assert_eq!(reopened.recent(10).len(), 3);
+        }
+    }
+
+    use crate::admin_audit::AdminAuditLog;
 
     #[test]
     fn cell_registry_survives_roundtrip() {
@@ -1486,6 +2257,7 @@ mod tests {
             region: "us-east".into(),
             controller_url: "http://broker1:8080".into(),
             label: Some("prod".into()),
+            admin_token: Some("sk_local_prod".into()),
         });
         registry.upsert_member(CellMember {
             profile: "dispatch".into(),
@@ -1495,11 +2267,58 @@ mod tests {
             cell_id: "us-east".into(),
         });
         registry.save(&path).unwrap();
-        let loaded = CellRegistry::load(&path);
+        let loaded = CellRegistry::load(&path).unwrap();
         assert_eq!(loaded.cells.len(), 1);
         assert_eq!(loaded.cells[0].id, "us-east");
+        assert_eq!(
+            loaded.cells[0].admin_token.as_deref(),
+            Some("sk_local_prod")
+        );
         assert_eq!(loaded.members.len(), 1);
         assert_eq!(loaded.members[0].profile, "dispatch");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn missing_registry_is_empty_and_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cell-registry.json");
+        let (registry, persist) = CellRegistry::load_for_startup(&path);
+        assert!(registry.cells.is_empty());
+        assert!(persist);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn corrupt_registry_is_preserved_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cell-registry.json");
+        std::fs::write(&path, b"{\"cells\": [{\"id\": \"eu\", \"regi").unwrap();
+        assert!(CellRegistry::load(&path).is_err());
+        let mut admin = AdminState::remote_with_path(
+            Some("http://broker1:8080".into()),
+            CellRegistry::load_for_startup(&path).0,
+            Some(path.clone()),
+        );
+        admin.cluster_secret = None;
+        let saved: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert_eq!(saved.len(), 1, "damaged file kept for recovery");
+        assert_eq!(
+            std::fs::read(&saved[0]).unwrap(),
+            b"{\"cells\": [{\"id\": \"eu\", \"regi"
+        );
+        let fresh = CellRegistry::load(&path).unwrap();
+        assert_eq!(fresh.cells.len(), 1, "only the default controller cell");
     }
 
     #[test]
@@ -1508,6 +2327,9 @@ mod tests {
         assert!(validate_attach_url("http://broker2:8080").is_ok());
         assert!(validate_attach_url("http://10.0.0.5:8090").is_ok());
         assert!(validate_attach_url("http://169.254.169.254/").is_err());
+        assert!(validate_attach_url("http://[::ffff:169.254.169.254]/").is_err());
+        assert!(validate_attach_url("http://[fe80::1]:8080").is_err());
+        assert!(validate_attach_url("http://metadata.google.internal/").is_err());
         assert!(validate_attach_url("http://user:pass@broker2:8080").is_err());
         assert!(validate_attach_url("ftp://broker2:8080").is_err());
     }

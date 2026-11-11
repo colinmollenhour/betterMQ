@@ -18,7 +18,7 @@ pub enum Commands {
     Serve(ServeArgs),
     /// Standalone management gateway + control panel (no broker storage).
     Panel(PanelArgs),
-    /// Cluster management (legacy; prefer `bettermq.json` cluster section).
+    /// Retired cluster commands (print migration instructions; do not modify files).
     Cluster {
         #[command(subcommand)]
         cmd: ClusterCommands,
@@ -36,9 +36,9 @@ pub enum Commands {
 
 #[derive(Debug, Subcommand)]
 pub enum ClusterCommands {
-    /// Initialize a new cluster config in the data directory.
+    /// Retired: use config init --template cluster or Panel → Infrastructure.
     Init(ClusterInitArgs),
-    /// Join an existing cluster (writes local cluster-config.json).
+    /// Retired: use Panel → Infrastructure enrollment with a seed join token.
     Join(ClusterJoinArgs),
 }
 
@@ -116,7 +116,7 @@ pub struct ClusterInitArgs {
     /// Comma-separated peer base URLs (including this node).
     #[arg(long, value_delimiter = ',')]
     pub peers: Vec<String>,
-    /// Optional fixed node id (defaults to random v4).
+    /// Legacy node id (command is retired; no files are written).
     #[arg(long)]
     pub node_id: Option<Uuid>,
 }
@@ -193,6 +193,9 @@ pub struct ServeArgs {
     /// Internal cluster/replication listener.
     #[arg(long, env = "BETTERMQ_INTERNAL_LISTEN")]
     pub internal_listen: Option<SocketAddr>,
+    /// Advertised private peer URL (defaults to the public node URL).
+    #[arg(long, env = "BETTERMQ_INTERNAL_URL")]
+    pub internal_url: Option<String>,
 }
 
 /// Shared `bettermq serve` flags (cloud build).
@@ -258,6 +261,9 @@ pub struct ServeArgs {
     /// Internal cluster/replication listener.
     #[arg(long, env = "BETTERMQ_INTERNAL_LISTEN")]
     pub internal_listen: Option<SocketAddr>,
+    /// Advertised private peer URL (defaults to the public node URL).
+    #[arg(long, env = "BETTERMQ_INTERNAL_URL")]
+    pub internal_url: Option<String>,
 }
 
 #[derive(Debug, Parser)]

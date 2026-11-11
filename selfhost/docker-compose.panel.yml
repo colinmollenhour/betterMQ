@@ -4,19 +4,26 @@
 #
 # Browser: http://localhost:8090/panel/
 # Point `--controller` at a regional cell admin URL.
+#
+# BETTERMQ_CLUSTER_SECRET is required: it is the panel's admin credential, and
+# the panel rejects every admin call without it. The port is published on
+# loopback only; reach it through an SSH tunnel or a TLS reverse proxy.
 
 services:
   panel:
-    image: ghcr.io/bettermq/bettermq:latest
+    image: ${BETTERMQ_IMAGE:-ghcr.io/colinmollenhour/bettermq}:${BETTERMQ_VERSION:?pin BETTERMQ_VERSION to a release tag}
     build:
       context: ..
       dockerfile: selfhost/Dockerfile
     ports:
-      - "8090:8090"
+      - "127.0.0.1:8090:8090"
     environment:
-      BETTERMQ_CLUSTER_SECRET: ${BETTERMQ_CLUSTER_SECRET:-}
+      BETTERMQ_CLUSTER_SECRET: ${BETTERMQ_CLUSTER_SECRET:?set BETTERMQ_CLUSTER_SECRET (the panel admin credential)}
       BETTERMQ_PANEL_MODE: standalone
+      BETTERMQ_PANEL_DATA_DIR: /data
       BETTERMQ_CELL_LABEL: global
+    volumes:
+      - panel-data:/data
     command:
       [
         "panel",
@@ -26,3 +33,7 @@ services:
         "${BETTERMQ_CONTROLLER:-http://broker1:8080}",
       ]
     restart: unless-stopped
+    stop_grace_period: ${BETTERMQ_STOP_GRACE_PERIOD:-120s}
+
+volumes:
+  panel-data:

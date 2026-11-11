@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -78,6 +77,12 @@ struct Args {
     count: u64,
     #[arg(long, default_value_t = 32)]
     concurrency: usize,
+    /// Maximum time to establish a connection (milliseconds).
+    #[arg(long, default_value_t = 5_000)]
+    connect_timeout_ms: u64,
+    /// Whole HTTP request deadline, including response-body reads (milliseconds).
+    #[arg(long, default_value_t = 30_000)]
+    request_timeout_ms: u64,
     #[arg(long, default_value_t = 100)]
     batch_size: usize,
     #[arg(long, default_value_t = 1024)]
@@ -184,19 +189,13 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
     let endpoint = args.endpoint.resolve(args.batch_size)?;
-    let mut builder = reqwest::Client::builder().pool_max_idle_per_host(args.concurrency);
-    builder = match args.http {
-        HttpVersion::Http1 => builder.http1_only(),
-        HttpVersion::Http2 => builder.http2_prior_knowledge(),
-    };
-    let http = builder.build()?;
+    let http = build_http_client(&args)?;
     let run_id = args
         .run_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let body = Arc::new("x".repeat(args.body_bytes));
     let results = Arc::new(Results::new()?);
-    let slots = Arc::new(Semaphore::new(args.concurrency));
     let started = Instant::now();
     let mut tasks = JoinSet::new();
     let mut seq = 0u64;
@@ -227,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
         if args.linger_ms > 0 {
             tokio::time::sleep(Duration::from_millis(args.linger_ms)).await;
         }
-        let permit = slots.clone().acquire_owned().await?;
+        reap_for_slot(&mut tasks, args.concurrency).await?;
         let http = http.clone();
         let base = args.url.clone();
         let token = args.token.clone();
@@ -240,7 +239,6 @@ async fn main() -> anyhow::Result<()> {
         let idempotency = args.idempotency;
         let body_bytes = args.body_bytes as u64;
         tasks.spawn(async move {
-            let _permit = permit;
             let service_started = Instant::now();
             let outcome = send_request(
                 &http,
@@ -278,7 +276,35 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn build_http_client(args: &Args) -> reqwest::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
+        .pool_max_idle_per_host(args.concurrency)
+        .connect_timeout(Duration::from_millis(args.connect_timeout_ms))
+        .timeout(Duration::from_millis(args.request_timeout_ms));
+    match args.http {
+        HttpVersion::Http1 => builder.http1_only(),
+        HttpVersion::Http2 => builder.http2_prior_knowledge(),
+    }
+    .build()
+}
+
+async fn reap_for_slot(tasks: &mut JoinSet<()>, concurrency: usize) -> anyhow::Result<()> {
+    // Bound retained completed tasks as well as in-flight requests.
+    while tasks.len() >= concurrency {
+        if let Some(joined) = tasks.join_next().await {
+            joined.context("load task panicked")?;
+        }
+    }
+    while let Some(joined) = tasks.try_join_next() {
+        joined.context("load task panicked")?;
+    }
+    Ok(())
+}
+
 fn validate_args(args: &Args) -> anyhow::Result<()> {
+    if args.connect_timeout_ms == 0 || args.request_timeout_ms == 0 {
+        bail!("--connect-timeout-ms and --request-timeout-ms must be greater than zero");
+    }
     if args.count == 0 {
         bail!("--count must be greater than zero");
     }
@@ -351,11 +377,18 @@ async fn send_request(
     match req.send().await {
         Ok(resp) => {
             let status = resp.status();
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|error| format!("<read error: {error}>"));
-            parse_http_outcome(endpoint, status, &body, take, body_bytes, wire_bytes)
+            match resp.text().await {
+                Ok(body) => {
+                    parse_http_outcome(endpoint, status, &body, take, body_bytes, wire_bytes)
+                }
+                Err(error) => RequestOutcome {
+                    accepted: 0,
+                    failed: take,
+                    payload_bytes: 0,
+                    wire_bytes,
+                    error: Some(format!("response body: {error}")),
+                },
+            }
         }
         Err(error) => RequestOutcome {
             accepted: 0,
@@ -579,6 +612,76 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stalled_headers_and_bodies_count_as_failures() {
+        use tokio::io::AsyncWriteExt;
+
+        let args = Args::parse_from([
+            "loadgen",
+            "--request-timeout-ms",
+            "50",
+            "--connect-timeout-ms",
+            "50",
+        ]);
+        validate_args(&args).unwrap();
+        let client = build_http_client(&args).unwrap();
+        for send_headers in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                if send_headers {
+                    stream
+                        .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 100\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+                std::future::pending::<()>().await;
+            });
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(2),
+                send_request(
+                    &client,
+                    &format!("http://{addr}"),
+                    None,
+                    Endpoint::Publish,
+                    "x",
+                    "http://sink.test",
+                    "secret",
+                    "test",
+                    0,
+                    1,
+                    1,
+                    false,
+                    1,
+                ),
+            )
+            .await
+            .expect("HTTP deadline must bound response reads");
+            assert_eq!(outcome.accepted, 0);
+            assert_eq!(outcome.failed, 1);
+            assert!(outcome.error.is_some());
+            server.abort();
+        }
+        let invalid = Args::parse_from(["loadgen", "--request-timeout-ms", "0"]);
+        assert!(validate_args(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn task_retention_is_bounded_and_panics_surface() {
+        let mut tasks = JoinSet::new();
+        for _ in 0..10_000 {
+            reap_for_slot(&mut tasks, 4).await.unwrap();
+            tasks.spawn(async {});
+            assert!(tasks.len() <= 4);
+        }
+        while let Some(joined) = tasks.join_next().await {
+            joined.unwrap();
+        }
+        tasks.spawn(async { panic!("injected load task failure") });
+        assert!(reap_for_slot(&mut tasks, 1).await.is_err());
+    }
 
     #[test]
     fn single_publish_uses_public_body_shape() {

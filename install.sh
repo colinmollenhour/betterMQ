@@ -2,13 +2,13 @@
 #
 # betterMQ installer.
 #
-#   curl -fsSL https://bettermq.com/install | bash
+#   curl -fsSL https://raw.githubusercontent.com/colinmollenhour/betterMQ/main/install.sh | bash
 #
 # macOS, Linux, WSL, and Git Bash on Windows. For Windows PowerShell / CMD use:
-#   powershell -ExecutionPolicy Bypass -c "irm https://bettermq.com/install.ps1 | iex"
+#   powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/colinmollenhour/betterMQ/main/install.ps1 | iex"
 #
 # Detects your OS + arch, downloads the matching binary from the
-# betterMQ/betterMQ GitHub Releases, verifies sha256 against checksums.txt
+# BETTERMQ_REPO GitHub Releases (defaults to this fork), verifies checksums.txt
 # (required — install fails if the file or sha256 tool is missing), installs
 # to ~/.bettermq/bin and links it into ~/.local/bin/bettermq.
 #
@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-REPO="betterMQ/betterMQ"
+REPO="${BETTERMQ_REPO:-colinmollenhour/betterMQ}"
 BIN_NAME="bettermq"
 RELEASES_URL="https://github.com/$REPO/releases"
 INSTALL_DIR="${BETTERMQ_INSTALL_DIR:-$HOME/.bettermq}"
@@ -109,10 +109,10 @@ case "$uname_s" in
     die "unsupported OS: $uname_s
 
   macOS / Linux / WSL / Git Bash:
-    curl -fsSL https://bettermq.com/install | bash
+    curl -fsSL https://raw.githubusercontent.com/colinmollenhour/betterMQ/main/install.sh | bash
 
   Windows PowerShell:
-    powershell -ExecutionPolicy Bypass -c \"irm https://bettermq.com/install.ps1 | iex\"
+    powershell -ExecutionPolicy Bypass -c \"irm https://raw.githubusercontent.com/colinmollenhour/betterMQ/main/install.ps1 | iex\"
 
   Or download manually from $RELEASES_URL"
     ;;
@@ -178,7 +178,7 @@ if [ "${BETTERMQ_FORCE:-}" != "1" ] \
   && [ -f "$installed_bin" ]; then
   print_success "$version"
   printf '  %sAlready installed — nothing to do.%s\n' "$C_DIM" "$C_RESET"
-  printf '  %sForce reinstall:%s BETTERMQ_FORCE=1 curl -fsSL https://bettermq.com/install | bash\n\n' "$C_DIM" "$C_RESET"
+  printf '  %sForce reinstall:%s rerun this installer with BETTERMQ_FORCE=1\n\n' "$C_DIM" "$C_RESET"
   exit 0
 fi
 
@@ -196,7 +196,7 @@ dl "$asset_base/$asset.zip" "$zip_path" || die "download failed: $asset_base/$as
 actual=$(sha256 "$zip_path")
 [ -n "$actual" ] || die "sha256sum or shasum is required to verify the download"
 dl "$asset_base/checksums.txt" "$tmp/checksums.txt" || die "checksums.txt missing for $tag ($asset_base/checksums.txt)"
-expected=$(grep "  $asset.zip\$" "$tmp/checksums.txt" | awk '{print $1}' || true)
+expected=$(awk -v asset="$asset.zip" '$2 == asset && length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ { print tolower($1) }' "$tmp/checksums.txt")
 [ -n "$expected" ] || die "no checksum entry for $asset.zip in checksums.txt"
 [ "$expected" = "$actual" ] || die "checksum mismatch for $asset.zip (expected $expected, got $actual)"
 ok "Verified sha256"

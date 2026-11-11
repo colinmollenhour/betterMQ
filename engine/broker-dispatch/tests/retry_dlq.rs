@@ -63,6 +63,7 @@ async fn failed_delivery_moves_to_dlq_after_retries() {
 
     let resp = broker
         .publish(PublishRequest {
+            routing_id: None,
             topic: "jobs".into(),
             queue_id: None,
             group_id: None,
@@ -136,6 +137,7 @@ async fn fleet_delivery_honors_message_retries_before_dlq() {
             ..DispatchConfig::default()
         },
     );
+    let fleet = broker_dispatch::FleetDelivery::new(DispatchConfig::default());
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/fleet-fail"))
@@ -146,6 +148,7 @@ async fn fleet_delivery_honors_message_retries_before_dlq() {
 
     let response = broker
         .publish(PublishRequest {
+            routing_id: None,
             topic: String::new(),
             queue_id: None,
             group_id: None,
@@ -182,7 +185,7 @@ async fn fleet_delivery_honors_message_retries_before_dlq() {
         .read_message(&response.topic, partition, offset)
         .unwrap();
 
-    let uncommitted = dispatch.push_http_only(&message, offset).await.unwrap_err();
+    let uncommitted = fleet.push(&message, offset, 0).await.unwrap_err();
     assert!(matches!(
         uncommitted,
         broker_dispatch::DispatchError::Uncommitted
@@ -192,28 +195,23 @@ async fn fleet_delivery_honors_message_retries_before_dlq() {
         .await
         .unwrap_or_default()
         .is_empty());
-    let first_retry = dispatch
-        .push_http_only(&message, offset + 1)
-        .await
-        .unwrap_err();
-    let broker_dispatch::DispatchError::RetryDeferred { retry_after_ms, .. } = first_retry else {
-        panic!("first fleet failure must persist a deferred retry");
-    };
-    drop(dispatch);
-    tokio::time::sleep(Duration::from_millis(retry_after_ms)).await;
-    let dispatch = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
-    let second_retry = dispatch
-        .push_http_only(&message, offset + 1)
-        .await
-        .unwrap_err();
-    let broker_dispatch::DispatchError::RetryDeferred { retry_after_ms, .. } = second_retry else {
-        panic!("second fleet failure must remain deferred");
-    };
-    tokio::time::sleep(Duration::from_millis(retry_after_ms)).await;
-    let exhausted = dispatch
-        .push_http_only(&message, offset + 1)
-        .await
-        .unwrap_err();
+    // The broker reports the attempts already spent on every claim; the
+    // fleet keeps no retry state of its own.
+    for prior_attempts in 0..2 {
+        let failure = fleet
+            .push(&message, offset + 1, prior_attempts)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                failure,
+                broker_dispatch::DispatchError::RetryDeferred { .. }
+            ),
+            "attempt {} must be retried, got {failure:?}",
+            prior_attempts + 1
+        );
+    }
+    let exhausted = fleet.push(&message, offset + 1, 2).await.unwrap_err();
     assert!(matches!(
         exhausted,
         broker_dispatch::DispatchError::RetryExhausted(_)
@@ -236,8 +234,5 @@ async fn fleet_delivery_honors_message_retries_before_dlq() {
         1
     );
     let telemetry = dispatch.telemetry_snapshot();
-    assert!(telemetry.retries_scheduled >= 1);
-    assert!(telemetry.retries_due >= 2);
-    assert_eq!(telemetry.retries_exhausted, 1);
     assert_eq!(telemetry.dlq_committed, 1);
 }

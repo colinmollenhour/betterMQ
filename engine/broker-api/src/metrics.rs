@@ -6,6 +6,19 @@ use std::time::Duration;
 static ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static DUPLICATE: AtomicU64 = AtomicU64::new(0);
 static REJECTED: AtomicU64 = AtomicU64::new(0);
+const REJECTION_REASONS: [&str; 10] = [
+    "invalid_request",
+    "unauthorized",
+    "not_found",
+    "conflict",
+    "unavailable",
+    "replication_failed",
+    "saturated",
+    "tenant_saturated",
+    "broker_error",
+    "not_supported_in_cell",
+];
+static REJECTIONS_BY_REASON: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 static ACK_COUNT: AtomicU64 = AtomicU64::new(0);
 static ACK_SUM_US: AtomicU64 = AtomicU64::new(0);
 /// Non-cumulative bucket storage for 1, 2, 5, 10, 20, 50, 100, 250, 500, 1000 ms.
@@ -27,6 +40,124 @@ static ACK_BUCKETS: [AtomicU64; 10] = [
 ];
 const BUCKET_MS: [u64; 10] = [1, 2, 5, 10, 20, 50, 100, 250, 500, 1000];
 
+/// Scheduler failure stages (`bettermq_scheduler_failures_total{stage}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerFailure {
+    /// A delayed publish failed to fire and was requeued.
+    DelayedFire,
+    /// A cron tick failed to publish and was reverted.
+    CronFire,
+    /// Persisting fired jobs or cron progress failed.
+    Persist,
+    /// Acquiring or renewing the cluster scheduler lease failed.
+    Lease,
+}
+
+impl SchedulerFailure {
+    const ALL: [Self; 4] = [
+        Self::DelayedFire,
+        Self::CronFire,
+        Self::Persist,
+        Self::Lease,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::DelayedFire => "delayed_fire",
+            Self::CronFire => "cron_fire",
+            Self::Persist => "persist",
+            Self::Lease => "lease",
+        }
+    }
+}
+
+/// Why a newly gained shard stayed fenced
+/// (`bettermq_shard_recovery_failures_total{reason}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardRecoveryFailure {
+    /// Storage, transport or replica-quorum failure; retried every cycle.
+    Retryable,
+    /// The local or replica tail cannot be verified; needs reconciliation.
+    UnverifiedTail,
+}
+
+impl ShardRecoveryFailure {
+    const ALL: [Self; 2] = [Self::Retryable, Self::UnverifiedTail];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Retryable => "retryable",
+            Self::UnverifiedTail => "unverified_tail",
+        }
+    }
+}
+
+static SCHEDULER_FAILURES: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+static SHARD_RECOVERY_FAILURES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static FLEET_CLAIM_FAILURES: AtomicU64 = AtomicU64::new(0);
+static FENCED_SHARDS: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_scheduler_failure(stage: SchedulerFailure) {
+    SCHEDULER_FAILURES[stage as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_shard_recovery_failure(reason: ShardRecoveryFailure) {
+    SHARD_RECOVERY_FAILURES[reason as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_fleet_claim_failure() {
+    FLEET_CLAIM_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Shards this node leads per placement but keeps fenced (not serving).
+pub fn set_fenced_shards(count: u64) {
+    FENCED_SHARDS.store(count, Ordering::Relaxed);
+}
+
+fn append_background_metrics(out: &mut String) {
+    out.push_str("# HELP bettermq_scheduler_failures_total Scheduler loop failures by stage\n");
+    out.push_str("# TYPE bettermq_scheduler_failures_total counter\n");
+    for stage in SchedulerFailure::ALL {
+        out.push_str(&format!(
+            "bettermq_scheduler_failures_total{{stage=\"{}\"}} {}\n",
+            stage.label(),
+            SCHEDULER_FAILURES[stage as usize].load(Ordering::Relaxed)
+        ));
+    }
+    out.push_str(
+        "# HELP bettermq_fleet_claim_failures_total Dispatch fleet lease claims that failed\n",
+    );
+    out.push_str("# TYPE bettermq_fleet_claim_failures_total counter\n");
+    out.push_str(&format!(
+        "bettermq_fleet_claim_failures_total {}\n",
+        FLEET_CLAIM_FAILURES.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP bettermq_shard_recovery_failures_total Leadership catch-ups that left a shard fenced\n",
+    );
+    out.push_str("# TYPE bettermq_shard_recovery_failures_total counter\n");
+    for reason in ShardRecoveryFailure::ALL {
+        out.push_str(&format!(
+            "bettermq_shard_recovery_failures_total{{reason=\"{}\"}} {}\n",
+            reason.label(),
+            SHARD_RECOVERY_FAILURES[reason as usize].load(Ordering::Relaxed)
+        ));
+    }
+    out.push_str(
+        "# HELP bettermq_shards_fenced Shards this node leads but keeps fenced pending catch-up\n",
+    );
+    out.push_str("# TYPE bettermq_shards_fenced gauge\n");
+    out.push_str(&format!(
+        "bettermq_shards_fenced {}\n",
+        FENCED_SHARDS.load(Ordering::Relaxed)
+    ));
+}
+
 pub fn record_accepted() {
     ACCEPTED.fetch_add(1, Ordering::Relaxed);
 }
@@ -37,6 +168,43 @@ pub fn record_duplicate() {
 
 pub fn record_rejected() {
     REJECTED.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_single_outcome<T>(
+    result: Result<T, crate::routes::ApiError>,
+) -> Result<T, crate::routes::ApiError> {
+    if let Err(error) = &result {
+        use crate::routes::ApiError;
+        let index = match error {
+            ApiError::BadRequest(_) => 0,
+            ApiError::Unauthorized(_) => 1,
+            ApiError::NotFound(_) => 2,
+            ApiError::Conflict(_) => 3,
+            ApiError::Unavailable(_) => 4,
+            ApiError::ReplicationFailed(_) => 5,
+            ApiError::Overloaded { .. } => 6,
+            ApiError::TooManyRequests { .. } => 7,
+            ApiError::Broker(_) => 8,
+            ApiError::NotImplemented(_) => 9,
+            ApiError::Upstream { status, .. } => {
+                let code = error.failure().code;
+                REJECTION_REASONS
+                    .iter()
+                    .position(|reason| *reason == code)
+                    .unwrap_or(match status.as_u16() {
+                        401 | 403 => 1,
+                        404 => 2,
+                        409 => 3,
+                        429 => 7,
+                        500..=599 => 4,
+                        _ => 0,
+                    })
+            }
+        };
+        record_rejected();
+        REJECTIONS_BY_REASON[index].fetch_add(1, Ordering::Relaxed);
+    }
+    result
 }
 
 pub fn record_ack_latency(d: Duration) {
@@ -99,6 +267,13 @@ pub fn prometheus_text() -> String {
         snapshot.rejected
     ));
     out.push_str("# HELP bettermq_ingest_stage_records_total Records observed at ingest stages\n");
+    out.push_str("# HELP bettermq_ingest_single_rejected_total Single-record rejections by bounded reason\n# TYPE bettermq_ingest_single_rejected_total counter\n");
+    for (reason, count) in REJECTION_REASONS.iter().zip(&REJECTIONS_BY_REASON) {
+        out.push_str(&format!(
+            "bettermq_ingest_single_rejected_total{{reason=\"{reason}\"}} {}\n",
+            count.load(Ordering::Relaxed)
+        ));
+    }
     out.push_str("# TYPE bettermq_ingest_stage_records_total counter\n");
     out.push_str(&format!(
         "bettermq_ingest_stage_records_total{{stage=\"accepted\"}} {}\n",
@@ -139,10 +314,36 @@ pub fn prometheus_text() -> String {
         "bettermq_ingest_ack_latency_ms_count {}\n",
         snapshot.ack_observations
     ));
+    append_background_metrics(&mut out);
     out
 }
 
+/// Delayed-job queue state. In a cell every local delayed job is a legacy job
+/// from before the cell gate, kept with node-local durability until it fires.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScheduleTelemetry {
+    pub delayed_pending: usize,
+    pub legacy_delayed_pending: usize,
+    pub legacy_imported: broker_schedule::LegacyImportTotals,
+}
+
+impl ScheduleTelemetry {
+    pub fn from_state(state: &crate::AppState) -> Self {
+        let delayed_pending = state.schedule.count();
+        Self {
+            delayed_pending,
+            legacy_delayed_pending: if state.cluster.is_some() {
+                delayed_pending
+            } else {
+                0
+            },
+            legacy_imported: broker_schedule::legacy_import_totals(),
+        }
+    }
+}
+
 pub struct NativeTelemetrySnapshot {
+    pub schedule: ScheduleTelemetry,
     pub storage: broker_storage::StorageTelemetrySnapshot,
     pub partition: broker_partition::PartitionTelemetrySnapshot,
     pub replication: Option<broker_replication::ReplicationTelemetrySnapshot>,
@@ -150,10 +351,13 @@ pub struct NativeTelemetrySnapshot {
     pub archive: broker_storage::ArchiveLagStatus,
     pub dispatch: broker_dispatch::DispatchTelemetrySnapshot,
     pub fairness: broker_dispatch::TenantFairnessSnapshot,
+    pub retention: broker_partition::RetentionTelemetrySnapshot,
+    pub payload_repair: broker_partition::PayloadRepairSnapshot,
 }
 
 pub fn native_snapshot(state: &crate::AppState) -> NativeTelemetrySnapshot {
     NativeTelemetrySnapshot {
+        schedule: ScheduleTelemetry::from_state(state),
         storage: broker_storage::storage_telemetry_snapshot(),
         partition: broker_partition::partition_telemetry_snapshot(),
         replication: state
@@ -167,6 +371,8 @@ pub fn native_snapshot(state: &crate::AppState) -> NativeTelemetrySnapshot {
         archive: broker_storage::archive_lag_status(),
         dispatch: state.dispatch.telemetry_snapshot(),
         fairness: state.fair_queue.telemetry_snapshot(),
+        retention: broker_partition::retention_telemetry_snapshot(),
+        payload_repair: broker_partition::payload_repair_snapshot(),
     }
 }
 
@@ -181,8 +387,167 @@ pub fn prometheus_text_with_native(native: &NativeTelemetrySnapshot) -> String {
         append_controller_metrics(&mut out, controller);
     }
     append_archive_metrics(&mut out, &native.archive);
+    append_shared_metadata_metrics(&mut out, &broker_storage::shared_metadata_telemetry());
     append_dispatch_metrics(&mut out, &native.dispatch, &native.fairness);
+    append_retention_metrics(&mut out, &native.retention);
+    append_payload_repair_metrics(&mut out, &native.payload_repair);
+    append_schedule_metrics(&mut out, &native.schedule);
     out
+}
+
+fn append_payload_repair_metrics(
+    out: &mut String,
+    snapshot: &broker_partition::PayloadRepairSnapshot,
+) {
+    out.push_str(
+        "# HELP bettermq_legacy_payload_unresolved Legacy payload blobs no peer could supply\n",
+    );
+    out.push_str("# TYPE bettermq_legacy_payload_unresolved gauge\n");
+    for (shard, unresolved) in &snapshot.unresolved_by_shard {
+        out.push_str(&format!(
+            "bettermq_legacy_payload_unresolved{{shard=\"{shard}\"}} {unresolved}\n"
+        ));
+    }
+    out.push_str(
+        "# HELP bettermq_legacy_payload_repaired_total Legacy payload blobs repaired from peers\n",
+    );
+    out.push_str("# TYPE bettermq_legacy_payload_repaired_total counter\n");
+    out.push_str(&format!(
+        "bettermq_legacy_payload_repaired_total {}\n",
+        snapshot.repaired_total
+    ));
+    out.push_str("# HELP bettermq_legacy_payload_unhashed_total Repaired legacy blobs verified by size only (no sha256)\n");
+    out.push_str("# TYPE bettermq_legacy_payload_unhashed_total counter\n");
+    out.push_str(&format!(
+        "bettermq_legacy_payload_unhashed_total {}\n",
+        snapshot.unhashed_total
+    ));
+}
+
+/// Per-log retention gauges are capped so V1 topic counts cannot explode
+/// label cardinality; totals cover every log.
+const MAX_RETENTION_LOG_LABELS: usize = 256;
+
+fn append_retention_metrics(
+    out: &mut String,
+    snapshot: &broker_partition::RetentionTelemetrySnapshot,
+) {
+    out.push_str("# HELP bettermq_wal_retained_bytes WAL bytes on local disk per log\n");
+    out.push_str("# TYPE bettermq_wal_retained_bytes gauge\n");
+    out.push_str("# HELP bettermq_wal_base_offset First retained WAL offset per log\n");
+    out.push_str("# TYPE bettermq_wal_base_offset gauge\n");
+    out.push_str(
+        "# HELP bettermq_retention_frontier End of the fully delivered prefix per log (leader)\n",
+    );
+    out.push_str("# TYPE bettermq_retention_frontier gauge\n");
+    out.push_str("# HELP bettermq_retention_safe_watermark Safe GC watermark per log (leader)\n");
+    out.push_str("# TYPE bettermq_retention_safe_watermark gauge\n");
+    out.push_str("# HELP bettermq_gc_watermark GC watermark applied on this node per log\n");
+    out.push_str("# TYPE bettermq_gc_watermark gauge\n");
+    out.push_str(
+        "# HELP bettermq_retention_segments_deleted_total Sealed WAL segments deleted per log\n",
+    );
+    out.push_str("# TYPE bettermq_retention_segments_deleted_total counter\n");
+    let mut retained_total = 0u64;
+    for (index, (log, entry)) in snapshot.logs.iter().enumerate() {
+        retained_total = retained_total.saturating_add(entry.retained_bytes);
+        if index >= MAX_RETENTION_LOG_LABELS {
+            continue;
+        }
+        let (namespace, partition) = log.rsplit_once('/').unwrap_or((log.as_str(), ""));
+        let label = format!(
+            "log=\"{}\",partition=\"{}\"",
+            namespace.replace('\\', "\\\\").replace('"', "\\\""),
+            partition
+        );
+        out.push_str(&format!(
+            "bettermq_wal_retained_bytes{{{label}}} {}\n",
+            entry.retained_bytes
+        ));
+        out.push_str(&format!(
+            "bettermq_wal_base_offset{{{label}}} {}\n",
+            entry.base_offset
+        ));
+        if let Some(frontier) = entry.frontier {
+            out.push_str(&format!(
+                "bettermq_retention_frontier{{{label}}} {frontier}\n"
+            ));
+        }
+        if let Some(safe) = entry.safe_watermark {
+            out.push_str(&format!(
+                "bettermq_retention_safe_watermark{{{label}}} {safe}\n"
+            ));
+        }
+        if let Some(applied) = entry.gc_watermark {
+            out.push_str(&format!("bettermq_gc_watermark{{{label}}} {applied}\n"));
+        }
+        out.push_str(&format!(
+            "bettermq_retention_segments_deleted_total{{{label}}} {}\n",
+            entry.segments_deleted_total
+        ));
+    }
+    out.push_str("# HELP bettermq_wal_retained_bytes_total WAL bytes on local disk, all logs\n");
+    out.push_str("# TYPE bettermq_wal_retained_bytes_total gauge\n");
+    out.push_str(&format!(
+        "bettermq_wal_retained_bytes_total {retained_total}\n"
+    ));
+    out.push_str("# HELP bettermq_payload_blobs_deleted_total Payload blobs reclaimed\n");
+    out.push_str("# TYPE bettermq_payload_blobs_deleted_total counter\n");
+    out.push_str(&format!(
+        "bettermq_payload_blobs_deleted_total {}\n",
+        snapshot.blobs_deleted_total
+    ));
+    out.push_str(
+        "# HELP bettermq_payload_blob_delete_failures_total Payload blob deletes that failed\n",
+    );
+    out.push_str("# TYPE bettermq_payload_blob_delete_failures_total counter\n");
+    out.push_str(&format!(
+        "bettermq_payload_blob_delete_failures_total {}\n",
+        snapshot.blob_delete_failures_total
+    ));
+    out.push_str(
+        "# HELP bettermq_payload_blob_tombstones_pending Payload blobs awaiting deletion\n",
+    );
+    out.push_str("# TYPE bettermq_payload_blob_tombstones_pending gauge\n");
+    out.push_str(&format!(
+        "bettermq_payload_blob_tombstones_pending {}\n",
+        snapshot.blob_tombstones_pending
+    ));
+    out.push_str("# HELP bettermq_retention_errors_total Failed retention operations\n");
+    out.push_str("# TYPE bettermq_retention_errors_total counter\n");
+    out.push_str(&format!(
+        "bettermq_retention_errors_total {}\n",
+        snapshot.errors_total
+    ));
+}
+
+fn append_schedule_metrics(out: &mut String, snapshot: &ScheduleTelemetry) {
+    out.push_str("# HELP bettermq_schedule_delayed_pending Delayed jobs waiting on this node\n");
+    out.push_str("# TYPE bettermq_schedule_delayed_pending gauge\n");
+    out.push_str(&format!(
+        "bettermq_schedule_delayed_pending {}\n",
+        snapshot.delayed_pending
+    ));
+    out.push_str(
+        "# HELP bettermq_schedule_legacy_delayed_pending Pre-upgrade delayed jobs in a cell, node-local until they fire\n",
+    );
+    out.push_str("# TYPE bettermq_schedule_legacy_delayed_pending gauge\n");
+    out.push_str(&format!(
+        "bettermq_schedule_legacy_delayed_pending {}\n",
+        snapshot.legacy_delayed_pending
+    ));
+    out.push_str(
+        "# HELP bettermq_schedule_legacy_imported_total Jobs imported from the legacy shared meta dir\n",
+    );
+    out.push_str("# TYPE bettermq_schedule_legacy_imported_total counter\n");
+    out.push_str(&format!(
+        "bettermq_schedule_legacy_imported_total{{kind=\"delayed\"}} {}\n",
+        snapshot.legacy_imported.delayed
+    ));
+    out.push_str(&format!(
+        "bettermq_schedule_legacy_imported_total{{kind=\"cron\"}} {}\n",
+        snapshot.legacy_imported.crons
+    ));
 }
 
 fn append_storage_metrics(out: &mut String, snapshot: &broker_storage::StorageTelemetrySnapshot) {
@@ -202,6 +567,14 @@ fn append_storage_metrics(out: &mut String, snapshot: &broker_storage::StorageTe
     out.push_str("# TYPE bettermq_wal_fsync_total counter\n");
     out.push_str("# HELP bettermq_wal_fsync_failures_total Failed WAL fsync operations\n");
     out.push_str("# TYPE bettermq_wal_fsync_failures_total counter\n");
+    out.push_str(
+        "# HELP bettermq_wal_fence_events_total Partition logs fenced (writes refused until reopen)\n",
+    );
+    out.push_str("# TYPE bettermq_wal_fence_events_total counter\n");
+    out.push_str(
+        "# HELP bettermq_wal_quarantine_events_total WAL corruption found or opens refused by a quarantine marker\n",
+    );
+    out.push_str("# TYPE bettermq_wal_quarantine_events_total counter\n");
     out.push_str("# HELP bettermq_wal_fsync_records_total Records covered by successful fsyncs\n");
     out.push_str("# TYPE bettermq_wal_fsync_records_total counter\n");
     out.push_str("# HELP bettermq_wal_records_per_fsync Mean records per successful fsync\n");
@@ -241,6 +614,14 @@ fn append_storage_metrics(out: &mut String, snapshot: &broker_storage::StorageTe
         out.push_str(&format!(
             "bettermq_wal_fsync_failures_total{{{label}}} {}\n",
             shard.fsync_failures
+        ));
+        out.push_str(&format!(
+            "bettermq_wal_fence_events_total{{{label}}} {}\n",
+            shard.fence_events
+        ));
+        out.push_str(&format!(
+            "bettermq_wal_quarantine_events_total{{{label}}} {}\n",
+            shard.quarantine_events
         ));
         out.push_str(&format!(
             "bettermq_wal_fsync_records_total{{{label}}} {}\n",
@@ -402,7 +783,77 @@ fn append_controller_metrics(
     ));
 }
 
+fn append_shared_metadata_metrics(
+    out: &mut String,
+    snapshot: &broker_storage::SharedMetadataTelemetry,
+) {
+    for (name, description, histogram) in [
+        (
+            "bettermq_shared_metadata_lock_wait_seconds",
+            "Shared metadata flock wait",
+            &snapshot.lock_wait,
+        ),
+        (
+            "bettermq_shared_metadata_fsync_seconds",
+            "Shared metadata append and durability latency",
+            &snapshot.fsync,
+        ),
+    ] {
+        out.push_str(&format!(
+            "# HELP {name} {description}\n# TYPE {name} histogram\n"
+        ));
+        append_histogram(
+            out,
+            name,
+            "",
+            &broker_storage::FSYNC_BUCKET_US.map(|edge| edge as f64 / 1_000_000.0),
+            &histogram.buckets,
+            histogram.count,
+            histogram.sum_us as f64 / 1_000_000.0,
+        );
+    }
+    for (name, description, value) in [
+        (
+            "bettermq_shared_metadata_replay_bytes_total",
+            "Shared metadata incrementally replayed bytes",
+            snapshot.replay_bytes,
+        ),
+        (
+            "bettermq_shared_metadata_compactions_total",
+            "Shared metadata published generations",
+            snapshot.compactions,
+        ),
+        (
+            "bettermq_shared_metadata_errors_total",
+            "Shared metadata failed operations",
+            snapshot.errors,
+        ),
+        (
+            "bettermq_shared_metadata_expired_entries_total",
+            "Expired dedup mappings removed by shared metadata compaction",
+            snapshot.expired_entries,
+        ),
+        (
+            "bettermq_legacy_unverifiable_dedup_hits_total",
+            "Legacy dedup hits retained without record verification after WAL reclamation",
+            snapshot.legacy_unverifiable_dedup_hits,
+        ),
+    ] {
+        out.push_str(&format!(
+            "# HELP {name} {description}\n# TYPE {name} counter\n{name} {value}\n"
+        ));
+    }
+}
+
 fn append_archive_metrics(out: &mut String, snapshot: &broker_storage::ArchiveLagStatus) {
+    out.push_str(
+        "# HELP bettermq_archive_initialization_failed Configured archive failed initialization\n",
+    );
+    out.push_str("# TYPE bettermq_archive_initialization_failed gauge\n");
+    out.push_str(&format!(
+        "bettermq_archive_initialization_failed {}\n",
+        u8::from(snapshot.initialization_error.is_some())
+    ));
     out.push_str("# HELP bettermq_archive_enabled Whether asynchronous archive is configured\n");
     out.push_str("# TYPE bettermq_archive_enabled gauge\n");
     out.push_str(&format!(
@@ -427,12 +878,28 @@ fn append_archive_metrics(out: &mut String, snapshot: &broker_storage::ArchiveLa
         "bettermq_archive_oldest_pending_age_seconds {}\n",
         snapshot.oldest_age_ms as f64 / 1_000.0
     ));
-    out.push_str("# HELP bettermq_archive_failures_total Failed segment archive attempts\n");
-    out.push_str("# TYPE bettermq_archive_failures_total counter\n");
+    out.push_str("# HELP bettermq_archive_failing_segments Currently failing segment archives\n");
+    out.push_str("# TYPE bettermq_archive_failing_segments gauge\n");
+    out.push_str(&format!(
+        "bettermq_archive_failing_segments {}\n",
+        snapshot.failed_records
+    ));
+    out.push_str(
+        "# HELP bettermq_archive_failing_bytes Bytes in currently failing segment archives\n",
+    );
+    out.push_str("# TYPE bettermq_archive_failing_bytes gauge\n");
+    out.push_str(&format!(
+        "bettermq_archive_failing_bytes {}\n",
+        snapshot.failed_bytes
+    ));
+    out.push_str("# HELP bettermq_archive_failures_total Deprecated alias of bettermq_archive_failing_segments\n");
+    out.push_str("# TYPE bettermq_archive_failures_total gauge\n");
     out.push_str(&format!(
         "bettermq_archive_failures_total {}\n",
         snapshot.failed_records
     ));
+    out.push_str("# HELP bettermq_archive_failed_bytes_total Deprecated alias of bettermq_archive_failing_bytes\n");
+    out.push_str("# TYPE bettermq_archive_failed_bytes_total gauge\n");
     out.push_str(&format!(
         "bettermq_archive_failed_bytes_total {}\n",
         snapshot.failed_bytes
@@ -465,6 +932,31 @@ fn append_dispatch_metrics(
             out.push_str(&format!(concat!($name, " {}\n"), $value));
         };
     }
+    out.push_str("# HELP bettermq_dispatch_delivery_outcomes_total Webhook attempts by bounded outcome class\n# TYPE bettermq_dispatch_delivery_outcomes_total counter\n");
+    for (class, count) in broker_dispatch::DELIVERY_OUTCOME_CLASSES
+        .iter()
+        .zip(snapshot.delivery.outcomes)
+    {
+        out.push_str(&format!(
+            "bettermq_dispatch_delivery_outcomes_total{{outcome=\"{class}\"}} {count}\n"
+        ));
+    }
+    out.push_str("# HELP bettermq_dispatch_webhook_duration_seconds Webhook time to response headers or failure\n# TYPE bettermq_dispatch_webhook_duration_seconds histogram\n");
+    append_histogram(
+        out,
+        "bettermq_dispatch_webhook_duration_seconds",
+        "",
+        &broker_dispatch::WEBHOOK_DURATION_BUCKETS,
+        &snapshot.delivery.duration_buckets,
+        snapshot.delivery.outcomes.iter().sum(),
+        snapshot.delivery.duration_sum_us as f64 / 1_000_000.0,
+    );
+    metric!(
+        "Flow deliveries returning an error",
+        "counter",
+        "bettermq_dispatch_flow_errors_total",
+        snapshot.delivery.flow_errors
+    );
     metric!(
         "Committed ranges announced to dispatch",
         "counter",
@@ -484,10 +976,22 @@ fn append_dispatch_metrics(
         snapshot.queue_depth
     );
     metric!(
-        "Delivery jobs rejected by the bounded ready queue",
+        "Delivery jobs rejected by bounded ready or flow admission",
         "counter",
         "bettermq_dispatch_queue_rejected_total",
         snapshot.queue_rejected
+    );
+    metric!(
+        "Delivery jobs deferred for retry or policy waits",
+        "counter",
+        "bettermq_dispatch_deferred_total",
+        snapshot.deferred_jobs
+    );
+    metric!(
+        "Deferred jobs rejected by the bounded scheduler",
+        "counter",
+        "bettermq_dispatch_defer_rejected_total",
+        snapshot.defer_rejected
     );
     metric!(
         "Queued or executing dispatch jobs",
@@ -663,6 +1167,7 @@ fn append_dispatch_metrics(
     out.push_str("# TYPE bettermq_dispatch_completion_gap_records gauge\n");
     out.push_str("# HELP bettermq_dispatch_tracked_cursor_lanes Internally tracked cursor lanes\n");
     out.push_str("# TYPE bettermq_dispatch_tracked_cursor_lanes gauge\n");
+    out.push_str("# HELP bettermq_dispatch_oldest_pending_age_seconds Age of the oldest tracked pending delivery in a shard\n# TYPE bettermq_dispatch_oldest_pending_age_seconds gauge\n");
     for shard in &snapshot.shards {
         let label = format!("shard=\"{}\"", shard.shard);
         out.push_str(&format!(
@@ -689,6 +1194,10 @@ fn append_dispatch_metrics(
             "bettermq_dispatch_tracked_cursor_lanes{{{label}}} {}\n",
             shard.tracked_cursor_lanes
         ));
+        out.push_str(&format!(
+            "bettermq_dispatch_oldest_pending_age_seconds{{{label}}} {}\n",
+            shard.oldest_pending_age_ms as f64 / 1000.0
+        ));
     }
     metric!(
         "Cursor lanes omitted after the bounded telemetry cap",
@@ -708,20 +1217,61 @@ fn append_histogram<const N: usize>(
     sum: f64,
 ) {
     let mut cumulative = 0u64;
+    let bucket_labels = if labels.is_empty() {
+        String::new()
+    } else {
+        format!("{labels},")
+    };
     for (boundary, bucket) in boundaries.iter().zip(buckets) {
         cumulative = cumulative.saturating_add(*bucket);
         out.push_str(&format!(
-            "{name}_bucket{{{labels},le=\"{boundary}\"}} {cumulative}\n"
+            "{name}_bucket{{{bucket_labels}le=\"{boundary}\"}} {cumulative}\n"
         ));
     }
-    out.push_str(&format!("{name}_bucket{{{labels},le=\"+Inf\"}} {count}\n"));
+    out.push_str(&format!(
+        "{name}_bucket{{{bucket_labels}le=\"+Inf\"}} {count}\n"
+    ));
     out.push_str(&format!("{name}_sum{{{labels}}} {sum}\n"));
     out.push_str(&format!("{name}_count{{{labels}}} {count}\n"));
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn single_failure_accounting_covers_admission_and_replication() {
+        use super::*;
+        use crate::routes::ApiError;
+        for (index, error) in [
+            (
+                6,
+                ApiError::Overloaded {
+                    retry_after_ms: 1000,
+                    message: "busy".into(),
+                },
+            ),
+            (5, ApiError::ReplicationFailed("quorum".into())),
+        ] {
+            let before = REJECTIONS_BY_REASON[index].load(Ordering::Relaxed);
+            let total = snapshot().rejected;
+            assert!(record_single_outcome::<()>(Err(error)).is_err());
+            assert!(REJECTIONS_BY_REASON[index].load(Ordering::Relaxed) > before);
+            assert!(snapshot().rejected > total);
+        }
+        let before = REJECTIONS_BY_REASON[5].load(Ordering::Relaxed);
+        assert!(record_single_outcome(Ok::<_, ApiError>(())).is_ok());
+        assert_eq!(REJECTIONS_BY_REASON[5].load(Ordering::Relaxed), before);
+    }
     use super::*;
+
+    #[test]
+    fn shared_metadata_histograms_have_valid_unlabelled_buckets() {
+        let mut out = String::new();
+        append_shared_metadata_metrics(&mut out, &broker_storage::shared_metadata_telemetry());
+        assert!(out.contains("bettermq_shared_metadata_lock_wait_seconds_bucket{le=\"+Inf\"}"));
+        assert!(out.contains("bettermq_shared_metadata_fsync_seconds_bucket{le=\"0.0001\"}"));
+        assert!(out.contains("bettermq_legacy_unverifiable_dedup_hits_total"));
+        assert!(!out.contains("{,"));
+    }
 
     #[test]
     fn finite_histogram_boundaries_use_microsecond_precision() {
@@ -738,8 +1288,36 @@ mod tests {
     }
 
     #[test]
+    fn background_loop_failures_are_exported() {
+        record_scheduler_failure(SchedulerFailure::CronFire);
+        record_shard_recovery_failure(ShardRecoveryFailure::UnverifiedTail);
+        record_fleet_claim_failure();
+        set_fenced_shards(3);
+        let output = prometheus_text();
+        let value = |series: &str| -> u64 {
+            output
+                .lines()
+                .find_map(|line| line.strip_prefix(series)?.trim().parse().ok())
+                .unwrap_or_else(|| panic!("missing {series}"))
+        };
+        assert!(value("bettermq_scheduler_failures_total{stage=\"cron_fire\"}") >= 1);
+        assert!(value("bettermq_scheduler_failures_total{stage=\"lease\"}") < u64::MAX);
+        assert!(value("bettermq_shard_recovery_failures_total{reason=\"unverified_tail\"}") >= 1);
+        assert!(value("bettermq_fleet_claim_failures_total") >= 1);
+        assert_eq!(value("bettermq_shards_fenced"), 3);
+    }
+
+    #[test]
     fn prometheus_renders_real_native_snapshots_with_bounded_labels() {
         let native = NativeTelemetrySnapshot {
+            schedule: ScheduleTelemetry {
+                delayed_pending: 4,
+                legacy_delayed_pending: 4,
+                legacy_imported: broker_schedule::LegacyImportTotals {
+                    delayed: 3,
+                    crons: 1,
+                },
+            },
             storage: broker_storage::StorageTelemetrySnapshot {
                 shards: vec![broker_storage::StorageShardTelemetrySnapshot {
                     shard: 7,
@@ -755,6 +1333,8 @@ mod tests {
                     fsync_latency_count: 3,
                     fsync_latency_sum_us: 21_000,
                     fsync_buckets: [1, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                    fence_events: 1,
+                    quarantine_events: 2,
                 }],
                 dropped_shards: 0,
             },
@@ -793,6 +1373,7 @@ mod tests {
             }),
             archive: broker_storage::ArchiveLagStatus {
                 enabled: true,
+                initialization_error: None,
                 queued_records: 4,
                 queued_bytes: 8192,
                 failed_records: 1,
@@ -802,10 +1383,18 @@ mod tests {
                 admission_blocked: false,
             },
             dispatch: broker_dispatch::DispatchTelemetrySnapshot {
+                delivery: broker_dispatch::DeliveryTelemetrySnapshot {
+                    outcomes: [2, 0, 1, 3, 1, 0, 0],
+                    duration_buckets: [0; 16],
+                    duration_sum_us: 123_000,
+                    flow_errors: 1,
+                },
                 committed_ready_ranges: 4,
                 committed_ready_records: 16,
                 queue_depth: 3,
                 queue_rejected: 1,
+                deferred_jobs: 3,
+                defer_rejected: 1,
                 in_flight_deliveries: 5,
                 active_http_deliveries: 2,
                 retries_pending: 6,
@@ -831,6 +1420,7 @@ mod tests {
                     cursor_max_offset: 50,
                     completion_gap_records: 4,
                     tracked_cursor_lanes: 2,
+                    oldest_pending_age_ms: 10_000,
                 }],
                 dropped_cursor_lanes: 0,
                 host_pressure: broker_dispatch::HostPressureSnapshot {
@@ -848,10 +1438,52 @@ mod tests {
                 saturation_ratio: 8.0 / 1024.0,
                 saturated: false,
             },
+            retention: broker_partition::RetentionTelemetrySnapshot {
+                logs: [(
+                    "__physical/7".to_string(),
+                    broker_partition::LogRetentionTelemetry {
+                        retained_bytes: 4096,
+                        base_offset: 100,
+                        frontier: Some(140),
+                        safe_watermark: Some(120),
+                        gc_watermark: Some(120),
+                        limited_by: Some(broker_partition::RetentionLimit::MinAge),
+                        segments_deleted_total: 3,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                blobs_deleted_total: 2,
+                blob_delete_failures_total: 0,
+                blob_tombstones_pending: 1,
+                errors_total: 0,
+            },
+            payload_repair: broker_partition::PayloadRepairSnapshot {
+                unresolved_by_shard: [(7u32, 2u64)].into_iter().collect(),
+                repaired_total: 3,
+                unhashed_total: 1,
+                failures_total: 2,
+            },
         };
         let output = prometheus_text_with_native(&native);
+        assert!(output.contains("bettermq_dispatch_delivery_outcomes_total{outcome=\"5xx\"} 3"));
+        assert!(output.contains("bettermq_dispatch_webhook_duration_seconds_bucket{le=\"+Inf\"} 7"));
+        assert!(output.contains("bettermq_dispatch_oldest_pending_age_seconds{shard=\"7\"} 10"));
+        assert!(!output.contains("{,le="));
+        assert!(
+            output.contains("bettermq_wal_retained_bytes{log=\"__physical\",partition=\"7\"} 4096")
+        );
+        assert!(output.contains("bettermq_gc_watermark{log=\"__physical\",partition=\"7\"} 120"));
+        assert!(
+            output.contains("bettermq_retention_frontier{log=\"__physical\",partition=\"7\"} 140")
+        );
+        assert!(output.contains("bettermq_wal_retained_bytes_total 4096"));
+        assert!(output.contains("bettermq_legacy_payload_unresolved{shard=\"7\"} 2"));
+        assert!(output.contains("bettermq_legacy_payload_repaired_total 3"));
         assert!(output.contains("bettermq_wal_epoch_total{shard=\"7\"} 3"));
         assert!(output.contains("bettermq_wal_records_per_fsync{shard=\"7\"} 6"));
+        assert!(output.contains("bettermq_wal_fence_events_total{shard=\"7\"} 1"));
+        assert!(output.contains("bettermq_wal_quarantine_events_total{shard=\"7\"} 2"));
         assert!(output
             .contains("bettermq_wal_fsync_duration_seconds_bucket{shard=\"7\",le=\"+Inf\"} 3"));
         assert!(output.contains("bettermq_shard_queue_bytes{shard=\"7\"} 512"));
@@ -860,11 +1492,17 @@ mod tests {
         assert!(output.contains("bettermq_controller_term 13"));
         assert!(output.contains("bettermq_controller_quorum_ready 1"));
         assert!(output.contains("bettermq_archive_queue_headroom_segments 124"));
+        assert!(output.contains("# TYPE bettermq_archive_failing_segments gauge"));
+        assert!(output.contains("bettermq_archive_failing_segments 1"));
+        assert!(output.contains("bettermq_archive_failing_bytes 1024"));
+        assert!(!output.contains("# TYPE bettermq_archive_failures_total counter"));
         assert!(output.contains("bettermq_dispatch_committed_ready_depth 3"));
         assert!(output.contains("bettermq_dispatch_retries_scheduled_total 9"));
         assert!(output.contains("bettermq_dispatch_dlq_failures_total 1"));
         assert!(output.contains("bettermq_dispatch_completion_gap_records{shard=\"7\"} 4"));
         assert!(output.contains("bettermq_dispatch_destination_hosts_blocked 1"));
+        assert!(output.contains("bettermq_schedule_legacy_delayed_pending 4"));
+        assert!(output.contains("bettermq_schedule_legacy_imported_total{kind=\"delayed\"} 3"));
         assert!(output.contains("bettermq_dispatch_fairness_tracked_tenants 8"));
         assert!(!output.contains("topic="));
         assert!(!output.contains("peer="));

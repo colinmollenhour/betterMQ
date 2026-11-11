@@ -1,6 +1,6 @@
 //! S3-compatible object store (MinIO dev, R2/S3 prod) for SlateDB.
 
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 pub use object_store::ObjectStore;
 use std::sync::Arc;
 use thiserror::Error;
@@ -32,6 +32,7 @@ pub fn open_object_store_from_config(
         return Err(S3StoreError::Config("bucket required".into()));
     }
     let store = AmazonS3Builder::new()
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
         .with_endpoint(cfg.endpoint.trim())
         .with_bucket_name(cfg.bucket.trim())
         .with_access_key_id(cfg.access_key.trim())
@@ -97,6 +98,7 @@ fn open_bucket(
     let allow_http = endpoint.trim().starts_with("http://");
 
     let store = AmazonS3Builder::new()
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
         .with_endpoint(endpoint)
         .with_bucket_name(bucket)
         .with_access_key_id(access_key)

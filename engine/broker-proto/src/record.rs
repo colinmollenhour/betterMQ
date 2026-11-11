@@ -12,12 +12,34 @@ pub const MAX_FRAME_HEADER_BYTES: usize = 1024 * 1024;
 /// Default max payload size (aligned with the HTTP body cap).
 pub const DEFAULT_MAX_FRAME_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
-pub fn max_frame_payload_bytes() -> usize {
+fn configured_http_body_bytes() -> Option<usize> {
     std::env::var("BETTERMQ_MAX_HTTP_BODY_BYTES")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|n: &usize| *n > 0)
-        .unwrap_or(DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+}
+
+/// The client ingest limit (`BETTERMQ_MAX_HTTP_BODY_BYTES`, default 64 MiB).
+/// The HTTP layer enforces it on fresh requests; the frame codec does not,
+/// see [`max_frame_decode_payload_bytes`].
+pub fn max_frame_payload_bytes() -> usize {
+    configured_http_body_bytes().unwrap_or(DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+}
+
+/// Largest payload a frame may carry, for encoding and decoding.
+///
+/// Frames in the WAL, or arriving from a peer, were accepted under whatever
+/// ingest limit applied when they were written, and internal republishes
+/// (dead-lettering, schedules) re-encode bodies that were already accepted.
+/// Lowering `BETTERMQ_MAX_HTTP_BODY_BYTES` must not make any of them
+/// unreadable or impossible to move, so the codec uses the format default
+/// unless the configured limit is larger.
+pub fn max_frame_decode_payload_bytes() -> usize {
+    decode_payload_limit(configured_http_body_bytes())
+}
+
+fn decode_payload_limit(configured: Option<usize>) -> usize {
+    configured.unwrap_or(0).max(DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
 }
 
 #[derive(Debug, Error)]
@@ -200,7 +222,9 @@ pub fn encode_frame(
     writer: &mut impl Write,
 ) -> Result<(), RecordError> {
     let header_bytes = crate::codec::encode(header)?;
-    if header_bytes.len() > MAX_FRAME_HEADER_BYTES || payload.len() > max_frame_payload_bytes() {
+    if header_bytes.len() > MAX_FRAME_HEADER_BYTES
+        || payload.len() > max_frame_decode_payload_bytes()
+    {
         return Err(RecordError::FrameTooLarge {
             header_len: header_bytes.len(),
             payload_len: payload.len(),
@@ -230,17 +254,15 @@ pub fn decode_frame(mut reader: impl Read) -> Result<(LogRecord, Vec<u8>), Recor
     let header_len = u32::from_be_bytes(len_buf) as usize;
     reader.read_exact(&mut len_buf)?;
     let payload_len = u32::from_be_bytes(len_buf) as usize;
-    if header_len > MAX_FRAME_HEADER_BYTES || payload_len > max_frame_payload_bytes() {
+    if header_len > MAX_FRAME_HEADER_BYTES || payload_len > max_frame_decode_payload_bytes() {
         return Err(RecordError::FrameTooLarge {
             header_len,
             payload_len,
         });
     }
 
-    let mut header_bytes = vec![0u8; header_len];
-    reader.read_exact(&mut header_bytes)?;
-    let mut payload = vec![0u8; payload_len];
-    reader.read_exact(&mut payload)?;
+    let header_bytes = read_exact_len(&mut reader, header_len)?;
+    let payload = read_exact_len(&mut reader, payload_len)?;
 
     let mut checksum_bytes = [0u8; 4];
     reader.read_exact(&mut checksum_bytes)?;
@@ -260,13 +282,26 @@ pub fn decode_frame(mut reader: impl Read) -> Result<(LogRecord, Vec<u8>), Recor
     Ok((header, payload))
 }
 
+/// Read exactly `len` bytes, growing the buffer with the data actually read
+/// so a corrupt length field cannot force a huge up-front allocation.
+fn read_exact_len(reader: &mut impl Read, len: usize) -> Result<Vec<u8>, RecordError> {
+    let mut buf = Vec::with_capacity(len.min(1024 * 1024));
+    reader.take(len as u64).read_to_end(&mut buf)?;
+    if buf.len() != len {
+        return Err(RecordError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "frame truncated",
+        )));
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn roundtrip_frame() {
-        let header = LogRecord {
+    fn sample_header() -> LogRecord {
+        LogRecord {
             id: Uuid::new_v4(),
             tenant_id: "default".into(),
             topic: "orders".into(),
@@ -290,13 +325,59 @@ mod tests {
             http_headers_json: None,
             http_sign: None,
             payload_ref_json: None,
-        };
+        }
+    }
+
+    #[test]
+    fn roundtrip_frame() {
+        let header = sample_header();
         let payload = b"hello".to_vec();
         let mut buf = Vec::new();
         encode_frame(&header, &payload, &mut buf).unwrap();
         let (h, p) = decode_frame(std::io::Cursor::new(buf)).unwrap();
         assert_eq!(h, header);
         assert_eq!(p, payload);
+    }
+
+    #[test]
+    fn lowered_ingest_limit_does_not_restrict_the_codec() {
+        let payload = vec![7u8; 256 * 1024];
+        // Neither encode nor decode reads a lowered value, so this cannot
+        // affect other tests running concurrently.
+        std::env::set_var("BETTERMQ_MAX_HTTP_BODY_BYTES", "1024");
+        let mut buf = Vec::new();
+        let encoded = encode_frame(&sample_header(), &payload, &mut buf);
+        let decoded = encoded
+            .as_ref()
+            .ok()
+            .map(|()| decode_frame(std::io::Cursor::new(&buf)));
+        let ingest_limit = max_frame_payload_bytes();
+        std::env::remove_var("BETTERMQ_MAX_HTTP_BODY_BYTES");
+        encoded.unwrap();
+        assert_eq!(decoded.unwrap().unwrap().1, payload);
+        assert_eq!(ingest_limit, 1024);
+    }
+
+    #[test]
+    fn decode_limit_never_drops_below_the_format_default() {
+        assert_eq!(decode_payload_limit(None), DEFAULT_MAX_FRAME_PAYLOAD_BYTES);
+        assert_eq!(
+            decode_payload_limit(Some(128 * 1024)),
+            DEFAULT_MAX_FRAME_PAYLOAD_BYTES
+        );
+        assert_eq!(
+            decode_payload_limit(Some(256 * 1024 * 1024)),
+            256 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn truncated_frame_is_unexpected_eof() {
+        let mut buf = Vec::new();
+        encode_frame(&sample_header(), b"payload", &mut buf).unwrap();
+        buf.truncate(buf.len() - 6);
+        let err = decode_frame(std::io::Cursor::new(buf)).unwrap_err();
+        assert!(matches!(err, RecordError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof));
     }
 
     #[test]

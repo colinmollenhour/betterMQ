@@ -412,12 +412,15 @@ dependencies = [
  "broker-storage",
  "chrono",
  "futures-util",
+ "hex",
+ "hmac",
  "http",
  "parking_lot",
  "percent-encoding",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
@@ -449,9 +452,11 @@ version = "0.6.2"
 dependencies = [
  "broker-proto",
  "broker-raft-meta",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "url",
  "uuid",
 ]
 
@@ -459,7 +464,9 @@ dependencies = [
 name = "broker-dispatch"
 version = "0.6.2"
 dependencies = [
+ "base64",
  "broker-partition",
+ "broker-payload",
  "broker-proto",
  "broker-storage",
  "bytes",
@@ -546,6 +553,7 @@ dependencies = [
  "serde",
  "serde_json",
  "siphasher",
+ "tempfile",
  "thiserror 2.0.18",
  "uuid",
 ]
@@ -576,6 +584,7 @@ dependencies = [
 name = "broker-replication"
 version = "0.6.2"
 dependencies = [
+ "axum",
  "base64",
  "broker-proto",
  "broker-raft-meta",
@@ -585,6 +594,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -630,12 +640,16 @@ dependencies = [
  "broker-schedule",
  "broker-storage",
  "chrono",
+ "hex",
+ "hmac",
  "mime_guess",
  "reqwest",
  "rust-embed",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -650,11 +664,14 @@ dependencies = [
  "bincode-next",
  "broker-proto",
  "bytes",
+ "clap",
+ "crc32c",
  "criterion",
  "fjall",
  "fs2",
  "futures",
  "hex",
+ "libc",
  "object_store",
  "rocksdb",
  "serde",
@@ -966,6 +983,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "crc32c"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f132a176423ee852e8f0a35d43088d1850966b50745be818a88b76f64b1c6cb"
+dependencies = [
+ "rustc_version",
 ]
 
 [[package]]
@@ -3338,8 +3364,21 @@ checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
 dependencies = [
  "dyn-clone",
  "ref-cast",
+ "schemars_derive",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -3417,6 +3456,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "serde_derive_internals"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]

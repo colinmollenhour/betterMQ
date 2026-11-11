@@ -1,6 +1,8 @@
 import { reactive } from "vue";
-import { isExternalAuth } from "@/lib/config";
-import { adminUrl, apiGet, apiPost, publicUrl } from "@/lib/api";
+import { isExternalAuth, isStandalone } from "@/lib/config";
+import { ApiError, adminUrl, apiGet, apiPost, isAuthRejection, onAuthRejected, publicUrl, setBrokerAccessGuard } from "@/lib/api";
+import { isLocalCell } from "@/lib/targets";
+import { serverVersion } from "@/lib/health";
 import { refreshFlows, refreshGroups, refreshQueues } from "@/lib/catalog";
 import {
   applyTheme,
@@ -14,13 +16,14 @@ import {
   type ThemeMode,
 } from "@/lib/storage";
 
-export type AuthPhase = "loading" | "setup" | "gate" | "reveal" | "app";
+export type AuthPhase = "loading" | "unavailable" | "setup" | "gate" | "reveal" | "app";
 
 export type CellRecord = {
   id: string;
   region: string;
   controllerUrl: string;
   label?: string | null;
+  adminTokenConfigured?: boolean;
 };
 
 export type CellMember = {
@@ -36,6 +39,7 @@ export type AuthConfig = {
   configured: boolean;
   setup_open?: boolean;
   setup_closes_in_secs?: number | null;
+  setup_code_required?: boolean;
 };
 
 export type ClusterNode = {
@@ -64,9 +68,13 @@ export const session = reactive({
   apiBase: loadSavedApiBase(),
   token: "",
   revealedToken: "",
+  revealWarning: "",
   auth: null as AuthConfig | null,
   health: "…",
+  version: null as string | null,
   healthOk: false,
+  ready: null as boolean | null,
+  readyAt: 0,
   clusterLabel: "—",
   cluster: null as ClusterStatus | null,
   cells: [] as CellRecord[],
@@ -77,15 +85,48 @@ export const session = reactive({
   joinToken: "",
   gateMessage: "",
   isSeed: false,
+  cellsError: "",
+  clusterError: "",
 });
 
 session.token = loadSavedToken(session.apiBase);
+setBrokerAccessGuard(() => session.phase !== "app" || localBrokerSelected());
+onAuthRejected((error) => handleAuthFailure(error));
+
+export function localBrokerSelected(): boolean {
+  return !isStandalone() && isLocalCell(session.selectedCellId || selectedCell()?.id || "local", session.cluster?.cluster_id);
+}
 
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 let clusterTimer: ReturnType<typeof setInterval> | null = null;
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+let retryDelay = 1000;
+
+export function stopPolling() {
+  if (healthTimer) clearInterval(healthTimer);
+  if (clusterTimer) clearInterval(clusterTimer);
+  if (retryTimer) clearTimeout(retryTimer);
+  healthTimer = clusterTimer = retryTimer = null;
+}
+
+export function handleAuthFailure(error: unknown) {
+  stopPolling();
+  if (isAuthRejection(error)) {
+    setToken("");
+    session.phase = "gate";
+    session.gateMessage = "Authentication rejected. Enter a valid credential.";
+  } else {
+    session.phase = "unavailable";
+    session.gateMessage = "Broker unavailable. Your credential has been kept; retrying automatically.";
+    retryTimer = setTimeout(() => void initAuth(), retryDelay);
+    retryDelay = Math.min(retryDelay * 2, 30000);
+  }
+}
 
 export function selectedCell(): CellRecord | null {
-  return session.cells.find((c) => c.id === session.selectedCellId) || session.cells[0] || null;
+  return session.selectedCellId
+    ? session.cells.find((c) => c.id === session.selectedCellId) || null
+    : session.cells[0] || null;
 }
 
 export function setApiBase(base: string) {
@@ -111,13 +152,19 @@ export function setTheme(mode: ThemeMode) {
 }
 
 export async function initAuth() {
+  stopPolling();
   applyTheme(session.themeMode);
   session.phase = "loading";
   session.splitAuth = false;
   session.gateMessage = "";
   try {
-    const a = await fetch(publicUrl("/v1/auth/config")).then((r) => r.json() as Promise<AuthConfig>);
-    const b = await fetch(publicUrl("/v1/auth/config")).then((r) => r.json() as Promise<AuthConfig>);
+    if (isStandalone()) {
+      await validateSessionToken();
+      startApp();
+      return;
+    }
+    const a = await apiGet<AuthConfig>(publicUrl("/v1/auth/config"));
+    const b = await apiGet<AuthConfig>(publicUrl("/v1/auth/config"));
     if (a.configured !== b.configured || a.mode !== b.mode) {
       session.splitAuth = true;
       session.phase = "gate";
@@ -141,57 +188,85 @@ export async function initAuth() {
       return;
     }
     try {
-      await apiGet(publicUrl("/v1/queues"));
+      await validateSessionToken();
       startApp();
     } catch (e) {
-      setToken("");
-      session.phase = "gate";
-      session.gateMessage = e instanceof Error ? e.message : "Invalid API token for this broker.";
+      handleAuthFailure(e);
     }
-  } catch {
-    session.phase = "gate";
-    session.gateMessage = `Cannot reach broker at ${session.apiBase}. Check that BetterMQ is running.`;
+  } catch (e) {
+    handleAuthFailure(e);
   }
 }
 
-export async function setupPassword(password: string) {
-  const res = await apiPost<{ token: string }>(publicUrl("/v1/local-auth/setup"), { password });
+export async function setupPassword(password: string, setupCode: string) {
+  const res = await apiPost<{ token: string }>(publicUrl("/v1/local-auth/setup"), {
+    password,
+    setup_code: setupCode.trim() || undefined,
+  });
   setToken(res.token);
   session.revealedToken = res.token;
   session.phase = "reveal";
 }
 
+export type AuthPropagation = {
+  peers: number;
+  applied: number;
+  failed: { peer: string; error: string }[];
+};
+
+export const REGENERATE_WARNING =
+  "Regenerating revokes the current API token for every producer, consumer and panel session " +
+  "on every broker in this cell. All API clients must be updated with the new token. Continue?";
+
+function propagationWarning(p: AuthPropagation | undefined): string {
+  if (!p || !p.failed?.length) return "";
+  const peers = p.failed.map((f) => `${f.peer} (${f.error})`).join("; ");
+  return `The new token reached ${p.applied} of ${p.peers} peer broker(s). These still accept the old token until fixed (Infrastructure → Re-sync on each): ${peers}`;
+}
+
 export async function regenerateToken(password: string) {
-  const res = await apiPost<{ token: string }>(publicUrl("/v1/local-auth/regenerate"), { password });
+  const res = await apiPost<{ token: string; propagation?: AuthPropagation }>(
+    publicUrl("/v1/local-auth/regenerate"),
+    { password },
+  );
   setToken(res.token);
   session.revealedToken = res.token;
+  session.revealWarning = propagationWarning(res.propagation);
   session.phase = "reveal";
 }
 
 export function finishReveal() {
   session.revealedToken = "";
+  session.revealWarning = "";
   startApp();
 }
 
 export function submitGateToken(raw: string) {
   const t = raw.trim();
-  if (!t) throw new Error("Paste your sk_local_… token.");
-  if (!t.startsWith("sk_local_")) throw new Error("Expected a sk_local_… token from this broker's setup.");
+  if (!t) throw new Error(isStandalone() ? "Paste the standalone admin credential." : "Paste your sk_local_… token.");
+  if (!isStandalone() && !t.startsWith("sk_local_")) throw new Error("Expected a sk_local_… token from this broker's setup.");
   setToken(t);
 }
 
+export function validateSessionToken() {
+  return apiGet(isStandalone() ? adminUrl("/cells") : publicUrl("/v1/queues"));
+}
+
 export function startApp() {
+  retryDelay = 1000;
   session.phase = "app";
-  void refreshCells();
-  void refreshQueues();
-  void refreshGroups();
-  void refreshFlows();
-  void pollHealth();
-  void pollCluster();
+  void refreshCells().catch(() => {});
+  if (localBrokerSelected()) {
+    void refreshQueues().catch(() => {});
+    void refreshGroups().catch(() => {});
+    void refreshFlows().catch(() => {});
+  }
+  void pollHealth().catch(() => {});
+  void pollCluster().catch(() => {});
   if (healthTimer) clearInterval(healthTimer);
   if (clusterTimer) clearInterval(clusterTimer);
-  healthTimer = setInterval(() => void pollHealth(), 15000);
-  clusterTimer = setInterval(() => void pollCluster(), 5000);
+  healthTimer = setInterval(() => void pollHealth().catch(() => {}), 15000);
+  clusterTimer = setInterval(() => void pollCluster().catch(() => {}), 5000);
 }
 
 export async function refreshCells() {
@@ -199,31 +274,58 @@ export async function refreshCells() {
     const reg = await apiGet<{ cells?: CellRecord[]; members?: CellMember[] }>(adminUrl("/cells"));
     session.cells = reg.cells || [];
     session.members = reg.members || [];
+    session.cellsError = "";
     if (!session.cells.some((c) => c.id === session.selectedCellId)) {
       session.selectedCellId = session.cells[0]?.id || "local";
     }
-  } catch {
-    session.cells = [];
-    session.members = [];
+  } catch (error) {
+    session.cellsError = String(error);
+    throw error;
   }
 }
 
 export async function pollHealth() {
-  try {
-    const r = await fetch(publicUrl("/healthz"));
-    session.healthOk = r.ok;
-    const j = (await r.json().catch(() => ({}))) as { status?: string; version?: string };
-    session.health = j.version || (r.ok ? "ok" : "down");
-  } catch {
-    session.healthOk = false;
-    session.health = "down";
-  }
+  const live = (async () => {
+    try {
+      const r = await fetch(publicUrl("/healthz"), { signal: AbortSignal.timeout(5000) });
+      session.healthOk = r.ok;
+      const j = (await r.json().catch(() => ({}))) as { status?: string; version?: string };
+      session.version = r.ok ? serverVersion(j) : null;
+      session.health = j.version || (r.ok ? "ok" : "down");
+    } catch {
+      session.healthOk = false;
+      session.health = "down";
+      session.version = null;
+    }
+  })();
+  const readiness = (async () => {
+    try {
+      const result = await apiGet<{ ready?: boolean }>(isStandalone() ? adminUrl("/readyz") : publicUrl("/readyz"), { signal: AbortSignal.timeout(5000) });
+      session.ready = typeof result.ready === "boolean" ? result.ready : null;
+      session.readyAt = Date.now();
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 503 && error.body && typeof error.body === "object" && "ready" in error.body && error.body.ready === false) {
+        session.ready = false;
+        session.readyAt = Date.now();
+        return;
+      }
+      session.ready = null;
+      session.readyAt = 0;
+      throw error;
+    }
+  })();
+  await Promise.all([live, readiness]);
 }
 
 export async function pollCluster() {
+  if (isStandalone()) {
+    session.clusterLabel = "federated";
+    return;
+  }
   try {
     const c = await apiGet<ClusterStatus>(publicUrl("/v1/cluster"));
     session.cluster = c;
+    session.clusterError = "";
     if (c && (c.node_count || (c.nodes || []).length)) {
       const n = c.node_count || (c.nodes || []).length;
       const h = c.healthy_count ?? n;
@@ -231,9 +333,10 @@ export async function pollCluster() {
     } else {
       session.clusterLabel = "standalone";
     }
-  } catch {
-    session.cluster = null;
+  } catch (error) {
+    session.clusterError = String(error);
     session.clusterLabel = "—";
+    throw error;
   }
 }
 

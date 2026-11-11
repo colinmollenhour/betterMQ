@@ -11,6 +11,9 @@ import Field from "@/components/form/Field.vue";
 import ActionMessage from "@/components/form/ActionMessage.vue";
 import AppSelect from "@/components/form/AppSelect.vue";
 import RetryFields from "@/components/form/RetryFields.vue";
+import SecretInput from "@/components/form/SecretInput.vue";
+import { prepareDestination } from "@/lib/destination";
+import { confirmDeletion } from "@/lib/deletion";
 import { useActionStatus } from "@/composables/useActionStatus";
 import { apiDelete, apiGet, apiPost, publicUrl } from "@/lib/api";
 import { catalog, flowId, refreshFlows } from "@/lib/catalog";
@@ -41,8 +44,8 @@ type Cron = {
 const form = reactive({
   type: "cron",
   key: "cron-1",
-  url: "https://webhook.site",
-  secret: "whsec_demo",
+  url: "",
+  secret: "",
   priority: 5,
   expr: "*/1 * * * *",
   every: 10,
@@ -61,6 +64,7 @@ const flowOptions = computed(() => [
 const selectedFlow = computed(() => catalog.flows.find((f) => flowId(f) === form.flowId) || null);
 
 const delayed = ref<Delayed[]>([]);
+const delayedNext = ref("");
 const crons = ref<Cron[]>([]);
 const loadStatus = useActionStatus();
 const createStatus = useActionStatus();
@@ -74,12 +78,26 @@ async function load() {
   loadStatus.reset();
   try {
     const [d, c] = await Promise.all([
-      apiGet<{ delayed?: Delayed[] }>(publicUrl("/v1/delayed")),
+      apiGet<{ delayed?: Delayed[]; next_cursor?: string | null }>(publicUrl("/v1/delayed?limit=50")),
       apiGet<{ crons?: Cron[] }>(publicUrl("/v1/crons")),
       refreshFlows(),
     ]);
     delayed.value = d.delayed || [];
+    delayedNext.value = d.next_cursor || "";
     crons.value = c.crons || [];
+  } catch (e) {
+    loadStatus.fail(e);
+  }
+}
+
+async function nextDelayedPage() {
+  loadStatus.reset();
+  try {
+    const data = await apiGet<{ delayed?: Delayed[]; next_cursor?: string | null }>(
+      publicUrl(`/v1/delayed?${new URLSearchParams({ limit: "50", cursor: delayedNext.value })}`),
+    );
+    delayed.value = data.delayed || [];
+    delayedNext.value = data.next_cursor || "";
   } catch (e) {
     loadStatus.fail(e);
   }
@@ -87,10 +105,8 @@ async function load() {
 
 async function create() {
   createStatus.reset();
-  if (!form.url.trim() || !form.secret.trim()) {
-    createStatus.fail("Schedule needs destination URL and secret");
-    return;
-  }
+  const error = prepareDestination(form);
+  if (error) { createStatus.fail(error); return; }
   const payload: Record<string, unknown> = {
     url: form.url.trim(),
     secret: form.secret.trim(),
@@ -117,6 +133,7 @@ async function create() {
 }
 
 async function act(kind: string, id: string) {
+  if ((kind === "delayed" || kind === "cron-delete") && !await confirmDeletion(`${kind === "delayed" ? "delayed job" : "cron schedule"} ${id}`)) return;
   listStatus.reset();
   try {
     if (kind === "delayed") await apiDelete(publicUrl(`/v1/delayed/${id}`));
@@ -158,9 +175,9 @@ function fmt(ms?: number) {
         </Field>
         <Field label="Routing key"><Input v-model="form.key" /></Field>
         <Field label="Destination URL" class="sm:col-span-2">
-          <Input v-model="form.url" class="font-mono text-xs" />
+          <Input v-model="form.url" placeholder="https://example.com/webhook" class="font-mono text-xs" />
         </Field>
-        <Field label="Secret"><Input v-model="form.secret" class="font-mono" /></Field>
+        <Field label="Secret"><SecretInput v-model="form.secret" /></Field>
         <Field label="Priority"><Input v-model="form.priority" type="number" /></Field>
         <Field
           v-if="form.type === 'cron'"
@@ -238,6 +255,7 @@ function fmt(ms?: number) {
             </TableRow>
           </TableBody>
         </Table>
+        <Button v-if="delayedNext" class="mt-3" variant="outline" size="sm" @click="nextDelayedPage">Next delayed page</Button>
       </CardContent>
     </Card>
   </div>

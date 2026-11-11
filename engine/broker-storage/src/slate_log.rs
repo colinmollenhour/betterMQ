@@ -64,6 +64,24 @@ const META_NEXT_OFFSET: &[u8] = b"meta/next_offset";
 #[cfg(feature = "slate")]
 const META_LEADER_GEN: &[u8] = b"meta/leader_generation";
 
+#[cfg(feature = "slate")]
+pub fn slate_topics(store: Arc<dyn ObjectStore>, tenant: &str) -> Result<Vec<String>, LogError> {
+    let tenant = broker_proto::sanitize_path_segment(tenant)
+        .map_err(|error| LogError::Slate(error.to_string()))?;
+    let prefix = object_store::path::Path::from(format!("bettermq/{tenant}/topics"));
+    block_on_slate(async move {
+        let listing = store
+            .list_with_delimiter(Some(&prefix))
+            .await
+            .map_err(|error| LogError::Slate(error.to_string()))?;
+        Ok(listing
+            .common_prefixes
+            .into_iter()
+            .filter_map(|path| path.parts().last().map(|part| part.as_ref().to_string()))
+            .collect())
+    })
+}
+
 /// Stable object-store prefix shared by every broker in a cluster (not per-node `data_dir`).
 #[cfg(feature = "slate")]
 pub fn slate_db_path(
@@ -129,33 +147,30 @@ impl SlatePartitionLog {
         })
     }
 
-    /// Prefer `meta/next_offset`; scan frame keys so a durable frame is never overwritten after crash.
+    /// The offset and its frame are committed atomically in the same WriteBatch.
+    /// Recovery must not probe historical offsets (which may also be purged).
     fn recover_next_offset(db: Arc<Db>, _partition: u32) -> Result<u64, LogError> {
-        let db_meta = Arc::clone(&db);
-        let from_meta = block_on_slate(async move {
-            match db_meta.get(META_NEXT_OFFSET).await.map_err(slate_err)? {
-                Some(bytes) if bytes.len() >= 8 => {
-                    let mut buf = [0u8; 8];
-                    buf.copy_from_slice(&bytes[..8]);
-                    Ok::<Option<u64>, LogError>(Some(u64::from_be_bytes(buf)))
+        block_on_slate(async move {
+            match db.get(META_NEXT_OFFSET).await.map_err(slate_err)? {
+                Some(bytes) => {
+                    let buf: [u8; 8] = bytes.as_ref().try_into().map_err(|_| {
+                        LogError::Slate("invalid durable next_offset metadata".into())
+                    })?;
+                    Ok(u64::from_be_bytes(buf))
                 }
-                _ => Ok::<Option<u64>, LogError>(None),
+                None => {
+                    // Only an empty database may have no offset. Failing closed
+                    // on inconsistent metadata prevents overwriting old frames.
+                    let mut frames = db.scan_prefix(b"fr/").await.map_err(slate_err)?;
+                    if frames.next().await.map_err(slate_err)?.is_some() {
+                        return Err(LogError::Slate(
+                            "frame data exists without durable next_offset metadata".into(),
+                        ));
+                    }
+                    Ok(0)
+                }
             }
-        })?;
-
-        let mut next = from_meta.unwrap_or(0);
-        let scan_until = next.saturating_add(4096);
-        for off in 0..scan_until {
-            let db_scan = Arc::clone(&db);
-            let key = frame_key(off);
-            let exists = block_on_slate(async move {
-                Ok::<bool, LogError>(db_scan.get(&key).await.map_err(slate_err)?.is_some())
-            })?;
-            if exists {
-                next = next.max(off + 1);
-            }
-        }
-        Ok(next)
+        })
     }
 
     /// Reject stale leaders against the durable generation, not only the in-memory copy.
@@ -286,23 +301,34 @@ impl SlatePartitionLog {
         offset: u64,
         max_messages: usize,
     ) -> Result<Vec<StoredMessage>, LogError> {
-        let mut out = Vec::new();
-        for i in 0..max_messages {
-            let off = offset + i as u64;
-            if off >= self.next_offset {
-                break;
-            }
-            let db = Arc::clone(&self.db);
-            let key = frame_key(off);
-            let frame = block_on_slate(async move { db.get(&key).await.map_err(slate_err) })?
-                .ok_or(LogError::OffsetNotFound(off))?;
-            let (header, payload) = {
-                let mut cursor = std::io::Cursor::new(frame.as_ref());
-                decode_frame(&mut cursor)?
-            };
-            out.push(stored_from_header(header, partition, off, payload));
+        if max_messages == 0 || offset >= self.next_offset {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        let db = Arc::clone(&self.db);
+        let end = self.next_offset;
+        block_on_slate(async move {
+            let mut out = Vec::with_capacity(max_messages.min(256));
+            // Range iteration skips deleted frames and counts live messages,
+            // just like the local WAL, without probing every purged offset.
+            let mut frames = db
+                .scan(frame_key(offset)..frame_key(end))
+                .await
+                .map_err(slate_err)?;
+            while out.len() < max_messages {
+                let Some(frame) = frames.next().await.map_err(slate_err)? else {
+                    break;
+                };
+                let off = std::str::from_utf8(&frame.key)
+                    .ok()
+                    .and_then(|key| key.strip_prefix("fr/"))
+                    .and_then(|key| key.parse::<u64>().ok())
+                    .ok_or_else(|| LogError::Slate("invalid frame offset key".into()))?;
+                let mut cursor = std::io::Cursor::new(frame.value.as_ref());
+                let (header, payload) = decode_frame(&mut cursor)?;
+                out.push(stored_from_header(header, partition, off, payload));
+            }
+            Ok(out)
+        })
     }
 
     pub fn high_watermark(&self) -> u64 {
@@ -388,4 +414,105 @@ fn stored_from_header(
 #[cfg(feature = "slate")]
 fn slate_err(e: slatedb::Error) -> LogError {
     LogError::Slate(e.to_string())
+}
+
+#[cfg(all(test, feature = "slate"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_and_slate_reads_skip_purges_after_reopen() {
+        for slate in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+            let open = || {
+                if slate {
+                    crate::PartitionBackend::open_slate(
+                        "purge-parity".into(),
+                        dir.path(),
+                        store.clone(),
+                        0,
+                        PartitionLogConfig::default(),
+                    )
+                    .unwrap()
+                } else {
+                    crate::PartitionBackend::open_local(dir.path(), PartitionLogConfig::default())
+                        .unwrap()
+                }
+            };
+            let close = |backend: crate::PartitionBackend| {
+                if let crate::PartitionBackend::Slate(log) = backend {
+                    block_on_slate(async move { log.db.close().await }).unwrap();
+                }
+            };
+            let mut backend = open();
+            for n in 0..4u8 {
+                let header: LogRecord = serde_json::from_value(serde_json::json!({
+                    "id": uuid::Uuid::new_v4(), "tenant_id": "tenant", "topic": "dlq",
+                    "routing_key": "", "idempotency_key": null, "published_at_ms": 0
+                }))
+                .unwrap();
+                backend.append(0, header, vec![n]).unwrap();
+            }
+            assert!(backend.purge_offset(0).unwrap());
+            assert!(backend.purge_offset(2).unwrap());
+            backend.sync().unwrap();
+            close(backend);
+            let mut backend = open();
+            assert_eq!(backend.high_watermark(), 4);
+            let messages = backend.read_range(0, 0, 2).unwrap();
+            assert_eq!(
+                messages.iter().map(|m| m.offset).collect::<Vec<_>>(),
+                vec![1, 3]
+            );
+            assert_eq!(backend.read_range(0, 2, 1).unwrap()[0].payload, vec![3]);
+            assert!(backend.read_range(0, 0, 0).unwrap().is_empty());
+            assert!(backend.read_range(0, u64::MAX, 10).unwrap().is_empty());
+            assert!(backend.purge_offset(1).unwrap());
+            assert!(backend.purge_offset(3).unwrap());
+            assert!(backend.read_range(0, 0, 10).unwrap().is_empty());
+            close(backend);
+            let backend = open();
+            assert_eq!(backend.high_watermark(), 4);
+            assert!(backend.read_range(0, 0, 10).unwrap().is_empty());
+            close(backend);
+        }
+    }
+
+    #[test]
+    fn recovery_uses_atomic_offset_independent_of_history_size() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let db = Arc::new(block_on_slate(Db::open("offset-recovery", store)).unwrap());
+        let writer = db.clone();
+        block_on_slate(async move {
+            writer
+                .put(META_NEXT_OFFSET, u64::MAX.to_be_bytes())
+                .await
+                .unwrap();
+        });
+        // A history scan up to this value would never finish. Purged frames do
+        // not affect the monotonically increasing durable offset.
+        assert_eq!(
+            SlatePartitionLog::recover_next_offset(db.clone(), 0).unwrap(),
+            u64::MAX
+        );
+        block_on_slate(async move { db.close().await }).unwrap();
+    }
+
+    #[test]
+    fn recovery_rejects_missing_or_malformed_metadata_with_frames() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let db = Arc::new(block_on_slate(Db::open("bad-offset", store)).unwrap());
+        assert_eq!(
+            SlatePartitionLog::recover_next_offset(db.clone(), 0).unwrap(),
+            0
+        );
+        let writer = db.clone();
+        block_on_slate(async move { writer.put(frame_key(0), b"frame").await }).unwrap();
+        assert!(SlatePartitionLog::recover_next_offset(db.clone(), 0).is_err());
+        let writer = db.clone();
+        block_on_slate(async move { writer.put(META_NEXT_OFFSET, b"bad").await }).unwrap();
+        assert!(SlatePartitionLog::recover_next_offset(db.clone(), 0).is_err());
+        block_on_slate(async move { db.close().await }).unwrap();
+    }
 }

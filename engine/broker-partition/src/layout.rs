@@ -49,6 +49,16 @@ impl ShardLayout {
         self.version >= LAYOUT_V2
     }
 
+    pub fn validate_storage(
+        &self,
+        storage: broker_storage::StorageMode,
+    ) -> Result<(), LayoutError> {
+        if self.is_physical() && storage == broker_storage::StorageMode::Slate {
+            return Err(LayoutError::Invalid("physical shard layout V2 is not implemented for Slate storage; retain local storage".into()));
+        }
+        Ok(())
+    }
+
     pub fn storage_namespace<'a>(&self, topic: &'a str) -> &'a str {
         if self.is_physical() {
             "__physical"
@@ -138,6 +148,33 @@ impl ShardLayout {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn storage_compatibility_is_checked_before_opening_backends() {
+        let mut layout = ShardLayout::v1(1);
+        assert!(layout
+            .validate_storage(broker_storage::StorageMode::Slate)
+            .is_ok());
+        layout.version = LAYOUT_V2;
+        assert!(layout
+            .validate_storage(broker_storage::StorageMode::Local)
+            .is_ok());
+        assert!(layout
+            .validate_storage(broker_storage::StorageMode::Slate)
+            .is_err());
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            ShardLayout::path(dir.path()),
+            serde_json::to_vec(&layout).unwrap(),
+        )
+        .unwrap();
+        let mut config = crate::BrokerConfig::new(dir.path().to_path_buf());
+        config.storage = broker_storage::StorageMode::Slate;
+        let error = crate::Broker::open(config)
+            .err()
+            .expect("V2 Slate startup must fail");
+        assert!(error.to_string().contains("physical shard layout V2"));
+    }
 
     #[test]
     fn existing_layout_is_not_overwritten() {

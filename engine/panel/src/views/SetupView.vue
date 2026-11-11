@@ -9,6 +9,7 @@ import { errText } from "@/lib/payload";
 
 const p1 = ref("");
 const p2 = ref("");
+const code = ref("");
 const error = ref("");
 const busy = ref(false);
 
@@ -22,9 +23,13 @@ async function submit() {
     error.value = "Passwords do not match.";
     return;
   }
+  if (session.auth?.setup_code_required && !code.value.trim()) {
+    error.value = "Enter the setup code from the BetterMQ startup log.";
+    return;
+  }
   busy.value = true;
   try {
-    await setupPassword(p1.value);
+    await setupPassword(p1.value, code.value);
   } catch (e) {
     error.value = errText(e);
   } finally {
@@ -42,6 +47,13 @@ async function submit() {
           Choose a password (at least 12 characters). You will get an API token once — copy it.
         </p>
       </div>
+      <Field
+        v-if="session.auth?.setup_code_required"
+        label="Setup code"
+        hint="Printed in the startup log: docker logs <container>, or the terminal running bettermq serve."
+      >
+        <Input v-model="code" autocomplete="off" placeholder="XXXX-XXXX-XXXX-XXXX" />
+      </Field>
       <Field label="Password">
         <Input v-model="p1" type="password" autocomplete="new-password" />
       </Field>

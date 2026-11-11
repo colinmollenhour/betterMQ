@@ -30,6 +30,7 @@ async function copy() {
           Shown once. It will not be displayed again. Regenerate from Settings with your password.
         </p>
       </div>
+      <p v-if="session.revealWarning" class="text-sm text-destructive">{{ session.revealWarning }}</p>
       <pre class="overflow-x-auto rounded-2xl border bg-muted p-3 font-mono text-xs">{{ session.revealedToken }}</pre>
       <ActionMessage :error="copyError" :ok="copyOk" />
       <Button class="w-full" variant="outline" @click="copy">Copy token</Button>

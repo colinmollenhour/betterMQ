@@ -1,6 +1,7 @@
 # HA + fleet: 3 brokers (shared meta) + N fleet workers.
 #
-#   export BETTERMQ_CLUSTER_SECRET=dev-secret
+#   export BETTERMQ_CLUSTER_SECRET=$(openssl rand -hex 32)
+#   export BETTERMQ_METRICS_TOKEN=$(openssl rand -hex 32)
 #   cd selfhost && docker compose -f docker-compose.ha-fleet.yml up -d --build
 #   docker compose -f docker-compose.ha-fleet.yml up -d --scale fleet=3
 #
@@ -8,19 +9,24 @@
 # Fleet: no public ports; claims via BETTERMQ_BROKER_URLS
 
 x-broker: &broker
-  image: ghcr.io/bettermq/bettermq:latest
+  image: ${BETTERMQ_IMAGE:-ghcr.io/colinmollenhour/bettermq}:${BETTERMQ_VERSION:?pin BETTERMQ_VERSION to a release tag}
   build:
     context: ..
     dockerfile: selfhost/Dockerfile
-  environment:
+  environment: &broker-env
+    BETTERMQ_INTERNAL_LISTEN: 0.0.0.0:9080
     BETTERMQ_CLUSTER_SECRET: ${BETTERMQ_CLUSTER_SECRET:?set BETTERMQ_CLUSTER_SECRET}
+    # Leases, cursors, catalogs and host breaker only. Delayed-job and cron
+    # journals stay in each broker's own data dir; delayed delivery and cron
+    # create/update return 501 in a cell (see README "Scheduling in a cell").
     BETTERMQ_SHARED_META_DIR: /cluster-shared/meta
     BETTERMQ_METRICS_TOKEN: ${BETTERMQ_METRICS_TOKEN:?set BETTERMQ_METRICS_TOKEN}
   volumes:
     - cluster-meta:/cluster-shared/meta
   restart: unless-stopped
+  stop_grace_period: ${BETTERMQ_STOP_GRACE_PERIOD:-120s}
   healthcheck:
-    test: ["CMD", "curl", "-f", "http://localhost:8080/readyz"]
+    test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
     interval: 10s
     timeout: 3s
     retries: 5
@@ -29,6 +35,9 @@ x-broker: &broker
 services:
   broker1:
     <<: *broker
+    environment:
+      <<: *broker-env
+      BETTERMQ_INTERNAL_URL: http://broker1:9080
     ports:
       - "8081:8080"
     volumes:
@@ -46,6 +55,9 @@ services:
 
   broker2:
     <<: *broker
+    environment:
+      <<: *broker-env
+      BETTERMQ_INTERNAL_URL: http://broker2:9080
     ports:
       - "8082:8080"
     volumes:
@@ -63,6 +75,9 @@ services:
 
   broker3:
     <<: *broker
+    environment:
+      <<: *broker-env
+      BETTERMQ_INTERNAL_URL: http://broker3:9080
     ports:
       - "8083:8080"
     volumes:
@@ -79,13 +94,13 @@ services:
       ]
 
   fleet:
-    image: ghcr.io/bettermq/bettermq:latest
+    image: ${BETTERMQ_IMAGE:-ghcr.io/colinmollenhour/bettermq}:${BETTERMQ_VERSION:?pin BETTERMQ_VERSION to a release tag}
     build:
       context: ..
       dockerfile: selfhost/Dockerfile
     environment:
       BETTERMQ_CLUSTER_SECRET: ${BETTERMQ_CLUSTER_SECRET:?set BETTERMQ_CLUSTER_SECRET}
-      BETTERMQ_BROKER_URLS: http://broker1:8080,http://broker2:8080,http://broker3:8080
+      BETTERMQ_BROKER_URLS: http://broker1:9080,http://broker2:9080,http://broker3:9080
       BETTERMQ_FLEET_CONCURRENCY: "1"
       # Optional long-wait tier (fleet only): 15m | 1h | 6h | 12h
       # BETTERMQ_LONG_WAIT_TIER: 1h
@@ -97,6 +112,7 @@ services:
       broker3:
         condition: service_healthy
     restart: unless-stopped
+    stop_grace_period: ${BETTERMQ_STOP_GRACE_PERIOD:-120s}
     command:
       [
         "serve",

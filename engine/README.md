@@ -19,7 +19,7 @@ cargo build --release -p broker-server
 Run locally:
 
 ```bash
-cargo run -p broker-cli -- serve
+cargo run -p broker-server -- serve
 ```
 
 The control panel is `panel/` (Vite + Vue 3 + shadcn/vue). `npm run build` writes `dist/`, which `broker-server` embeds. For live UI work:

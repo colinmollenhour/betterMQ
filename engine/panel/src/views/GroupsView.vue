@@ -8,6 +8,9 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import Field from "@/components/form/Field.vue";
 import ActionMessage from "@/components/form/ActionMessage.vue";
 import AppSelect from "@/components/form/AppSelect.vue";
+import SecretInput from "@/components/form/SecretInput.vue";
+import { prepareDestination } from "@/lib/destination";
+import { confirmDeletion } from "@/lib/deletion";
 import { useActionStatus } from "@/composables/useActionStatus";
 import { apiDelete, apiGet, apiPost, publicUrl } from "@/lib/api";
 import { catalog, groupId, refreshGroups, type GroupRow } from "@/lib/catalog";
@@ -16,11 +19,12 @@ import { errText } from "@/lib/payload";
 const name = ref("alerts");
 const tab = ref("list");
 const selected = ref("");
+let memberGroup = "";
 const members = ref<{ member_id?: string; id?: string; name?: string; url?: string; parallelism?: number; rate?: number }[]>([]);
 const member = reactive({
   name: "primary",
-  secret: "whsec_demo",
-  url: "https://webhook.site",
+  secret: "",
+  url: "",
   parallelism: 1,
   rate: 0,
   period: 60,
@@ -32,7 +36,7 @@ const memberStatus = useActionStatus();
 const memberListStatus = useActionStatus();
 
 onMounted(() => {
-  void refreshGroups();
+  void refreshGroups().catch(() => {});
 });
 
 const groupOptions = () =>
@@ -55,20 +59,25 @@ async function create() {
 }
 
 async function loadMembers(gid: string) {
+  memberListStatus.reset();
+  if (memberGroup !== gid) members.value = [];
+  memberGroup = gid;
   if (!gid) {
     members.value = [];
     return;
   }
   try {
     const d = await apiGet<{ members?: typeof members.value }>(publicUrl(`/v1/groups/${encodeURIComponent(gid)}`));
-    members.value = d.members || [];
-  } catch {
-    members.value = [];
+    if (selected.value === gid) members.value = d.members || [];
+  } catch (error) {
+    memberListStatus.fail(`Members unavailable: ${errText(error)}. Previously loaded results may be stale.`);
   }
 }
 
 async function addMember() {
   memberStatus.reset();
+  const error = prepareDestination(member);
+  if (error) { memberStatus.fail(error); return; }
   if (!selected.value) {
     memberStatus.fail("Select a group first");
     return;
@@ -93,6 +102,7 @@ async function addMember() {
 }
 
 async function removeGroup(g: GroupRow) {
+  if (!await confirmDeletion(`group ${g.name || groupId(g)} (${groupId(g)}) and its members`)) return;
   listStatus.reset();
   try {
     await apiDelete(publicUrl(`/v1/groups/${encodeURIComponent(groupId(g))}`));
@@ -104,10 +114,13 @@ async function removeGroup(g: GroupRow) {
 }
 
 async function removeMember(id: string) {
+  const gid = selected.value;
+  const name = members.value.find((m) => (m.member_id || m.id) === id)?.name || id;
+  if (!await confirmDeletion(`member ${name} (${id}) from group ${gid}`)) return;
   memberListStatus.reset();
   try {
     await apiDelete(
-      publicUrl(`/v1/groups/${encodeURIComponent(selected.value)}/members/${encodeURIComponent(id)}`),
+      publicUrl(`/v1/groups/${encodeURIComponent(gid)}/members/${encodeURIComponent(id)}`),
     );
     memberListStatus.succeed("Member removed");
     await loadMembers(selected.value);
@@ -194,8 +207,8 @@ function openMembers(g: GroupRow) {
               />
             </Field>
             <Field label="Name"><Input v-model="member.name" /></Field>
-            <Field label="Secret"><Input v-model="member.secret" class="font-mono" /></Field>
-            <Field label="Webhook URL" class="sm:col-span-2"><Input v-model="member.url" class="font-mono text-xs" /></Field>
+            <Field label="Secret"><SecretInput v-model="member.secret" /></Field>
+            <Field label="Webhook URL" class="sm:col-span-2"><Input v-model="member.url" placeholder="https://example.com/webhook" class="font-mono text-xs" /></Field>
             <Field label="Parallelism"><Input v-model="member.parallelism" type="number" min="1" /></Field>
             <Field label="Rate" hint="0 = unlimited"><Input v-model="member.rate" type="number" min="0" /></Field>
             <Field label="Period (s)"><Input v-model="member.period" type="number" min="1" /></Field>

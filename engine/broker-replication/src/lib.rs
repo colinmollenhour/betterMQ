@@ -1,12 +1,20 @@
 //! Replicate encoded log frames to peer brokers (quorum ack).
 
 mod append;
+mod isr;
+mod repair;
 mod telemetry;
 
 pub use append::{
-    CatchUpFrame, ReplicaProgress, ReplicateAppendRequest, ReplicateBatchAck,
-    ReplicateBatchRequest, ReplicateCatchUpRange, ReplicateCatchUpRequest,
+    cell_body_limits, cell_body_limits_for, configured_max_epoch_bytes, epoch_frame_ranges,
+    max_catchup_page_bytes, CatchUpFrame, CellBodyLimits, ReplicaProgress, ReplicateAppendRequest,
+    ReplicateBatchAck, ReplicateBatchRequest, ReplicateCatchUpRange, ReplicateCatchUpRequest,
     ReplicateCatchUpResponse, ReplicateError, ReplicateOutcome, ReplicationClient,
+    DLQ_ENVELOPE_ALLOWANCE,
+};
+pub use repair::{
+    FollowerFence, ReplicaLogSource, ReplicaPositionConflict, ReplicateTruncateRequest,
+    ReplicateTruncateResponse,
 };
 pub use telemetry::{
     ReplicationShardTelemetrySnapshot, ReplicationTelemetrySnapshot,

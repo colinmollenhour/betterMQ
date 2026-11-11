@@ -38,10 +38,18 @@ use rocksdb::ColumnFamily;
 use rocksdb::ColumnFamilyDescriptor;
 use rocksdb::Direction;
 use rocksdb::Options;
+use rocksdb::WriteBatch;
+use rocksdb::WriteOptions;
 use rocksdb::DB;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::RwLock;
+
+use crate::controller::{
+    apply_replicated, ControllerCommand, ControllerRejection, ControllerState, StateKey, STATE_KEY,
+};
+use crate::controller_store;
+use std::collections::BTreeSet;
 
 pub type RocksNodeId = u64;
 
@@ -57,28 +65,87 @@ openraft::declare_raft_types!(
         AsyncRuntime = TokioRuntime
 );
 
-/**
- * Here you will set the types of request that will interact with the raft nodes.
- * For example the `Set` will be used to write data (key and value) to the raft database.
- * The `AddNode` will append a new node to the current existing shared list of nodes.
- * You will want to add any request that can write data in all nodes here.
- */
+/// Replicated state-machine requests.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum RocksRequest {
+    /// Legacy full-value write. Older controllers replicated the whole
+    /// controller state this way; entries still in the log are applied as-is.
     Set { key: String, value: String },
+    /// Install the initial controller state. A no-op once any controller
+    /// state has been committed, so racing bootstraps cannot overwrite it.
+    ControllerBootstrap { state: Box<ControllerState> },
+    /// One controller command, applied deterministically to the replicated
+    /// controller state by every node's state machine.
+    Controller { command: ControllerCommand },
 }
 
-/**
- * Here you will defined what type of answer you expect from reading the data of a node.
- * In this example it will return a optional value from a given key in
- * the `RocksRequest.Set`.
- *
- * TODO: Should we explain how to create multiple `AppDataResponse`?
- *
- */
+/// Result of applying one entry.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RocksResponse {
     pub value: Option<String>,
+    /// Set when a controller command was rejected by the state machine. The
+    /// entry is still applied (as a no-op) so every replica agrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<ControllerRejection>,
+}
+
+impl RocksResponse {
+    fn empty() -> Self {
+        Self {
+            value: None,
+            rejected: None,
+        }
+    }
+}
+
+/// Controller state staged while one batch of entries is applied, so later
+/// entries in the batch see the effects of earlier ones. It is published to
+/// readers only after the batch has been committed.
+#[derive(Default)]
+struct StagedController {
+    loaded: bool,
+    state: Option<ControllerState>,
+    touched: BTreeSet<StateKey>,
+    /// Replace every stored entity (bootstrap or a legacy full-state write).
+    rewrite_all: bool,
+    changed: bool,
+}
+
+impl StagedController {
+    fn state(&mut self, store: &RocksStore) -> &mut Option<ControllerState> {
+        if !self.loaded {
+            self.state = store.controller_state().map(|state| state.as_ref().clone());
+            self.loaded = true;
+        }
+        &mut self.state
+    }
+
+    fn replace(&mut self, state: ControllerState) {
+        self.loaded = true;
+        self.state = Some(state);
+        self.touched.clear();
+        self.rewrite_all = true;
+        self.changed = true;
+    }
+
+    fn stage(&self, sm: &RocksStateMachine, batch: &mut WriteBatch) -> StorageResult<()> {
+        let Some(state) = &self.state else {
+            return Ok(());
+        };
+        let keys = if self.rewrite_all {
+            sm.stage_delete_controller(batch)?;
+            controller_store::all_keys(state)
+        } else {
+            self.touched.iter().cloned().collect()
+        };
+        for key in keys {
+            match controller_store::encode_entity(state, &key).map_err(sm_w_err)? {
+                Some(value) => batch.put_cf(sm.cf_sm_data(), key.encode(), value),
+                None => batch.delete_cf(sm.cf_sm_data(), key.encode()),
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -149,7 +216,7 @@ impl RocksStateMachine {
         self.db.cf_handle("sm_meta").unwrap()
     }
 
-    fn cf_sm_data(&self) -> &ColumnFamily {
+    pub(crate) fn cf_sm_data(&self) -> &ColumnFamily {
         self.db.cf_handle("sm_data").unwrap()
     }
 
@@ -164,17 +231,17 @@ impl RocksStateMachine {
             })
     }
 
-    fn set_last_membership(
+    fn stage_last_membership(
         &self,
-        membership: StoredMembership<RocksNodeId, BasicNode>,
+        batch: &mut WriteBatch,
+        membership: &StoredMembership<RocksNodeId, BasicNode>,
     ) -> StorageResult<()> {
-        self.db
-            .put_cf(
-                self.cf_sm_meta(),
-                "last_membership".as_bytes(),
-                serde_json::to_vec(&membership).map_err(sm_w_err)?,
-            )
-            .map_err(sm_w_err)
+        batch.put_cf(
+            self.cf_sm_meta(),
+            "last_membership".as_bytes(),
+            serde_json::to_vec(membership).map_err(sm_w_err)?,
+        );
+        Ok(())
     }
 
     fn get_last_applied_log(&self) -> StorageResult<Option<LogId<RocksNodeId>>> {
@@ -188,41 +255,100 @@ impl RocksStateMachine {
             })
     }
 
-    fn set_last_applied_log(&self, log_id: LogId<RocksNodeId>) -> StorageResult<()> {
-        self.db
-            .put_cf(
-                self.cf_sm_meta(),
-                "last_applied_log".as_bytes(),
-                serde_json::to_vec(&log_id).map_err(sm_w_err)?,
-            )
-            .map_err(sm_w_err)
+    fn stage_last_applied_log(
+        &self,
+        batch: &mut WriteBatch,
+        log_id: &LogId<RocksNodeId>,
+    ) -> StorageResult<()> {
+        batch.put_cf(
+            self.cf_sm_meta(),
+            "last_applied_log".as_bytes(),
+            serde_json::to_vec(log_id).map_err(sm_w_err)?,
+        );
+        Ok(())
     }
 
-    fn from_serializable(sm: SerializableRocksStateMachine, db: Arc<DB>) -> StorageResult<Self> {
-        let r = Self { db };
+    /// Commit staged state-machine writes as one atomic, WAL-synced batch, so
+    /// the applied log id never lands without the data and membership it
+    /// covers (or the other way round).
+    fn commit(&self, batch: WriteBatch) -> StorageResult<()> {
+        let mut options = WriteOptions::default();
+        options.set_sync(true);
+        self.db.write_opt(batch, &options).map_err(sm_w_err)
+    }
 
-        for (key, value) in sm.data {
-            r.db.put_cf(r.cf_sm_data(), key.as_bytes(), value.as_bytes())
-                .map_err(sm_w_err)?;
+    /// Replace the whole state machine with a snapshot in one atomic batch.
+    /// Keys that are absent from the snapshot are removed rather than left
+    /// behind from the previous state.
+    fn replace_with(&self, sm: SerializableRocksStateMachine) -> StorageResult<()> {
+        let mut batch = WriteBatch::default();
+        for item in self
+            .db
+            .iterator_cf(self.cf_sm_data(), rocksdb::IteratorMode::Start)
+        {
+            let (key, _) = item.map_err(sm_r_err)?;
+            batch.delete_cf(self.cf_sm_data(), key);
         }
-
-        if let Some(log_id) = sm.last_applied_log {
-            r.set_last_applied_log(log_id)?;
+        for (key, value) in &sm.data {
+            batch.put_cf(self.cf_sm_data(), key.as_bytes(), value.as_bytes());
         }
-
-        r.set_last_membership(sm.last_membership)?;
-
-        Ok(r)
+        match &sm.last_applied_log {
+            Some(log_id) => self.stage_last_applied_log(&mut batch, log_id)?,
+            None => batch.delete_cf(self.cf_sm_meta(), "last_applied_log".as_bytes()),
+        }
+        self.stage_last_membership(&mut batch, &sm.last_membership)?;
+        self.commit(batch)
     }
 
     fn new(db: Arc<DB>) -> RocksStateMachine {
         Self { db }
     }
 
-    fn insert(&self, key: String, value: String) -> StorageResult<()> {
-        self.db
-            .put_cf(self.cf_sm_data(), key.as_bytes(), value.as_bytes())
-            .map_err(|e| StorageIOError::write(&e).into())
+    /// Stage deletion of every stored controller entity and of the legacy
+    /// single-value controller state.
+    fn stage_delete_controller(&self, batch: &mut WriteBatch) -> StorageResult<()> {
+        for (key, _) in self.controller_entities()? {
+            batch.delete_cf(self.cf_sm_data(), key);
+        }
+        batch.delete_cf(self.cf_sm_data(), STATE_KEY.as_bytes());
+        Ok(())
+    }
+
+    fn controller_entities(&self) -> StorageResult<Vec<(String, Vec<u8>)>> {
+        let prefix = controller_store::PREFIX.as_bytes();
+        let mut entries = Vec::new();
+        for item in self.db.iterator_cf(
+            self.cf_sm_data(),
+            rocksdb::IteratorMode::From(prefix, Direction::Forward),
+        ) {
+            let (key, value) = item.map_err(sm_r_err)?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let key = String::from_utf8(key.to_vec()).map_err(sm_r_err)?;
+            entries.push((key, value.to_vec()));
+        }
+        Ok(entries)
+    }
+
+    /// Load the committed controller state, converting a legacy single-value
+    /// state into per-entity keys in one atomic batch first.
+    fn load_controller(&self) -> StorageResult<Option<ControllerState>> {
+        if let Some(legacy) = self.get(STATE_KEY)? {
+            let state: ControllerState = serde_json::from_str(&legacy).map_err(sm_r_err)?;
+            let staged = StagedController {
+                loaded: true,
+                state: Some(state),
+                rewrite_all: true,
+                ..StagedController::default()
+            };
+            let mut batch = WriteBatch::default();
+            staged.stage(self, &mut batch)?;
+            self.commit(batch)?;
+            return Ok(staged.state);
+        }
+        controller_store::decode_state(self.controller_entities()?)
+            .map_err(|error| sm_r_err(std::io::Error::other(error)))
     }
 
     pub fn get(&self, key: &str) -> StorageResult<Option<String>> {
@@ -240,6 +366,19 @@ pub struct RocksStore {
 
     /// The Raft state machine.
     pub state_machine: RwLock<RocksStateMachine>,
+
+    /// Committed controller state, published after each applied batch is
+    /// durable. Readers share the snapshot instead of decoding or copying it.
+    controller: parking_lot::RwLock<Option<Arc<ControllerState>>>,
+
+    /// Test-only: size of the last committed state-machine batch.
+    #[cfg(test)]
+    pub(crate) last_commit_bytes: std::sync::atomic::AtomicUsize,
+
+    /// Test-only fault injection: fail the next state-machine commit after
+    /// every write of the batch has been staged.
+    #[cfg(test)]
+    fail_next_commit: std::sync::atomic::AtomicBool,
 }
 type StorageResult<T> = Result<T, StorageError<RocksNodeId>>;
 
@@ -317,7 +456,54 @@ mod meta {
     }
 }
 
+type StoredSnapshot = (SnapshotMeta<RocksNodeId, BasicNode>, Vec<u8>);
+
+const SNAPSHOT_META_KEY: &str = "snapshot_meta";
+const SNAPSHOT_DATA_KEY: &str = "snapshot_data";
+
 impl RocksStore {
+    /// Store the current snapshot as JSON metadata plus raw data bytes in one
+    /// batch. The legacy `snapshot` record encoded the data as a JSON number
+    /// array, several times its size.
+    fn put_snapshot(
+        &self,
+        meta: &SnapshotMeta<RocksNodeId, BasicNode>,
+        data: &[u8],
+    ) -> StorageResult<()> {
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            self.cf_meta(),
+            SNAPSHOT_META_KEY,
+            serde_json::to_vec(meta).map_err(|e| StorageIOError::write_snapshot(None, &e))?,
+        );
+        batch.put_cf(self.cf_meta(), SNAPSHOT_DATA_KEY, data);
+        batch.delete_cf(self.cf_meta(), <meta::Snapshot as meta::StoreMeta>::KEY);
+        let mut options = WriteOptions::default();
+        options.set_sync(true);
+        self.db
+            .write_opt(batch, &options)
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e).into())
+    }
+
+    fn get_snapshot(&self) -> StorageResult<Option<StoredSnapshot>> {
+        let meta = self
+            .db
+            .get_cf(self.cf_meta(), SNAPSHOT_META_KEY)
+            .map_err(snapshot_r_err)?;
+        if let Some(meta) = meta {
+            let meta = serde_json::from_slice(&meta).map_err(snapshot_r_err)?;
+            let data = self
+                .db
+                .get_cf(self.cf_meta(), SNAPSHOT_DATA_KEY)
+                .map_err(snapshot_r_err)?
+                .unwrap_or_default();
+            return Ok(Some((meta, data)));
+        }
+        Ok(self
+            .get_meta::<meta::Snapshot>()?
+            .map(|snapshot| (snapshot.meta, snapshot.data)))
+    }
+
     fn cf_meta(&self) -> &ColumnFamily {
         self.db.cf_handle("meta").unwrap()
     }
@@ -431,12 +617,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<RocksStore> {
             snapshot_id,
         };
 
-        let snapshot = RocksSnapshot {
-            meta: meta.clone(),
-            data: data.clone(),
-        };
-
-        self.put_meta::<meta::Snapshot>(&snapshot)?;
+        self.put_snapshot(&meta, &data)?;
 
         Ok(Snapshot {
             meta,
@@ -563,31 +744,95 @@ impl RaftStorage<TypeConfig> for Arc<RocksStore> {
         let mut res = Vec::with_capacity(entries.len());
 
         let sm = self.state_machine.write().await;
+        let mut batch = WriteBatch::default();
+        let mut controller = StagedController::default();
 
         for entry in entries {
             tracing::debug!(%entry.log_id, "replicate to sm");
 
-            sm.set_last_applied_log(entry.log_id)?;
+            sm.stage_last_applied_log(&mut batch, &entry.log_id)?;
 
             match entry.payload {
-                EntryPayload::Blank => res.push(RocksResponse { value: None }),
+                EntryPayload::Blank => res.push(RocksResponse::empty()),
                 EntryPayload::Normal(ref req) => match req {
-                    RocksRequest::Set { key, value } => {
-                        sm.insert(key.clone(), value.clone())?;
+                    RocksRequest::Set { key, value } if key == STATE_KEY => {
+                        // Legacy full-state entry still in the log.
+                        let state: ControllerState =
+                            serde_json::from_str(value).map_err(sm_r_err)?;
+                        controller.replace(state);
                         res.push(RocksResponse {
                             value: Some(value.clone()),
+                            rejected: None,
+                        })
+                    }
+                    RocksRequest::Set { key, value } => {
+                        batch.put_cf(sm.cf_sm_data(), key.as_bytes(), value.as_bytes());
+                        res.push(RocksResponse {
+                            value: Some(value.clone()),
+                            rejected: None,
+                        })
+                    }
+                    RocksRequest::ControllerBootstrap { state } => {
+                        if controller.state(self).is_none() {
+                            controller.replace(state.as_ref().clone());
+                        }
+                        res.push(RocksResponse::empty())
+                    }
+                    RocksRequest::Controller { command } => {
+                        let rejected = match controller.state(self) {
+                            None => Some(ControllerRejection::InvalidCommand(
+                                "controller state is not bootstrapped".into(),
+                            )),
+                            Some(state) => {
+                                match apply_replicated(
+                                    state,
+                                    command.clone(),
+                                    entry.log_id.leader_id.term,
+                                ) {
+                                    Ok(touched) => {
+                                        controller.changed |= !touched.is_empty();
+                                        controller.touched.extend(touched);
+                                        None
+                                    }
+                                    Err(error) => Some(ControllerRejection::from(error)),
+                                }
+                            }
+                        };
+                        res.push(RocksResponse {
+                            value: None,
+                            rejected,
                         })
                     }
                 },
                 EntryPayload::Membership(ref mem) => {
-                    sm.set_last_membership(StoredMembership::new(Some(entry.log_id), mem.clone()))?;
-                    res.push(RocksResponse { value: None })
+                    sm.stage_last_membership(
+                        &mut batch,
+                        &StoredMembership::new(Some(entry.log_id), mem.clone()),
+                    )?;
+                    res.push(RocksResponse::empty())
                 }
             };
         }
-        self.db
-            .flush_wal(true)
-            .map_err(|e| StorageIOError::write_logs(&e))?;
+        if controller.changed {
+            controller.stage(&sm, &mut batch)?;
+        }
+        #[cfg(test)]
+        if self
+            .fail_next_commit
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageIOError::write_state_machine(AnyError::error(
+                "injected crash before state-machine commit",
+            ))
+            .into());
+        }
+        #[cfg(test)]
+        self.last_commit_bytes
+            .store(batch.size_in_bytes(), std::sync::atomic::Ordering::SeqCst);
+        sm.commit(batch)?;
+        if controller.changed {
+            *self.controller.write() = controller.state.map(Arc::new);
+        }
         Ok(res)
     }
 
@@ -613,6 +858,7 @@ impl RaftStorage<TypeConfig> for Arc<RocksStore> {
             meta: meta.clone(),
             data: snapshot.into_inner(),
         };
+        let RocksSnapshot { meta: _, data } = &new_snapshot;
 
         // Update the state machine.
         {
@@ -620,12 +866,12 @@ impl RaftStorage<TypeConfig> for Arc<RocksStore> {
                 serde_json::from_slice(&new_snapshot.data).map_err(|e| {
                     StorageIOError::read_snapshot(Some(new_snapshot.meta.signature()), &e)
                 })?;
-            let mut state_machine = self.state_machine.write().await;
-            *state_machine =
-                RocksStateMachine::from_serializable(updated_state_machine, self.db.clone())?;
+            let state_machine = self.state_machine.write().await;
+            state_machine.replace_with(updated_state_machine)?;
+            *self.controller.write() = state_machine.load_controller()?.map(Arc::new);
         }
 
-        self.put_meta::<meta::Snapshot>(&new_snapshot)?;
+        self.put_snapshot(meta, data)?;
 
         Ok(())
     }
@@ -634,18 +880,10 @@ impl RaftStorage<TypeConfig> for Arc<RocksStore> {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<RocksNodeId>> {
-        let curr_snap = self.get_meta::<meta::Snapshot>()?;
-
-        match curr_snap {
-            Some(snapshot) => {
-                let data = snapshot.data.clone();
-                Ok(Some(Snapshot {
-                    meta: snapshot.meta,
-                    snapshot: Box::new(Cursor::new(data)),
-                }))
-            }
-            None => Ok(None),
-        }
+        Ok(self.get_snapshot()?.map(|(meta, data)| Snapshot {
+            meta,
+            snapshot: Box::new(Cursor::new(data)),
+        }))
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
@@ -658,7 +896,7 @@ impl RaftStorage<TypeConfig> for Arc<RocksStore> {
 }
 
 impl RocksStore {
-    pub async fn new<P: AsRef<Path>>(db_path: P) -> Arc<RocksStore> {
+    pub async fn new<P: AsRef<Path>>(db_path: P) -> StorageResult<Arc<RocksStore>> {
         let mut db_opts = Options::default();
         db_opts.create_missing_column_families(true);
         db_opts.create_if_missing(true);
@@ -668,17 +906,132 @@ impl RocksStore {
         let sm_data = ColumnFamilyDescriptor::new("sm_data", Options::default());
         let logs = ColumnFamilyDescriptor::new("logs", Options::default());
 
-        let db =
-            DB::open_cf_descriptors(&db_opts, db_path, vec![meta, sm_meta, sm_data, logs]).unwrap();
+        let db = DB::open_cf_descriptors(&db_opts, db_path, vec![meta, sm_meta, sm_data, logs])
+            .map_err(|e| StorageIOError::read(&e))?;
 
         let db = Arc::new(db);
-        let state_machine = RwLock::new(RocksStateMachine::new(db.clone()));
-        Arc::new(RocksStore { db, state_machine })
+        let state_machine = RocksStateMachine::new(db.clone());
+        let controller = state_machine.load_controller()?.map(Arc::new);
+        Ok(Arc::new(RocksStore {
+            db,
+            state_machine: RwLock::new(state_machine),
+            controller: parking_lot::RwLock::new(controller),
+            #[cfg(test)]
+            last_commit_bytes: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_commit: std::sync::atomic::AtomicBool::new(false),
+        }))
     }
+
+    /// Latest committed controller state, if any has been bootstrapped.
+    pub fn controller_state(&self) -> Option<Arc<ControllerState>> {
+        self.controller.read().clone()
+    }
+}
+
+fn snapshot_r_err<E: Error + 'static>(e: E) -> StorageError<RocksNodeId> {
+    StorageIOError::read_snapshot(None, &e).into()
 }
 
 fn read_logs_err(e: impl Error + 'static) -> StorageError<RocksNodeId> {
     StorageError::IO {
         source: StorageIOError::read_logs(&e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::CommittedLeaderId;
+    use openraft::Membership;
+    use std::collections::BTreeSet;
+
+    fn entry(index: u64, payload: EntryPayload<TypeConfig>) -> Entry<TypeConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+            payload,
+        }
+    }
+
+    fn set(index: u64, value: &str) -> Entry<TypeConfig> {
+        entry(
+            index,
+            EntryPayload::Normal(RocksRequest::Set {
+                key: "k".into(),
+                value: value.into(),
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn crash_before_commit_leaves_applied_index_and_data_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut store = RocksStore::new(dir.path()).await.unwrap();
+            store
+                .apply_to_state_machine(&[set(1, "one")])
+                .await
+                .unwrap();
+            store
+                .fail_next_commit
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let membership = Membership::<RocksNodeId, BasicNode>::new(
+                vec![BTreeSet::from([1])],
+                BTreeMap::from([(1, BasicNode::new("http://n1"))]),
+            );
+            assert!(store
+                .apply_to_state_machine(&[
+                    set(2, "two"),
+                    entry(3, EntryPayload::Membership(membership))
+                ])
+                .await
+                .is_err());
+        }
+        let mut reopened = RocksStore::new(dir.path()).await.unwrap();
+        let (applied, membership) = reopened.last_applied_state().await.unwrap();
+        assert_eq!(applied.map(|log_id| log_id.index), Some(1));
+        assert_eq!(membership.log_id(), &None);
+        let value = reopened.state_machine.read().await.get("k").unwrap();
+        assert_eq!(value.as_deref(), Some("one"));
+    }
+
+    #[tokio::test]
+    async fn installed_snapshot_replaces_previous_state_machine_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RocksStore::new(dir.path()).await.unwrap();
+        store
+            .apply_to_state_machine(&[entry(
+                1,
+                EntryPayload::Normal(RocksRequest::Set {
+                    key: "stale".into(),
+                    value: "old".into(),
+                }),
+            )])
+            .await
+            .unwrap();
+        let snapshot = SerializableRocksStateMachine {
+            last_applied_log: Some(LogId::new(CommittedLeaderId::new(2, 1), 9)),
+            last_membership: StoredMembership::default(),
+            data: BTreeMap::from([("fresh".to_string(), "new".to_string())]),
+        };
+        let meta = SnapshotMeta {
+            last_log_id: snapshot.last_applied_log,
+            last_membership: StoredMembership::default(),
+            snapshot_id: "test".into(),
+        };
+        store
+            .install_snapshot(
+                &meta,
+                Box::new(Cursor::new(serde_json::to_vec(&snapshot).unwrap())),
+            )
+            .await
+            .unwrap();
+        let sm = store.state_machine.read().await;
+        assert_eq!(sm.get("stale").unwrap(), None);
+        assert_eq!(sm.get("fresh").unwrap().as_deref(), Some("new"));
+        assert_eq!(
+            sm.get_last_applied_log().unwrap().map(|id| id.index),
+            Some(9)
+        );
     }
 }

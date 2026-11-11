@@ -2,6 +2,10 @@
 # (e.g. backfill v0.4.0 without cutting a new release).
 name: Publish Docker
 
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -10,9 +14,9 @@ on:
         required: true
         type: string
       latest:
-        description: Also tag as latest
+        description: Promote latest (only allowed for the newest stable tag)
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: read
@@ -23,7 +27,26 @@ env:
   IMAGE_NAME: bettermq
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate backfill tag and promotion
+        env:
+          TAG: ${{ inputs.tag }}
+          PROMOTE: ${{ inputs.latest }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Expected stable vX.Y.Z tag'; exit 1; }
+          git rev-parse --verify "refs/tags/$TAG"
+          newest=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          if [[ "$PROMOTE" == true && "$TAG" != "$newest" ]]; then
+            echo "Refusing to promote $TAG over $newest"; exit 1
+          fi
+
   build:
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -86,10 +109,22 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Recheck latest before promotion
+        env:
+          TAG: ${{ inputs.tag }}
+          PROMOTE: ${{ inputs.latest }}
+        run: |
+          git fetch origin --tags
+          newest=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          [[ "$PROMOTE" != true || "$TAG" == "$newest" ]] || { echo 'A newer release exists'; exit 1; }
       - name: Resolve version
         id: ver
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
-          TAG="${{ inputs.tag }}"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Image name (lowercase for GHCR)

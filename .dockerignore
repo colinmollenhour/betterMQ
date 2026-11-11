@@ -1,4 +1,7 @@
 target
+**/node_modules
+**/target
+.audit
 data
 .git
 .cursor

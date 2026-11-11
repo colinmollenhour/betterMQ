@@ -7,6 +7,9 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import Field from "@/components/form/Field.vue";
 import ActionMessage from "@/components/form/ActionMessage.vue";
 import RetryFields from "@/components/form/RetryFields.vue";
+import SecretInput from "@/components/form/SecretInput.vue";
+import { prepareDestination } from "@/lib/destination";
+import { confirmDeletion } from "@/lib/deletion";
 import { useActionStatus } from "@/composables/useActionStatus";
 import { apiDelete, apiPost, publicUrl } from "@/lib/api";
 import { catalog, queueId, refreshQueues, type QueueRow } from "@/lib/catalog";
@@ -14,8 +17,8 @@ import { defaultRetry, mergeRetry } from "@/lib/payload";
 
 const form = reactive({
   queue: "jobs",
-  url: "https://webhook.site",
-  secret: "whsec_demo",
+  url: "",
+  secret: "",
   parallelism: "",
   retry: defaultRetry(),
 });
@@ -24,11 +27,13 @@ const createStatus = useActionStatus();
 const listStatus = useActionStatus();
 
 onMounted(() => {
-  void refreshQueues();
+  void refreshQueues().catch(() => {});
 });
 
 async function create() {
   createStatus.reset();
+  const error = prepareDestination(form);
+  if (error) { createStatus.fail(error); return; }
   try {
     const body: Record<string, unknown> = mergeRetry(
       { queue: form.queue, url: form.url, secret: form.secret },
@@ -47,6 +52,7 @@ async function create() {
 }
 
 async function remove(q: QueueRow) {
+  if (!await confirmDeletion(`queue ${q.queue || q.name || queueId(q)} (${queueId(q)})`)) return;
   listStatus.reset();
   try {
     await apiDelete(publicUrl(`/v1/queues/${encodeURIComponent(queueId(q))}`));
@@ -74,8 +80,8 @@ async function remove(q: QueueRow) {
       </CardHeader>
       <CardContent class="grid gap-2 sm:grid-cols-2">
         <Field label="Name"><Input v-model="form.queue" /></Field>
-        <Field label="HMAC secret"><Input v-model="form.secret" class="font-mono" /></Field>
-        <Field label="Webhook URL" class="sm:col-span-2"><Input v-model="form.url" class="font-mono text-xs" /></Field>
+        <Field label="HMAC secret"><SecretInput v-model="form.secret" /></Field>
+        <Field label="Webhook URL" class="sm:col-span-2"><Input v-model="form.url" placeholder="https://example.com/webhook" class="font-mono text-xs" /></Field>
         <Field
           label="Parallelism"
           hint="Max in-flight without a key. Empty = unlimited. 1 = the whole queue is serial."

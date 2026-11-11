@@ -14,6 +14,10 @@ export function panelMode(): string {
   return window.__BETTERMQ_PANEL_MODE__ || "embedded";
 }
 
+export function isStandalone(): boolean {
+  return panelMode() === "standalone";
+}
+
 export function adminApiRoot(): string {
   return window.__BETTERMQ_ADMIN_API__ || "/admin/v1";
 }

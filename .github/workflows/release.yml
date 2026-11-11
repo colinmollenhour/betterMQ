@@ -1,5 +1,9 @@
 name: Release
 
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -24,11 +28,13 @@ env:
 
 jobs:
   bump:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.bump.outputs.version }}
       tag: ${{ steps.bump.outputs.tag }}
       pr_number: ${{ steps.open_pr.outputs.pr_number }}
+      sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -71,6 +77,10 @@ jobs:
             engine/broker-server/openapi/bettermq.openapi.json > /tmp/openapi.json
           mv /tmp/openapi.json engine/broker-server/openapi/bettermq.openapi.json
 
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - name: Sync workspace lockfile after version bump
+        run: cargo update --workspace
+
       - name: Commit version bump and tag
         id: commit
         run: |
@@ -78,7 +88,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           TAG="${{ steps.bump.outputs.tag }}"
-          git add Cargo.toml engine/broker-server/openapi/bettermq.openapi.json
+          git add Cargo.toml Cargo.lock engine/broker-server/openapi/bettermq.openapi.json
           if git diff --staged --quiet; then
             echo "committed=false" >> "$GITHUB_OUTPUT"
             echo "Nothing to commit — main already has ${{ steps.bump.outputs.version }}"
@@ -86,7 +96,8 @@ jobs:
             git commit -m "chore(release): ${TAG}"
             echo "committed=true" >> "$GITHUB_OUTPUT"
           fi
-          git tag -f "${TAG}"
+          git tag "${TAG}"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       # main is protected — never push HEAD:main; use release branch + PR (or tag-only).
@@ -139,8 +150,14 @@ jobs:
           echo "pr_number=${PR}" >> "$GITHUB_OUTPUT"
           echo "Open PR #${PR} — merge when ready: ${RUN_URL}"
 
-  build:
+  verify:
     needs: bump
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.bump.outputs.sha }}
+
+  build:
+    needs: [bump, verify]
     strategy:
       fail-fast: false
       matrix:
@@ -162,7 +179,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.bump.outputs.tag }}
+          ref: ${{ needs.bump.outputs.sha }}
           fetch-depth: 0
           fetch-tags: true
 
@@ -181,8 +198,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build broker-server
-        run: cargo build -p broker-server --release --target ${{ matrix.target }}
+      - name: Build broker and recovery tools
+        run: cargo build --locked -p broker-server -p broker-storage --features broker-storage/s3 --bins --release --target ${{ matrix.target }}
 
       - name: Stage binary
         shell: bash
@@ -193,14 +210,20 @@ jobs:
           else
             cp "target/${{ matrix.target }}/release/bettermq" "dist/${{ matrix.artifact }}"
           fi
+          artifact="${{ matrix.artifact }}"
+          ext=""
+          [[ "${{ matrix.os }}" != windows-latest ]] || ext=.exe
+          for tool in archive wal-migrate; do
+            cp "target/${{ matrix.target }}/release/bettermq-${tool}${ext}" "dist/${artifact/bettermq-/bettermq-${tool}-}"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
+          path: dist/*
 
   docker:
-    needs: bump
+    needs: [bump, verify]
     strategy:
       fail-fast: false
       matrix:
@@ -216,7 +239,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.bump.outputs.tag }}
+          ref: ${{ needs.bump.outputs.sha }}
           fetch-depth: 0
           fetch-tags: true
 
@@ -263,7 +286,7 @@ jobs:
           retention-days: 1
 
   docker-merge:
-    needs: [bump, docker]
+    needs: [bump, verify, build, docker]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -311,7 +334,7 @@ jobs:
             "${{ steps.image.outputs.name }}:${{ needs.bump.outputs.version }}"
 
   publish:
-    needs: [bump, build]
+    needs: [bump, verify, build, docker-merge]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

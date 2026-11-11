@@ -14,6 +14,10 @@ use uuid::Uuid;
 
 type SharedReplicaProgress = Arc<Mutex<HashMap<(String, u32, Uuid), ReplicaProgress>>>;
 
+/// Progress for a stream that has seen no replication traffic for this long
+/// is dropped (deleted topics, departed peers).
+const PROGRESS_RETENTION_MS: u64 = 60 * 60 * 1000;
+
 const EPOCH_MAGIC: [u8; 4] = *b"BMQE";
 const EPOCH_VERSION: u16 = 1;
 const FIXED_HEADER_LEN: usize = 64;
@@ -24,7 +28,148 @@ const MAX_EPOCH_RECORDS: usize = 65_536;
 const CATCHUP_MAGIC: [u8; 4] = *b"BMQC";
 const CATCHUP_VERSION: u16 = 1;
 const CATCHUP_HEADER_LEN: usize = 32;
+/// v2 appends the source's retained `base_offset`; only sent when non-zero so
+/// peers that never collected a prefix still speak v1.
+const CATCHUP_VERSION_BASE: u16 = 2;
+const CATCHUP_HEADER_LEN_BASE: usize = 40;
 const MAX_CATCHUP_RECORDS: usize = 4096;
+
+/// Bytes an epoch header may spend on its tenant and topic (both are
+/// length-prefixed with a u16).
+const EPOCH_NAME_BUDGET: usize = 2 * u16::MAX as usize;
+/// Fixed bytes of one broker-proto frame around its header and payload:
+/// magic, header length, payload length and CRC.
+const FRAME_FIXED_BYTES: usize = 16;
+/// Per-frame length prefix inside an epoch.
+const EPOCH_FRAME_PREFIX: usize = 4;
+
+/// Replication epoch cap (`BETTERMQ_MAX_REPLICATION_EPOCH_BYTES`, 16 MiB).
+pub fn configured_max_epoch_bytes() -> usize {
+    env_bytes(
+        "BETTERMQ_MAX_REPLICATION_EPOCH_BYTES",
+        DEFAULT_MAX_EPOCH_BYTES,
+    )
+    .min(Semaphore::MAX_PERMITS)
+}
+
+/// Replication in-flight cap (`BETTERMQ_MAX_REPLICATION_IN_FLIGHT_BYTES`).
+fn configured_max_in_flight_bytes() -> usize {
+    env_bytes(
+        "BETTERMQ_MAX_REPLICATION_IN_FLIGHT_BYTES",
+        DEFAULT_MAX_IN_FLIGHT_BYTES,
+    )
+    .min(Semaphore::MAX_PERMITS)
+}
+
+/// Bytes of every cell body budget reserved for the dead-letter envelope.
+/// A DLQ record wraps the original body with metadata (source queue, message
+/// id, destination, reason, headers), and it must still fit one replication
+/// epoch, so any body accepted at ingest stays dead-letterable. The DLQ
+/// writer must keep its envelope overhead within this allowance.
+pub const DLQ_ENVELOPE_ALLOWANCE: usize = 64 * 1024;
+
+/// Body-size policy of a local-WAL multi-node cell. Bodies travel inline in
+/// their WAL frame, so a worst-case frame (largest header) must fit one
+/// replication epoch, which must fit the receiver's decode cap and the
+/// internal HTTP body limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellBodyLimits {
+    pub max_epoch_bytes: usize,
+    /// Largest frame payload one epoch can carry with a worst-case header
+    /// (what a DLQ record may use).
+    pub max_frame_body: usize,
+    /// Largest message body (decoded bytes) the cell accepts at ingest:
+    /// `max_frame_body - DLQ_ENVELOPE_ALLOWANCE`.
+    pub max_inline_body: usize,
+}
+
+/// The single source of the cell body limit (`cell_max_inline_body`).
+/// Errors when the configuration cannot replicate safely; cell nodes must
+/// refuse to start then.
+pub fn cell_body_limits(
+    internal_body_limit: usize,
+    frame_payload_limit: usize,
+) -> Result<CellBodyLimits, String> {
+    cell_body_limits_for(
+        configured_max_epoch_bytes(),
+        internal_body_limit,
+        frame_payload_limit,
+    )
+}
+
+pub fn cell_body_limits_for(
+    max_epoch_bytes: usize,
+    internal_body_limit: usize,
+    frame_payload_limit: usize,
+) -> Result<CellBodyLimits, String> {
+    if max_epoch_bytes > MAX_DECODE_EPOCH_BYTES {
+        return Err(format!(
+            "BETTERMQ_MAX_REPLICATION_EPOCH_BYTES={max_epoch_bytes} exceeds the replication decode cap of {MAX_DECODE_EPOCH_BYTES} bytes"
+        ));
+    }
+    if max_epoch_bytes > internal_body_limit {
+        return Err(format!(
+            "BETTERMQ_MAX_REPLICATION_EPOCH_BYTES={max_epoch_bytes} exceeds the internal HTTP body limit of {internal_body_limit} bytes (BETTERMQ_MAX_HTTP_BODY_BYTES)"
+        ));
+    }
+    let overhead = FIXED_HEADER_LEN
+        + EPOCH_NAME_BUDGET
+        + EPOCH_FRAME_PREFIX
+        + FRAME_FIXED_BYTES
+        + broker_proto::record::MAX_FRAME_HEADER_BYTES;
+    let max_frame_body = max_epoch_bytes
+        .saturating_sub(overhead)
+        .min(frame_payload_limit);
+    let max_inline_body = max_frame_body
+        .checked_sub(DLQ_ENVELOPE_ALLOWANCE)
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| {
+            format!(
+                "BETTERMQ_MAX_REPLICATION_EPOCH_BYTES={max_epoch_bytes} leaves no room for a message body (needs more than {} bytes of frame, epoch and DLQ-envelope overhead)",
+                overhead + DLQ_ENVELOPE_ALLOWANCE
+            )
+        })?;
+    Ok(CellBodyLimits {
+        max_epoch_bytes,
+        max_frame_body,
+        max_inline_body,
+    })
+}
+
+/// Split consecutive frames into epochs that each encode within
+/// `max_epoch_bytes` and [`MAX_EPOCH_RECORDS`]. Every range holds at least one
+/// frame; a single frame larger than the budget gets a range of its own (and
+/// is rejected by the sender), which pre-append body checks prevent.
+pub fn epoch_frame_ranges(
+    frame_lens: &[usize],
+    tenant_len: usize,
+    topic_len: usize,
+    max_epoch_bytes: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let header = FIXED_HEADER_LEN + tenant_len + topic_len;
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = header;
+    for (index, len) in frame_lens.iter().enumerate() {
+        let cost = EPOCH_FRAME_PREFIX + len;
+        let count = index - start;
+        if count > 0 && (bytes + cost > max_epoch_bytes || count >= MAX_EPOCH_RECORDS) {
+            ranges.push(start..index);
+            start = index;
+            bytes = header;
+        }
+        bytes += cost;
+    }
+    if start < frame_lens.len() {
+        ranges.push(start..frame_lens.len());
+    }
+    ranges
+}
+
+/// Byte budget for frames in one catch-up page (stays below the decoder cap).
+pub fn max_catchup_page_bytes() -> usize {
+    MAX_DECODE_EPOCH_BYTES - CATCHUP_HEADER_LEN_BASE - MAX_CATCHUP_RECORDS * 12
+}
 
 #[derive(Debug, Error)]
 pub enum ReplicateError {
@@ -353,6 +498,8 @@ pub struct ReplicateOutcome {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ReplicaProgress {
     pub peer_id: Uuid,
+    /// Replication stream: the logical topic of a V1 partition log, or empty
+    /// for a V2 physical shard (whose log carries many topics).
     pub topic: String,
     pub partition: u32,
     pub durable_hwm: u64,
@@ -361,6 +508,10 @@ pub struct ReplicaProgress {
     pub in_sync: bool,
     pub last_success_ms: Option<u64>,
     pub consecutive_failures: u64,
+    /// Last time this stream was updated (success or failure).
+    pub last_update_ms: u64,
+    /// Follower log end reported by its last position conflict.
+    pub log_end: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -381,6 +532,8 @@ fn default_catchup_max() -> usize {
 pub struct ReplicateCatchUpResponse {
     pub frames: Vec<ReplicateAppendRequest>,
     pub committed_hwm: u64,
+    #[serde(default)]
+    pub base_offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,6 +547,9 @@ pub struct ReplicateCatchUpRange {
     pub partition: u32,
     pub leader_generation: u64,
     pub committed_hwm: u64,
+    /// First offset the source still retains; frames below it were
+    /// collected by retention and cannot be served.
+    pub base_offset: u64,
     pub frames: Vec<CatchUpFrame>,
 }
 
@@ -404,14 +560,16 @@ impl ReplicateCatchUpRange {
                 "catch-up range has too many records".into(),
             ));
         }
-        let total = self
-            .frames
-            .iter()
-            .try_fold(CATCHUP_HEADER_LEN, |size, frame| {
-                size.checked_add(12)
-                    .and_then(|value| value.checked_add(frame.bytes.len()))
-                    .ok_or_else(|| ReplicateError::InvalidEpoch("catch-up length overflow".into()))
-            })?;
+        let (version, header_len) = if self.base_offset > 0 {
+            (CATCHUP_VERSION_BASE, CATCHUP_HEADER_LEN_BASE)
+        } else {
+            (CATCHUP_VERSION, CATCHUP_HEADER_LEN)
+        };
+        let total = self.frames.iter().try_fold(header_len, |size, frame| {
+            size.checked_add(12)
+                .and_then(|value| value.checked_add(frame.bytes.len()))
+                .ok_or_else(|| ReplicateError::InvalidEpoch("catch-up length overflow".into()))
+        })?;
         if total > MAX_DECODE_EPOCH_BYTES {
             return Err(ReplicateError::EpochTooLarge {
                 bytes: total,
@@ -420,12 +578,15 @@ impl ReplicateCatchUpRange {
         }
         let mut output = Vec::with_capacity(total);
         output.extend_from_slice(&CATCHUP_MAGIC);
-        output.extend_from_slice(&CATCHUP_VERSION.to_be_bytes());
+        output.extend_from_slice(&version.to_be_bytes());
         output.extend_from_slice(&0u16.to_be_bytes());
         output.extend_from_slice(&self.partition.to_be_bytes());
         output.extend_from_slice(&self.leader_generation.to_be_bytes());
         output.extend_from_slice(&self.committed_hwm.to_be_bytes());
         output.extend_from_slice(&(self.frames.len() as u32).to_be_bytes());
+        if version == CATCHUP_VERSION_BASE {
+            output.extend_from_slice(&self.base_offset.to_be_bytes());
+        }
         for frame in &self.frames {
             let len = u32::try_from(frame.bytes.len())
                 .map_err(|_| ReplicateError::InvalidEpoch("catch-up frame too large".into()))?;
@@ -448,11 +609,17 @@ impl ReplicateCatchUpRange {
                 "invalid catch-up range header".into(),
             ));
         }
-        if read_u16(body, 4)? != CATCHUP_VERSION {
-            return Err(ReplicateError::InvalidEpoch(
-                "unsupported catch-up range version".into(),
-            ));
-        }
+        let (header_len, base_offset) = match read_u16(body, 4)? {
+            CATCHUP_VERSION => (CATCHUP_HEADER_LEN, 0),
+            CATCHUP_VERSION_BASE if body.len() >= CATCHUP_HEADER_LEN_BASE => {
+                (CATCHUP_HEADER_LEN_BASE, read_u64(body, 32)?)
+            }
+            _ => {
+                return Err(ReplicateError::InvalidEpoch(
+                    "unsupported catch-up range version".into(),
+                ))
+            }
+        };
         let partition = read_u32(body, 8)?;
         let leader_generation = read_u64(body, 12)?;
         let committed_hwm = read_u64(body, 20)?;
@@ -462,7 +629,7 @@ impl ReplicateCatchUpRange {
                 "catch-up record count exceeds limit".into(),
             ));
         }
-        let mut cursor = CATCHUP_HEADER_LEN;
+        let mut cursor = header_len;
         let mut frames = Vec::with_capacity(count);
         for _ in 0..count {
             let offset = read_u64(body, cursor)?;
@@ -489,6 +656,7 @@ impl ReplicateCatchUpRange {
             partition,
             leader_generation,
             committed_hwm,
+            base_offset,
             frames,
         })
     }
@@ -524,6 +692,7 @@ impl ReplicateCatchUpRange {
             partition,
             leader_generation,
             committed_hwm: response.committed_hwm,
+            base_offset: response.base_offset,
             frames,
         })
     }
@@ -531,28 +700,24 @@ impl ReplicateCatchUpRange {
 
 #[derive(Clone)]
 pub struct ReplicationClient {
-    http: reqwest::Client,
-    cluster: ClusterConfig,
-    in_flight: Arc<Semaphore>,
-    max_epoch_bytes: usize,
-    progress: SharedReplicaProgress,
+    pub(crate) http: reqwest::Client,
+    pub(crate) cluster: ClusterConfig,
+    pub(crate) in_flight: Arc<Semaphore>,
+    pub(crate) max_epoch_bytes: usize,
+    pub(crate) progress: SharedReplicaProgress,
     telemetry: Arc<crate::telemetry::ReplicationTelemetry>,
-    runtime: Option<broker_raft_meta::ClusterRuntime>,
+    pub(crate) runtime: Option<broker_raft_meta::ClusterRuntime>,
+    physical_shards: bool,
+    pub(crate) repair: Arc<crate::repair::RepairRegistry>,
+    fence: Arc<crate::repair::FollowerFence>,
 }
 
 impl ReplicationClient {
     pub fn new(cluster: ClusterConfig) -> Self {
-        let max_epoch_bytes = env_bytes(
-            "BETTERMQ_MAX_REPLICATION_EPOCH_BYTES",
-            DEFAULT_MAX_EPOCH_BYTES,
-        )
-        .min(Semaphore::MAX_PERMITS);
-        let max_in_flight = env_bytes(
-            "BETTERMQ_MAX_REPLICATION_IN_FLIGHT_BYTES",
-            DEFAULT_MAX_IN_FLIGHT_BYTES,
-        )
-        .max(max_epoch_bytes)
-        .min(Semaphore::MAX_PERMITS);
+        let max_epoch_bytes = configured_max_epoch_bytes();
+        let max_in_flight = configured_max_in_flight_bytes()
+            .max(max_epoch_bytes)
+            .min(Semaphore::MAX_PERMITS);
         Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
@@ -564,7 +729,36 @@ impl ReplicationClient {
             progress: Arc::new(Mutex::new(HashMap::new())),
             telemetry: Arc::new(crate::telemetry::ReplicationTelemetry::default()),
             runtime: None,
+            physical_shards: false,
+            repair: Arc::default(),
+            fence: Arc::default(),
         }
+    }
+
+    /// Follower-side truncation fence for this node's replicas.
+    pub fn follower_fence(&self) -> &crate::repair::FollowerFence {
+        &self.fence
+    }
+
+    /// V2 layouts keep one log per physical shard, so progress is tracked per
+    /// shard and peer rather than per logical topic.
+    pub fn with_physical_shards(mut self, physical: bool) -> Self {
+        self.physical_shards = physical;
+        self
+    }
+
+    /// Progress stream for an epoch of `topic`.
+    pub fn progress_stream(&self, topic: &str) -> String {
+        if self.physical_shards {
+            String::new()
+        } else {
+            topic.to_string()
+        }
+    }
+
+    /// Encoded-size cap of one replication epoch.
+    pub fn max_epoch_bytes(&self) -> usize {
+        self.max_epoch_bytes
     }
 
     pub fn with_runtime(mut self, runtime: broker_raft_meta::ClusterRuntime) -> Self {
@@ -572,11 +766,15 @@ impl ReplicationClient {
         self
     }
 
-    fn targets_for_shard(&self, shard: u32) -> (Vec<broker_raft_meta::NodeConfig>, usize) {
+    pub(crate) fn targets_for_shard(&self, shard: u32) -> broker_raft_meta::ReplicationTargets {
         if let Some(runtime) = &self.runtime {
             return runtime.replication_targets(shard);
         }
-        (self.cluster.peer_nodes(), self.cluster.quorum_size())
+        broker_raft_meta::ReplicationTargets {
+            replicas: self.cluster.peer_nodes(),
+            learners: Vec::new(),
+            min_isr: self.cluster.quorum_size(),
+        }
     }
 
     pub fn with_config(cluster: ClusterConfig) -> Self {
@@ -611,7 +809,7 @@ impl ReplicationClient {
             .map(|_| ())
     }
 
-    fn apply_cluster_secret(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    pub(crate) fn apply_cluster_secret(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Ok(secret) = std::env::var("BETTERMQ_CLUSTER_SECRET") {
             if !secret.trim().is_empty() {
                 return req.header("x-bettermq-cluster-secret", secret);
@@ -680,29 +878,38 @@ impl ReplicationClient {
                 .map_err(|_| ReplicateError::Closed)?,
         );
         let encoded = bytes::Bytes::from(req.encode_binary()?);
-        let (peers, quorum) = self.targets_for_shard(req.partition);
+        let targets = self.targets_for_shard(req.partition);
+        let quorum = targets.min_isr;
+        let stream = self.progress_stream(&req.topic);
+        let peers: Vec<_> = targets
+            .replicas
+            .into_iter()
+            .map(|peer| (peer, true))
+            .chain(targets.learners.into_iter().map(|peer| (peer, false)))
+            .collect();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(peers.len().max(1));
-        for peer in peers {
-            let url = format!(
-                "{}/internal/v1/replicate/batch",
-                peer.addr.trim_end_matches('/')
-            );
+        for (peer, replica) in peers {
+            let url = format!("{}/internal/v1/replicate/batch", peer.internal_base());
             let http = self.http.clone();
             let body = encoded.clone();
             let tx = tx.clone();
             let epoch_permit = Arc::clone(&epoch_permit);
-            let progress = Arc::clone(&self.progress);
-            let topic = req.topic.clone();
+            let client = self.clone();
+            let stream = stream.clone();
             let partition = req.partition;
             let leader_epoch = req.leader_epoch;
-            let peer_id = peer.id;
+            // A peer that is out of sync or under repair still receives the
+            // push, but only a completed repair makes it count again.
+            // Learners are caught up the same way but never count.
+            let counted = replica && self.counts_toward_quorum(&stream, partition, peer.id);
             tokio::spawn(async move {
+                let peer_id = peer.id;
                 let builder = Self::apply_cluster_secret(
                     http.post(&url)
                         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
                         .body(body),
                 );
-                let ok = match builder.send().await {
+                let outcome = match builder.send().await {
                     Ok(resp) if resp.status().is_success() => {
                         match resp.json::<ReplicateBatchAck>().await {
                             Ok(response)
@@ -711,16 +918,7 @@ impl ReplicationClient {
                                     && response.leader_epoch == leader_epoch
                                     && response.durable_hwm >= required_hwm =>
                             {
-                                update_progress(
-                                    &progress,
-                                    &topic,
-                                    partition,
-                                    peer_id,
-                                    required_hwm,
-                                    response.durable_hwm,
-                                    true,
-                                );
-                                true
+                                PushOutcome::Durable(response.durable_hwm)
                             }
                             Ok(response) => {
                                 warn!(
@@ -730,61 +928,61 @@ impl ReplicationClient {
                                     actual_hwm = response.durable_hwm,
                                     "replicate peer returned non-durable or mismatched ack"
                                 );
-                                update_progress(
-                                    &progress,
-                                    &topic,
-                                    partition,
-                                    peer_id,
-                                    required_hwm,
-                                    response.durable_hwm,
-                                    false,
-                                );
-                                false
+                                PushOutcome::Short(response.durable_hwm)
                             }
                             Err(e) => {
                                 warn!(error = %e, url = %url, "replicate peer returned invalid ack");
-                                update_progress(
-                                    &progress,
-                                    &topic,
-                                    partition,
-                                    peer_id,
-                                    required_hwm,
-                                    0,
-                                    false,
-                                );
-                                false
+                                PushOutcome::Failed
                             }
+                        }
+                    }
+                    Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                        match resp.json::<crate::repair::ReplicaPositionConflict>().await {
+                            Ok(conflict) if conflict.node_id == peer_id => {
+                                debug!(
+                                    url = %url,
+                                    log_end = conflict.log_end,
+                                    want = conflict.want,
+                                    "replicate peer is at a different position; scheduling repair"
+                                );
+                                PushOutcome::Conflict(conflict.log_end)
+                            }
+                            _ => PushOutcome::Failed,
                         }
                     }
                     Ok(resp) => {
                         warn!(status = %resp.status(), url = %url, "replicate batch peer rejected");
-                        update_progress(
-                            &progress,
-                            &topic,
-                            partition,
-                            peer_id,
-                            required_hwm,
-                            0,
-                            false,
-                        );
-                        false
+                        PushOutcome::Failed
                     }
                     Err(e) => {
                         warn!(error = %e, url = %url, "replicate batch peer failed");
-                        update_progress(
-                            &progress,
-                            &topic,
-                            partition,
-                            peer_id,
-                            required_hwm,
-                            0,
-                            false,
-                        );
-                        false
+                        PushOutcome::Failed
                     }
                 };
+                let durable = matches!(outcome, PushOutcome::Durable(_));
+                let (durable_hwm, log_end) = match outcome {
+                    PushOutcome::Durable(hwm) | PushOutcome::Short(hwm) => (hwm, None),
+                    PushOutcome::Conflict(log_end) => (0, Some(log_end)),
+                    PushOutcome::Failed => (0, None),
+                };
+                update_progress(
+                    &client.progress,
+                    ProgressUpdate {
+                        stream: &stream,
+                        partition,
+                        peer_id,
+                        leader_hwm: required_hwm,
+                        durable_hwm,
+                        success: durable,
+                        may_mark_in_sync: counted,
+                        log_end,
+                    },
+                );
+                if !durable {
+                    client.schedule_repair(&stream, partition, peer);
+                }
                 drop(epoch_permit);
-                let _ = tx.send(ok).await;
+                let _ = tx.send(durable && counted).await;
             });
         }
         drop(tx);
@@ -838,19 +1036,37 @@ impl ReplicationClient {
     }
 
     pub fn replica_progress(&self) -> Vec<ReplicaProgress> {
-        let mut progress: Vec<_> = self
+        let mut all = self
             .progress
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cutoff = now_ms().saturating_sub(PROGRESS_RETENTION_MS);
+        all.retain(|_, entry| entry.last_update_ms >= cutoff);
+        let mut progress: Vec<_> = all.values().cloned().collect();
+        drop(all);
         progress.sort_by_key(|p| (p.partition, p.topic.clone(), p.peer_id));
         progress
     }
 
+    /// ISR and lag telemetry. Only peers that are current replication targets
+    /// of a shard count toward its ISR.
     pub fn telemetry_snapshot(&self) -> crate::telemetry::ReplicationTelemetrySnapshot {
-        let progress = self.replica_progress();
+        let mut progress = self.replica_progress();
+        if self.runtime.is_some() {
+            let mut targets: HashMap<u32, Vec<Uuid>> = HashMap::new();
+            progress.retain(|entry| {
+                targets
+                    .entry(entry.partition)
+                    .or_insert_with(|| {
+                        self.targets_for_shard(entry.partition)
+                            .replicas
+                            .into_iter()
+                            .map(|peer| peer.id)
+                            .collect()
+                    })
+                    .contains(&entry.peer_id)
+            });
+        }
         self.telemetry.snapshot(&progress)
     }
 
@@ -918,47 +1134,167 @@ fn env_bytes(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_millis() as u64
 }
 
-fn update_progress(
+enum PushOutcome {
+    Durable(u64),
+    Short(u64),
+    Conflict(u64),
+    Failed,
+}
+
+pub(crate) struct ProgressUpdate<'a> {
+    pub stream: &'a str,
+    pub partition: u32,
+    pub peer_id: Uuid,
+    pub leader_hwm: u64,
+    pub durable_hwm: u64,
+    pub success: bool,
+    /// A hot-path ack only keeps an in-sync peer in sync; turning an
+    /// out-of-sync peer back in sync is reserved for a completed repair.
+    pub may_mark_in_sync: bool,
+    pub log_end: Option<u64>,
+}
+
+pub(crate) fn update_progress(
     progress: &Mutex<HashMap<(String, u32, Uuid), ReplicaProgress>>,
-    topic: &str,
-    partition: u32,
-    peer_id: Uuid,
-    leader_hwm: u64,
-    durable_hwm: u64,
-    success: bool,
-) {
-    let key = (topic.to_string(), partition, peer_id);
+    update: ProgressUpdate<'_>,
+) -> bool {
+    let ProgressUpdate {
+        stream,
+        partition,
+        peer_id,
+        leader_hwm,
+        durable_hwm,
+        success,
+        may_mark_in_sync,
+        log_end,
+    } = update;
+    let key = (stream.to_string(), partition, peer_id);
     let mut all = progress
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let entry = all.entry(key).or_insert_with(|| ReplicaProgress {
         peer_id,
-        topic: topic.to_string(),
+        topic: stream.to_string(),
         partition,
         durable_hwm: 0,
         leader_hwm,
         lag: leader_hwm,
-        in_sync: false,
+        // A peer is presumed in sync until the first failed push.
+        in_sync: true,
         last_success_ms: None,
         consecutive_failures: 0,
+        last_update_ms: 0,
+        log_end: None,
     });
-    entry.leader_hwm = leader_hwm;
+    let was_in_sync = entry.in_sync;
+    entry.last_update_ms = now_ms();
+    // Concurrent epochs can complete out of order; an older epoch's ack must
+    // not hide a failure of a newer one, so the leader frontier only grows.
+    entry.leader_hwm = entry.leader_hwm.max(leader_hwm);
     if success {
         entry.durable_hwm = entry.durable_hwm.max(durable_hwm);
         entry.last_success_ms = Some(now_ms());
         entry.consecutive_failures = 0;
+        entry.log_end = None;
     } else {
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        if log_end.is_some() {
+            entry.log_end = log_end;
+        }
     }
-    entry.lag = leader_hwm.saturating_sub(entry.durable_hwm);
-    entry.in_sync = success && entry.durable_hwm >= leader_hwm;
+    entry.lag = entry.leader_hwm.saturating_sub(entry.durable_hwm);
+    entry.in_sync =
+        success && may_mark_in_sync && was_in_sync && entry.durable_hwm >= entry.leader_hwm;
+    entry.in_sync
+}
+
+impl ReplicationClient {
+    /// Whether a durable ack from `peer` counts toward quorum right now.
+    pub(crate) fn counts_toward_quorum(&self, stream: &str, partition: u32, peer: Uuid) -> bool {
+        let key = (stream.to_string(), partition, peer);
+        if self.repair.is_active(&key) {
+            return false;
+        }
+        self.progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .is_none_or(|entry| entry.in_sync)
+    }
+
+    pub(crate) fn record_repair_progress(
+        &self,
+        stream: &str,
+        partition: u32,
+        peer_id: Uuid,
+        leader_hwm: u64,
+        durable_hwm: u64,
+    ) {
+        update_progress(
+            &self.progress,
+            ProgressUpdate {
+                stream,
+                partition,
+                peer_id,
+                leader_hwm,
+                durable_hwm,
+                success: true,
+                may_mark_in_sync: false,
+                log_end: None,
+            },
+        );
+    }
+
+    /// Mark a peer in sync after repair verified it holds the leader's log
+    /// through `leader_end`. Returns false if pushes have moved the leader
+    /// frontier beyond what was verified, so repair must continue.
+    pub(crate) fn mark_repaired(
+        &self,
+        stream: &str,
+        partition: u32,
+        peer_id: Uuid,
+        leader_end: u64,
+        durable_hwm: u64,
+    ) -> bool {
+        let mut all = self
+            .progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = all
+            .entry((stream.to_string(), partition, peer_id))
+            .or_insert_with(|| ReplicaProgress {
+                peer_id,
+                topic: stream.to_string(),
+                partition,
+                durable_hwm: 0,
+                leader_hwm: leader_end,
+                lag: leader_end,
+                in_sync: false,
+                last_success_ms: None,
+                consecutive_failures: 0,
+                last_update_ms: 0,
+                log_end: None,
+            });
+        let now = now_ms();
+        entry.last_update_ms = now;
+        entry.last_success_ms = Some(now);
+        entry.consecutive_failures = 0;
+        entry.log_end = None;
+        // Repair may have truncated the follower, so its durable HWM is set,
+        // not maxed.
+        entry.durable_hwm = durable_hwm;
+        entry.leader_hwm = entry.leader_hwm.max(leader_end);
+        entry.lag = entry.leader_hwm.saturating_sub(entry.durable_hwm);
+        entry.in_sync = entry.durable_hwm >= entry.leader_hwm;
+        entry.in_sync
+    }
 }
 
 #[cfg(test)]
@@ -1010,6 +1346,7 @@ mod tests {
             partition: 7,
             leader_generation: 12,
             committed_hwm: 45,
+            base_offset: 0,
             frames: vec![
                 CatchUpFrame {
                     offset: 42,
@@ -1030,9 +1367,152 @@ mod tests {
     }
 
     #[test]
+    fn cell_inline_limit_leaves_room_for_a_worst_case_frame() {
+        let limits = cell_body_limits_for(16 * 1024 * 1024, 64 * 1024 * 1024, usize::MAX).unwrap();
+        // Worst case: largest header and longest tenant/topic names.
+        let epoch = FIXED_HEADER_LEN
+            + EPOCH_NAME_BUDGET
+            + EPOCH_FRAME_PREFIX
+            + FRAME_FIXED_BYTES
+            + broker_proto::record::MAX_FRAME_HEADER_BYTES
+            + limits.max_frame_body;
+        assert_eq!(epoch, limits.max_epoch_bytes);
+        assert!(limits.max_inline_body > 14 * 1024 * 1024);
+        // The frame payload cap also binds, and the DLQ allowance still holds.
+        let capped = cell_body_limits_for(16 * 1024 * 1024, 64 * 1024 * 1024, 100_000).unwrap();
+        assert_eq!(capped.max_frame_body, 100_000);
+        assert_eq!(capped.max_inline_body, 100_000 - DLQ_ENVELOPE_ALLOWANCE);
+        assert!(cell_body_limits_for(16 * 1024 * 1024, 64 * 1024 * 1024, 1_000).is_err());
+        // Unsafe configurations refuse.
+        assert!(cell_body_limits_for(MAX_DECODE_EPOCH_BYTES + 1, usize::MAX, usize::MAX).is_err());
+        assert!(cell_body_limits_for(16 * 1024 * 1024, 8 * 1024 * 1024, usize::MAX).is_err());
+        assert!(cell_body_limits_for(1024 * 1024, usize::MAX, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn every_accepted_body_stays_dead_letterable() {
+        for epoch in [2 * 1024 * 1024, 16 * 1024 * 1024, MAX_DECODE_EPOCH_BYTES] {
+            for frame_cap in [usize::MAX, 4 * 1024 * 1024] {
+                let Ok(limits) = cell_body_limits_for(epoch, usize::MAX, frame_cap) else {
+                    continue;
+                };
+                // A body at the ingest limit, wrapped in a DLQ envelope of up
+                // to the allowance, still fits the epoch-derived frame limit.
+                assert!(
+                    limits.max_inline_body + DLQ_ENVELOPE_ALLOWANCE <= limits.max_frame_body,
+                    "{limits:?}"
+                );
+                let dlq_frame = FIXED_HEADER_LEN
+                    + EPOCH_NAME_BUDGET
+                    + EPOCH_FRAME_PREFIX
+                    + FRAME_FIXED_BYTES
+                    + broker_proto::record::MAX_FRAME_HEADER_BYTES
+                    + limits.max_inline_body
+                    + DLQ_ENVELOPE_ALLOWANCE;
+                assert!(dlq_frame <= limits.max_epoch_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn epoch_ranges_respect_byte_budget_and_keep_order() {
+        let lens = vec![400, 400, 400, 900, 10, 10];
+        let budget = FIXED_HEADER_LEN + 3 + 4 + (EPOCH_FRAME_PREFIX + 400) * 2;
+        let ranges = epoch_frame_ranges(&lens, 3, 4, budget);
+        assert_eq!(ranges, vec![0..2, 2..3, 3..4, 4..6]);
+        for range in &ranges {
+            let bytes: usize = FIXED_HEADER_LEN
+                + 7
+                + lens[range.clone()]
+                    .iter()
+                    .map(|len| EPOCH_FRAME_PREFIX + len)
+                    .sum::<usize>();
+            assert!(bytes <= budget || range.len() == 1);
+        }
+        assert!(epoch_frame_ranges(&[], 0, 0, budget).is_empty());
+        let many = vec![1usize; MAX_EPOCH_RECORDS + 5];
+        let ranges = epoch_frame_ranges(&many, 0, 0, usize::MAX);
+        assert_eq!(
+            ranges,
+            vec![
+                0..MAX_EPOCH_RECORDS,
+                MAX_EPOCH_RECORDS..MAX_EPOCH_RECORDS + 5
+            ]
+        );
+    }
+
+    #[test]
+    fn split_epochs_of_large_inline_frames_always_encode_within_the_cap() {
+        let max_epoch = 16 * 1024 * 1024;
+        let limits = cell_body_limits_for(max_epoch, usize::MAX, usize::MAX).unwrap();
+        // Bodies from 200 KiB up to the cell limit, in a mixed order.
+        let sizes: Vec<usize> = (0..40)
+            .map(|index| {
+                let span = limits.max_inline_body - 200 * 1024;
+                200 * 1024 + (index * 7_919 * 4_099) % span
+            })
+            .chain([limits.max_inline_body, 200 * 1024, limits.max_inline_body])
+            .collect();
+        let frames: Vec<Vec<u8>> = sizes
+            .iter()
+            .map(|size| vec![0u8; FRAME_FIXED_BYTES + 2048 + size])
+            .collect();
+        let lens: Vec<usize> = frames.iter().map(Vec::len).collect();
+        let tenant = "default".to_string();
+        let topic = "jobs".to_string();
+        let ranges = epoch_frame_ranges(&lens, tenant.len(), topic.len(), max_epoch);
+        let mut next = 0usize;
+        for range in ranges {
+            assert_eq!(range.start, next, "ranges keep offset order");
+            next = range.end;
+            let request = ReplicateBatchRequest::new(
+                tenant.clone(),
+                topic.clone(),
+                0,
+                Uuid::nil(),
+                1,
+                range.start as u64,
+                frames[range].to_vec(),
+            )
+            .unwrap();
+            assert!(request.binary_len().unwrap() <= max_epoch);
+        }
+        assert_eq!(next, frames.len());
+    }
+
+    #[test]
+    fn catch_up_range_carries_the_retained_base() {
+        let range = ReplicateCatchUpRange {
+            partition: 2,
+            leader_generation: 3,
+            committed_hwm: 900,
+            base_offset: 512,
+            frames: vec![CatchUpFrame {
+                offset: 512,
+                bytes: b"first retained".to_vec(),
+            }],
+        };
+        let encoded = range.encode_binary().unwrap();
+        assert_eq!(read_u16(&encoded, 4).unwrap(), CATCHUP_VERSION_BASE);
+        assert_eq!(
+            ReplicateCatchUpRange::decode_binary(&encoded).unwrap(),
+            range
+        );
+        // Without a collected prefix the v1 wire format is unchanged.
+        let v1 = ReplicateCatchUpRange {
+            base_offset: 0,
+            ..range
+        };
+        let encoded = v1.encode_binary().unwrap();
+        assert_eq!(read_u16(&encoded, 4).unwrap(), CATCHUP_VERSION);
+        assert_eq!(ReplicateCatchUpRange::decode_binary(&encoded).unwrap(), v1);
+    }
+
+    #[test]
     fn legacy_catch_up_json_remains_decodable() {
         let legacy = ReplicateCatchUpResponse {
             committed_hwm: 2,
+            base_offset: 0,
             frames: vec![ReplicateAppendRequest {
                 tenant_id: "tenant".into(),
                 topic: "jobs".into(),
@@ -1053,6 +1533,7 @@ mod tests {
             partition: 1,
             leader_generation: 1,
             committed_hwm: 0,
+            base_offset: 0,
             frames: Vec::new(),
         };
         let mut encoded = range.encode_binary().unwrap();
@@ -1063,12 +1544,63 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn v2_progress_is_per_physical_shard_and_out_of_order_acks_do_not_hide_lag() {
+        let peer = Uuid::new_v4();
+        let client = ReplicationClient::new(ClusterConfig {
+            cluster_id: Uuid::new_v4(),
+            nodes: Vec::new(),
+            node_id: Uuid::new_v4(),
+            generation: 1,
+            hash_version: 1,
+        })
+        .with_physical_shards(true);
+        // Two logical topics routed to physical shard 4 share one stream.
+        let push = |stream: &str, leader_hwm: u64, durable_hwm: u64, success: bool| {
+            update_progress(
+                &client.progress,
+                ProgressUpdate {
+                    stream,
+                    partition: 4,
+                    peer_id: peer,
+                    leader_hwm,
+                    durable_hwm,
+                    success,
+                    may_mark_in_sync: true,
+                    log_end: None,
+                },
+            )
+        };
+        for topic in ["orders", "billing"] {
+            push(&client.progress_stream(topic), 10, 10, true);
+        }
+        assert_eq!(client.replica_progress().len(), 1);
+        assert_eq!(client.telemetry_snapshot().shards[0].isr_members, 2);
+
+        // Epoch ending at 20 fails, then the older epoch ending at 15 acks.
+        let stream = client.progress_stream("orders");
+        push(&stream, 20, 0, false);
+        push(&stream, 15, 15, true);
+        let progress = client.replica_progress();
+        assert!(!progress[0].in_sync);
+        assert_eq!(progress[0].lag, 5);
+        assert_eq!(client.telemetry_snapshot().shards[0].isr_members, 1);
+        // Even a full ack does not restore it: only a completed repair does.
+        assert!(!push(&stream, 20, 20, true));
+        assert!(client.mark_repaired(&stream, 4, peer, 20, 20));
+        assert_eq!(client.telemetry_snapshot().shards[0].isr_members, 2);
+
+        let v1 = ReplicationClient::new(client.cluster.clone());
+        assert_eq!(v1.progress_stream("orders"), "orders");
+    }
+
     #[tokio::test]
     async fn single_node_quorum_updates_native_telemetry() {
         let node_id = Uuid::new_v4();
         let client = ReplicationClient::new(ClusterConfig {
             cluster_id: Uuid::new_v4(),
             nodes: vec![broker_raft_meta::NodeConfig {
+                internal_url: None,
                 id: node_id,
                 addr: "http://127.0.0.1:8080".into(),
             }],
@@ -1089,6 +1621,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replication_calls_private_url_and_falls_back_for_legacy_members() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for private in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let leader = Uuid::new_v4();
+            let follower = Uuid::new_v4();
+            let req = request(vec![b"frame".to_vec()]);
+            let hwm = req.end_offset().unwrap();
+            let ack = serde_json::to_string(&ReplicateBatchAck {
+                node_id: follower,
+                partition: req.partition,
+                leader_epoch: req.leader_epoch,
+                durable_hwm: hwm,
+            })
+            .unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut received = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    received.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = received.windows(4).position(|s| s == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&received[..end]);
+                        assert!(headers.starts_with("POST /internal/v1/replicate/batch "));
+                        let size = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (key, value) = line.split_once(':')?;
+                                key.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        if received.len() >= end + 4 + size {
+                            break;
+                        }
+                    }
+                }
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ack}", ack.len()).as_bytes()).await.unwrap();
+            });
+            let client = ReplicationClient::new(ClusterConfig {
+                cluster_id: Uuid::new_v4(),
+                node_id: leader,
+                generation: 1,
+                hash_version: 1,
+                nodes: vec![
+                    broker_raft_meta::NodeConfig {
+                        id: leader,
+                        addr: "http://127.0.0.1:1".into(),
+                        internal_url: None,
+                    },
+                    broker_raft_meta::NodeConfig {
+                        id: follower,
+                        addr: if private {
+                            "http://127.0.0.1:1".into()
+                        } else {
+                            base.clone()
+                        },
+                        internal_url: private.then_some(base),
+                    },
+                ],
+            });
+            let result =
+                tokio::time::timeout(Duration::from_secs(3), client.replicate_batch(req, hwm))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(result.durable_acks, 2);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn local_fsync_overlaps_replica_fanout() {
         let leader = Uuid::new_v4();
         let follower = Uuid::new_v4();
@@ -1096,10 +1703,12 @@ mod tests {
             cluster_id: Uuid::new_v4(),
             nodes: vec![
                 broker_raft_meta::NodeConfig {
+                    internal_url: None,
                     id: leader,
                     addr: "http://127.0.0.1:1".into(),
                 },
                 broker_raft_meta::NodeConfig {
+                    internal_url: None,
                     id: follower,
                     addr: "http://127.0.0.1:1".into(),
                 },

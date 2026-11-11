@@ -51,8 +51,24 @@ async fn snapshot(
         .map_err(|error| (StatusCode::CONFLICT, error.to_string()))
 }
 
+async fn command(
+    State(controller): State<OpenRaftController>,
+    headers: axum::http::HeaderMap,
+    Json(command): Json<ControllerCommand>,
+) -> Result<Json<broker_raft_meta::ControllerCommandResponse>, ApiError> {
+    let applied_index_only = headers
+        .get(broker_raft_meta::CONTROLLER_RESPONSE_HEADER)
+        .is_some_and(|value| value == broker_raft_meta::CONTROLLER_RESPONSE_APPLIED_INDEX);
+    controller
+        .serve_forwarded(command, applied_index_only)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))
+}
+
 fn app(controller: OpenRaftController) -> Router {
     Router::new()
+        .route("/internal/v1/controller/command", post(command))
         .route("/internal/v1/controller/raft/vote", post(vote))
         .route("/internal/v1/controller/raft/append", post(append))
         .route("/internal/v1/controller/raft/snapshot", post(snapshot))
@@ -61,26 +77,36 @@ fn app(controller: OpenRaftController) -> Router {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_http_cluster_commits_and_snapshots_controller_state() {
+    catalog_cluster(3).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_voter_learner_receives_catalog_and_new_leader_preserves_revisions() {
+    catalog_cluster(4).await;
+}
+
+async fn catalog_cluster(node_count: usize) {
     let mut listeners = Vec::new();
     let mut addresses = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..node_count {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         addresses.push(format!("http://{}", listener.local_addr().unwrap()));
         listeners.push(listener);
     }
-    let ids: Vec<_> = (0..3).map(|_| Uuid::new_v4()).collect();
+    let ids: Vec<_> = (0..node_count).map(|_| Uuid::new_v4()).collect();
     let nodes: Vec<_> = ids
         .iter()
         .enumerate()
         .map(|(index, id)| NodeConfig {
+            internal_url: None,
             id: *id,
             addr: addresses[index].clone(),
         })
         .collect();
     let cluster_id = Uuid::new_v4();
-    let dirs: Vec<_> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+    let dirs: Vec<_> = (0..node_count).map(|_| TempDir::new().unwrap()).collect();
     let mut controllers = Vec::new();
-    for index in 0..3 {
+    for index in 0..node_count {
         let config = ClusterConfig {
             cluster_id,
             nodes: nodes.clone(),
@@ -106,7 +132,7 @@ async fn three_node_http_cluster_commits_and_snapshots_controller_state() {
         })
         .collect();
 
-    let leader = tokio::time::timeout(Duration::from_secs(15), async {
+    let mut leader = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if let Some(controller) = controllers
                 .iter()
@@ -120,8 +146,22 @@ async fn three_node_http_cluster_commits_and_snapshots_controller_state() {
     .await
     .expect("three-node OpenRaft election");
 
+    use broker_raft_meta::catalog::{CatalogKind, CatalogMutation};
+    let id = Uuid::new_v4();
+    let mutation = CatalogMutation {
+        tenant_id: "tenant".into(),
+        kind: CatalogKind::Queue,
+        id,
+        payload_json: serde_json::json!({"id":id,"tenant_id":"tenant","topic":"jobs"}).to_string(),
+        tombstone: false,
+        expected_version: None,
+    };
     let committed = leader
-        .submit(ControllerCommand::AdvanceCatalogEpoch)
+        .submit(ControllerCommand::MutateCatalog {
+            request_fingerprint: None,
+            operation_id: Uuid::new_v4(),
+            mutations: vec![mutation.clone()],
+        })
         .await
         .unwrap();
     assert_eq!(committed.catalog_epoch, 1);
@@ -140,6 +180,65 @@ async fn three_node_http_cluster_commits_and_snapshots_controller_state() {
     .await
     .expect("controller state replicated to all three nodes");
 
+    // A follower forwards to the leader and reads the result from its own
+    // replica once it has applied the entry.
+    let follower = controllers
+        .iter()
+        .find(|controller| !controller.is_leader_with_quorum())
+        .unwrap();
+    let forwarded = follower
+        .submit(ControllerCommand::AdvanceCatalogEpoch)
+        .await
+        .unwrap();
+    assert_eq!(forwarded.catalog_epoch, 2);
+    assert_eq!(follower.state().catalog_epoch, 2);
+
+    // Lose the current leader between mutations. The next leader's barrier must
+    // precede its state read, including when its cached state is still behind.
+    let previous_id = leader.raft().metrics().borrow().id;
+    let old_index = controllers
+        .iter()
+        .position(|c| c.raft().metrics().borrow().id == previous_id)
+        .unwrap();
+    servers[old_index].abort();
+    controllers[old_index].raft().shutdown().await.unwrap();
+    leader = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(next) = controllers
+                .iter()
+                .enumerate()
+                .find(|(index, c)| *index != old_index && c.is_leader_with_quorum())
+            {
+                break next.1.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("new leader after leader loss");
+    let mut updated = mutation.clone();
+    updated.expected_version = Some(1);
+    let updated_state = leader
+        .submit(ControllerCommand::MutateCatalog {
+            request_fingerprint: None,
+            operation_id: Uuid::new_v4(),
+            mutations: vec![updated],
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated_state.catalog_epoch, 3);
+    assert_eq!(updated_state.catalog_records[&mutation.key()].version, 2);
+    let stale = tokio::time::timeout(
+        Duration::from_secs(3),
+        controllers[old_index].submit_local(ControllerCommand::MutateCatalog {
+            request_fingerprint: None,
+            operation_id: Uuid::new_v4(),
+            mutations: vec![mutation.clone()],
+        }),
+    )
+    .await;
+    assert!(!matches!(stale, Ok(Ok(_))));
+
     leader.trigger_snapshot().await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -156,6 +255,7 @@ async fn three_node_http_cluster_commits_and_snapshots_controller_state() {
     for (index, server) in servers.iter().enumerate() {
         if controllers[index].raft().metrics().borrow().id != leader_id {
             server.abort();
+            let _ = controllers[index].raft().shutdown().await;
         }
     }
     tokio::time::timeout(Duration::from_secs(8), async {

@@ -1,7 +1,13 @@
 //! Wire format and shared domain types for BetterMQ.
 
+mod atomic_file;
 pub mod codec;
+pub use atomic_file::write_secret_atomic;
 pub mod epoch;
+pub const SLATE_SINGLE_BROKER: &str =
+    "Slate storage supports a single broker; multi-broker Slate is unsupported";
+/// Documented minimum client retry window; deployments may retain keys longer.
+pub const DEFAULT_DEDUP_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 pub mod paths;
 pub mod record;
 pub mod recover;
@@ -21,7 +27,8 @@ pub use paths::{
     PathSegmentError,
 };
 pub use record::{
-    batch_crc, decode_frame, encode_frame, encode_frame_vec, LogRecord, RecordError, StoredMessage,
+    batch_crc, decode_frame, encode_frame, encode_frame_vec, max_frame_decode_payload_bytes,
+    LogRecord, RecordError, StoredMessage,
 };
 pub use recover::allow_empty_metadata_recovery;
 pub use retry::{RetryBackoff, RetryBackoffKind, RetryDefaults};

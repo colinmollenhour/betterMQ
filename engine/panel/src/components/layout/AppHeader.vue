@@ -5,10 +5,13 @@ import { Button } from "@/components/ui/button";
 import ActionMessage from "@/components/form/ActionMessage.vue";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { useActionStatus } from "@/composables/useActionStatus";
+import { useReadiness } from "@/composables/useReadiness";
+import { isStandalone } from "@/lib/config";
 import { refreshFlows, refreshGroups, refreshQueues } from "@/lib/catalog";
-import { pollCluster, pollHealth, refreshCells, session } from "@/lib/session";
+import { localBrokerSelected, pollCluster, pollHealth, refreshCells, session } from "@/lib/session";
 
 const refreshStatus = useActionStatus();
+const readiness = useReadiness();
 
 async function refreshAll() {
   refreshStatus.reset();
@@ -17,9 +20,7 @@ async function refreshAll() {
       pollHealth(),
       pollCluster(),
       refreshCells(),
-      refreshQueues(),
-      refreshGroups(),
-      refreshFlows(),
+      ...(localBrokerSelected() ? [refreshQueues(), refreshGroups(), refreshFlows()] : []),
     ]);
     refreshStatus.succeed("Refreshed");
   } catch (e) {
@@ -31,14 +32,15 @@ async function refreshAll() {
 <template>
   <header class="flex h-12 shrink-0 items-center gap-2 border-b px-4">
     <SidebarTrigger />
-    <Badge variant="outline" class="font-mono text-xs">0.4.0</Badge>
+    <Badge variant="outline" class="font-mono text-xs" title="Version reported by the local server">{{ session.version || "Version unknown" }}</Badge>
     <Badge
-      :variant="session.healthOk ? 'outline' : 'destructive'"
-      :class="session.healthOk ? 'border-transparent bg-success/15 text-success' : ''"
+      :variant="readiness === 'Not ready' ? 'destructive' : 'outline'"
+      :class="readiness === 'Ready' ? 'border-transparent bg-success/15 text-success' : ''"
       class="text-xs"
     >
-      {{ session.healthOk ? "Healthy" : "down" }}
+      {{ isStandalone() ? 'Panel: ' : '' }}{{ readiness }}
     </Badge>
+    <Badge variant="outline" class="text-xs">{{ session.healthOk ? "Live" : "Liveness unknown" }}</Badge>
     <Badge variant="secondary" class="font-mono text-xs">{{ session.clusterLabel }}</Badge>
     <div class="ml-auto flex items-center gap-2">
       <ActionMessage :error="refreshStatus.error" :ok="refreshStatus.ok" />

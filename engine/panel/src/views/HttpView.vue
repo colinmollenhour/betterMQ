@@ -15,10 +15,13 @@ import { apiGet, apiPost, publicUrl } from "@/lib/api";
 import { outbound } from "@/lib/payload";
 
 type Host = { host: string; remaining_ms?: number; remaining?: number };
+type ControlScope = { applied_nodes?: string[]; shared_metadata?: boolean };
 
 const host = ref("");
 const minutes = ref(30);
 const blocked = ref<Host[]>([]);
+const servingNode = ref("unknown serving process");
+const sharedMetadata = ref(false);
 const loadStatus = useActionStatus();
 const blockStatus = useActionStatus();
 
@@ -29,8 +32,12 @@ onMounted(() => {
 async function load() {
   loadStatus.reset();
   try {
-    const d = await apiGet<{ hosts?: Host[] } | Host[]>(publicUrl("/v1/destinations/blocked"));
+    const d = await apiGet<({ hosts?: Host[] } & ControlScope) | Host[]>(publicUrl("/v1/destinations/blocked"));
     blocked.value = Array.isArray(d) ? d : d.hosts || [];
+    if (!Array.isArray(d)) {
+      servingNode.value = d.applied_nodes?.join(", ") || "unknown serving process";
+      sharedMetadata.value = d.shared_metadata || false;
+    }
   } catch (e) {
     loadStatus.fail(e);
   }
@@ -44,11 +51,11 @@ async function block() {
     return;
   }
   try {
-    const res = await apiPost<{ host?: string }>(publicUrl("/v1/destinations/block"), {
+    const res = await apiPost<{ host?: string } & ControlScope>(publicUrl("/v1/destinations/block"), {
       host: h,
       duration_ms: (Number(minutes.value) || 30) * 60 * 1000,
     });
-    blockStatus.succeed(`Blocked ${res.host || h} for ${minutes.value}m`);
+    blockStatus.succeed(`Blocked ${res.host || h} for ${minutes.value}m; confirmed on ${res.applied_nodes?.join(", ") || servingNode.value} only. Peer/fleet application is not confirmed.`);
     host.value = "";
     await load();
   } catch (e) {
@@ -59,8 +66,8 @@ async function block() {
 async function unblock(h: string) {
   blockStatus.reset();
   try {
-    await apiPost(publicUrl("/v1/destinations/unblock"), { host: h });
-    blockStatus.succeed(`Unblocked ${h}`);
+    const res = await apiPost<ControlScope>(publicUrl("/v1/destinations/unblock"), { host: h });
+    blockStatus.succeed(`Unblocked ${h}; confirmed on ${res.applied_nodes?.join(", ") || servingNode.value} only. Peer/fleet application is not confirmed.`);
     await load();
   } catch (e) {
     blockStatus.fail(e);
@@ -106,7 +113,10 @@ function remaining(h: Host) {
     <Card>
       <CardHeader>
         <CardTitle>Blocked destinations</CardTitle>
-        <CardDescription>Hosts paused after transport failures</CardDescription>
+        <CardDescription>
+          Host controls on {{ servingNode }}. These are not cluster-wide controls and do not confirm peer or fleet-worker application.
+          <span v-if="sharedMetadata">Nodes using the same shared metadata may observe changes asynchronously.</span>
+        </CardDescription>
       </CardHeader>
       <CardContent class="space-y-4">
         <div class="flex flex-wrap items-end gap-3">

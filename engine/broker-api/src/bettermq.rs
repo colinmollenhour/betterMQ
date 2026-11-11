@@ -16,6 +16,7 @@ use broker_partition::{
     CreateSubscriptionResponse, DestinationSnapshot, FlowSpec, PublishRequest, PublishResponse,
     ResolvedFlow, ScheduledInfo, StoredMessage, Subscription, DIRECT_TOPIC,
 };
+use broker_raft_meta::catalog::CatalogKind;
 use broker_schedule::{
     CronError, CronJob, ScheduleError, ScheduledPublish, ScheduledPublishRequest,
 };
@@ -34,6 +35,8 @@ pub fn bettermq_routes() -> Router<Arc<AppState>> {
         .route("/v1/queues/{queue_id}/enqueue", post(enqueue_to_queue))
         .route("/v1/dlq", get(list_dlq).delete(delete_dlq_message))
         .route("/v1/dlq/sources", get(list_dlq_sources))
+        .route("/v1/dlq/message", get(get_dlq_message))
+        .route("/v1/inspection/counts", get(inspection_counts))
         .route("/v1/flows", get(list_flows).post(create_flow))
         .route("/v1/flows/{flow_id}", delete(delete_flow))
         .route("/v1/queues", get(list_queues).post(create_queue))
@@ -166,6 +169,9 @@ pub struct DlqQuery {
     pub dlq_topic: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: usize,
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub include_body: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy)]
@@ -259,13 +265,15 @@ pub struct DlqListResponse {
     pub queue: String,
     pub dlq_topic: String,
     pub messages: Vec<DlqMessage>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DlqMessage {
     pub message_id: Uuid,
     pub key: String,
-    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
     pub published_at_ms: i64,
     pub partition: u32,
     pub offset: u64,
@@ -276,6 +284,9 @@ pub struct DlqMessage {
     /// Why the message was moved to the DLQ (HTTP status, transport error, retries exhausted, …).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// `base64` when `body` holds a base64-encoded binary payload; `utf8` for text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_encoding: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,7 +307,11 @@ pub struct DlqSourceResponse {
     /// `queue` | `direct` | `group_member`
     pub kind: String,
     pub label: String,
-    pub count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
+    pub count_ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count_unavailable_reason: Option<String>,
     /// Set when `kind` is `queue` — pass as `?queue=` to list messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
@@ -331,6 +346,95 @@ fn default_limit() -> usize {
     10
 }
 
+fn encode_cursor(value: &impl Serialize) -> Result<String, ApiError> {
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(value).map_err(|error| ApiError::BadRequest(error.to_string()))?,
+    ))
+}
+
+fn decode_cursor<T: serde::de::DeserializeOwned>(
+    cursor: Option<&str>,
+) -> Result<Option<T>, ApiError> {
+    use base64::Engine;
+    cursor
+        .map(|cursor| {
+            if cursor.len() > 1024 {
+                return Err(ApiError::BadRequest("invalid listing cursor".into()));
+            }
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(cursor)
+                .map_err(|_| ApiError::BadRequest("invalid listing cursor".into()))?;
+            serde_json::from_slice(&bytes)
+                .map_err(|_| ApiError::BadRequest("invalid listing cursor".into()))
+        })
+        .transpose()
+}
+
+async fn inspection_blocking<T: Send + 'static>(
+    tenant: String,
+    operation: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let permit = SLOTS
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::Overloaded {
+            retry_after_ms: 1000,
+            message: "inspection workers busy".into(),
+        })?;
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        runtime.block_on(broker_partition::scope_tenant(tenant, async move {
+            operation()
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::Unavailable(format!("inspection task failed: {error}")))?
+}
+
+async fn inspection_counts(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let (counts, ready) = state.broker.dlq_counts();
+    Json(
+        serde_json::json!({ "delayed": state.schedule.count(), "crons": state.crons.count(),
+        "dlq": ready.then(|| counts.values().sum::<usize>()), "dlq_ready": ready,
+        "dlq_count_reason": dlq_count_reason(state.broker.config().storage, ready), "scope": "node_local" }),
+    )
+}
+
+fn dlq_count_reason(storage: broker_storage::StorageMode, ready: bool) -> Option<&'static str> {
+    if ready {
+        None
+    } else if storage == broker_storage::StorageMode::Slate {
+        Some("count unavailable on this storage backend")
+    } else {
+        Some("DLQ count recovery in progress")
+    }
+}
+
+async fn get_dlq_message(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DeleteDlqQuery>,
+) -> Result<Json<DlqMessage>, ApiError> {
+    if !is_dlq_topic(&q.dlq_topic) {
+        return Err(ApiError::BadRequest("invalid DLQ topic".into()));
+    }
+    let (partition, offset) = q
+        .partition
+        .zip(q.offset)
+        .ok_or_else(|| ApiError::BadRequest("partition and offset required".into()))?;
+    let broker = state.broker.clone();
+    inspection_blocking(state.broker.tenant(), move || {
+        let message = broker
+            .get_topic_message(&q.dlq_topic, partition, offset)?
+            .ok_or_else(|| ApiError::NotFound("DLQ message not found".into()))?;
+        Ok(Json(to_dlq_message(message, true)))
+    })
+    .await
+}
+
 fn to_publish_enqueue(req: EnqueueRequest) -> Result<PublishRequest, ApiError> {
     if req.queue_id.is_none() && req.queue.is_empty() {
         return Err(ApiError::Broker(BrokerError::QueueNotFound(
@@ -338,6 +442,7 @@ fn to_publish_enqueue(req: EnqueueRequest) -> Result<PublishRequest, ApiError> {
         )));
     }
     let mut pr = PublishRequest {
+        routing_id: None,
         topic: req.queue,
         queue_id: req.queue_id,
         group_id: None,
@@ -388,6 +493,7 @@ fn to_publish_job(req: PublishJobRequest) -> Result<PublishRequest, ApiError> {
 
     if has_group {
         let mut pr = PublishRequest {
+            routing_id: None,
             topic: String::new(),
             queue_id: None,
             group_id: req.group_id,
@@ -423,6 +529,7 @@ fn to_publish_job(req: PublishJobRequest) -> Result<PublishRequest, ApiError> {
         ));
     }
     let mut pr = PublishRequest {
+        routing_id: None,
         topic: broker_partition::DIRECT_TOPIC.to_string(),
         queue_id: None,
         group_id: None,
@@ -490,6 +597,20 @@ fn fanout_max_attempts() -> u32 {
         .max(1)
 }
 
+fn fanout_expanded_bytes(members: usize, request_bytes: usize) -> Result<usize, ApiError> {
+    // Bound metadata, journal serialization, and transient request copies too.
+    let bytes = request_bytes
+        .checked_add(4096)
+        .and_then(|bytes| bytes.checked_mul(members))
+        .and_then(|bytes| bytes.checked_mul(4));
+    if members > 1000 || bytes.is_none_or(|bytes| bytes > 64 * 1024 * 1024) {
+        return Err(ApiError::BadRequest(
+            "fan-out exceeds 1000 members or 64 MiB expanded memory budget".into(),
+        ));
+    }
+    Ok(bytes.expect("checked above"))
+}
+
 async fn publish_to_group(
     state: Arc<AppState>,
     ingest: Option<axum::extract::Extension<crate::metering::IngestAuth>>,
@@ -497,7 +618,7 @@ async fn publish_to_group(
         axum::extract::Extension<broker_control_plane::PlanLimits>,
     >,
     group_id: Uuid,
-    base: PublishRequest,
+    mut base: PublishRequest,
 ) -> Result<(StatusCode, Json<EnqueueResponse>), ApiError> {
     #[cfg(feature = "cloud")]
     let fanout_tenant = ingest
@@ -506,6 +627,8 @@ async fn publish_to_group(
         .unwrap_or_else(|| state.broker.tenant());
     #[cfg(not(feature = "cloud"))]
     let fanout_tenant = state.broker.tenant();
+    // Each member copy carries the body inline in a local-WAL cell.
+    state.broker.check_publish_body(&base)?;
     let fanout_id = match base.idempotency_key.as_deref() {
         Some(key) => Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
@@ -520,11 +643,14 @@ async fn publish_to_group(
         .as_ref()
         .and_then(|cluster| cluster.runtime.controller())
         .and_then(|controller| controller.state().fanout_outbox.get(&fanout_id).cloned())
-        .map(|entry| serde_json::from_str(&entry.payload_json))
+        .map(|entry| crate::fanout::authoritative_command(&entry))
         .transpose()
         .map_err(|error| fanout_store_error(crate::fanout::FanoutStoreError::Serde(error)))?;
-    let command = if let Some(existing) =
-        replicated_existing.or(fanout_store.get(fanout_id).map_err(fanout_store_error)?)
+    let mut expansion_permit = None;
+    let command = if let Some(existing) = replicated_existing.or(fanout_store
+        .get_async(fanout_id)
+        .await
+        .map_err(fanout_store_error)?)
     {
         if existing.group_id != group_id
             || (!existing.tenant_id.is_empty() && existing.tenant_id != fanout_tenant)
@@ -566,6 +692,17 @@ async fn publish_to_group(
             }
         }
 
+        // Reserve before materializing requests or serializing the outbox.
+        let request_bytes = serde_json::to_vec(&base)
+            .map_err(|error| fanout_store_error(crate::fanout::FanoutStoreError::Serde(error)))?
+            .len();
+        let expanded_bytes = fanout_expanded_bytes(members.len(), request_bytes)?;
+        expansion_permit = Some(crate::admission::check_admission(
+            &state,
+            ingest.as_ref().map(|auth| auth.0.tenant_id),
+            expanded_bytes,
+        )?);
+        let shared_payload = Arc::new(std::mem::take(&mut base.payload));
         let members = members
             .into_iter()
             .map(|member| {
@@ -579,8 +716,11 @@ async fn publish_to_group(
                 crate::fanout::FanoutMemberCommand { member_id, request }
             })
             .collect();
-        let acceptance_bytes = serde_json::to_vec(&(fanout_tenant.as_str(), group_id, &members))
-            .map_err(|error| fanout_store_error(crate::fanout::FanoutStoreError::Serde(error)))?;
+        let acceptance_bytes =
+            serde_json::to_vec(&(fanout_tenant.as_str(), group_id, &shared_payload, &members))
+                .map_err(|error| {
+                    fanout_store_error(crate::fanout::FanoutStoreError::Serde(error))
+                })?;
         let acceptance_hash = Uuid::new_v5(&Uuid::NAMESPACE_OID, &acceptance_bytes).to_string();
         let now_ms = chrono::Utc::now().timestamp_millis();
         crate::fanout::FanoutCommand {
@@ -590,6 +730,7 @@ async fn publish_to_group(
             group_id,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
+            shared_payload: Some(shared_payload),
             members,
             outcomes: std::collections::HashMap::new(),
             completed: false,
@@ -607,10 +748,11 @@ async fn publish_to_group(
         .and_then(|command| crate::fanout::try_begin_execution(command.id));
     let can_execute = execution_guard.is_some();
     let command = claimed.unwrap_or(command);
+    drop(expansion_permit);
 
     let mut deliveries = Vec::new();
-    let mut joins = tokio::task::JoinSet::new();
-    for member in command.members.clone() {
+    let mut attempts = Vec::new();
+    for member in &command.members {
         let member_id = member.member_id;
         if let Some(outcome) = command.outcomes.get(&member_id) {
             if let Some(response) = &outcome.response {
@@ -646,11 +788,12 @@ async fn publish_to_group(
             });
             continue;
         }
-        let member_req = member.request;
+        let command = &command;
         let state = state.clone();
         #[cfg(feature = "cloud")]
         let plan = plan.clone();
-        joins.spawn(async move {
+        attempts.push(async move {
+            let member_req = command.request_for_attempt(member);
             #[cfg(feature = "cloud")]
             let result = publish(State(state), ingest, plan, Json(member_req))
                 .await
@@ -662,9 +805,9 @@ async fn publish_to_group(
             (member_id, result)
         });
     }
-    while let Some(joined) = joins.join_next().await {
-        let (member_id, result) =
-            joined.map_err(|e| ApiError::BadRequest(format!("fanout join: {e}")))?;
+    use futures_util::StreamExt;
+    let mut attempts = futures_util::stream::iter(attempts).buffer_unordered(8);
+    while let Some((member_id, result)) = attempts.next().await {
         match result {
             Ok(inner) => {
                 let attempts = command
@@ -674,7 +817,7 @@ async fn publish_to_group(
                     .unwrap_or(0)
                     .saturating_add(1);
                 let updated = fanout_store
-                    .record_result(
+                    .record_result_async(
                         fanout_id,
                         member_id,
                         crate::fanout::FanoutMemberOutcome {
@@ -685,6 +828,7 @@ async fn publish_to_group(
                             terminal: false,
                         },
                     )
+                    .await
                     .map_err(fanout_store_error)?;
                 crate::fanout::update_authoritative(&state, &fanout_store, updated)
                     .await
@@ -692,7 +836,7 @@ async fn publish_to_group(
                 deliveries.push(to_group_delivery_ref(member_id, &inner));
             }
             Err(error) => {
-                let error = format!("{error:?}");
+                let error = error.to_string();
                 let attempts = command
                     .outcomes
                     .get(&member_id)
@@ -700,7 +844,7 @@ async fn publish_to_group(
                     .unwrap_or(0)
                     .saturating_add(1);
                 let updated = fanout_store
-                    .record_result(
+                    .record_result_async(
                         fanout_id,
                         member_id,
                         crate::fanout::FanoutMemberOutcome {
@@ -716,6 +860,7 @@ async fn publish_to_group(
                             terminal: attempts >= fanout_max_attempts(),
                         },
                     )
+                    .await
                     .map_err(fanout_store_error)?;
                 crate::fanout::update_authoritative(&state, &fanout_store, updated)
                     .await
@@ -817,7 +962,13 @@ pub(crate) fn spawn_dlq_retention(state: Arc<AppState>) {
                 }
             };
             for topic in topics {
-                match state.broker.purge_dlq_topic(&topic, Some(cutoff)) {
+                let broker = state.broker.clone();
+                let purge_topic = topic.clone();
+                match inspection_blocking(state.broker.tenant(), move || {
+                    Ok(broker.purge_dlq_topic(&purge_topic, Some(cutoff))?)
+                })
+                .await
+                {
                     Ok(0) => {}
                     Ok(deleted) => {
                         tracing::info!(topic, deleted, days, "purged expired DLQ messages")
@@ -864,7 +1015,7 @@ pub(crate) fn spawn_fanout_replay(state: Arc<AppState>) {
             if crate::admission::is_shutting_down() {
                 break;
             }
-            let pending = match crate::fanout::pending_authoritative(&state, &store, 32) {
+            let pending = match crate::fanout::pending_authoritative(&state, &store, 32).await {
                 Ok(pending) => pending,
                 Err(error) => {
                     tracing::warn!(%error, "fanout replay scan failed");
@@ -909,7 +1060,7 @@ async fn replay_fanout_command(
     command: crate::fanout::FanoutCommand,
 ) -> Result<(), ApiError> {
     let now_ms = chrono::Utc::now().timestamp_millis();
-    for member in command.members.clone() {
+    for member in &command.members {
         let existing = command.outcomes.get(&member.member_id);
         if existing.is_some_and(|outcome| outcome.response.is_some()) {
             continue;
@@ -927,30 +1078,32 @@ async fn replay_fanout_command(
             .map(|outcome| outcome.attempts)
             .unwrap_or(0)
             .saturating_add(1);
-        let outcome = match crate::cluster::publish_with_cluster(state, member.request, None).await
-        {
-            Ok(response) => {
-                crate::cluster::enqueue_dispatch_after_publish(state, &response);
-                crate::fanout::FanoutMemberOutcome {
-                    response: Some(response),
-                    error: None,
-                    attempts,
-                    next_attempt_at_ms: None,
-                    terminal: false,
+        let outcome =
+            match crate::ingest::submit_one(state, command.request_for_attempt(member), None).await
+            {
+                Ok(response) => {
+                    crate::cluster::enqueue_dispatch_after_publish(state, &response);
+                    crate::fanout::FanoutMemberOutcome {
+                        response: Some(response),
+                        error: None,
+                        attempts,
+                        next_attempt_at_ms: None,
+                        terminal: false,
+                    }
                 }
-            }
-            Err(error) => crate::fanout::FanoutMemberOutcome {
-                response: None,
-                error: Some(format!("{error:?}")),
-                attempts,
-                next_attempt_at_ms: Some(now_ms.saturating_add(
-                    1_000i64.saturating_mul(1i64 << attempts.saturating_sub(1).min(6)),
-                )),
-                terminal: attempts >= fanout_max_attempts(),
-            },
-        };
+                Err(error) => crate::fanout::FanoutMemberOutcome {
+                    response: None,
+                    error: Some(error.to_string()),
+                    attempts,
+                    next_attempt_at_ms: Some(now_ms.saturating_add(
+                        1_000i64.saturating_mul(1i64 << attempts.saturating_sub(1).min(6)),
+                    )),
+                    terminal: attempts >= fanout_max_attempts(),
+                },
+            };
         let updated = store
-            .record_result(command.id, member.member_id, outcome)
+            .record_result_async(command.id, member.member_id, outcome)
+            .await
             .map_err(fanout_store_error)?;
         crate::fanout::update_authoritative(state, store, updated)
             .await
@@ -960,9 +1113,52 @@ async fn replay_fanout_command(
 }
 
 fn fanout_store_error(error: crate::fanout::FanoutStoreError) -> ApiError {
+    match error {
+        crate::fanout::FanoutStoreError::TooLarge { .. } => {
+            return ApiError::BadRequest(error.to_string())
+        }
+        crate::fanout::FanoutStoreError::OutboxFull => {
+            return ApiError::Overloaded {
+                retry_after_ms: 1_000,
+                message: error.to_string(),
+            }
+        }
+        _ => {}
+    }
     ApiError::Broker(BrokerError::Storage(broker_storage::LogError::Io(
         std::io::Error::other(error.to_string()),
     )))
+}
+
+#[cfg(test)]
+mod inspection_tests {
+    use super::*;
+
+    #[test]
+    fn slate_count_unavailability_is_explicit() {
+        assert_eq!(
+            dlq_count_reason(broker_storage::StorageMode::Slate, false),
+            Some("count unavailable on this storage backend")
+        );
+        assert_eq!(
+            dlq_count_reason(broker_storage::StorageMode::Local, true),
+            None
+        );
+        assert!(dlq_count_reason(broker_storage::StorageMode::Local, false).is_some());
+    }
+
+    #[tokio::test]
+    async fn blocking_inspection_preserves_authenticated_tenant_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = broker_partition::Broker::open(broker_partition::BrokerConfig::new(
+            dir.path().to_path_buf(),
+        ))
+        .unwrap();
+        let tenant = inspection_blocking("tenant-a".into(), move || Ok(broker.tenant()))
+            .await
+            .unwrap();
+        assert_eq!(tenant, "tenant-a");
+    }
 }
 
 #[cfg(test)]
@@ -971,6 +1167,14 @@ mod fanout_tests {
     use broker_dispatch::{DispatchConfig, DispatchEngine, LeaseTable};
     use broker_partition::{Broker, BrokerConfig};
     use broker_schedule::{CronRegistry, ScheduleQueue};
+
+    #[test]
+    fn expansion_is_bounded_before_request_materialization() {
+        assert!(fanout_expanded_bytes(100, 4 * 1024 * 1024).is_err());
+        assert!(fanout_expanded_bytes(1001, 0).is_err());
+        assert!(fanout_expanded_bytes(2, usize::MAX).is_err());
+        assert!(fanout_expanded_bytes(2, 100).is_ok());
+    }
 
     #[tokio::test]
     async fn group_publish_returns_explicit_partial_member_results() {
@@ -1020,6 +1224,7 @@ mod fanout_tests {
             control_plane: None,
         });
         let base = PublishRequest {
+            routing_id: None,
             topic: String::new(),
             queue_id: None,
             group_id: Some(group.id),
@@ -1044,7 +1249,10 @@ mod fanout_tests {
             request: None,
         };
 
-        let (status, Json(response)) = publish_to_group(state, None, group.id, base).await.unwrap();
+        let (status, Json(response)) =
+            publish_to_group(state.clone(), None, group.id, base.clone())
+                .await
+                .unwrap();
         assert_eq!(status, StatusCode::MULTI_STATUS);
         assert_eq!(response.accepted, Some(1));
         assert_eq!(response.partial, Some(true));
@@ -1052,22 +1260,100 @@ mod fanout_tests {
         assert_eq!(deliveries.len(), 2);
         assert_eq!(deliveries.iter().filter(|d| d.accepted).count(), 1);
         assert_eq!(deliveries.iter().filter(|d| d.error.is_some()).count(), 1);
+
+        // Simulate recovery after durable acceptance but before member scheduling.
+        let store = crate::fanout::FanoutStore::open(dir.path()).unwrap();
+        let stored = store.get(response.fanout_id.unwrap()).unwrap().unwrap();
+        assert_eq!(stored.shared_payload.as_ref().unwrap().as_str(), "body");
+        assert!(stored
+            .members
+            .iter()
+            .all(|member| member.request.payload.is_empty()));
+        let encoded = serde_json::to_value(&stored).unwrap();
+        // Metadata-only requests also make old binaries fail closed instead of
+        // ignoring shared_payload and silently replaying empty message bodies.
+        assert!(encoded["members"][0]["request"].get("payload").is_none());
+        let old_reader =
+            serde_json::from_value::<PublishRequest>(encoded["members"][0]["request"].clone());
+        assert!(old_reader.is_err());
+        let member = state
+            .broker
+            .active_group_members(group.id)
+            .unwrap()
+            .into_iter()
+            .find(|member| member.url.starts_with("https://"))
+            .unwrap();
+        let mut request = state
+            .broker
+            .group_member_publish_request(group.id, &member, &base);
+        request.delay_ms = Some(60_000);
+        request.idempotency_key = Some("recovered-delayed-member".into());
+        let accepted_at = chrono::Utc::now().timestamp_millis() - 10_000;
+        let command = crate::fanout::FanoutCommand {
+            id: Uuid::new_v4(),
+            acceptance_hash: "recovery".into(),
+            tenant_id: state.broker.tenant(),
+            group_id: group.id,
+            created_at_ms: accepted_at,
+            updated_at_ms: accepted_at,
+            shared_payload: None,
+            members: vec![crate::fanout::FanoutMemberCommand {
+                member_id: member.id,
+                request,
+            }],
+            outcomes: Default::default(),
+            completed: false,
+            completed_at_ms: None,
+        };
+        store.accept(command.clone()).unwrap();
+        // Reopen the legacy shape (without shared_payload) before replay.
+        store.evict_cached_state();
+        let store = crate::fanout::FanoutStore::open(dir.path()).unwrap();
+        let command = store.get(command.id).unwrap().unwrap();
+        replay_fanout_command(&state, &store, command.clone())
+            .await
+            .unwrap();
+        let restored = store.get(command.id).unwrap().unwrap();
+        let response = restored.outcomes[&member.id].response.as_ref().unwrap();
+        assert!(
+            response.offset.is_none(),
+            "replay must not append a delayed member"
+        );
+        let scheduled = response.scheduled.as_ref().unwrap();
+        assert!((scheduled.deliver_at_ms - (accepted_at + 60_000)).abs() < 1000);
+
+        let mut invalid = command;
+        invalid.id = Uuid::new_v4();
+        invalid.members[0].request.url = Some("not-a-url".into());
+        store.accept(invalid.clone()).unwrap();
+        replay_fanout_command(&state, &store, invalid.clone())
+            .await
+            .unwrap();
+        assert!(store.get(invalid.id).unwrap().unwrap().outcomes[&member.id]
+            .response
+            .is_none());
     }
 }
 
-fn parse_dlq_payload(body: &str) -> (Option<String>, Option<String>, Option<String>, String) {
+struct DlqEnvelope {
+    source_queue: Option<String>,
+    destination_url: Option<String>,
+    reason: Option<String>,
+    body: String,
+    body_encoding: Option<String>,
+}
+
+fn parse_dlq_payload(body: &str) -> DlqEnvelope {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return (None, None, None, body.to_string());
+        return DlqEnvelope {
+            source_queue: None,
+            destination_url: None,
+            reason: None,
+            body: body.to_string(),
+            body_encoding: None,
+        };
     };
-    let source_queue = v
-        .get("source_queue")
-        .and_then(|x| x.as_str())
-        .map(str::to_string);
-    let destination_url = v
-        .get("destination_url")
-        .and_then(|x| x.as_str())
-        .map(str::to_string);
-    let reason = v.get("reason").and_then(|x| x.as_str()).map(str::to_string);
+    let text = |field: &str| v.get(field).and_then(|x| x.as_str()).map(str::to_string);
     let display_body = v
         .get("body")
         .map(|b| match b {
@@ -1075,22 +1361,94 @@ fn parse_dlq_payload(body: &str) -> (Option<String>, Option<String>, Option<Stri
             other => other.to_string(),
         })
         .unwrap_or_else(|| body.to_string());
-    (source_queue, destination_url, reason, display_body)
+    DlqEnvelope {
+        source_queue: text("source_queue"),
+        destination_url: text("destination_url"),
+        reason: text("reason"),
+        body: display_body,
+        body_encoding: text("body_encoding"),
+    }
 }
 
-fn to_dlq_message(msg: StoredMessage) -> DlqMessage {
-    let raw = String::from_utf8_lossy(&msg.payload).into_owned();
-    let (source_queue, destination_url, reason, body) = parse_dlq_payload(&raw);
+/// Current DLQ records: magic, one JSON metadata line, then the original body
+/// bytes. Returns the metadata and the body.
+fn split_dlq_record(record: &[u8]) -> Option<(serde_json::Value, &[u8])> {
+    let rest = record.strip_prefix(broker_dispatch::DLQ_RECORD_MAGIC)?;
+    let newline = rest.iter().position(|byte| *byte == b'\n')?;
+    let meta: serde_json::Value = serde_json::from_slice(&rest[..newline]).ok()?;
+    Some((meta, &rest[newline + 1..]))
+}
+
+fn dlq_text(meta: &serde_json::Value, field: &str) -> Option<String> {
+    meta.get(field).and_then(|x| x.as_str()).map(str::to_string)
+}
+
+/// Text bodies are shown as text, binary ones base64-encoded.
+fn parse_dlq_record(record: &[u8]) -> Option<DlqEnvelope> {
+    let (meta, body) = split_dlq_record(record)?;
+    let (body, body_encoding) = match std::str::from_utf8(body) {
+        Ok(text) => (text.to_string(), "utf8"),
+        Err(_) => {
+            use base64::Engine;
+            (
+                base64::engine::general_purpose::STANDARD.encode(body),
+                "base64",
+            )
+        }
+    };
+    Some(DlqEnvelope {
+        source_queue: dlq_text(&meta, "source_queue"),
+        destination_url: dlq_text(&meta, "destination_url"),
+        reason: dlq_text(&meta, "reason"),
+        body,
+        body_encoding: Some(body_encoding.to_string()),
+    })
+}
+
+/// Listing rows: `include_body = false` reads only the metadata, never the body.
+fn to_dlq_message(mut msg: StoredMessage, include_body: bool) -> DlqMessage {
+    let envelope = if include_body {
+        match parse_dlq_record(&msg.payload) {
+            Some(envelope) => envelope,
+            None => {
+                let raw = String::from_utf8_lossy(&std::mem::take(&mut msg.payload)).into_owned();
+                parse_dlq_payload(&raw)
+            }
+        }
+    } else {
+        #[derive(Deserialize, Default)]
+        struct Metadata {
+            source_queue: Option<String>,
+            destination_url: Option<String>,
+            reason: Option<String>,
+        }
+        let metadata = match split_dlq_record(&msg.payload) {
+            Some((meta, _)) => Metadata {
+                source_queue: dlq_text(&meta, "source_queue"),
+                destination_url: dlq_text(&meta, "destination_url"),
+                reason: dlq_text(&meta, "reason"),
+            },
+            None => serde_json::from_slice(&msg.payload).unwrap_or_default(),
+        };
+        DlqEnvelope {
+            source_queue: metadata.source_queue,
+            destination_url: metadata.destination_url,
+            reason: metadata.reason,
+            body: String::new(),
+            body_encoding: None,
+        }
+    };
     DlqMessage {
         message_id: msg.id,
         key: msg.routing_key,
-        body,
+        body: include_body.then_some(envelope.body),
         published_at_ms: msg.published_at_ms,
         partition: msg.partition,
         offset: msg.offset,
-        source_queue,
-        destination_url,
-        reason,
+        source_queue: envelope.source_queue,
+        destination_url: envelope.destination_url,
+        reason: envelope.reason,
+        body_encoding: envelope.body_encoding,
     }
 }
 
@@ -1252,11 +1610,39 @@ async fn apply_inline_flow(
     let parallelism = flow.parallelism.unwrap_or(1).max(1);
     let rate = flow.rate.unwrap_or(0);
     let period_secs = flow.period_secs.unwrap_or(60).max(1);
-    let profile =
+    let existing = state.broker.get_flow_profile_by_key(&key)?;
+    let unchanged = existing.as_ref().is_some_and(|p| {
+        p.parallelism == parallelism && p.rate == rate && p.period_secs == period_secs
+    });
+    let profile = if unchanged {
+        existing.expect("unchanged profile")
+    } else if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(state)?;
+        let existing = state.broker.get_flow_profile_by_key(&key)?;
+        let id = existing.as_ref().map_or_else(
+            || mutation.id(&state.broker.tenant(), CatalogKind::Flow),
+            |p| p.id,
+        );
+        let profile = state
+            .broker
+            .prepare_flow(key.clone(), parallelism, rate, period_secs, id)?;
+        mutation
+            .commit(
+                state,
+                profile.tenant_id.clone(),
+                CatalogKind::Flow,
+                id,
+                &profile,
+                false,
+            )
+            .await?;
+        profile
+    } else {
         state
             .broker
-            .ensure_flow_profile_by_key(key.clone(), parallelism, rate, period_secs)?;
-    crate::cluster::replicate_flow_catalog(state, profile.clone()).await;
+            .ensure_flow_profile_by_key_with_change(key.clone(), parallelism, rate, period_secs)?
+            .0
+    };
     req.flow_id = Some(profile.id);
     let mut spec = profile.to_spec();
     if spec.key.is_none() {
@@ -1341,12 +1727,35 @@ async fn list_dlq(
     Query(q): Query<DlqQuery>,
 ) -> Result<Json<DlqListResponse>, ApiError> {
     let topic = resolve_dlq_topic(&q)?;
-    let messages = state
-        .broker
-        .list_topic_messages(&topic, q.limit)?
-        .into_iter()
-        .map(to_dlq_message)
-        .collect();
+    let start = decode_cursor::<(String, u32, u64)>(q.cursor.as_deref())?;
+    if start
+        .as_ref()
+        .is_some_and(|(bound_topic, _, _)| bound_topic != &topic)
+    {
+        return Err(ApiError::BadRequest(
+            "cursor belongs to another DLQ topic".into(),
+        ));
+    }
+    let position = start
+        .map(|(_, partition, offset)| (partition, offset))
+        .unwrap_or((0, 0));
+    let broker = state.broker.clone();
+    let scan_topic = topic.clone();
+    let (messages, next) = inspection_blocking(state.broker.tenant(), move || {
+        let page =
+            broker.list_topic_messages_page(&scan_topic, position, q.limit.clamp(1, 1000))?;
+        Ok((
+            page.messages
+                .into_iter()
+                .map(|message| to_dlq_message(message, q.include_body))
+                .collect(),
+            page.next,
+        ))
+    })
+    .await?;
+    let next_cursor = next
+        .map(|(partition, offset)| encode_cursor(&(topic.clone(), partition, offset)))
+        .transpose()?;
     let queue_label = q
         .queue
         .clone()
@@ -1361,6 +1770,7 @@ async fn list_dlq(
         queue: queue_label,
         dlq_topic: topic,
         messages,
+        next_cursor,
     }))
 }
 
@@ -1375,17 +1785,19 @@ async fn delete_dlq_message(
     }
     match (q.partition, q.offset) {
         (None, None) => {
-            let deleted = state
-                .broker
-                .purge_dlq_topic(&q.dlq_topic, None)
-                .map_err(ApiError::Broker)?;
+            let broker = state.broker.clone();
+            let deleted = inspection_blocking(state.broker.tenant(), move || {
+                Ok(broker.purge_dlq_topic(&q.dlq_topic, None)?)
+            })
+            .await?;
             Ok((StatusCode::OK, Json(DlqDeleteResponse { deleted })).into_response())
         }
         (Some(partition), Some(offset)) => {
-            let removed = state
-                .broker
-                .purge_dlq_message(&q.dlq_topic, partition, offset)
-                .map_err(ApiError::Broker)?;
+            let broker = state.broker.clone();
+            let removed = inspection_blocking(state.broker.tenant(), move || {
+                Ok(broker.purge_dlq_message(&q.dlq_topic, partition, offset)?)
+            })
+            .await?;
             if removed {
                 Ok(StatusCode::NO_CONTENT.into_response())
             } else {
@@ -1402,21 +1814,31 @@ async fn delete_dlq_message(
 async fn list_dlq_sources(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<DlqSourceResponse>>, ApiError> {
-    let topics = collect_dlq_topic_candidates(&state)?;
-    let mut sources = Vec::new();
-    for topic in topics {
-        let count = state.broker.list_topic_messages(&topic, 10_000)?.len();
-        let (kind, label, queue) = dlq_source_label(&state, &topic);
-        sources.push(DlqSourceResponse {
-            dlq_topic: topic,
-            kind,
-            label,
-            count,
-            queue,
-        });
-    }
-    sources.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
-    Ok(Json(sources))
+    inspection_blocking(state.broker.tenant(), move || {
+        let (counts, ready) = state.broker.dlq_counts();
+        let mut topics = collect_dlq_topic_candidates(&state)?;
+        topics.extend(counts.keys().cloned());
+        topics.sort();
+        topics.dedup();
+        let mut sources = Vec::new();
+        for topic in topics {
+            let count = ready.then(|| counts.get(&topic).copied().unwrap_or(0));
+            let (kind, label, queue) = dlq_source_label(&state, &topic);
+            sources.push(DlqSourceResponse {
+                dlq_topic: topic,
+                kind,
+                label,
+                count,
+                count_ready: ready,
+                count_unavailable_reason: dlq_count_reason(state.broker.config().storage, ready)
+                    .map(str::to_string),
+                queue,
+            });
+        }
+        sources.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.label.cmp(&b.label)));
+        Ok(Json(sources))
+    })
+    .await
 }
 
 async fn create_queue(
@@ -1435,22 +1857,6 @@ async fn create_queue(
         }),
     )
     .await?;
-    crate::cluster::replicate_queue_catalog(
-        &state,
-        Subscription {
-            id: inner.id,
-            tenant_id: state.broker.tenant(),
-            topic: inner.topic.clone(),
-            url: inner.url.clone(),
-            secret: req.secret,
-            paused: false,
-            parallelism: inner.parallelism,
-            default_max_retries: inner.default_max_retries,
-            retry_backoff: req.retry.retry_backoff.clone(),
-            updated_at_ms: chrono::Utc::now().timestamp_millis(),
-        },
-    )
-    .await;
     Ok((status, Json(to_queue_response(inner))))
 }
 
@@ -1458,11 +1864,31 @@ async fn create_flow(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateFlowRequest>,
 ) -> Result<(StatusCode, Json<FlowProfileResponse>), ApiError> {
-    let p =
+    let p = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let p = state.broker.prepare_flow(
+            req.key,
+            req.parallelism,
+            req.rate,
+            req.period_secs,
+            mutation.id(&state.broker.tenant(), CatalogKind::Flow),
+        )?;
+        mutation
+            .commit(
+                &state,
+                p.tenant_id.clone(),
+                CatalogKind::Flow,
+                p.id,
+                &p,
+                false,
+            )
+            .await?;
+        p
+    } else {
         state
             .broker
-            .create_flow_profile(req.key, req.parallelism, req.rate, req.period_secs)?;
-    crate::cluster::replicate_flow_catalog(&state, p.clone()).await;
+            .create_flow_profile(req.key, req.parallelism, req.rate, req.period_secs)?
+    };
     Ok((StatusCode::CREATED, Json(to_flow_response(p))))
 }
 
@@ -1483,8 +1909,26 @@ async fn delete_flow(
     State(state): State<Arc<AppState>>,
     Path(flow_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<FlowProfileResponse>), ApiError> {
-    let p = state.broker.delete_flow_profile(flow_id)?;
-    crate::cluster::replicate_flow_delete(&state, flow_id).await;
+    let p = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let p = state
+            .broker
+            .get_flow_profile(flow_id)?
+            .ok_or(broker_partition::BrokerError::FlowProfileNotFound(flow_id))?;
+        mutation
+            .commit(
+                &state,
+                p.tenant_id.clone(),
+                CatalogKind::Flow,
+                flow_id,
+                &p,
+                true,
+            )
+            .await?;
+        p
+    } else {
+        state.broker.delete_flow_profile(flow_id)?
+    };
     Ok((StatusCode::OK, Json(to_flow_response(p))))
 }
 
@@ -1504,8 +1948,26 @@ async fn delete_queue(
     State(state): State<Arc<AppState>>,
     Path(queue_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<QueueResponse>), ApiError> {
-    let s = state.broker.delete_endpoint(queue_id)?;
-    crate::cluster::replicate_queue_delete(&state, queue_id).await;
+    let s = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let s = state
+            .broker
+            .get_queue_by_id(queue_id)?
+            .ok_or_else(|| broker_partition::BrokerError::QueueNotFound(queue_id.to_string()))?;
+        mutation
+            .commit(
+                &state,
+                s.tenant_id.clone(),
+                CatalogKind::Queue,
+                queue_id,
+                &s,
+                true,
+            )
+            .await?;
+        s
+    } else {
+        state.broker.delete_endpoint(queue_id)?
+    };
     Ok((StatusCode::OK, Json(queue_response(&s))))
 }
 
@@ -1520,12 +1982,22 @@ pub struct DelayedJobResponse {
     pub queue: String,
     pub key: String,
     pub deliver_at_ms: i64,
-    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DelayedListResponse {
     pub delayed: Vec<DelayedJobResponse>,
+    pub next_cursor: Option<String>,
+    pub total: usize,
+}
+
+#[derive(Deserialize)]
+struct DelayedQuery {
+    #[serde(default = "default_limit")]
+    limit: usize,
+    cursor: Option<String>,
 }
 
 fn to_delayed_response(item: ScheduledPublish) -> DelayedJobResponse {
@@ -1534,19 +2006,38 @@ fn to_delayed_response(item: ScheduledPublish) -> DelayedJobResponse {
         queue: item.request.topic,
         key: item.request.routing_key,
         deliver_at_ms: item.deliver_at_ms,
-        body: item.request.payload,
+        body: Some(item.request.payload),
     }
 }
 
-async fn list_delayed(State(state): State<Arc<AppState>>) -> Json<DelayedListResponse> {
-    Json(DelayedListResponse {
-        delayed: state
-            .schedule
-            .list()
+async fn list_delayed(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DelayedQuery>,
+) -> Result<Json<DelayedListResponse>, ApiError> {
+    let after = decode_cursor::<(i64, Uuid)>(q.cursor.as_deref())?;
+    let limit = q.limit.clamp(1, 1000);
+    let page = state.schedule.page(after, limit);
+    let next_cursor = if page.len() == limit {
+        page.last()
+            .map(|item| encode_cursor(&(item.deliver_at_ms, item.id)))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(Json(DelayedListResponse {
+        delayed: page
             .into_iter()
-            .map(to_delayed_response)
+            .map(|item| DelayedJobResponse {
+                schedule_id: item.id,
+                queue: item.topic,
+                key: item.routing_key,
+                deliver_at_ms: item.deliver_at_ms,
+                body: None,
+            })
             .collect(),
-    })
+        next_cursor,
+        total: state.schedule.count(),
+    }))
 }
 
 async fn cancel_delayed(
@@ -1576,6 +2067,9 @@ impl From<ScheduleError> for DelayedApiError {
             ScheduleError::UnsupportedVersion(version) => DelayedApiError::Internal(format!(
                 "unsupported delayed schedule version: {version}"
             )),
+            ScheduleError::Locked(_)
+            | ScheduleError::BacklogFull { .. }
+            | ScheduleError::InvalidDelay(_) => DelayedApiError::Internal(e.to_string()),
         }
     }
 }
@@ -1619,11 +2113,43 @@ async fn upsert_flow_control(
     Json(body): Json<UpsertFlowControlRequest>,
 ) -> Result<(StatusCode, Json<FlowProfileResponse>), FlowApiError> {
     let owner = flow_lane_owner(&q)?;
-    let profile = state
-        .broker
-        .upsert_flow_profile_by_key(key.clone(), body.parallelism, body.rate, body.period_secs)
-        .map_err(ApiError::Broker)?;
-    crate::cluster::replicate_flow_catalog(&state, profile.clone()).await;
+    let profile = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let existing = state
+            .broker
+            .get_flow_profile_by_key(&key)
+            .map_err(ApiError::Broker)?;
+        let id = existing.map_or_else(
+            || mutation.id(&state.broker.tenant(), CatalogKind::Flow),
+            |p| p.id,
+        );
+        let profile = state
+            .broker
+            .prepare_flow(
+                key.clone(),
+                body.parallelism,
+                body.rate,
+                body.period_secs,
+                id,
+            )
+            .map_err(ApiError::Broker)?;
+        mutation
+            .commit(
+                &state,
+                profile.tenant_id.clone(),
+                CatalogKind::Flow,
+                id,
+                &profile,
+                false,
+            )
+            .await?;
+        profile
+    } else {
+        state
+            .broker
+            .upsert_flow_profile_by_key(key.clone(), body.parallelism, body.rate, body.period_secs)
+            .map_err(ApiError::Broker)?
+    };
     let limits = resolved_flow_for_profile(&key, &profile);
     state.dispatch.flow.ensure_lane(owner, &key, limits).await;
     Ok((StatusCode::OK, Json(to_flow_response(profile))))
@@ -1870,17 +2396,7 @@ async fn build_cron_scheduled_request(
     let destination =
         crate::routes::resolve_destination_with_repair(state, req.queue_id, queue_name)
             .await
-            .map_err(|e| match e {
-                ApiError::Broker(be) => CronApiError::BadRequest(be.to_string()),
-                ApiError::BadRequest(m)
-                | ApiError::Unauthorized(m)
-                | ApiError::NotFound(m)
-                | ApiError::Conflict(m)
-                | ApiError::Unavailable(m)
-                | ApiError::ReplicationFailed(m)
-                | ApiError::Overloaded { message: m, .. }
-                | ApiError::TooManyRequests { message: m, .. } => CronApiError::BadRequest(m),
-            })?;
+            .map_err(CronApiError::Api)?;
     let mut scheduled = ScheduledPublishRequest {
         topic: destination
             .queue_id
@@ -1912,10 +2428,17 @@ async fn create_cron(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateCronRequest>,
 ) -> Result<(StatusCode, Json<CronResponse>), CronApiError> {
+    // D1: cron definitions cannot be created or changed in a multi-node cell
+    // (node-local execution state); delete stays allowed.
+    reject_cron_mutation_in_cell(&state)?;
     let schedule = parse_schedule_kind(&req)?;
     let scheduled = build_cron_scheduled_request(&state, &req).await?;
+    // Every fire must fit the cell's inline body limit; refuse up front.
+    state
+        .broker
+        .check_body(&scheduled.payload, scheduled.payload_encoding.as_deref())
+        .map_err(ApiError::from)?;
     let job = state.crons.create_with_kind(schedule, scheduled)?;
-    crate::cluster::replicate_cron_catalog(&state, job.clone()).await;
     Ok((StatusCode::CREATED, Json(to_cron_response(job))))
 }
 
@@ -1941,8 +2464,8 @@ async fn pause_cron(
     State(state): State<Arc<AppState>>,
     Path(cron_id): Path<Uuid>,
 ) -> Result<Json<CronResponse>, CronApiError> {
+    reject_cron_mutation_in_cell(&state)?;
     let job = state.crons.pause(cron_id)?;
-    crate::cluster::replicate_cron_catalog(&state, job.clone()).await;
     Ok(Json(to_cron_response(job)))
 }
 
@@ -1950,8 +2473,8 @@ async fn resume_cron(
     State(state): State<Arc<AppState>>,
     Path(cron_id): Path<Uuid>,
 ) -> Result<Json<CronResponse>, CronApiError> {
+    reject_cron_mutation_in_cell(&state)?;
     let job = state.crons.resume(cron_id)?;
-    crate::cluster::replicate_cron_catalog(&state, job.clone()).await;
     Ok(Json(to_cron_response(job)))
 }
 
@@ -1959,17 +2482,51 @@ async fn delete_cron(
     State(state): State<Arc<AppState>>,
     Path(cron_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<CronResponse>), CronApiError> {
-    let removed = state.crons.delete(cron_id)?;
-    crate::cluster::replicate_cron_delete(&state, cron_id).await;
+    let removed = if state.cluster.is_some() {
+        let mutation = crate::catalog_applier::begin(&state)?;
+        let job = state.crons.get(cron_id)?;
+        mutation
+            .commit(
+                &state,
+                "default".into(),
+                CatalogKind::Cron,
+                cron_id,
+                &job,
+                true,
+            )
+            .await?;
+        job
+    } else {
+        state.crons.delete(cron_id)?
+    };
     Ok((StatusCode::OK, Json(to_cron_response(removed))))
+}
+
+/// Cron state is node-local and not quorum-replicated, so a cell refuses
+/// creating or changing crons. Delete stays allowed so operators can clean up.
+fn reject_cron_mutation_in_cell(state: &AppState) -> Result<(), CronApiError> {
+    if state.cluster.is_some() {
+        return Err(CronApiError::NotImplemented(
+            crate::cluster::CRON_MUTATION_UNSUPPORTED_IN_CELL.into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
 enum CronApiError {
+    Api(ApiError),
     InvalidCron(String),
     BadRequest(String),
     NotFound(Uuid),
+    NotImplemented(String),
     Internal(String),
+}
+
+impl From<ApiError> for CronApiError {
+    fn from(error: ApiError) -> Self {
+        Self::Api(error)
+    }
 }
 
 impl From<CronError> for CronApiError {
@@ -1982,6 +2539,10 @@ impl From<CronError> for CronApiError {
             CronError::Io(e) => CronApiError::Internal(e.to_string()),
             CronError::Serde(e) => CronApiError::Internal(e.to_string()),
             CronError::MetadataLoad(e) => CronApiError::Internal(e.to_string()),
+            CronError::Locked(path) => CronApiError::Internal(format!(
+                "cron journal {} is locked by another process",
+                path.display()
+            )),
         }
     }
 }
@@ -1989,10 +2550,12 @@ impl From<CronError> for CronApiError {
 impl IntoResponse for CronApiError {
     fn into_response(self) -> axum::response::Response {
         let (status, msg) = match self {
+            CronApiError::Api(error) => return error.into_response(),
             CronApiError::InvalidCron(m) | CronApiError::BadRequest(m) => {
                 (StatusCode::BAD_REQUEST, m)
             }
             CronApiError::NotFound(id) => (StatusCode::NOT_FOUND, format!("cron not found: {id}")),
+            CronApiError::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, m),
             CronApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };
         let body = serde_json::json!({ "error": msg });
@@ -2026,5 +2589,114 @@ impl IntoResponse for FlowApiError {
         };
         let body = serde_json::json!({ "error": msg });
         (status, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod cell_cron_tests {
+    use super::*;
+    use crate::test_support::cell_state;
+
+    fn cron_body() -> CreateCronRequest {
+        serde_json::from_value(serde_json::json!({
+            "every_seconds": 60,
+            "url": "https://example.com/hook",
+            "secret": "s",
+            "body": "x",
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cron_create_and_update_are_501_in_a_cell_but_delete_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = cell_state(&dir);
+        let error = create_cron(State(state.clone()), Json(cron_body()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.into_response().status(), StatusCode::NOT_IMPLEMENTED);
+        assert!(state.crons.list().is_empty());
+
+        // A pre-upgrade cron already on this node: pause/resume refused,
+        // delete allowed.
+        let job = state
+            .crons
+            .create_with_kind(
+                broker_schedule::ScheduleKind::Interval { every_seconds: 60 },
+                build_cron_scheduled_request(&state, &cron_body())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+        for response in [
+            pause_cron(State(state.clone()), Path(job.id))
+                .await
+                .unwrap_err()
+                .into_response(),
+            resume_cron(State(state.clone()), Path(job.id))
+                .await
+                .unwrap_err()
+                .into_response(),
+        ] {
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        }
+        assert!(!state.crons.get(job.id).unwrap().paused);
+
+        let mut peer_copy = job.clone();
+        peer_copy.paused = true;
+        peer_copy.updated_at_ms += 1;
+        let pushed = crate::cluster::internal_catalog_cron(
+            State(state.clone()),
+            Json(crate::cluster::CatalogCronUpsert { job: peer_copy }),
+        )
+        .await;
+        assert!(matches!(pushed, Err(ApiError::NotImplemented(_))));
+        assert!(!state.crons.get(job.id).unwrap().paused);
+
+        // Delete is not gated; in a cell it commits a catalog tombstone, which
+        // this controller-less fixture cannot do (503, not 501). The committed
+        // delete path is covered by the catalog applier tests.
+        let error = delete_cron(State(state.clone()), Path(job.id))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+}
+
+#[cfg(test)]
+mod dlq_envelope_tests {
+    use super::{parse_dlq_payload, parse_dlq_record};
+
+    #[test]
+    fn dlq_record_bodies_are_shown_as_text_or_base64() {
+        let mut record = broker_dispatch::DLQ_RECORD_MAGIC.to_vec();
+        record.extend_from_slice(br#"{"source_queue":"orders","reason":"HTTP 400"}"#);
+        record.push(b'\n');
+        let mut binary = record.clone();
+        record.extend_from_slice(b"plain\ntext");
+        binary.extend_from_slice(&[0xff, 0x00]);
+        let text = parse_dlq_record(&record).unwrap();
+        assert_eq!(text.body, "plain\ntext");
+        assert_eq!(text.body_encoding.as_deref(), Some("utf8"));
+        assert_eq!(text.reason.as_deref(), Some("HTTP 400"));
+        let binary = parse_dlq_record(&binary).unwrap();
+        assert_eq!(binary.body, "/wA=");
+        assert_eq!(binary.body_encoding.as_deref(), Some("base64"));
+        assert!(parse_dlq_record(br#"{"body":"legacy"}"#).is_none());
+    }
+
+    #[test]
+    fn dlq_listing_reports_body_encoding() {
+        let envelope = parse_dlq_payload(
+            r#"{"source_queue":"orders","reason":"HTTP 400","body":"/wA=","body_encoding":"base64"}"#,
+        );
+        assert_eq!(envelope.body, "/wA=");
+        assert_eq!(envelope.body_encoding.as_deref(), Some("base64"));
+        assert_eq!(envelope.source_queue.as_deref(), Some("orders"));
+        let legacy = parse_dlq_payload(r#"{"body":"text"}"#);
+        assert_eq!(legacy.body_encoding, None);
     }
 }

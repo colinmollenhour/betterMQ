@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
+import { useTimestamp } from "@vueuse/core";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -37,7 +38,11 @@ import {
 } from "@/lib/federation";
 import { useActionStatus } from "@/composables/useActionStatus";
 import { errText } from "@/lib/payload";
-import { refreshCells, selectedCell, session, type CellMember, type CellRecord } from "@/lib/session";
+import { canRemoveNode } from "@/lib/targets";
+import { isStandalone } from "@/lib/config";
+import { memberHealthLabel, readinessLabel } from "@/lib/health";
+import { cellCredentialError } from "@/lib/cellCredentials";
+import { localBrokerSelected, refreshCells, selectedCell, session, type CellMember, type CellRecord } from "@/lib/session";
 
 type SectionId = "overview" | "nodes" | "cells" | "cluster" | "this-node" | "storage";
 
@@ -46,7 +51,7 @@ type NodeRow = {
   name: string;
   role: string;
   addr: string;
-  healthy: boolean;
+  healthy?: boolean;
   self: boolean;
   cellId: string;
   cellLabel: string;
@@ -54,14 +59,14 @@ type NodeRow = {
   member?: CellMember;
 };
 
-const sections: { id: SectionId; label: string }[] = [
+const sections = computed(() => ([
   { id: "overview", label: "Overview" },
   { id: "nodes", label: "Nodes" },
   { id: "cells", label: "Cells" },
   { id: "cluster", label: "Cluster" },
   { id: "this-node", label: "This node" },
   { id: "storage", label: "Storage" },
-];
+].filter((item) => localBrokerSelected() || !["this-node", "storage"].includes(item.id)) as { id: SectionId; label: string }[]));
 
 const section = ref<SectionId>("overview");
 const selectedNodeKey = ref("");
@@ -69,13 +74,19 @@ const selectedNodeKey = ref("");
 const nodesByCell = reactive<Record<string, AdminNode[]>>({});
 const shardsByCell = reactive<Record<string, AdminShard[]>>({});
 const clusterByCell = reactive<Record<string, AdminCluster>>({});
+const federationObservedAt = ref(0);
+const now = useTimestamp({ interval: 1000 });
 const restartMsg = ref("");
 const rfMsg = ref("");
 const infraStatus = ref<Record<string, unknown> | null>(null);
 const joinToken = ref("");
+const hasMembership = ref<boolean | null>(null);
+const hasSavedS3Secret = ref(false);
 
 const createOpen = ref(false);
-const cellForm = reactive({ id: "", region: "", controllerUrl: "", label: "" });
+const editingCell = ref(false);
+const cellForm = reactive({ id: "", region: "", controllerUrl: "", label: "", adminToken: "" });
+watch(createOpen, (open) => { if (!open) cellForm.adminToken = ""; });
 
 const attachOpen = ref(false);
 const attach = reactive({
@@ -107,11 +118,6 @@ const profileOptions = [
   { value: "dispatch", label: "dispatch fleet" },
   { value: "gateway", label: "gateway" },
   { value: "panel", label: "panel" },
-];
-
-const storageOptions = [
-  { value: "local", label: "Local disk (WAL + RocksDB)" },
-  { value: "slate", label: "SlateDB (S3 / MinIO / R2)" },
 ];
 
 const fedStatus = useActionStatus();
@@ -166,7 +172,7 @@ const nodeRows = computed<NodeRow[]>(() => {
         name: n.name || shortId(n.id) || n.addr || "broker",
         role: "broker",
         addr: n.addr || "",
-        healthy: n.alive ?? n.healthy ?? true,
+        healthy: now.value - federationObservedAt.value > 30000 ? undefined : n.alive ?? n.healthy,
         self: Boolean(n.self ?? n.is_self),
         cellId: cell.id,
         cellLabel: cell.label || cell.id,
@@ -181,7 +187,7 @@ const nodeRows = computed<NodeRow[]>(() => {
         name: m.name || m.profile,
         role: m.profile,
         addr: m.reachUrl,
-        healthy: true,
+        healthy: undefined,
         self: false,
         cellId: cell.id,
         cellLabel: cell.label || cell.id,
@@ -195,16 +201,13 @@ const nodeRows = computed<NodeRow[]>(() => {
 const selectedRow = computed(() => nodeRows.value.find((row) => row.key === selectedNodeKey.value) || null);
 
 const currentCluster = computed(() => {
-  const cell = selectedCell();
-  if (cell && clusterByCell[cell.id]) return clusterByCell[cell.id];
-  return Object.values(clusterByCell)[0] || null;
+  const id = session.selectedCellId || selectedCell()?.id || "local";
+  return clusterByCell[id] || null;
 });
 
 const shardRows = computed(() => {
-  const cell = selectedCell();
-  if (cell && shardsByCell[cell.id]) return shardsByCell[cell.id];
-  const first = Object.keys(shardsByCell)[0];
-  return first ? shardsByCell[first] || [] : [];
+  const id = session.selectedCellId || selectedCell()?.id || "local";
+  return shardsByCell[id] || [];
 });
 
 const kpiNode = computed(() => String(infraStatus.value?.node_name || "—"));
@@ -216,7 +219,7 @@ onMounted(() => {
 });
 
 async function load() {
-  await refreshCells();
+  try { await refreshCells(); } catch (error) { fedStatus.fail(error); return; }
   await Promise.all([loadFed(), loadInfra()]);
   if (selectedNodeKey.value && !nodeRows.value.some((row) => row.key === selectedNodeKey.value)) {
     selectedNodeKey.value = "";
@@ -225,6 +228,9 @@ async function load() {
 
 async function loadFed() {
   fedStatus.reset();
+  for (const key of Object.keys(nodesByCell)) delete nodesByCell[key];
+  for (const key of Object.keys(shardsByCell)) delete shardsByCell[key];
+  for (const key of Object.keys(clusterByCell)) delete clusterByCell[key];
   try {
     const [nodes, shards, cluster] = await Promise.all([
       queryCells<{ nodes?: AdminNode[] }>("nodes"),
@@ -237,8 +243,9 @@ async function loadFed() {
     for (const row of shards.ok || []) shardsByCell[row.cell] = row.data.shards || [];
     for (const key of Object.keys(clusterByCell)) delete clusterByCell[key];
     for (const row of cluster.ok || []) clusterByCell[row.cell] = row.data;
+    federationObservedAt.value = Date.now();
     const failed = [...(nodes.failed || []), ...(shards.failed || []), ...(cluster.failed || [])];
-    if (failed.length) fedStatus.fail(`Federated query failed: ${failed[0].cell} — ${failed[0].error}`);
+    if (failed.length) fedStatus.fail(`Federated query failed: ${[...new Set(failed.map((failure) => `${failure.cell} — ${failure.error}`))].join("; ")}`);
     const cell = selectedCell();
     if (cell) {
       const ov = dataForCell(cluster, cell.id);
@@ -250,6 +257,7 @@ async function loadFed() {
 }
 
 async function loadInfra() {
+  if (!localBrokerSelected()) return;
   try {
     const st = await apiGet<Record<string, unknown>>(publicUrl("/v1/infra/status"));
     infraStatus.value = st;
@@ -265,11 +273,14 @@ async function loadInfra() {
   try {
     const cfg = await apiGet<{
       node?: { name?: string; publicUrl?: string };
+      cluster?: { id?: string; nodes?: unknown[] } | null;
       storage?: { mode?: string; s3?: Record<string, string> };
     }>(publicUrl("/v1/infra/config"));
     nodeForm.name = cfg.node?.name || "";
     nodeForm.publicUrl = cfg.node?.publicUrl || "";
+    hasMembership.value = Boolean(cfg.cluster?.id || cfg.cluster?.nodes?.length || session.cluster?.enabled);
     if (cfg.storage?.mode === "slate" && cfg.storage.s3) {
+      hasSavedS3Secret.value = true;
       storage.mode = "slate";
       storage.endpoint = cfg.storage.s3.endpoint || "";
       storage.bucket = cfg.storage.s3.bucket || "";
@@ -277,6 +288,7 @@ async function loadInfra() {
       storage.accessKey = cfg.storage.s3.accessKey || "";
       storage.region = cfg.storage.s3.region || "auto";
     } else {
+      hasSavedS3Secret.value = false;
       storage.mode = "local";
     }
   } catch {
@@ -286,12 +298,15 @@ async function loadInfra() {
 
 async function createCell() {
   cellStatus.reset();
+  const credentialError = cellCredentialError(cellForm.adminToken, editingCell.value);
+  if (credentialError) { cellStatus.fail(credentialError); return; }
   try {
     await apiPost(adminUrl("/cells"), {
       id: cellForm.id,
       region: cellForm.region,
       controllerUrl: cellForm.controllerUrl,
       label: cellForm.label || undefined,
+      adminToken: cellForm.adminToken.trim() || undefined,
     });
     cellStatus.succeed(`Registered cell ${cellForm.id}`);
     createOpen.value = false;
@@ -300,6 +315,17 @@ async function createCell() {
   } catch (e) {
     cellStatus.fail(e);
   }
+}
+
+function openCellForm(cell?: CellRecord) {
+  editingCell.value = Boolean(cell);
+  cellForm.id = cell?.id || "";
+  cellForm.region = cell?.region || "";
+  cellForm.controllerUrl = cell?.controllerUrl || "";
+  cellForm.label = cell?.label || "";
+  cellForm.adminToken = "";
+  cellStatus.reset();
+  createOpen.value = true;
 }
 
 async function probe() {
@@ -318,6 +344,10 @@ async function probe() {
 }
 
 async function attachNode() {
+  if (needsToken.value && !localBrokerSelected()) {
+    attach.error = "Broker joins are supported only from the target cell's embedded panel.";
+    return;
+  }
   attach.error = "";
   attachOk.value = "";
   const cell = selectedCell();
@@ -350,6 +380,8 @@ async function attachNode() {
 }
 
 async function createCluster() {
+  if (hasMembership.value !== false || !localBrokerSelected()) return;
+  if (!confirm("Create a new cluster seed on this unclustered node? Existing deployments must be joined, not replaced.")) return;
   clusterStatus.reset();
   try {
     const res = await apiPost<{ join_token?: string; message?: string; needs_restart?: boolean }>(
@@ -368,6 +400,7 @@ async function createCluster() {
 }
 
 async function syncCluster() {
+  if (!localBrokerSelected()) return;
   clusterStatus.reset();
   try {
     const res = await apiPost<{ nodes?: unknown[] }>(publicUrl("/v1/infra/cluster/sync"), {});
@@ -379,8 +412,14 @@ async function syncCluster() {
   }
 }
 
-async function removeNode(name: string) {
-  if (!confirm(`Remove ${name} from the cluster?`)) return;
+function removable(row: NodeRow) {
+  return localBrokerSelected() && canRemoveNode(row, session.isSeed, session.cluster?.cluster_id);
+}
+
+async function removeNode(row: NodeRow) {
+  if (!removable(row)) return;
+  const name = row.broker?.name || row.broker?.addr || row.name;
+  if (!confirm(`Remove ${name} from cell ${row.cellLabel} (${row.cellId})?`)) return;
   detailStatus.reset();
   try {
     const res = await apiPost<{ message?: string; needs_restart?: boolean }>(
@@ -402,7 +441,6 @@ async function saveNode() {
     const res = await apiPut<{ message?: string; needs_restart?: boolean }>(publicUrl("/v1/infra/node"), {
       name: nodeForm.name,
       public_url: nodeForm.publicUrl,
-      listen: "0.0.0.0:8080",
     });
     nodeStatus.succeed(res.message || "Node settings saved");
     if (res.needs_restart) restartMsg.value = res.message || "Restart required.";
@@ -415,6 +453,7 @@ async function saveNode() {
 async function testS3() {
   storageStatus.reset();
   try {
+    if (!storage.secretKey && !hasSavedS3Secret.value) throw new Error("Secret key is required for first-time S3 setup.");
     const res = await apiPost<{ ok?: boolean; message?: string }>(publicUrl("/v1/infra/storage/test"), {
       endpoint: storage.endpoint,
       bucket: storage.bucket,
@@ -433,6 +472,10 @@ async function testS3() {
 
 async function saveStorage() {
   storageStatus.reset();
+  if (storage.mode === "slate" && !storage.secretKey && !hasSavedS3Secret.value) {
+    storageStatus.fail("Secret key is required for first-time S3 setup.");
+    return;
+  }
   const body: Record<string, unknown> = { mode: storage.mode };
   if (storage.mode === "slate") {
     body.s3 = {
@@ -472,9 +515,12 @@ function openAddNode() {
 
 <template>
   <div class="space-y-4">
-    <div>
-      <h1 class="text-lg font-semibold tracking-tight">Infrastructure</h1>
-      <p class="text-sm text-muted-foreground">Cells, brokers, storage, and replication</p>
+    <div class="flex items-center justify-between gap-2">
+      <div>
+        <h1 class="text-lg font-semibold tracking-tight">Infrastructure</h1>
+        <p class="text-sm text-muted-foreground">Cells, brokers, storage, and replication</p>
+      </div>
+      <Button size="sm" variant="outline" @click="load">Refresh infrastructure</Button>
     </div>
 
     <Alert v-if="restartMsg">
@@ -508,14 +554,14 @@ function openAddNode() {
       <div class="min-w-0 flex-1 space-y-4">
         <template v-if="section === 'overview'">
           <div class="grid gap-3 sm:grid-cols-3">
-            <Card>
+            <Card v-if="!isStandalone()">
               <CardHeader class="pb-2">
                 <CardDescription>This node</CardDescription>
                 <CardTitle>{{ kpiNode }}</CardTitle>
               </CardHeader>
               <CardContent class="truncate font-mono text-xs text-muted-foreground">{{ kpiUrl }}</CardContent>
             </Card>
-            <Card>
+            <Card v-if="!isStandalone()">
               <CardHeader class="pb-2">
                 <CardDescription>Storage</CardDescription>
                 <CardTitle class="capitalize">{{ kpiStorage }}</CardTitle>
@@ -524,7 +570,7 @@ function openAddNode() {
             <Card>
               <CardHeader class="pb-2">
                 <CardDescription>Cluster</CardDescription>
-                <CardTitle>{{ session.clusterLabel }}</CardTitle>
+                <CardTitle>{{ currentCluster ? `${currentCluster.nodeCount ?? '—'} nodes` : 'Unavailable' }}</CardTitle>
               </CardHeader>
               <CardContent class="text-xs text-muted-foreground">
                 {{ nodeRows.length }} node{{ nodeRows.length === 1 ? "" : "s" }}
@@ -565,8 +611,8 @@ function openAddNode() {
                     </TableCell>
                     <TableCell class="capitalize">{{ row.role }}</TableCell>
                     <TableCell>
-                      <Badge :variant="row.healthy ? 'outline' : 'destructive'">
-                        {{ row.healthy ? "Healthy" : "Down" }}
+                      <Badge :variant="row.healthy === false ? 'destructive' : 'outline'">
+                        {{ memberHealthLabel(row.healthy) }}
                       </Badge>
                     </TableCell>
                     <TableCell class="max-w-[16rem] truncate font-mono text-xs">{{ row.addr || "—" }}</TableCell>
@@ -617,8 +663,8 @@ function openAddNode() {
                       <TableCell class="capitalize">{{ row.role }}</TableCell>
                       <TableCell>{{ row.cellLabel }}</TableCell>
                       <TableCell>
-                        <Badge :variant="row.healthy ? 'outline' : 'destructive'">
-                          {{ row.healthy ? "Healthy" : "Down" }}
+                        <Badge :variant="row.healthy === false ? 'destructive' : 'outline'">
+                          {{ memberHealthLabel(row.healthy) }}
                         </Badge>
                       </TableCell>
                     </TableRow>
@@ -639,7 +685,7 @@ function openAddNode() {
                   </div>
                   <div>
                     <p class="text-xs text-muted-foreground">Health</p>
-                    <p>{{ selectedRow.healthy ? "Healthy" : "Down" }}</p>
+                    <p>{{ memberHealthLabel(selectedRow.healthy) }}</p>
                   </div>
                   <div v-if="selectedRow.broker?.id">
                     <p class="text-xs text-muted-foreground">Node ID</p>
@@ -655,14 +701,14 @@ function openAddNode() {
                   </div>
                 </CardContent>
                 <CardFooter
-                  v-if="session.isSeed && selectedRow.broker && !selectedRow.self"
+                  v-if="removable(selectedRow)"
                   class="flex-wrap"
                 >
                   <ActionMessage :error="detailStatus.error" :ok="detailStatus.ok" />
                   <Button
                     variant="destructive"
                     size="sm"
-                    @click="removeNode(selectedRow.broker.name || selectedRow.broker.addr || selectedRow.name)"
+                    @click="removeNode(selectedRow)"
                   >
                     Remove
                   </Button>
@@ -682,7 +728,7 @@ function openAddNode() {
               <h2 class="text-base font-medium">Cells</h2>
               <p class="text-sm text-muted-foreground">Register another region’s controller. This does not start VMs.</p>
             </div>
-            <Button size="sm" @click="createOpen = true">Create cell</Button>
+            <Button size="sm" @click="openCellForm()">Create cell</Button>
           </div>
           <Card>
             <CardContent class="pt-4">
@@ -693,6 +739,8 @@ function openAddNode() {
                     <TableHead>Label</TableHead>
                     <TableHead>Region</TableHead>
                     <TableHead>Controller</TableHead>
+                    <TableHead>Admin credential</TableHead>
+                    <TableHead />
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -703,6 +751,8 @@ function openAddNode() {
                     <TableCell class="max-w-[16rem] truncate font-mono text-xs">
                       {{ cell.controllerUrl || "—" }}
                     </TableCell>
+                    <TableCell>{{ cell.adminTokenConfigured ? 'Configured' : 'Not configured' }}</TableCell>
+                    <TableCell><Button size="sm" variant="outline" @click="openCellForm(cell)">Edit</Button></TableCell>
                   </TableRow>
                 </TableBody>
               </Table>
@@ -718,13 +768,15 @@ function openAddNode() {
             </CardHeader>
             <CardContent class="space-y-3">
               <p class="text-sm text-muted-foreground">
-                Status: {{ session.clusterLabel }}
+                Selected cell: {{ selectedCell()?.label || session.selectedCellId || 'local' }}
+                <span v-if="!currentCluster"> · Cluster data unavailable</span>
                 <span v-if="currentCluster">
                   · {{ currentCluster.nodeCount || 0 }} nodes · RF {{ currentCluster.replicationFactor || "—" }}
+                  · {{ readinessLabel(currentCluster.ready ?? null, federationObservedAt, now) }}
                 </span>
               </p>
-              <div class="flex flex-wrap items-center gap-2">
-                <Button size="sm" @click="createCluster">Create cluster</Button>
+              <div v-if="localBrokerSelected()" class="flex flex-wrap items-center gap-2">
+                <Button v-if="hasMembership === false" size="sm" @click="createCluster">Create cluster</Button>
                 <Button size="sm" variant="outline" @click="syncCluster">Re-sync</Button>
                 <ActionMessage :error="clusterStatus.error" :ok="clusterStatus.ok" />
               </div>
@@ -736,7 +788,7 @@ function openAddNode() {
           </Card>
         </template>
 
-        <template v-else-if="section === 'this-node'">
+        <template v-else-if="section === 'this-node' && localBrokerSelected()">
           <Card>
             <CardHeader>
               <CardTitle>This node</CardTitle>
@@ -755,23 +807,31 @@ function openAddNode() {
           </Card>
         </template>
 
-        <template v-else>
+        <template v-else-if="section === 'storage' && localBrokerSelected()">
           <Card>
             <CardHeader>
               <CardTitle>Storage</CardTitle>
-              <CardDescription>WAL backend for this broker</CardDescription>
+              <CardDescription>Storage location is read-only while the broker is running. Only credentials can be updated here.</CardDescription>
             </CardHeader>
             <CardContent class="grid gap-3">
-              <Field label="Mode"><AppSelect v-model="storage.mode" :options="storageOptions" /></Field>
+              <Alert>
+                <AlertTitle>No live backend or location changes</AlertTitle>
+                <AlertDescription>
+                  Switching stores strands pending, retrying and dead-letter messages; this panel does not migrate data.
+                  Stop ingestion and use a verified offline migration, or start a new deployment.
+                  In a cluster, coordinate migration across every replica before restarting.
+                </AlertDescription>
+              </Alert>
+              <Field label="Mode"><Input :model-value="storage.mode" readonly /></Field>
               <template v-if="storage.mode === 'slate'">
-                <Field label="Endpoint"><Input v-model="storage.endpoint" class="font-mono text-xs" /></Field>
-                <Field label="Bucket"><Input v-model="storage.bucket" class="font-mono" /></Field>
-                <Field label="Payload bucket"><Input v-model="storage.payloadBucket" class="font-mono" /></Field>
+                <Field label="Endpoint"><Input :model-value="storage.endpoint" readonly class="font-mono text-xs" /></Field>
+                <Field label="Bucket"><Input :model-value="storage.bucket" readonly class="font-mono" /></Field>
+                <Field label="Payload bucket"><Input :model-value="storage.payloadBucket" readonly class="font-mono" /></Field>
                 <Field label="Access key"><Input v-model="storage.accessKey" class="font-mono" /></Field>
                 <Field label="Secret key">
-                  <Input v-model="storage.secretKey" type="password" placeholder="leave blank to keep" />
+                  <Input v-model="storage.secretKey" type="password" :placeholder="hasSavedS3Secret ? 'leave blank to keep' : 'required for first-time setup'" />
                 </Field>
-                <Field label="Region"><Input v-model="storage.region" class="font-mono" /></Field>
+                <Field label="Region"><Input :model-value="storage.region" readonly class="font-mono" /></Field>
               </template>
               <p v-if="storage.test" class="text-xs text-muted-foreground">{{ storage.test }}</p>
             </CardContent>
@@ -789,23 +849,26 @@ function openAddNode() {
   <Dialog v-model:open="createOpen">
     <DialogContent>
       <DialogHeader>
-        <DialogTitle>Create cell</DialogTitle>
+        <DialogTitle>{{ editingCell ? 'Edit cell' : 'Create cell' }}</DialogTitle>
         <DialogDescription>
           Register another region’s controller. This does not start VMs or join Raft.
         </DialogDescription>
       </DialogHeader>
       <div class="grid gap-3">
-        <Field label="ID"><Input v-model="cellForm.id" placeholder="eu-west" /></Field>
+        <Field label="ID"><Input v-model="cellForm.id" :readonly="editingCell" placeholder="eu-west" /></Field>
         <Field label="Region"><Input v-model="cellForm.region" placeholder="eu-west" /></Field>
         <Field label="Controller URL">
           <Input v-model="cellForm.controllerUrl" class="font-mono text-xs" placeholder="http://10.0.0.9:8090" />
         </Field>
         <Field label="Label"><Input v-model="cellForm.label" placeholder="EU" /></Field>
+        <Field label="Cell admin token" :hint="editingCell ? 'Write-only. Leave blank to keep the saved token.' : 'Required: the target cell’s sk_local_ admin token. Never use the cluster secret.'">
+          <Input v-model="cellForm.adminToken" type="password" autocomplete="off" :placeholder="editingCell ? 'Leave blank to keep' : 'sk_local_…'" />
+        </Field>
       </div>
       <DialogFooter>
         <ActionMessage :error="cellStatus.error" :ok="cellStatus.ok" />
         <Button variant="outline" size="sm" @click="createOpen = false">Cancel</Button>
-        <Button size="sm" @click="createCell">Register</Button>
+        <Button size="sm" @click="createCell">{{ editingCell ? 'Save' : 'Register' }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

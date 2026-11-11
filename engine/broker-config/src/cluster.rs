@@ -31,6 +31,14 @@ pub fn build_cluster_config(cfg: &BetterMqConfig) -> Result<ClusterConfig, Confi
         .map(|n| NodeConfig {
             id: stable_node_id(&n.name),
             addr: n.public_url.trim_end_matches('/').to_string(),
+            internal_url: if n.name == cfg.node.name {
+                cfg.node
+                    .internal_url
+                    .clone()
+                    .or_else(|| n.internal_url.clone())
+            } else {
+                n.internal_url.clone()
+            },
         })
         .collect();
 
@@ -79,7 +87,7 @@ pub fn ensure_cluster_config(cfg: &BetterMqConfig, data_dir: &Path) -> Result<bo
     if write {
         ClusterRuntime::init_cluster_file(data_dir, &desired)
             .map_err(|e| ConfigError::Invalid(e.to_string()))?;
-        std::fs::write(cfg_path, serde_json::to_vec_pretty(&desired)?)?;
+        broker_proto::write_secret_atomic(&cfg_path, &serde_json::to_vec_pretty(&desired)?)?;
     }
 
     Ok(true)
@@ -89,8 +97,14 @@ fn addrs_match(a: &[NodeConfig], b: &[NodeConfig]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    let mut aa: Vec<_> = a.iter().map(|n| n.addr.as_str()).collect();
-    let mut bb: Vec<_> = b.iter().map(|n| n.addr.as_str()).collect();
+    let mut aa: Vec<_> = a
+        .iter()
+        .map(|n| (n.addr.as_str(), n.internal_base()))
+        .collect();
+    let mut bb: Vec<_> = b
+        .iter()
+        .map(|n| (n.addr.as_str(), n.internal_base()))
+        .collect();
     aa.sort_unstable();
     bb.sort_unstable();
     aa == bb
@@ -117,5 +131,24 @@ mod tests {
         assert_eq!(cluster.nodes.len(), 3);
         assert!(!cluster.preferred_leader_for_shard(0).is_nil());
         assert_eq!(cluster.hash_version, HASH_VERSION);
+    }
+
+    #[test]
+    fn private_endpoints_are_separate_and_legacy_members_fall_back() {
+        let mut cfg = BetterMqConfig::template_cluster_local();
+        cfg.node.internal_url = Some("http://broker1:9080".into());
+        cfg.cluster.as_mut().unwrap().nodes[1].internal_url = Some("http://broker2:9080/".into());
+        let cluster = build_cluster_config(&cfg).unwrap();
+        assert_eq!(cluster.nodes[0].addr, "http://broker1:8080");
+        assert_eq!(cluster.nodes[0].internal_base(), "http://broker1:9080");
+        assert_eq!(cluster.nodes[1].internal_base(), "http://broker2:9080");
+        assert_eq!(cluster.nodes[2].internal_base(), "http://broker3:8080");
+        let mut legacy = serde_json::to_value(&cluster).unwrap();
+        for node in legacy["nodes"].as_array_mut().unwrap() {
+            node.as_object_mut().unwrap().remove("internal_url");
+        }
+        let parsed: ClusterConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.nodes[0].internal_base(), parsed.nodes[0].addr);
+        assert!(!addrs_match(&parsed.nodes, &cluster.nodes));
     }
 }

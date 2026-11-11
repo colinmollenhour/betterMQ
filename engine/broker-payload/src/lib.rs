@@ -11,7 +11,10 @@ mod s3;
 pub use fs::FsBlobStore;
 pub use inline::InlinePayloadStore;
 pub use r#ref::PayloadRef;
-pub use store::{hydrate_payload, inline_max_bytes, max_blob_bytes, prepare_for_log, BlobStore};
+pub use store::{
+    hydrate_payload, inline_max_bytes, max_blob_bytes, prepare_for_log, prepare_for_log_with,
+    BlobStore, PayloadPolicy,
+};
 
 #[cfg(feature = "s3")]
 pub use s3::S3BlobStore;
@@ -33,6 +36,12 @@ pub enum PayloadError {
     Store(String),
     #[error("payload too large: {size} bytes exceeds limit {limit}")]
     TooLarge { size: u64, limit: u64 },
+    /// Local-WAL cells keep bodies inline in the replicated WAL frame, so a
+    /// body must fit one replication epoch.
+    #[error("payload too large for this cell: {size} bytes exceeds the {limit}-byte inline limit")]
+    TooLargeForCell { size: u64, limit: u64 },
+    #[error("payload blob does not match its reference: {0}")]
+    Mismatch(String),
     #[error("invalid blob key: {0}")]
     InvalidKey(#[from] broker_proto::PathSegmentError),
 }
@@ -78,6 +87,88 @@ mod tests {
         assert_eq!(reference.size, 300_000);
         let loaded = store.get_blob(&reference).unwrap();
         assert_eq!(loaded, body);
+    }
+
+    #[test]
+    fn inline_only_policy_never_writes_blobs_and_rejects_above_the_limit() {
+        let dir = tempdir().unwrap();
+        let store = BlobStore::open_local(dir.path()).unwrap();
+        let policy = PayloadPolicy::InlineOnly { max_body: 1_000 };
+        let body = vec![7u8; 1_000];
+        let (inline, reference) =
+            prepare_for_log_with(&store, policy, "default", Uuid::new_v4(), body.clone()).unwrap();
+        assert_eq!(inline, body);
+        assert!(reference.is_none());
+        assert!(matches!(
+            prepare_for_log_with(&store, policy, "default", Uuid::new_v4(), vec![0u8; 1_001]),
+            Err(PayloadError::TooLargeForCell {
+                size: 1_001,
+                limit: 1_000
+            })
+        ));
+        // Above BETTERMQ_INLINE_MAX_BYTES, still inline.
+        let big = vec![1u8; inline_max_bytes() + 1];
+        let wide = PayloadPolicy::InlineOnly {
+            max_body: big.len(),
+        };
+        let (inline, reference) =
+            prepare_for_log_with(&store, wide, "default", Uuid::new_v4(), big.clone()).unwrap();
+        assert_eq!(inline.len(), big.len());
+        assert!(reference.is_none());
+        let blobs = dir.path().join("payload-blobs");
+        assert!(walk_files(&blobs).is_empty(), "no blob written");
+    }
+
+    fn walk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    out.extend(walk_files(&path));
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn repaired_blob_is_verified_then_installed() {
+        let source_dir = tempdir().unwrap();
+        let source = BlobStore::open_local(source_dir.path()).unwrap();
+        let id = Uuid::new_v4();
+        let reference = source.put_blob("default", id, b"legacy body").unwrap();
+        let bytes = source.read_local_blob("default", id).unwrap();
+
+        let target_dir = tempdir().unwrap();
+        let target = BlobStore::open_local(target_dir.path()).unwrap();
+        assert!(target.verify_blob(&reference).is_err());
+        assert!(matches!(
+            target.install_blob(&reference, b"legacy b0dy"),
+            Err(PayloadError::ChecksumMismatch)
+        ));
+        assert!(matches!(
+            target.install_blob(&reference, b"short"),
+            Err(PayloadError::Mismatch(_))
+        ));
+        target.install_blob(&reference, &bytes).unwrap();
+        target.verify_blob(&reference).unwrap();
+        assert_eq!(target.get_blob(&reference).unwrap(), b"legacy body");
+    }
+
+    #[test]
+    fn fs_blob_delete_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let store = BlobStore::open_local(dir.path()).unwrap();
+        let reference = store.put_blob("default", Uuid::new_v4(), b"body").unwrap();
+        assert!(store.delete_blob(&reference).unwrap());
+        assert!(matches!(
+            store.get_blob(&reference),
+            Err(PayloadError::NotFound(_))
+        ));
+        assert!(!store.delete_blob(&reference).unwrap());
     }
 
     #[test]

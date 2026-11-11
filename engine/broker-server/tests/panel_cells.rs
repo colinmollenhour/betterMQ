@@ -102,7 +102,8 @@ async fn embedded_panel_persists_local_cell_and_federates_local_kinds() {
             "id": "eu-west",
             "region": "eu-west",
             "controllerUrl": "http://10.0.0.9:8090",
-            "label": "EU"
+            "label": "EU",
+            "adminToken": "sk_local_eu"
         }))
         .send()
         .await
@@ -110,6 +111,19 @@ async fn embedded_panel_persists_local_cell_and_federates_local_kinds() {
     assert!(upsert.status().is_success(), "{}", upsert.status());
     let on_disk = std::fs::read_to_string(data.path().join("cell-registry.json")).unwrap();
     assert!(on_disk.contains("eu-west"));
+    let listed = client
+        .get(format!("{base}/admin/v1/cells"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(listed.contains("\"adminTokenConfigured\":true"), "{listed}");
+    assert!(
+        !listed.contains("sk_local_eu"),
+        "cell token must be redacted"
+    );
 
     let cors = client
         .request(reqwest::Method::OPTIONS, format!("{base}/admin/v1/health"))
@@ -121,50 +135,6 @@ async fn embedded_panel_persists_local_cell_and_federates_local_kinds() {
     assert!(
         cors.headers().get("access-control-allow-origin").is_none(),
         "default CORS must stay closed"
-    );
-}
-
-#[tokio::test]
-async fn dispatch_fleet_enroll_is_rejected() {
-    let data = tempfile::tempdir().unwrap();
-    let address = free_addr();
-    let child = Command::new(env!("CARGO_BIN_EXE_bettermq"))
-        .args([
-            "serve",
-            "--dispatch-fleet",
-            "--listen",
-            &address.to_string(),
-            "--data-dir",
-            data.path().to_str().unwrap(),
-        ])
-        .env("BETTERMQ_INSECURE_NO_AUTH", "1")
-        .env("BETTERMQ_BROKER_URLS", "http://127.0.0.1:9")
-        .env("BETTERMQ_CLUSTER_SECRET", "panel-cells-test-secret")
-        .env("RUST_LOG", "error")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let _guard = ChildGuard(child);
-    let client = reqwest::Client::new();
-    let base = format!("http://{address}");
-    assert!(wait_health(&client, &format!("{base}/healthz")).await);
-
-    let resp = client
-        .post(format!("{base}/v1/infra/cluster/enroll"))
-        .json(&serde_json::json!({
-            "seed_url": "http://127.0.0.1:9",
-            "join_token": "nope",
-            "public_url": "http://127.0.0.1:9",
-            "node_name": "fleet1"
-        }))
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    assert!(
-        status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::NOT_FOUND,
-        "dispatch/WAL-less enroll must not join a replica set: {status}"
     );
 }
 
@@ -317,4 +287,125 @@ async fn split_panel_listen_serves_v1_on_panel_and_hides_panel_from_public() {
         reqwest::StatusCode::NOT_FOUND,
         "public listener must not serve /internal/v1"
     );
+}
+
+#[tokio::test]
+async fn partial_listener_splits_bind_once_and_isolate_roles() {
+    for split in ["admin", "panel", "internal", "shared", "collapsed"] {
+        let data = tempfile::tempdir().unwrap();
+        let public = free_addr();
+        let private = free_addr();
+        let public_arg = public.to_string();
+        let private_arg = private.to_string();
+        let mut args = vec![
+            "serve",
+            "--listen",
+            &public_arg,
+            "--data-dir",
+            data.path().to_str().unwrap(),
+        ];
+        match split {
+            "admin" => args.extend(["--admin-listen", &private_arg]),
+            "panel" => args.extend(["--panel-listen", &private_arg]),
+            "internal" => args.extend(["--internal-listen", &private_arg]),
+            "shared" => args.extend([
+                "--admin-listen",
+                &private_arg,
+                "--internal-listen",
+                &private_arg,
+            ]),
+            _ => {}
+        }
+        let _guard = ChildGuard(spawn_serve(&args, data.path()));
+        let client = reqwest::Client::new();
+        assert!(
+            wait_health(&client, &format!("http://{public}/healthz")).await,
+            "{split}"
+        );
+        let admin = if ["admin", "panel", "shared"].contains(&split) {
+            private
+        } else {
+            public
+        };
+        let internal = if ["internal", "shared"].contains(&split) {
+            private
+        } else {
+            public
+        };
+        for addr in [public, private] {
+            if addr == private && split == "collapsed" {
+                continue;
+            }
+            for (path, present) in [
+                ("/admin/v1/cells", addr == admin),
+                ("/panel/", addr == admin),
+                ("/docs", addr == admin),
+                ("/internal/v1/cluster", addr == internal),
+            ] {
+                let response = client
+                    .get(format!("http://{addr}{path}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status() != reqwest::StatusCode::NOT_FOUND,
+                    present,
+                    "{split}: {addr}{path}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn configured_public_listener_is_the_actual_bind_address() {
+    let data = tempfile::tempdir().unwrap();
+    let public = free_addr();
+    let unused = free_addr();
+    let mut cfg = broker_config::BetterMqConfig::template_single_local();
+    cfg.node.listen = unused.to_string();
+    cfg.listeners = Some(broker_config::ListenerSection {
+        public: Some(public.to_string()),
+        ..Default::default()
+    });
+    let path = data.path().join("bettermq.json");
+    broker_config::write_config(&path, &cfg).unwrap();
+    let _guard = ChildGuard(spawn_serve(
+        &[
+            "serve",
+            "--config",
+            path.to_str().unwrap(),
+            "--data-dir",
+            data.path().to_str().unwrap(),
+        ],
+        data.path(),
+    ));
+    assert!(wait_health(&reqwest::Client::new(), &format!("http://{public}/healthz")).await);
+    assert!(tokio::net::TcpStream::connect(unused).await.is_err());
+}
+
+#[tokio::test]
+async fn broker_only_still_hosts_the_setup_panel() {
+    let data = tempfile::tempdir().unwrap();
+    let addr = free_addr();
+    let _guard = ChildGuard(spawn_serve(
+        &[
+            "serve",
+            "--broker-only",
+            "--listen",
+            &addr.to_string(),
+            "--data-dir",
+            data.path().to_str().unwrap(),
+        ],
+        data.path(),
+    ));
+    let client = reqwest::Client::new();
+    assert!(wait_health(&client, &format!("http://{addr}/healthz")).await);
+    assert!(client
+        .get(format!("http://{addr}/panel/"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
 }

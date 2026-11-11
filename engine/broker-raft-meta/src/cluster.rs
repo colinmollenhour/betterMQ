@@ -1,6 +1,6 @@
 //! Cluster membership, peer health, and shard leader election (CP7b / HA M2).
 
-use crate::election::{elect_shard_leader, DEFAULT_PEER_TTL_MS};
+use crate::election::{choose_shard_leader, elect_shard_leader, DEFAULT_PEER_TTL_MS};
 use crate::epoch::{ControllerLeaderProof, ControllerVoteRequest, ControllerVoteResponse};
 use crate::{ControllerCommand, ControllerState, OpenRaftController};
 use broker_storage::FileLock;
@@ -52,6 +52,48 @@ pub enum ClusterError {
 pub struct NodeConfig {
     pub id: Uuid,
     pub addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_url: Option<String>,
+}
+
+impl NodeConfig {
+    pub fn internal_base(&self) -> &str {
+        self.internal_url
+            .as_deref()
+            .unwrap_or(&self.addr)
+            .trim()
+            .trim_end_matches('/')
+    }
+}
+
+#[cfg(test)]
+mod internal_url_tests {
+    use super::*;
+
+    #[test]
+    fn internal_transport_overrides_without_changing_public_addresses() {
+        let mut node: NodeConfig = serde_json::from_value(serde_json::json!({
+            "id": Uuid::nil(), "addr": "http://public.test:8080/"
+        }))
+        .unwrap();
+        assert_eq!(node.internal_base(), "http://public.test:8080");
+        node.internal_url = Some("http://private.test:9080/".into());
+        let config = ClusterConfig {
+            cluster_id: Uuid::nil(),
+            node_id: node.id,
+            nodes: vec![node],
+            generation: 1,
+            hash_version: 1,
+        };
+        assert_eq!(
+            config.node_addr(Uuid::nil()).as_deref(),
+            Some("http://public.test:8080/")
+        );
+        assert_eq!(
+            config.node_internal_addr(Uuid::nil()).as_deref(),
+            Some("http://private.test:9080")
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,7 +131,7 @@ impl ClusterConfig {
         self.nodes
             .iter()
             .filter(|n| n.id != self.node_id)
-            .map(|n| n.addr.clone())
+            .map(|n| n.internal_base().to_owned())
             .collect()
     }
 
@@ -111,6 +153,24 @@ impl ClusterConfig {
             .find(|n| n.id == id)
             .map(|n| n.addr.clone())
     }
+
+    pub fn node_internal_addr(&self, id: Uuid) -> Option<String> {
+        self.nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.internal_base().to_owned())
+    }
+}
+
+/// Where one shard's epochs go; see [`ClusterRuntime::replication_targets`].
+#[derive(Debug, Clone)]
+pub struct ReplicationTargets {
+    /// Replica peers (excluding this node).
+    pub replicas: Vec<NodeConfig>,
+    /// Learners being caught up; pushed to but not counted toward quorum.
+    pub learners: Vec<NodeConfig>,
+    /// Acks required including this node.
+    pub min_isr: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -409,7 +469,9 @@ impl ClusterRuntime {
     }
 
     /// Health-based placement recommendation. Only the current OpenRaft
-    /// leader may commit this recommendation as authoritative placement.
+    /// leader may commit this recommendation as authoritative placement. With
+    /// a controller the choice is limited to the shard's live in-sync
+    /// replicas; the static node ring is used only without one.
     pub fn desired_leader_for_shard(&self, shard: u32) -> Option<Uuid> {
         self.refresh_from_disk();
         let now = Utc::now().timestamp_millis();
@@ -424,6 +486,13 @@ impl ClusterRuntime {
             }
             Self::peer_alive_in_state(&state, id, now, ttl)
         };
+        if let Some(controller) = &self.controller {
+            let snapshot = controller.state();
+            return snapshot
+                .shards
+                .get(&shard)
+                .and_then(|placement| choose_shard_leader(placement, is_alive));
+        }
         elect_shard_leader(&config.nodes, shard, is_alive)
     }
 
@@ -452,23 +521,60 @@ impl ClusterRuntime {
         self.config.nodes.iter().map(|n| n.id).collect()
     }
 
-    pub fn replication_targets(&self, shard: u32) -> (Vec<NodeConfig>, usize) {
+    /// Peers to replicate `shard` to, resolved from committed membership:
+    /// replicas (whose acks count toward `min_isr`) and learners (which are
+    /// sent every epoch but never counted). Falls back to the startup node
+    /// list without a controller.
+    pub fn replication_targets(&self, shard: u32) -> ReplicationTargets {
         let replicas = self.replica_ids_for_shard(shard);
-        let peers = self
-            .config
-            .peer_nodes()
-            .into_iter()
-            .filter(|peer| replicas.contains(&peer.id))
-            .collect::<Vec<_>>();
-        let rf = replicas.len().max(1);
-        let min_isr = self
+        let state = self
             .controller
             .as_ref()
-            .map(|c| c.state().min_isr as usize)
+            .map(|controller| controller.state());
+        let learner_ids = state
+            .as_ref()
+            .and_then(|state| state.shards.get(&shard))
+            .map(|placement| placement.learners.clone())
+            .unwrap_or_default();
+        let resolve = |id: Uuid| -> Option<NodeConfig> {
+            if id == self.config.node_id {
+                return None;
+            }
+            // The startup config carries the node's private `internal_url`.
+            let internal_url = self
+                .config
+                .nodes
+                .iter()
+                .find(|node| node.id == id)
+                .and_then(|node| node.internal_url.clone());
+            state
+                .as_ref()
+                .and_then(|state| state.data_nodes.get(&id).map(|node| node.addr.clone()))
+                .or_else(|| self.config.node_addr(id))
+                .map(|addr| NodeConfig {
+                    id,
+                    addr,
+                    internal_url,
+                })
+        };
+        let peers = replicas.iter().copied().filter_map(resolve).collect();
+        let learners = learner_ids
+            .into_iter()
+            .filter(|id| !replicas.contains(id))
+            .filter_map(resolve)
+            .collect();
+        let rf = replicas.len().max(1);
+        let min_isr = state
+            .as_ref()
+            .map(|state| state.min_isr as usize)
             .filter(|v| *v > 0)
             .unwrap_or(if rf >= 3 { 2 } else { 1 })
             .clamp(1, rf);
-        (peers, min_isr)
+        ReplicationTargets {
+            replicas: peers,
+            learners,
+            min_isr,
+        }
     }
 
     pub fn is_replica_for_shard(&self, shard: u32) -> bool {
@@ -492,7 +598,7 @@ impl ClusterRuntime {
 
     pub fn leader_http_base_for_shard(&self, shard: u32) -> Option<String> {
         let leader = self.elect_leader_for_shard(shard)?;
-        self.config.node_addr(leader)
+        self.config.node_internal_addr(leader)
     }
 
     /// Shards this node currently leads (for logging / tests).
@@ -890,6 +996,7 @@ impl ClusterRuntime {
             return controller
                 .state()
                 .scheduler
+                .clone()
                 .filter(|lease| lease.expires_at_ms > now)
                 .map(|lease| lease.holder);
         }
@@ -925,13 +1032,25 @@ impl ClusterRuntime {
         }
     }
 
+    /// Acquire or renew the scheduler lease. In OpenRaft mode a renewal is a
+    /// quorum-replicated controller write, so the holder only renews once less
+    /// than half of `ttl_ms` remains; callers may poll this every tick.
     pub async fn acquire_scheduler_leader(&self, ttl_ms: i64) -> Result<bool, ClusterError> {
         if let Some(controller) = &self.controller {
             let now_ms = Utc::now().timestamp_millis();
-            if controller.state().scheduler.is_some_and(|lease| {
-                lease.holder != self.config.node_id && lease.expires_at_ms > now_ms
-            }) {
-                return Ok(false);
+            match controller.state().scheduler.as_ref() {
+                Some(lease)
+                    if lease.holder != self.config.node_id && lease.expires_at_ms > now_ms =>
+                {
+                    return Ok(false);
+                }
+                Some(lease)
+                    if lease.holder == self.config.node_id
+                        && lease.expires_at_ms.saturating_sub(now_ms) > ttl_ms.max(1) / 2 =>
+                {
+                    return Ok(true);
+                }
+                _ => {}
             }
             let state = controller
                 .submit(ControllerCommand::AcquireScheduler {
@@ -942,6 +1061,7 @@ impl ClusterRuntime {
                 .await?;
             return Ok(state
                 .scheduler
+                .as_ref()
                 .is_some_and(|lease| lease.holder == self.config.node_id));
         }
         Ok(self.try_acquire_scheduler_leader(ttl_ms))
@@ -949,7 +1069,10 @@ impl ClusterRuntime {
 
     pub async fn advance_catalog_epoch(&self) -> Result<u64, ClusterError> {
         let Some(controller) = &self.controller else {
-            return Ok(0);
+            return Err(crate::ControllerError::CatalogUnavailable(
+                "catalog mutations require an OpenRaft controller".into(),
+            )
+            .into());
         };
         let state = controller
             .submit(ControllerCommand::AdvanceCatalogEpoch)
@@ -965,7 +1088,10 @@ impl ClusterRuntime {
         tombstone: bool,
     ) -> Result<u64, ClusterError> {
         let Some(controller) = &self.controller else {
-            return Ok(0);
+            return Err(crate::ControllerError::CatalogUnavailable(
+                "catalog mutations require an OpenRaft controller".into(),
+            )
+            .into());
         };
         let state = controller
             .submit(ControllerCommand::PutCatalogRecord {
@@ -981,7 +1107,7 @@ impl ClusterRuntime {
     pub fn catalog_epoch(&self) -> u64 {
         self.controller
             .as_ref()
-            .map(|controller| controller.state().catalog_epoch)
+            .map(|controller| controller.catalog_revision())
             .unwrap_or(0)
     }
 
@@ -999,7 +1125,7 @@ impl ClusterRuntime {
         let state = ClusterStateFile::default();
         write_state_file(&path, &state)?;
         let cfg_path = data_dir.as_ref().join("cluster-config.json");
-        fs::write(cfg_path, serde_json::to_vec_pretty(config)?)?;
+        broker_proto::write_secret_atomic(&cfg_path, &serde_json::to_vec_pretty(config)?)?;
         Ok(())
     }
 
@@ -1018,6 +1144,55 @@ mod tests {
     use super::*;
     use crate::election::elect_shard_leader;
 
+    /// `BETTERMQ_SHARED_META_DIR` is process-wide: a test that sets it would
+    /// move a concurrent test's `cluster.json` (and its scheduler lease) into
+    /// the shared dir.
+    static SHARED_META_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scheduler_holder_renews_only_after_half_the_lease() {
+        let _env = SHARED_META_ENV.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let node = Uuid::new_v4();
+        let config = ClusterConfig {
+            cluster_id: Uuid::new_v4(),
+            nodes: vec![NodeConfig {
+                id: node,
+                addr: "http://127.0.0.1:1".into(),
+                internal_url: None,
+            }],
+            node_id: node,
+            generation: 1,
+            hash_version: 1,
+        };
+        let rt = ClusterRuntime::open_with_raft(dir.path(), config, 4)
+            .await
+            .unwrap();
+        let controller = rt.controller().unwrap().clone();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !(controller.is_ready() && controller.is_leader_with_quorum()) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("single-node controller becomes ready");
+        let last_log = || controller.raft().metrics().borrow().last_log_index;
+
+        assert!(rt.acquire_scheduler_leader(5_000).await.unwrap());
+        let acquired_at = last_log();
+        for _ in 0..10 {
+            assert!(rt.acquire_scheduler_leader(5_000).await.unwrap());
+        }
+        assert_eq!(last_log(), acquired_at, "fresh lease is not re-submitted");
+        assert!(rt.is_scheduler_leader());
+
+        // Less than half of a longer TTL remains, so this call renews.
+        let before = controller.state().scheduler.as_ref().unwrap().expires_at_ms;
+        assert!(rt.acquire_scheduler_leader(60_000).await.unwrap());
+        assert!(last_log() > acquired_at);
+        assert!(controller.state().scheduler.as_ref().unwrap().expires_at_ms > before);
+    }
+
     #[test]
     fn shard_leader_round_robin_when_all_healthy() {
         let n1 = Uuid::new_v4();
@@ -1026,10 +1201,12 @@ mod tests {
             cluster_id: Uuid::new_v4(),
             nodes: vec![
                 NodeConfig {
+                    internal_url: None,
                     id: n1,
                     addr: "http://n1:8080".into(),
                 },
                 NodeConfig {
+                    internal_url: None,
                     id: n2,
                     addr: "http://n2:8080".into(),
                 },
@@ -1054,14 +1231,17 @@ mod tests {
         let n3 = Uuid::new_v4();
         let nodes = vec![
             NodeConfig {
+                internal_url: None,
                 id: n1,
                 addr: "http://n1:8080".into(),
             },
             NodeConfig {
+                internal_url: None,
                 id: n2,
                 addr: "http://n2:8080".into(),
             },
             NodeConfig {
+                internal_url: None,
                 id: n3,
                 addr: "http://n3:8080".into(),
             },
@@ -1087,6 +1267,7 @@ mod tests {
 
     #[test]
     fn scheduler_lease_cas_under_shared_file() {
+        let _env = SHARED_META_ENV.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("BETTERMQ_SHARED_META_DIR", dir.path());
         let n1 = Uuid::new_v4();
@@ -1095,10 +1276,12 @@ mod tests {
             cluster_id: Uuid::new_v4(),
             nodes: vec![
                 NodeConfig {
+                    internal_url: None,
                     id: n1,
                     addr: "http://n1:8080".into(),
                 },
                 NodeConfig {
+                    internal_url: None,
                     id: n2,
                     addr: "http://n2:8080".into(),
                 },
@@ -1135,6 +1318,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, id)| NodeConfig {
+                internal_url: None,
                 id: *id,
                 addr: format!("http://n{index}:8080"),
             })
@@ -1178,14 +1362,17 @@ mod tests {
         let (first, second, voter) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let nodes = vec![
             NodeConfig {
+                internal_url: None,
                 id: first,
                 addr: "http://n0".into(),
             },
             NodeConfig {
+                internal_url: None,
                 id: second,
                 addr: "http://n1".into(),
             },
             NodeConfig {
+                internal_url: None,
                 id: voter,
                 addr: "http://n2".into(),
             },

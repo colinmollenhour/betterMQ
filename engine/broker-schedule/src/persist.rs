@@ -48,6 +48,26 @@ fn corrupt_quarantine_path(path: &Path) -> PathBuf {
     path.with_extension(format!("json.corrupt.{ts}"))
 }
 
+/// Quarantined copies of `path` (`<name>.json.corrupt.<ts>`).
+fn quarantined_copies(path: &Path) -> Vec<PathBuf> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{}.corrupt.", name.to_string_lossy());
+    let Ok(entries) = fs::read_dir(if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    }) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .map(|entry| entry.path())
+        .collect()
+}
+
 fn try_parse<T: serde::de::DeserializeOwned>(bytes: &[u8], label: &str) -> Option<T> {
     if bytes.is_empty() || bytes.iter().all(|b| b.is_ascii_whitespace()) {
         warn!(file = label, "json file is empty");
@@ -62,7 +82,20 @@ fn try_parse<T: serde::de::DeserializeOwned>(bytes: &[u8], label: &str) -> Optio
     }
 }
 
+/// Copy unreadable metadata aside for forensics. The main file is left in
+/// place until a recovery succeeds, so a failed start cannot turn into a
+/// "fresh install" on the next one.
 fn quarantine_corrupt_file(path: &Path, bytes: &[u8]) {
+    if quarantined_copies(path)
+        .iter()
+        .any(|copy| fs::read(copy).is_ok_and(|existing| existing == bytes))
+    {
+        warn!(
+            file = %path.display(),
+            "unreadable json already quarantined; will attempt recovery from .tmp / .bak"
+        );
+        return;
+    }
     let quarantine = corrupt_quarantine_path(path);
     match fs::write(&quarantine, bytes) {
         Ok(()) => warn!(
@@ -76,30 +109,47 @@ fn quarantine_corrupt_file(path: &Path, bytes: &[u8]) {
             "could not quarantine corrupt json"
         ),
     }
-    let _ = fs::remove_file(path);
+}
+
+/// Replace the main file with recovered bytes without rotating the (corrupt)
+/// main file over a good `.bak`.
+fn restore_main(path: &Path, bytes: &[u8]) {
+    if let Err(error) = broker_storage::atomic_write_file(path, bytes) {
+        warn!(file = %path.display(), %error, "could not rewrite recovered metadata file");
+    }
 }
 
 /// Load JSON from `path`, falling back to `.json.tmp`, then `.json.bak`.
 /// Returns `Err` if the file existed but no valid copy was found (unless `BETTERMQ_METADATA_RECOVER=empty`).
+/// A missing file next to a quarantined copy is treated the same way, not as a fresh install.
 pub fn load_json_with_recovery<T, F>(
     path: &Path,
     default: F,
 ) -> Result<JsonLoadOutcome<T>, MetadataLoadError>
 where
-    T: serde::de::DeserializeOwned,
+    T: serde::de::DeserializeOwned + serde::Serialize,
     F: FnOnce() -> T,
 {
     if !path.exists() {
-        return Ok(JsonLoadOutcome {
-            value: default(),
-            source: JsonLoadSource::Missing,
-        });
+        let quarantined = quarantined_copies(path);
+        if quarantined.is_empty() {
+            return Ok(JsonLoadOutcome {
+                value: default(),
+                source: JsonLoadSource::Missing,
+            });
+        }
+        warn!(
+            file = %path.display(),
+            quarantined = quarantined.len(),
+            "metadata file missing but quarantined copies exist; not treating as a fresh install"
+        );
     }
 
     let tmp = temp_path(path);
     let bak = backup_path(path);
 
     match fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Ok(bytes) => {
             if let Some(v) = try_parse(&bytes, &path.display().to_string()) {
                 return Ok(JsonLoadOutcome {
@@ -125,7 +175,7 @@ where
                     file = %path.display(),
                     "recovered json metadata from .json.tmp"
                 );
-                let _ = persist_json_atomic(path, &bytes);
+                restore_main(path, &bytes);
                 return Ok(JsonLoadOutcome {
                     value: v,
                     source: JsonLoadSource::Temp,
@@ -142,7 +192,7 @@ where
                     file = %path.display(),
                     "recovered json metadata from .json.bak"
                 );
-                let _ = persist_json_atomic(path, &bytes);
+                restore_main(path, &bytes);
                 return Ok(JsonLoadOutcome {
                     value: v,
                     source: JsonLoadSource::Backup,
@@ -157,8 +207,15 @@ where
             file = %path.display(),
             "no valid json found; starting with empty state (BETTERMQ_METADATA_RECOVER=empty)"
         );
+        let value = default();
+        // Persist the operator's choice so later starts without the override
+        // load the empty state instead of failing on the corrupt file again.
+        match serde_json::to_vec(&value) {
+            Ok(bytes) => restore_main(path, &bytes),
+            Err(error) => warn!(file = %path.display(), %error, "could not encode empty metadata"),
+        }
         return Ok(JsonLoadOutcome {
-            value: default(),
+            value,
             source: JsonLoadSource::EmptyRecovery,
         });
     }
@@ -260,13 +317,48 @@ mod tests {
         let err = load_json_with_recovery(&path, || Sample { items: vec![] })
             .expect_err("expected load to fail");
         assert_eq!(err.path, path);
-        assert!(!path.exists());
-        let quarantined: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains("json.corrupt."))
-            .collect();
-        assert_eq!(quarantined.len(), 1);
+        assert_eq!(fs::read(&path).unwrap(), b"{broken", "main file kept");
+        assert_eq!(quarantined_copies(&path).len(), 1);
+
+        // A restart (e.g. restart: unless-stopped) must fail closed again,
+        // without piling up identical quarantine copies.
+        load_json_with_recovery(&path, || Sample { items: vec![] })
+            .expect_err("second load must also fail");
+        assert_eq!(quarantined_copies(&path).len(), 1);
+    }
+
+    #[test]
+    fn missing_main_next_to_quarantine_fails_closed() {
+        let _guard = LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("BETTERMQ_METADATA_RECOVER") };
+        let dir = TempDir::new().unwrap();
+        let path = sample_path(dir.path());
+        fs::write(
+            path.with_extension("json.corrupt.20260101T000000.000Z"),
+            b"{broken",
+        )
+        .unwrap();
+        load_json_with_recovery(&path, || Sample { items: vec![] })
+            .expect_err("missing main beside a quarantined copy is not a fresh install");
+
+        let bak = backup_path(&path);
+        fs::write(&bak, br#"{"items":[4]}"#).unwrap();
+        let out = load_json_with_recovery(&path, || Sample { items: vec![] }).unwrap();
+        assert_eq!(out.source, JsonLoadSource::Backup);
+        assert_eq!(out.value.items, vec![4]);
+    }
+
+    #[test]
+    fn backup_recovery_does_not_overwrite_good_backup() {
+        let dir = TempDir::new().unwrap();
+        let path = sample_path(dir.path());
+        fs::write(&path, b"{broken").unwrap();
+        fs::write(backup_path(&path), br#"{"items":[5]}"#).unwrap();
+        let out = load_json_with_recovery(&path, || Sample { items: vec![] }).unwrap();
+        assert_eq!(out.source, JsonLoadSource::Backup);
+        assert_eq!(fs::read(backup_path(&path)).unwrap(), br#"{"items":[5]}"#);
+        assert_eq!(fs::read(&path).unwrap(), br#"{"items":[5]}"#);
+        assert_eq!(quarantined_copies(&path).len(), 1);
     }
 
     #[test]
@@ -279,6 +371,11 @@ mod tests {
         let out = load_json_with_recovery(&path, || Sample { items: vec![] }).unwrap();
         unsafe { std::env::remove_var("BETTERMQ_METADATA_RECOVER") };
         assert_eq!(out.source, JsonLoadSource::EmptyRecovery);
+        assert!(out.value.items.is_empty());
+
+        // The override is remembered: the next start loads the empty state.
+        let out = load_json_with_recovery(&path, || Sample { items: vec![9] }).unwrap();
+        assert_eq!(out.source, JsonLoadSource::Main);
         assert!(out.value.items.is_empty());
     }
 }

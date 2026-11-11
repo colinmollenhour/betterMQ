@@ -32,6 +32,44 @@ pub struct BatchEnqueueResponse {
 #[cfg(feature = "cloud")]
 const CLOUD_MAX_BATCH_MESSAGES: usize = MAX_BATCH_MESSAGES;
 
+/// 501 with one explicit rejected outcome per record when a batch sent to a
+/// cell carries any delayed record. Checked before anything is committed.
+pub(crate) fn delayed_batch_response<'a>(
+    requests: impl IntoIterator<Item = &'a broker_partition::PublishRequest>,
+) -> Option<(StatusCode, Json<BatchEnqueueResponse>)> {
+    let rejections = crate::ingest::delayed_batch_rejections(requests)?;
+    let failed = rejections.len();
+    let results = rejections
+        .into_iter()
+        .map(|(index, topic, error)| {
+            crate::metrics::record_rejected();
+            crate::ingest::IngestItemResult {
+                index,
+                accepted: false,
+                message_id: None,
+                topic,
+                partition: None,
+                offset: None,
+                duplicate: false,
+                commit_epoch: None,
+                scheduled: None,
+                failure: Some(crate::routes::ApiError::NotImplemented(error.clone()).failure()),
+                error: Some(error),
+            }
+        })
+        .collect();
+    Some((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(BatchEnqueueResponse {
+            accepted: 0,
+            failed,
+            partial: false,
+            message_ids: Vec::new(),
+            results,
+        }),
+    ))
+}
+
 async fn enqueue_batch_inner(
     state: Arc<AppState>,
     ingest: Option<Extension<crate::metering::IngestAuth>>,
@@ -43,6 +81,11 @@ async fn enqueue_batch_inner(
         return Err(ApiError::BadRequest(format!(
             "batch exceeds max size of {max_messages}"
         )));
+    }
+    if state.cluster.is_some() {
+        if let Some(rejected) = delayed_batch_response(&body.messages) {
+            return Ok(rejected);
+        }
     }
     if state.uses_cloud_auth() {
         #[cfg(feature = "cloud")]
@@ -103,6 +146,7 @@ async fn enqueue_batch_inner(
                     commit_epoch: resp.commit_epoch,
                     scheduled: resp.scheduled.clone(),
                     error: None,
+                    failure: None,
                 });
             }
             Err(error) => {
@@ -117,7 +161,8 @@ async fn enqueue_batch_inner(
                     duplicate: false,
                     commit_epoch: None,
                     scheduled: None,
-                    error: Some(format!("{error:?}")),
+                    failure: Some(error.failure()),
+                    error: Some(error.to_string()),
                 });
             }
         }
@@ -193,29 +238,6 @@ pub(crate) fn parse_ndjson_record(
     })
 }
 
-#[cfg(test)]
-fn parse_ndjson(body: &[u8]) -> Result<BatchEnqueueRequest, ApiError> {
-    if body.len() > MAX_BATCH_BYTES {
-        return Err(ApiError::BadRequest(format!(
-            "NDJSON batch exceeds max bytes of {MAX_BATCH_BYTES}"
-        )));
-    }
-    let mut messages = Vec::new();
-    for (index, line) in body.split(|b| *b == b'\n').enumerate() {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        if messages.len() >= MAX_HT_BATCH_MESSAGES {
-            return Err(ApiError::BadRequest(format!(
-                "NDJSON batch exceeds max size of {MAX_HT_BATCH_MESSAGES}"
-            )));
-        }
-        messages.push(parse_ndjson_record(line, index + 1)?);
-    }
-    Ok(BatchEnqueueRequest { messages })
-}
-
 pub(crate) async fn parse_ndjson_stream(body: Body) -> Result<BatchEnqueueRequest, ApiError> {
     let mut stream = body.into_data_stream();
     let mut pending = Vec::new();
@@ -273,7 +295,7 @@ pub(crate) async fn parse_ndjson_stream(body: Body) -> Result<BatchEnqueueReques
     Ok(BatchEnqueueRequest { messages })
 }
 
-fn validate_ndjson_content_encoding(headers: &HeaderMap) -> Result<(), ApiError> {
+pub(crate) fn validate_ndjson_content_encoding(headers: &HeaderMap) -> Result<(), ApiError> {
     let encoding = headers
         .get(CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok())
@@ -306,23 +328,54 @@ pub async fn batch_enqueue_ndjson(
 mod tests {
     use super::*;
 
-    #[test]
-    fn ndjson_accepts_crlf_and_blank_lines() {
-        let body = br#"
-{"routing_key":"a","payload":"one","url":"https://example.com/a","secret":"s"}
-
-{"routing_key":"b","payload":"two","url":"https://example.com/b","secret":"s"}
-"#;
-        let parsed = parse_ndjson(body).unwrap();
-        assert_eq!(parsed.messages.len(), 2);
-        assert_eq!(parsed.messages[0].routing_key, "a");
+    fn chunks(parts: Vec<Vec<u8>>) -> Body {
+        Body::from_stream(futures_util::stream::iter(
+            parts
+                .into_iter()
+                .map(|part| Ok::<_, std::io::Error>(axum::body::Bytes::from(part))),
+        ))
     }
 
-    #[test]
-    fn ndjson_reports_the_bad_line() {
-        let error =
-            parse_ndjson(b"{\"payload\":\"ok\"}\nnot-json\n{\"payload\":\"ok\"}").unwrap_err();
-        assert!(matches!(error, ApiError::BadRequest(message) if message.contains("line 2")));
+    #[tokio::test]
+    async fn ndjson_accepts_crlf_and_blank_lines() {
+        let body = b"\r\n{\"routing_key\":\"a\",\"payload\":\"one\"}\r\n \t\r\n{\"routing_key\":\"b\",\"body\":\"two\"}\r";
+        // Every split point, including inside CRLF and JSON tokens; no final LF.
+        for split in 0..=body.len() {
+            let parsed =
+                parse_ndjson_stream(chunks(vec![body[..split].to_vec(), body[split..].to_vec()]))
+                    .await
+                    .unwrap();
+            assert_eq!(parsed.messages.len(), 2);
+            assert_eq!(parsed.messages[0].routing_key, "a");
+            assert_eq!(parsed.messages[1].payload, "two");
+        }
+    }
+
+    #[tokio::test]
+    async fn ndjson_reports_the_bad_line() {
+        let error = parse_ndjson_stream(chunks(vec![
+            b"{\"payload\":\"ok\"}\r".to_vec(),
+            b"\n\r\nnot-".to_vec(),
+            b"json".to_vec(),
+        ]))
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ApiError::BadRequest(message) if message.contains("line 3")));
+    }
+
+    #[tokio::test]
+    async fn ndjson_rejects_empty_too_many_and_broken_streams() {
+        assert!(parse_ndjson_stream(Body::from("\r\n \t")).await.is_err());
+        let body = "{\"payload\":\"x\"}\n".repeat(MAX_HT_BATCH_MESSAGES + 1);
+        assert!(
+            matches!(parse_ndjson_stream(Body::from(body)).await, Err(ApiError::BadRequest(message)) if message.contains("max size"))
+        );
+        let body = Body::from_stream(futures_util::stream::iter(vec![
+            Err::<axum::body::Bytes, _>(std::io::Error::other("broken")),
+        ]));
+        assert!(
+            matches!(parse_ndjson_stream(body).await, Err(ApiError::BadRequest(message)) if message.contains("read NDJSON body"))
+        );
     }
 
     #[test]

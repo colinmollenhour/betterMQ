@@ -33,6 +33,7 @@ pub struct ServeOverrides {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedServeSettings {
+    pub dedup_retention: u64,
     pub listen: SocketAddr,
     pub data_dir: PathBuf,
     pub storage: StorageMode,
@@ -76,6 +77,10 @@ pub enum ResolvedAuth {
 impl ResolvedServeSettings {
     /// Set process env vars consumed by existing broker crates (backward compatible).
     pub fn apply_env(&self) {
+        std::env::set_var(
+            "BETTERMQ_DEDUP_RETENTION_SECS",
+            self.dedup_retention.to_string(),
+        );
         std::env::set_var("BETTERMQ_DATA_DIR", &self.data_dir);
         let storage = match self.storage {
             StorageMode::Local => "local",
@@ -120,10 +125,40 @@ pub fn resolve_serve(
     file_cfg: Option<&BetterMqConfig>,
     overrides: &ServeOverrides,
 ) -> Result<ResolvedServeSettings, ConfigError> {
-    let base = file_cfg
+    resolve_serve_with_env(file_cfg, overrides, |key| std::env::var(key).ok())
+}
+
+fn resolve_serve_with_env(
+    file_cfg: Option<&BetterMqConfig>,
+    overrides: &ServeOverrides,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<ResolvedServeSettings, ConfigError> {
+    let mut base = file_cfg
         .cloned()
         .unwrap_or_else(BetterMqConfig::template_single_local);
+    base.validate()?;
+    apply_runtime_env(&mut base, &env)?;
+    let dedup_retention = match std::env::var("BETTERMQ_DEDUP_RETENTION_SECS") {
+        Ok(value) => value.parse::<u64>().map_err(|error| {
+            ConfigError::Invalid(format!("invalid BETTERMQ_DEDUP_RETENTION_SECS: {error}"))
+        })?,
+        Err(std::env::VarError::NotPresent) => base.dedup_retention,
+        Err(error) => return Err(ConfigError::Invalid(error.to_string())),
+    };
+    if dedup_retention < broker_proto::DEFAULT_DEDUP_RETENTION_SECS
+        || dedup_retention.checked_mul(1000).is_none()
+    {
+        return Err(ConfigError::Invalid(
+            "dedup_retention must cover the seven-day client retry window".into(),
+        ));
+    }
 
+    let configured_public = base
+        .listeners
+        .as_ref()
+        .and_then(|s| s.public.as_deref())
+        .map(parse_listen)
+        .transpose()?;
     let listen = overrides
         .listen
         .or_else(|| {
@@ -131,6 +166,7 @@ pub fn resolve_serve(
                 .port
                 .map(|port| SocketAddr::from(([0, 0, 0, 0], port)))
         })
+        .or(configured_public)
         .or_else(|| parse_listen(&base.node.listen).ok())
         .unwrap_or_else(|| "0.0.0.0:8080".parse().expect("default listen"));
 
@@ -145,6 +181,11 @@ pub fn resolve_serve(
         StorageConfig::Local => (StorageMode::Local, None),
         StorageConfig::Slate { s3 } => (StorageMode::Slate, Some(s3.clone())),
     };
+    if storage == StorageMode::Slate && cluster_enabled {
+        return Err(ConfigError::Invalid(
+            broker_proto::SLATE_SINGLE_BROKER.into(),
+        ));
+    }
 
     let auth = match (&base.auth, &overrides.database_url) {
         (_, Some(url)) if !url.is_empty() => ResolvedAuth::Cloud {
@@ -178,27 +219,27 @@ pub fn resolve_serve(
         overrides.no_panel,
         overrides.standalone_panel,
     )?;
-    let mut panel_listen = overrides.panel_listen.or_else(|| {
-        base.panel
-            .as_ref()
-            .and_then(|section| section.listen.as_deref())
-            .and_then(|value| parse_listen(value).ok())
-    });
+    let mut panel_listen = overrides.panel_listen.or(base
+        .panel
+        .as_ref()
+        .and_then(|section| section.listen.as_deref())
+        .map(|v| crate::types::validate_listen("panel.listen", v))
+        .transpose()?);
     if panel_mode == PanelMode::Disabled {
         panel_listen = None;
     }
-    let admin_listen = overrides.admin_listen.or_else(|| {
-        base.listeners
-            .as_ref()
-            .and_then(|section| section.admin.as_deref())
-            .and_then(|value| parse_listen(value).ok())
-    });
-    let internal_listen = overrides.internal_listen.or_else(|| {
-        base.listeners
-            .as_ref()
-            .and_then(|section| section.internal.as_deref())
-            .and_then(|value| parse_listen(value).ok())
-    });
+    let admin_listen = overrides.admin_listen.or(base
+        .listeners
+        .as_ref()
+        .and_then(|section| section.admin.as_deref())
+        .map(|v| crate::types::validate_listen("listeners.admin", v))
+        .transpose()?);
+    let internal_listen = overrides.internal_listen.or(base
+        .listeners
+        .as_ref()
+        .and_then(|section| section.internal.as_deref())
+        .map(|v| crate::types::validate_listen("listeners.internal", v))
+        .transpose()?);
     let listeners = resolve_listeners(
         listen,
         admin_listen,
@@ -209,7 +250,9 @@ pub fn resolve_serve(
     listeners.validate_exposure(components)?;
     let replication = base.replication.clone().unwrap_or_else(|| {
         if cluster_enabled {
-            ReplicationPolicyConfig::default()
+            let count = base.cluster.as_ref().map_or(0, |c| c.nodes.len());
+            let (factor, min_isr) = broker_raft_meta::replication_policy(count);
+            ReplicationPolicyConfig { factor, min_isr }
         } else {
             ReplicationPolicyConfig {
                 factor: 1,
@@ -224,6 +267,7 @@ pub fn resolve_serve(
     });
 
     Ok(ResolvedServeSettings {
+        dedup_retention,
         listen,
         data_dir,
         storage,
@@ -250,6 +294,76 @@ pub fn resolve_serve(
         controller_url,
         opens_local_storage: components.requires_local_storage(),
     })
+}
+
+// Dispatch consumes typed values; storage crates still consume normalized S3 env.
+fn apply_runtime_env(
+    cfg: &mut BetterMqConfig,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<(), ConfigError> {
+    if let Some(mode) = env("BETTERMQ_STORAGE") {
+        cfg.storage = match mode.as_str() {
+            "local" | "rocksdb" | "wal" => StorageConfig::Local,
+            "slate" => match &cfg.storage {
+                StorageConfig::Slate { .. } => cfg.storage.clone(),
+                StorageConfig::Local => StorageConfig::Slate {
+                    s3: S3Config {
+                        endpoint: String::new(),
+                        bucket: String::new(),
+                        payload_bucket: None,
+                        access_key: String::new(),
+                        secret_key: String::new(),
+                        region: "auto".into(),
+                    },
+                },
+            },
+            _ => {
+                return Err(ConfigError::Invalid(format!(
+                    "invalid BETTERMQ_STORAGE '{mode}'"
+                )))
+            }
+        };
+    }
+    if let StorageConfig::Slate { s3 } = &mut cfg.storage {
+        for (key, field) in [
+            ("S3_ENDPOINT", &mut s3.endpoint),
+            ("S3_BUCKET", &mut s3.bucket),
+            ("S3_ACCESS_KEY", &mut s3.access_key),
+            ("S3_SECRET_KEY", &mut s3.secret_key),
+            ("S3_REGION", &mut s3.region),
+        ] {
+            if let Some(value) = env(key) {
+                *field = value;
+            }
+        }
+        if let Some(value) = env("S3_PAYLOAD_BUCKET") {
+            s3.payload_bucket = Some(value);
+        }
+        crate::types::validate_s3(s3)?;
+    }
+    for (key, field) in [
+        (
+            "BETTERMQ_HTTP_TIMEOUT_SECS",
+            &mut cfg.dispatch.http_timeout_secs,
+        ),
+        (
+            "BETTERMQ_LONG_HTTP_TIMEOUT_SECS",
+            &mut cfg.dispatch.long_http_timeout_secs,
+        ),
+    ] {
+        if let Some(value) = env(key) {
+            *field =
+                value.parse().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    ConfigError::Invalid(format!("{key} must be a positive integer"))
+                })?;
+        }
+    }
+    if let Some(value) = env("BETTERMQ_DEFAULT_MAX_RETRIES") {
+        cfg.dispatch.retry.max_retries = value.parse().map_err(|_| {
+            ConfigError::Invalid("BETTERMQ_DEFAULT_MAX_RETRIES must be an unsigned integer".into())
+        })?;
+    }
+    Ok(())
 }
 
 pub fn resolve_from_path(
@@ -315,4 +429,83 @@ mod tests {
         assert_eq!(settings.replication.factor, 3);
         assert_eq!(settings.replication.min_isr, 2);
     }
+
+    #[test]
+    fn public_listener_overrides_legacy_node_listen_but_not_cli() {
+        let cfg: BetterMqConfig = serde_json::from_value(serde_json::json!({
+            "version": 2, "node": {"name": "test", "listen": "0.0.0.0:8080", "publicUrl": "http://localhost:9000"},
+            "listeners": {"public": "127.0.0.1:9000"}
+        })).unwrap();
+        let resolved = resolve_serve(Some(&cfg), &ServeOverrides::default()).unwrap();
+        assert_eq!(resolved.listen, "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(resolved.listeners.public, resolved.listen);
+        let resolved = resolve_serve(
+            Some(&cfg),
+            &ServeOverrides {
+                port: Some(9100),
+                ..ServeOverrides::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.listen, "0.0.0.0:9100".parse().unwrap());
+    }
+
+    #[test]
+    fn storage_and_dispatch_env_override_file_and_defaults() {
+        let env = |key: &str| {
+            match key {
+                "BETTERMQ_STORAGE" => Some("slate"),
+                "S3_ENDPOINT" => Some("http://object-store:9000"),
+                "S3_BUCKET" => Some("messages"),
+                "S3_PAYLOAD_BUCKET" => Some("payloads"),
+                "S3_ACCESS_KEY" => Some("access"),
+                "S3_SECRET_KEY" => Some("secret"),
+                "BETTERMQ_HTTP_TIMEOUT_SECS" => Some("5"),
+                "BETTERMQ_LONG_HTTP_TIMEOUT_SECS" => Some("60"),
+                "BETTERMQ_DEFAULT_MAX_RETRIES" => Some("10"),
+                _ => None,
+            }
+            .map(str::to_owned)
+        };
+        for cfg in [None, Some(BetterMqConfig::template_single_local())] {
+            let resolved =
+                resolve_serve_with_env(cfg.as_ref(), &ServeOverrides::default(), env).unwrap();
+            assert_eq!(resolved.storage, StorageMode::Slate);
+            assert_eq!(resolved.s3.unwrap().bucket, "messages");
+            assert_eq!(resolved.dispatch_http_timeout_secs, 5);
+            assert_eq!(resolved.dispatch_long_http_timeout_secs, 60);
+            assert_eq!(resolved.dispatch_retry.max_retries, 10);
+        }
+    }
+
+    #[test]
+    fn invalid_runtime_env_fails_instead_of_silently_defaulting() {
+        for (key, value) in [
+            ("BETTERMQ_STORAGE", "typo"),
+            ("BETTERMQ_STORAGE", "slate"),
+            ("BETTERMQ_HTTP_TIMEOUT_SECS", "0"),
+            ("BETTERMQ_DEFAULT_MAX_RETRIES", "no"),
+        ] {
+            assert!(
+                resolve_serve_with_env(None, &ServeOverrides::default(), |k| (k == key)
+                    .then(|| value.into()))
+                .is_err()
+            );
+        }
+    }
+}
+#[test]
+fn slate_rejects_cluster_cli_override() {
+    let config = BetterMqConfig::template_single_slate();
+    let error = resolve_serve(
+        Some(&config),
+        &ServeOverrides {
+            cluster: Some(true),
+            ..ServeOverrides::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains(broker_proto::SLATE_SINGLE_BROKER));
 }

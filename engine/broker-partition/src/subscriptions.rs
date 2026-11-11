@@ -1,11 +1,13 @@
 //! Webhook subscription registry (file-backed until CP3 control plane).
 
+use crate::catalog_cache::CatalogCache;
 use crate::catalog_journal::CatalogJournal;
 use broker_proto::RetryBackoff;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::info;
 use uuid::Uuid;
@@ -48,7 +50,7 @@ pub struct Subscription {
     pub updated_at_ms: i64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SubscriptionFile {
     #[serde(default)]
     version: u16,
@@ -93,18 +95,72 @@ fn apply_command(file: &mut SubscriptionFile, command: SubscriptionCommand) {
 pub struct SubscriptionRegistry {
     path: PathBuf,
     journal: CatalogJournal,
+    cache: Arc<CatalogCache<SubscriptionFile>>,
 }
 
 fn meta_file_path(data_dir: &std::path::Path, name: &str) -> std::path::PathBuf {
-    if let Ok(shared) = std::env::var("BETTERMQ_SHARED_META_DIR") {
-        let dir = std::path::PathBuf::from(shared);
-        let _ = std::fs::create_dir_all(&dir);
-        return dir.join(name);
-    }
     data_dir.join(name)
 }
 
 impl SubscriptionRegistry {
+    pub fn import_snapshot(
+        &self,
+        subscriptions: Vec<Subscription>,
+    ) -> Result<(), SubscriptionError> {
+        let _lock = broker_storage::FileLock::exclusive(&self.path)?;
+        // `load()` would take the shared lock and self-deadlock under `exclusive`.
+        let (cached, _) = self.cache.read_locked(|| self.load_from_disk())?;
+        let mut file = SubscriptionFile::clone(&cached);
+        file.subscriptions = subscriptions;
+        file.revision += 1;
+        self.journal
+            .compact(&self.path, &file)
+            .map_err(|e| SubscriptionError::Journal(e.to_string()))?;
+        self.cache.store(file, 0);
+        Ok(())
+    }
+    pub fn legacy_shared(
+        data_dir: &std::path::Path,
+    ) -> Result<Vec<Subscription>, SubscriptionError> {
+        let Some(path) =
+            crate::catalog_journal::legacy_shared_path(data_dir, "subscriptions.json")?
+        else {
+            return Ok(Vec::new());
+        };
+        Self::read_snapshot_at(path)
+    }
+    pub fn read_snapshot_at(path: PathBuf) -> Result<Vec<Subscription>, SubscriptionError> {
+        let journal = CatalogJournal::new(&path, SUBSCRIPTION_CATALOG_VERSION);
+        let cache = Arc::new(CatalogCache::new(&path, journal.path()));
+        let registry = Self {
+            path,
+            journal,
+            cache,
+        };
+        // One-shot read: skip the cache so no lock file is created beside a
+        // legacy catalog.
+        let (file, _) = registry.load_from_disk()?;
+        Ok(file.subscriptions)
+    }
+    pub fn catalog_all(&self) -> Result<Vec<Subscription>, SubscriptionError> {
+        Ok(self.load()?.subscriptions.clone())
+    }
+
+    pub fn apply_authoritative(
+        &self,
+        tenant: &str,
+        id: Uuid,
+        subscription: Option<Subscription>,
+    ) -> Result<(), SubscriptionError> {
+        self.mutate(|file| {
+            file.subscriptions
+                .retain(|p| p.id != id || (tenant != "*" && p.tenant_id != tenant));
+            if let Some(subscription) = subscription {
+                file.subscriptions.push(subscription);
+            }
+            Ok(())
+        })
+    }
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, SubscriptionError> {
         let path = meta_file_path(data_dir.as_ref(), "subscriptions.json");
         if !path.exists() {
@@ -115,14 +171,20 @@ impl SubscriptionRegistry {
             std::fs::write(&path, serde_json::to_vec_pretty(&file)?)?;
         }
         let journal = CatalogJournal::new(&path, SUBSCRIPTION_CATALOG_VERSION);
-        Ok(Self { path, journal })
+        let cache = Arc::new(CatalogCache::new(&path, journal.path()));
+        Ok(Self {
+            path,
+            journal,
+            cache,
+        })
     }
 
-    fn load(&self) -> Result<SubscriptionFile, SubscriptionError> {
-        self.load_state().map(|state| state.0)
+    /// Cached catalog view; re-read from disk only when the files changed.
+    fn load(&self) -> Result<Arc<SubscriptionFile>, SubscriptionError> {
+        self.cache.read(|| self.load_from_disk())
     }
 
-    fn load_state(&self) -> Result<(SubscriptionFile, usize), SubscriptionError> {
+    fn load_from_disk(&self) -> Result<(SubscriptionFile, usize), SubscriptionError> {
         let bytes = std::fs::read(&self.path)?;
         let mut file: SubscriptionFile = serde_json::from_slice(&bytes)?;
         if file.version != 0 && file.version != SUBSCRIPTION_CATALOG_VERSION {
@@ -142,7 +204,8 @@ impl SubscriptionRegistry {
         f: impl FnOnce(&mut SubscriptionFile) -> Result<T, SubscriptionError>,
     ) -> Result<T, SubscriptionError> {
         let _lock = broker_storage::FileLock::exclusive(&self.path)?;
-        let (mut file, journal_ops) = self.load_state()?;
+        let (cached, journal_ops) = self.cache.read_locked(|| self.load_from_disk())?;
+        let mut file = SubscriptionFile::clone(&cached);
         let before = file.subscriptions.clone();
         let out = f(&mut file)?;
         let before_by_id: std::collections::HashMap<_, _> =
@@ -174,11 +237,14 @@ impl SubscriptionRegistry {
             .append(revision, &SubscriptionCommand::Patch { upserts, deletes })
             .map_err(|error| SubscriptionError::Journal(error.to_string()))?;
         file.revision = revision;
-        if journal_ops.saturating_add(1) >= SUBSCRIPTION_COMPACT_OPS {
+        let mut journal_ops = journal_ops.saturating_add(1);
+        if journal_ops >= SUBSCRIPTION_COMPACT_OPS {
             self.journal
                 .compact(&self.path, &file)
                 .map_err(|error| SubscriptionError::Journal(error.to_string()))?;
+            journal_ops = 0;
         }
+        self.cache.store(file, journal_ops);
         Ok(out)
     }
 
@@ -271,8 +337,9 @@ impl SubscriptionRegistry {
         let file = self.load()?;
         Ok(file
             .subscriptions
-            .into_iter()
-            .find(|s| s.tenant_id == tenant_id && s.topic == queue))
+            .iter()
+            .find(|s| s.tenant_id == tenant_id && s.topic == queue)
+            .cloned())
     }
 
     pub fn get_by_id(
@@ -283,8 +350,9 @@ impl SubscriptionRegistry {
         let file = self.load()?;
         Ok(file
             .subscriptions
-            .into_iter()
-            .find(|s| s.tenant_id == tenant_id && s.id == id))
+            .iter()
+            .find(|s| s.tenant_id == tenant_id && s.id == id)
+            .cloned())
     }
 
     /// Remove duplicate rows (same tenant, topic, URL). Returns number removed.
@@ -315,11 +383,11 @@ impl SubscriptionRegistry {
         let mut seen_urls = HashSet::new();
         for s in file
             .subscriptions
-            .into_iter()
+            .iter()
             .filter(|s| s.tenant_id == tenant_id && s.topic == topic && !s.paused)
         {
             if seen_urls.insert(s.url.clone()) {
-                out.push(s);
+                out.push(s.clone());
             }
         }
         Ok(out)
@@ -333,8 +401,9 @@ impl SubscriptionRegistry {
         let file = self.load()?;
         Ok(file
             .subscriptions
-            .into_iter()
+            .iter()
             .filter(|s| s.tenant_id == tenant_id && s.topic == topic && !s.paused)
+            .cloned()
             .collect())
     }
 
@@ -346,8 +415,9 @@ impl SubscriptionRegistry {
         let file = self.load()?;
         Ok(file
             .subscriptions
-            .into_iter()
+            .iter()
             .filter(|s| s.tenant_id == tenant_id && s.topic == topic)
+            .cloned()
             .collect())
     }
 
@@ -355,8 +425,9 @@ impl SubscriptionRegistry {
         let file = self.load()?;
         Ok(file
             .subscriptions
-            .into_iter()
+            .iter()
             .filter(|s| s.tenant_id == tenant_id)
+            .cloned()
             .collect())
     }
 
@@ -375,6 +446,118 @@ impl SubscriptionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_lookups_see_mutations_from_another_registry_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = SubscriptionRegistry::open(dir.path()).unwrap();
+        let reader = SubscriptionRegistry::open(dir.path()).unwrap();
+        let queue = writer
+            .create(
+                "tenant",
+                "orders".into(),
+                "https://example.com/a".into(),
+                "s".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            !reader
+                .get_by_id("tenant", queue.id)
+                .unwrap()
+                .unwrap()
+                .paused
+        );
+
+        let mut paused = queue.clone();
+        paused.paused = true;
+        paused.updated_at_ms += 1;
+        writer.upsert(paused).unwrap();
+        assert!(
+            reader
+                .get_by_id("tenant", queue.id)
+                .unwrap()
+                .unwrap()
+                .paused
+        );
+
+        writer.delete("tenant", queue.id).unwrap();
+        assert!(reader.get_by_name("tenant", "orders").unwrap().is_none());
+    }
+
+    #[test]
+    fn compaction_keeps_cached_and_reopened_views_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = SubscriptionRegistry::open(dir.path()).unwrap();
+        let observer = SubscriptionRegistry::open(dir.path()).unwrap();
+        for index in 0..SUBSCRIPTION_COMPACT_OPS + 3 {
+            registry
+                .create(
+                    "tenant",
+                    format!("q{index}"),
+                    "https://example.com/a".into(),
+                    "s".into(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            if index % 97 == 0 {
+                assert_eq!(observer.list_all("tenant").unwrap().len(), index + 1);
+            }
+        }
+        let expected = SUBSCRIPTION_COMPACT_OPS + 3;
+        assert_eq!(registry.list_all("tenant").unwrap().len(), expected);
+        assert_eq!(observer.list_all("tenant").unwrap().len(), expected);
+        let reopened = SubscriptionRegistry::open(dir.path()).unwrap();
+        assert_eq!(reopened.list_all("tenant").unwrap().len(), expected);
+    }
+
+    #[test]
+    fn mutation_after_torn_journal_tail_survives_restart() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let registry = SubscriptionRegistry::open(dir.path()).unwrap();
+        let first = registry
+            .create(
+                "tenant",
+                "orders".into(),
+                "https://example.com/a".into(),
+                "s".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let mut journal = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("subscriptions.journal"))
+            .unwrap();
+        journal.write_all(br#"{"version":1,"sequ"#).unwrap();
+        drop(journal);
+        drop(registry);
+
+        let registry = SubscriptionRegistry::open(dir.path()).unwrap();
+        let second = registry
+            .create(
+                "tenant",
+                "invoices".into(),
+                "https://example.com/b".into(),
+                "s".into(),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        drop(registry);
+
+        let reopened = SubscriptionRegistry::open(dir.path()).unwrap();
+        assert!(reopened.get_by_id("tenant", first.id).unwrap().is_some());
+        assert!(reopened.get_by_id("tenant", second.id).unwrap().is_some());
+    }
 
     #[test]
     fn queue_revision_survives_restart_and_newer_version_fails_closed() {

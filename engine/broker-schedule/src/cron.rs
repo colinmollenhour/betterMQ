@@ -1,14 +1,16 @@
 //! Recurring schedules: cron expression or fixed interval, file-backed.
 
+use crate::legacy::{self, LegacyImport};
 use crate::persist::{
     load_json_with_recovery, persist_json_atomic, JsonLoadSource, MetadataLoadError,
 };
+use crate::retry::{self, FireFailure, FireRetry};
 use crate::ScheduledPublishRequest;
+use broker_storage::{FileLock, JsonlJournal};
 use chrono::{DateTime, Utc};
 use cron::Schedule;
 use serde::{Deserialize, Serialize};
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -30,6 +32,8 @@ pub enum CronError {
     NotFound(Uuid),
     #[error(transparent)]
     MetadataLoad(#[from] MetadataLoadError),
+    #[error("cron journal {0} is in use by another process; every broker needs its own data dir")]
+    Locked(PathBuf),
 }
 
 /// Either a cron pattern or a fixed interval between runs.
@@ -70,6 +74,7 @@ pub struct CronJob {
     #[serde(default)]
     pub every_seconds: Option<u64>,
     pub paused: bool,
+    #[serde(default)]
     pub next_run_at_ms: i64,
     pub created_at_ms: i64,
     #[serde(default)]
@@ -92,6 +97,23 @@ impl CronJob {
             }
         }
     }
+
+    /// Publish idempotency key for one firing of this job, as returned by
+    /// [`CronRegistry::pop_due`] (whose `next_run_at_ms` is the scheduled slot
+    /// being fired, before advancing).
+    ///
+    /// Keyed on the slot rather than the tick time, so a retry after a failed
+    /// publish, a replay after a crash, or a second scheduler firing the same
+    /// slot all dedupe to one message. Dedup entries never expire, so the key
+    /// must differ per slot: a user-supplied `idempotency_key` is kept only as
+    /// a suffix, since reusing it verbatim would suppress every later firing.
+    pub fn fire_idempotency_key(&self) -> String {
+        let fire_ts = self.next_run_at_ms;
+        match self.request.idempotency_key.as_deref() {
+            Some(user_key) => format!("cron:{}:{}:{}", self.id, fire_ts, user_key),
+            None => format!("cron:{}:{}", self.id, fire_ts),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,14 +128,27 @@ struct CronFile {
 #[derive(Clone)]
 pub struct CronRegistry {
     path: PathBuf,
-    journal_path: PathBuf,
+    journal: JsonlJournal,
     inner: Arc<parking_lot::Mutex<CronState>>,
+    /// Exclusive ownership of the journal for the life of the registry.
+    _lock: Arc<FileLock>,
 }
 
 struct CronState {
     file: CronFile,
     sequence: u64,
     journal_ops: usize,
+    /// Failed-fire backoff per job (in memory only).
+    retries: HashMap<Uuid, CronRetry>,
+    /// Tentative occurrences popped but not yet committed: job id → fire
+    /// time. Kept out of `file` so snapshots hold committed positions only.
+    firing: HashMap<Uuid, i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CronRetry {
+    attempts: u32,
+    not_before_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,19 +182,15 @@ fn apply_command(file: &mut CronFile, command: CronCommand) {
     }
 }
 
-fn meta_file_path(data_dir: &Path, name: &str) -> PathBuf {
-    if let Ok(shared) = std::env::var("BETTERMQ_SHARED_META_DIR") {
-        let dir = PathBuf::from(shared);
-        let _ = std::fs::create_dir_all(&dir);
-        return dir.join(name);
-    }
-    data_dir.join(name)
-}
-
 impl CronRegistry {
+    /// Open the node-local cron registry in `data_dir`. Never shared between
+    /// processes: the journal is locked exclusively for the registry's lifetime.
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, CronError> {
-        let path = meta_file_path(data_dir.as_ref(), "crons.json");
+        let path = data_dir.as_ref().join("crons.json");
         let journal_path = path.with_extension("journal");
+        let lock = crate::lock_journal(&journal_path)?
+            .ok_or_else(|| CronError::Locked(journal_path.clone()))?;
+        let journal = JsonlJournal::new(journal_path);
         let mut loaded = load_json_with_recovery(&path, || CronFile {
             version: CRON_JOURNAL_VERSION,
             sequence: 0,
@@ -185,45 +216,108 @@ impl CronRegistry {
         loaded.value.version = CRON_JOURNAL_VERSION;
         let mut sequence = loaded.value.sequence;
         let mut journal_ops = 0usize;
-        if journal_path.exists() {
-            let bytes = std::fs::read(&journal_path)?;
-            let lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
-            for (index, line) in lines.iter().enumerate() {
-                if line.iter().all(|b| b.is_ascii_whitespace()) {
-                    continue;
-                }
-                let record = match serde_json::from_slice::<CronJournalRecord>(line) {
-                    Ok(record) => record,
-                    Err(error) if index + 1 == lines.len() => {
-                        tracing::warn!(%error, "ignoring torn cron journal tail");
-                        break;
-                    }
-                    Err(error) => return Err(CronError::Serde(error)),
-                };
+        for line in journal.read_lines()? {
+            let record = serde_json::from_slice::<CronJournalRecord>(&line)?;
+            if record.version != CRON_JOURNAL_VERSION {
+                return Err(CronError::InvalidSchedule(format!(
+                    "unsupported cron journal version {}",
+                    record.version
+                )));
+            }
+            if record.sequence <= sequence {
+                continue;
+            }
+            sequence = sequence.max(record.sequence);
+            journal_ops += 1;
+            apply_command(&mut loaded.value, record.command);
+        }
+        loaded.value.sequence = sequence;
+        Ok(Self {
+            path,
+            journal,
+            inner: Arc::new(parking_lot::Mutex::new(CronState {
+                file: loaded.value,
+                sequence,
+                journal_ops,
+                retries: HashMap::new(),
+                firing: HashMap::new(),
+            })),
+            _lock: Arc::new(lock),
+        })
+    }
+
+    /// Import cron jobs that older releases stored under the shared meta dir.
+    ///
+    /// Every node runs this, so whichever node holds the scheduler lease has
+    /// the crons. Shared files are only read, never renamed, truncated or
+    /// rewritten (other nodes import from them too). Jobs already local or
+    /// recorded in this node's import ledger are skipped, so re-scans never
+    /// resurrect a cron deleted here.
+    pub fn import_legacy_shared(&self, shared_dir: &Path) -> Result<LegacyImport, CronError> {
+        let mut report = LegacyImport::default();
+        if !shared_dir.is_dir() || legacy::is_same_dir(shared_dir, &self.path) {
+            return Ok(report);
+        }
+        let snapshot = shared_dir.join("crons.json");
+        let journal = shared_dir.join("crons.journal");
+        let mut found = CronFile {
+            version: CRON_JOURNAL_VERSION,
+            sequence: 0,
+            jobs: Vec::new(),
+        };
+        if snapshot.exists() {
+            found = serde_json::from_slice(&std::fs::read(&snapshot)?)?;
+            report.sources.push(snapshot);
+        }
+        if journal.exists() {
+            // Several writers shared this journal with colliding sequence
+            // numbers: apply in file order instead of filtering by sequence.
+            for line in JsonlJournal::new(&journal).read_lines_readonly()? {
+                let record = serde_json::from_slice::<CronJournalRecord>(&line)?;
                 if record.version != CRON_JOURNAL_VERSION {
                     return Err(CronError::InvalidSchedule(format!(
                         "unsupported cron journal version {}",
                         record.version
                     )));
                 }
-                if record.sequence <= sequence {
+                apply_command(&mut found, record.command);
+            }
+            report.sources.push(journal);
+        }
+        if found.jobs.is_empty() {
+            return Ok(report);
+        }
+        let mut ledger = legacy::Ledger::load(self.path.with_extension("imported.json"))?;
+        let mut ledger_changed = false;
+        {
+            let mut state = self.inner.lock();
+            for job in found.jobs {
+                let local = state.file.jobs.iter().any(|existing| existing.id == job.id);
+                if local || ledger.contains(&job.id) {
+                    ledger_changed |= ledger.insert(job.id);
+                    report.skipped += 1;
                     continue;
                 }
-                sequence = sequence.max(record.sequence);
-                journal_ops += 1;
-                apply_command(&mut loaded.value, record.command);
+                self.append_command(&mut state, CronCommand::Upsert { job: job.clone() })?;
+                ledger_changed |= ledger.insert(job.id);
+                apply_command(&mut state.file, CronCommand::Upsert { job });
+                report.imported += 1;
             }
+            self.maybe_compact(&mut state);
         }
-        loaded.value.sequence = sequence;
-        Ok(Self {
-            path,
-            journal_path,
-            inner: Arc::new(parking_lot::Mutex::new(CronState {
-                file: loaded.value,
-                sequence,
-                journal_ops,
-            })),
-        })
+        if ledger_changed {
+            ledger.save()?;
+        }
+        legacy::record_imported_crons(report.imported);
+        if report.imported > 0 {
+            info!(
+                shared_dir = %shared_dir.display(),
+                imported = report.imported,
+                skipped = report.skipped,
+                "imported legacy shared cron jobs"
+            );
+        }
+        Ok(report)
     }
 
     pub fn create(
@@ -236,6 +330,16 @@ impl CronRegistry {
 
     pub fn create_with_kind(
         &self,
+        kind: ScheduleKind,
+        request: ScheduledPublishRequest,
+    ) -> Result<CronJob, CronError> {
+        let job = Self::prepare_with_kind(kind, request)?;
+        self.upsert(job.clone())?;
+        Ok(job)
+    }
+
+    /// Build and validate a definition without persisting or scheduling it.
+    pub fn prepare_with_kind(
         kind: ScheduleKind,
         request: ScheduledPublishRequest,
     ) -> Result<CronJob, CronError> {
@@ -265,11 +369,45 @@ impl CronRegistry {
             request,
         };
 
-        let mut state = self.inner.lock();
-        self.append_command(&mut state, CronCommand::Upsert { job: job.clone() })?;
-        apply_command(&mut state.file, CronCommand::Upsert { job: job.clone() });
-        self.maybe_compact(&mut state);
         Ok(job)
+    }
+
+    /// Controller definitions contain no execution progress. Replaying one must
+    /// not rewind a committed fire, even after an apply/checkpoint crash.
+    pub fn apply_authoritative(
+        &self,
+        id: Uuid,
+        definition: Option<CronJob>,
+    ) -> Result<(), CronError> {
+        let mut state = self.inner.lock();
+        if definition.is_none() && !state.file.jobs.iter().any(|job| job.id == id) {
+            return Ok(());
+        }
+        let command = if let Some(mut job) = definition {
+            next_run_for_job(&job.cron, job.every_seconds, Utc::now().timestamp_millis())?;
+            if let Some(existing) = state.file.jobs.iter().find(|j| j.id == id) {
+                job.last_run_at_ms = existing.last_run_at_ms;
+                job.next_run_at_ms = if existing.cron != job.cron
+                    || existing.every_seconds != job.every_seconds
+                    || (existing.paused && !job.paused)
+                {
+                    next_run_for_job(&job.cron, job.every_seconds, Utc::now().timestamp_millis())?
+                } else {
+                    existing.next_run_at_ms
+                };
+            } else {
+                job.last_run_at_ms = None;
+                job.next_run_at_ms =
+                    next_run_for_job(&job.cron, job.every_seconds, Utc::now().timestamp_millis())?;
+            }
+            CronCommand::Upsert { job }
+        } else {
+            CronCommand::Delete { id }
+        };
+        self.append_command(&mut state, command.clone())?;
+        apply_command(&mut state.file, command);
+        self.maybe_compact(&mut state);
+        Ok(())
     }
 
     pub fn get(&self, id: Uuid) -> Result<CronJob, CronError> {
@@ -285,6 +423,10 @@ impl CronRegistry {
 
     pub fn list(&self) -> Vec<CronJob> {
         self.inner.lock().file.jobs.clone()
+    }
+
+    pub fn count(&self) -> usize {
+        self.inner.lock().file.jobs.len()
     }
 
     pub fn pause(&self, id: Uuid) -> Result<CronJob, CronError> {
@@ -309,6 +451,8 @@ impl CronRegistry {
         let removed = state.file.jobs[pos].clone();
         self.append_command(&mut state, CronCommand::Delete { id })?;
         apply_command(&mut state.file, CronCommand::Delete { id });
+        state.retries.remove(&id);
+        state.firing.remove(&id);
         self.maybe_compact(&mut state);
         Ok(removed)
     }
@@ -330,65 +474,112 @@ impl CronRegistry {
         Ok(())
     }
 
-    /// Jobs due now — advances next_run only in memory. Call [`Self::commit_fire`]
-    /// after successful publish, or [`Self::revert_fire`] on failure.
+    /// Jobs due now. Committed state is left untouched: the firing is held
+    /// as a tentative occurrence until [`Self::commit_fire`] (after a
+    /// successful publish) or [`Self::fail_fire`], so a compaction snapshot in
+    /// between only ever contains committed positions. Jobs already firing or
+    /// backing off after a failed fire are skipped. Each returned job is the
+    /// committed snapshot (its `next_run_at_ms` is the slot being fired)
+    /// stamped with `last_run_at_ms = now_ms`.
     pub fn pop_due(&self, now_ms: i64) -> Vec<CronJob> {
-        let mut state = self.inner.lock();
+        let mut guard = self.inner.lock();
+        let state = &mut *guard;
         let mut due = Vec::new();
-        for job in &mut state.file.jobs {
-            if job.paused || job.next_run_at_ms > now_ms {
+        for job in &state.file.jobs {
+            if job.paused || job.next_run_at_ms > now_ms || state.firing.contains_key(&job.id) {
                 continue;
             }
-            let previous = job.clone();
-            job.last_run_at_ms = Some(now_ms);
-            if let Ok(next) = next_run_for_job(&job.cron, job.every_seconds, now_ms) {
-                job.next_run_at_ms = next;
+            if state
+                .retries
+                .get(&job.id)
+                .is_some_and(|retry| retry.not_before_ms > now_ms)
+            {
+                continue;
             }
-            // Return the pre-advance snapshot stamped with fire time for idempotency.
-            let mut fired = previous;
+            state.firing.insert(job.id, now_ms);
+            let mut fired = job.clone();
             fired.last_run_at_ms = Some(now_ms);
             due.push(fired);
         }
-        // Do not persist here — commit_fire / revert_fire owns durability.
         due
     }
 
-    /// Persist advanced next_run after a successful cron publish.
+    /// Commit a successful firing: advance `next_run_at_ms` past the fire time
+    /// and persist it.
+    ///
+    /// Bumps `updated_at_ms` so the advanced position wins catalog LWW merges
+    /// over stale peer copies that still hold the fired slot.
     pub fn commit_fire(&self, id: Uuid) -> Result<(), CronError> {
         let mut state = self.inner.lock();
-        let job = state
+        let mut job = state
             .file
             .jobs
             .iter()
             .find(|job| job.id == id)
             .cloned()
             .ok_or(CronError::NotFound(id))?;
-        self.append_command(&mut state, CronCommand::Upsert { job })?;
+        let fired_at_ms = state
+            .firing
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
+        match next_run_for_job(&job.cron, job.every_seconds, fired_at_ms) {
+            Ok(next) => job.next_run_at_ms = next,
+            Err(error) => {
+                // No later run exists: stop instead of refiring every tick.
+                tracing::warn!(cron_id = %id, %error, "cron has no upcoming run; pausing it");
+                job.paused = true;
+            }
+        }
+        job.last_run_at_ms = Some(fired_at_ms);
+        job.updated_at_ms = Utc::now()
+            .timestamp_millis()
+            .max(job.updated_at_ms.saturating_add(1));
+        self.append_command(&mut state, CronCommand::Upsert { job: job.clone() })?;
+        apply_command(&mut state.file, CronCommand::Upsert { job });
+        state.firing.remove(&id);
+        state.retries.remove(&id);
         self.maybe_compact(&mut state);
         Ok(())
     }
 
-    /// Revert next_run after a failed publish so the tick retries.
-    pub fn revert_fire(&self, job: &CronJob) -> Result<(), CronError> {
-        let mut state = self.inner.lock();
-        let mut restored = state
-            .file
-            .jobs
-            .iter()
-            .find(|existing| existing.id == job.id)
-            .cloned()
-            .ok_or(CronError::NotFound(job.id))?;
-        restored.next_run_at_ms = job.next_run_at_ms;
-        restored.last_run_at_ms = job.last_run_at_ms;
-        self.append_command(
-            &mut state,
-            CronCommand::Upsert {
-                job: restored.clone(),
-            },
-        )?;
-        apply_command(&mut state.file, CronCommand::Upsert { job: restored });
-        self.maybe_compact(&mut state);
-        Ok(())
+    /// Record a failed publish of a job returned by [`Self::pop_due`].
+    ///
+    /// On [`FireRetry::Retry`] the tentative occurrence is dropped (nothing
+    /// durable changed) and the slot is retried after an exponential backoff.
+    /// On [`FireRetry::GiveUp`] (a permanent failure that kept failing) the
+    /// occurrence is skipped: it is committed as fired and the job keeps its
+    /// schedule.
+    pub fn fail_fire(
+        &self,
+        job: &CronJob,
+        failure: FireFailure,
+        now_ms: i64,
+    ) -> Result<FireRetry, CronError> {
+        let decision = {
+            let mut state = self.inner.lock();
+            let attempt = state
+                .retries
+                .get(&job.id)
+                .map_or(0, |retry| retry.attempts)
+                .saturating_add(1);
+            let decision = retry::decide(attempt, failure, now_ms);
+            if let FireRetry::Retry { retry_at_ms, .. } = decision {
+                state.firing.remove(&job.id);
+                state.retries.insert(
+                    job.id,
+                    CronRetry {
+                        attempts: attempt,
+                        not_before_ms: retry_at_ms,
+                    },
+                );
+            }
+            decision
+        };
+        if let FireRetry::GiveUp { .. } = decision {
+            self.commit_fire(job.id)?;
+        }
+        Ok(decision)
     }
 
     fn set_paused(&self, id: Uuid, paused: bool) -> Result<CronJob, CronError> {
@@ -432,14 +623,7 @@ impl CronRegistry {
             sequence,
             command,
         };
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.journal_path)?;
-        serde_json::to_writer(&mut file, &record)?;
-        file.write_all(b"\n")?;
-        file.sync_data()?;
-        broker_storage::set_secret_file_mode(&self.journal_path);
+        self.journal.append(&record)?;
         state.sequence = sequence;
         state.file.sequence = sequence;
         state.journal_ops += 1;
@@ -457,13 +641,7 @@ impl CronRegistry {
             return;
         }
         broker_storage::set_secret_file_mode(&self.path);
-        match OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.journal_path)
-            .and_then(|file| file.sync_data())
-        {
+        match self.journal.reset() {
             Ok(()) => state.journal_ops = 0,
             Err(error) => tracing::warn!(%error, "cron journal compaction failed"),
         }
@@ -563,6 +741,30 @@ fn next_run_after_cron(expr: &str, after_ms: i64) -> Result<i64, CronError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_definition_replay_preserves_execution_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = CronRegistry::open(dir.path()).unwrap();
+        let definition = CronRegistry::prepare_with_kind(
+            ScheduleKind::Interval { every_seconds: 1 },
+            sample_request(),
+        )
+        .unwrap();
+        assert!(registry.list().is_empty());
+        registry
+            .apply_authoritative(definition.id, Some(definition.clone()))
+            .unwrap();
+        registry.pop_due(definition.next_run_at_ms + 2000);
+        registry.commit_fire(definition.id).unwrap();
+        let before = registry.get(definition.id).unwrap();
+        registry
+            .apply_authoritative(definition.id, Some(definition.clone()))
+            .unwrap();
+        let after = registry.get(definition.id).unwrap();
+        assert_eq!(after.next_run_at_ms, before.next_run_at_ms);
+        assert_eq!(after.last_run_at_ms, before.last_run_at_ms);
+    }
     use std::env::temp_dir;
 
     fn sample_request() -> ScheduledPublishRequest {
@@ -656,8 +858,233 @@ mod tests {
         let now = job.created_at_ms;
         let due = reg.pop_due(now + 10_000);
         assert_eq!(due.len(), 1);
+        assert_eq!(
+            reg.get(job.id).unwrap().next_run_at_ms,
+            now + 10_000,
+            "popping alone does not advance the committed position"
+        );
+        assert!(reg.pop_due(now + 10_000).is_empty(), "already firing");
+        reg.commit_fire(job.id).unwrap();
         let updated = reg.get(job.id).unwrap();
         assert_eq!(updated.next_run_at_ms, now + 20_000);
+    }
+
+    #[test]
+    fn fire_idempotency_key_differs_per_firing_even_with_user_key() {
+        let dir = temp_dir().join(format!("bettermq-cron-key-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        let mut request = sample_request();
+        request.idempotency_key = Some("user-key".into());
+        let job = reg
+            .create_with_kind(ScheduleKind::Interval { every_seconds: 10 }, request)
+            .unwrap();
+
+        let first = reg.pop_due(job.created_at_ms + 10_000).pop().unwrap();
+        reg.commit_fire(first.id).unwrap();
+        let second = reg.pop_due(job.created_at_ms + 20_000).pop().unwrap();
+
+        let first_key = first.fire_idempotency_key();
+        let second_key = second.fire_idempotency_key();
+        assert_ne!(first_key, second_key);
+        assert!(first_key.starts_with(&format!("cron:{}:", job.id)));
+        assert!(first_key.ends_with(":user-key"));
+        assert!(second_key.ends_with(":user-key"));
+
+        let plain = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        let fired = reg
+            .pop_due(plain.created_at_ms + 10_000)
+            .into_iter()
+            .find(|due| due.id == plain.id)
+            .unwrap();
+        assert_eq!(
+            fired.fire_idempotency_key(),
+            format!("cron:{}:{}", plain.id, plain.created_at_ms + 10_000)
+        );
+    }
+
+    #[test]
+    fn failed_cron_fire_backs_off_then_gives_up_on_permanent_failure() {
+        let dir = temp_dir().join(format!("bettermq-cron-retry-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        let job = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        let slot = job.next_run_at_ms;
+        let now = slot + 1;
+
+        let fired = reg.pop_due(now).pop().unwrap();
+        assert_eq!(
+            reg.fail_fire(&fired, FireFailure::Transient, now).unwrap(),
+            FireRetry::Retry {
+                attempt: 1,
+                retry_at_ms: now + crate::FIRE_RETRY_BASE_MS
+            }
+        );
+        assert_eq!(reg.get(job.id).unwrap().next_run_at_ms, slot);
+        assert!(reg.pop_due(now + crate::FIRE_RETRY_BASE_MS - 1).is_empty());
+
+        let mut at = now + crate::FIRE_RETRY_BASE_MS;
+        let mut outcome = None;
+        for _ in 1..crate::PERMANENT_FAILURE_ATTEMPTS {
+            let fired = reg.pop_due(at).pop().expect("due after backoff");
+            let decision = reg.fail_fire(&fired, FireFailure::Permanent, at).unwrap();
+            if let FireRetry::Retry { retry_at_ms, .. } = decision {
+                at = retry_at_ms;
+            }
+            outcome = Some(decision);
+        }
+        assert_eq!(
+            outcome,
+            Some(FireRetry::GiveUp {
+                attempt: crate::PERMANENT_FAILURE_ATTEMPTS
+            })
+        );
+        // The occurrence is skipped but the cron keeps its schedule.
+        let skipped = reg.get(job.id).unwrap();
+        assert!(skipped.next_run_at_ms > at);
+        assert!(!skipped.paused);
+        let next = reg.pop_due(skipped.next_run_at_ms).pop().unwrap();
+        assert!(matches!(
+            reg.fail_fire(&next, FireFailure::Transient, skipped.next_run_at_ms)
+                .unwrap(),
+            FireRetry::Retry { attempt: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn retried_fire_reuses_the_slot_idempotency_key() {
+        let dir = temp_dir().join(format!("bettermq-cron-slot-key-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        let job = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        let slot = job.next_run_at_ms;
+
+        let first = reg.pop_due(slot + 7).pop().unwrap();
+        let retry_at = match reg.fail_fire(&first, FireFailure::Transient, slot + 7) {
+            Ok(FireRetry::Retry { retry_at_ms, .. }) => retry_at_ms,
+            other => panic!("unexpected {other:?}"),
+        };
+        let retried = reg.pop_due(retry_at + 123).pop().unwrap();
+        assert_eq!(first.fire_idempotency_key(), retried.fire_idempotency_key());
+        assert_eq!(
+            retried.fire_idempotency_key(),
+            format!("cron:{}:{}", job.id, slot)
+        );
+
+        // Crash between publish and commit: the reopened registry refires the
+        // same slot under the same key.
+        drop(reg);
+        let reopened = CronRegistry::open(&dir).unwrap();
+        let replayed = reopened.pop_due(retry_at + 999).pop().unwrap();
+        assert_eq!(
+            replayed.fire_idempotency_key(),
+            first.fire_idempotency_key()
+        );
+    }
+
+    #[test]
+    fn commit_fire_bumps_updated_at_so_stale_catalog_copies_lose() {
+        let dir = temp_dir().join(format!("bettermq-cron-bump-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        let job = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        let mut stale = job.clone();
+        stale.updated_at_ms -= 1;
+        reg.pop_due(job.next_run_at_ms).pop().unwrap();
+        reg.commit_fire(job.id).unwrap();
+        let advanced = reg.get(job.id).unwrap();
+        assert!(advanced.updated_at_ms > stale.updated_at_ms);
+
+        reg.upsert(stale.clone()).unwrap();
+        let after = reg.get(job.id).unwrap();
+        assert_eq!(after.next_run_at_ms, advanced.next_run_at_ms);
+        assert!(reg.pop_due(stale.next_run_at_ms).is_empty());
+    }
+
+    #[test]
+    fn compaction_mid_batch_does_not_persist_unpublished_advances() {
+        let dir = temp_dir().join(format!("bettermq-cron-m46-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        let first = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        let second = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        let now = first.next_run_at_ms.max(second.next_run_at_ms);
+        let due = reg.pop_due(now);
+        assert_eq!(due.len(), 2);
+
+        // Committing the first fire crosses the compaction threshold.
+        reg.inner.lock().journal_ops = CRON_COMPACT_OPS - 1;
+        reg.commit_fire(first.id).unwrap();
+        assert_eq!(reg.inner.lock().journal_ops, 0, "compacted");
+        let snapshot: CronFile =
+            serde_json::from_slice(&std::fs::read(dir.join("crons.json")).unwrap()).unwrap();
+        let persisted = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.id == second.id)
+            .unwrap();
+        assert_eq!(persisted.next_run_at_ms, second.next_run_at_ms);
+
+        // Crash before the second publish: it is still due, same slot.
+        drop(reg);
+        let reopened = CronRegistry::open(&dir).unwrap();
+        let refired = reopened.pop_due(now);
+        assert_eq!(refired.len(), 1);
+        assert_eq!(refired[0].id, second.id);
+        let original = due.iter().find(|job| job.id == second.id).unwrap();
+        assert_eq!(
+            refired[0].fire_idempotency_key(),
+            original.fire_idempotency_key()
+        );
+        assert!(reopened.get(first.id).unwrap().next_run_at_ms > now);
+    }
+
+    #[test]
+    fn failed_fire_writes_nothing_to_the_journal() {
+        let dir = temp_dir().join(format!("bettermq-cron-nofsync-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        let job = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        let before = std::fs::read(dir.join("crons.journal")).unwrap();
+        let fired = reg.pop_due(job.next_run_at_ms).pop().unwrap();
+        reg.fail_fire(&fired, FireFailure::Transient, job.next_run_at_ms)
+            .unwrap();
+        assert_eq!(std::fs::read(dir.join("crons.journal")).unwrap(), before);
     }
 
     #[test]
@@ -681,6 +1108,77 @@ mod tests {
         assert_eq!(restored.next_run_at_ms, job.created_at_ms + 20_000);
         assert_eq!(restored.last_run_at_ms, Some(job.created_at_ms + 10_000));
         assert!(dir.join("crons.journal").exists());
+    }
+
+    #[test]
+    fn append_after_torn_journal_tail_survives_restart() {
+        let dir = temp_dir().join(format!("bettermq-cron-torn-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        let first = reg.create("0 9 * * *", sample_request()).unwrap();
+        drop(reg);
+        let journal = dir.join("crons.journal");
+        let mut bytes = std::fs::read(&journal).unwrap();
+        bytes.extend_from_slice(br#"{"version":1,"sequence":2,"comm"#);
+        std::fs::write(&journal, bytes).unwrap();
+
+        let reg = CronRegistry::open(&dir).unwrap();
+        let second = reg.create("0 10 * * *", sample_request()).unwrap();
+        drop(reg);
+
+        let reopened = CronRegistry::open(&dir).unwrap();
+        assert!(reopened.get(first.id).is_ok());
+        assert!(reopened.get(second.id).is_ok());
+    }
+
+    #[test]
+    fn second_open_of_same_cron_journal_is_refused() {
+        let dir = temp_dir().join(format!("bettermq-cron-lock-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = CronRegistry::open(&dir).unwrap();
+        assert!(matches!(
+            CronRegistry::open(&dir),
+            Err(CronError::Locked(_))
+        ));
+        drop(reg);
+        CronRegistry::open(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_shared_crons_import_on_every_node_without_resurrection() {
+        let base = temp_dir().join(format!("bettermq-cron-legacy-{}", Uuid::new_v4()));
+        let shared = base.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let writer = CronRegistry::open(&shared).unwrap();
+        let kept = writer.create("0 9 * * *", sample_request()).unwrap();
+        let gone = writer.create("0 10 * * *", sample_request()).unwrap();
+        writer.delete(gone.id).unwrap();
+        drop(writer);
+        let shared_bytes = std::fs::read(shared.join("crons.journal")).unwrap();
+
+        for node in ["n1", "n2"] {
+            let dir = base.join(node);
+            std::fs::create_dir_all(&dir).unwrap();
+            let reg = CronRegistry::open(&dir).unwrap();
+            let report = reg.import_legacy_shared(&shared).unwrap();
+            assert_eq!(report.imported, 1);
+            let imported = reg.get(kept.id).unwrap();
+            assert_eq!(imported.next_run_at_ms, kept.next_run_at_ms);
+            assert!(reg.get(gone.id).is_err());
+
+            // Deleted locally: a re-scan or restart must not bring it back.
+            reg.delete(kept.id).unwrap();
+            assert_eq!(reg.import_legacy_shared(&shared).unwrap().imported, 0);
+            drop(reg);
+            let reopened = CronRegistry::open(&dir).unwrap();
+            assert_eq!(reopened.import_legacy_shared(&shared).unwrap().imported, 0);
+            assert!(reopened.get(kept.id).is_err());
+        }
+        assert_eq!(
+            std::fs::read(shared.join("crons.journal")).unwrap(),
+            shared_bytes,
+            "shared files are read-only"
+        );
     }
 
     #[test]

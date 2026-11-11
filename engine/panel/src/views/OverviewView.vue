@@ -1,18 +1,23 @@
 <script setup lang="ts">
-import { onMounted, reactive } from "vue";
+import { computed, onMounted, reactive } from "vue";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import Field from "@/components/form/Field.vue";
 import ActionMessage from "@/components/form/ActionMessage.vue";
+import SecretInput from "@/components/form/SecretInput.vue";
+import { prepareDestination } from "@/lib/destination";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { useActionStatus } from "@/composables/useActionStatus";
+import { useReadiness } from "@/composables/useReadiness";
+import { memberHealthLabel } from "@/lib/health";
 import { apiPost, publicUrl } from "@/lib/api";
 import { catalog, refreshFlows, refreshGroups, refreshQueues } from "@/lib/catalog";
 import { mergeOutbound, parseBody } from "@/lib/payload";
 import { pollCluster, pollHealth, session } from "@/lib/session";
 
 const publishStatus = useActionStatus();
+const readiness = useReadiness();
 
 const kpis = reactive({
   queues: "—",
@@ -23,30 +28,19 @@ const kpis = reactive({
 });
 
 const pub = reactive({
-  url: "https://webhook.site",
-  secret: "whsec_demo",
+  url: "",
+  secret: "",
   body: '{"from":"dashboard"}',
 });
 
 onMounted(async () => {
-  await Promise.all([pollHealth(), pollCluster(), refreshQueues(), refreshGroups(), refreshFlows()]);
-  kpis.queues = String(catalog.queues.length);
-  kpis.groups = String(catalog.groups.length);
-  kpis.flows = String(catalog.flows.length);
+  await Promise.allSettled([pollHealth(), pollCluster(), refreshQueues(), refreshGroups(), refreshFlows()]);
   try {
-    const [delayed, crons] = await Promise.all([
-      fetchJson("/v1/delayed"),
-      fetchJson("/v1/crons"),
-    ]);
-    kpis.schedules = String(((delayed.delayed as unknown[]) || []).length + ((crons.crons as unknown[]) || []).length);
+    const counts = await fetchJson("/v1/inspection/counts");
+    kpis.schedules = String(Number(counts.delayed || 0) + Number(counts.crons || 0));
+    kpis.dlq = counts.dlq_ready ? String(counts.dlq || 0) : String(counts.dlq_count_reason || "warming");
   } catch {
     kpis.schedules = "—";
-  }
-  try {
-    const sources = (await fetchJson("/v1/dlq/sources")) as { count?: number }[] | { sources?: { count?: number }[] };
-    const list = Array.isArray(sources) ? sources : sources.sources || [];
-    kpis.dlq = String(list.reduce((s, x) => s + (x.count || 0), 0));
-  } catch {
     kpis.dlq = "—";
   }
 });
@@ -57,6 +51,8 @@ async function fetchJson(path: string) {
 }
 
 async function quickPublish() {
+  const error = prepareDestination(pub);
+  if (error) { publishStatus.fail(error); return; }
   const payload: Record<string, unknown> = {
     url: pub.url,
     secret: pub.secret,
@@ -78,6 +74,8 @@ async function quickPublish() {
 }
 
 const clusterNodes = () => session.cluster?.nodes || [];
+const queueCount = computed(() => catalog.loaded.queues && !catalog.errors.queues ? String(catalog.queues.length) : "—");
+const groupCount = computed(() => catalog.loaded.groups && !catalog.errors.groups ? String(catalog.groups.length) : "—");
 </script>
 
 <template>
@@ -90,19 +88,19 @@ const clusterNodes = () => session.cluster?.nodes || [];
       <Card size="sm">
         <CardHeader class="pb-1">
           <CardDescription>Status</CardDescription>
-          <CardTitle class="font-mono text-lg">{{ session.health }}</CardTitle>
+          <CardTitle class="font-mono text-lg">{{ readiness }}</CardTitle>
         </CardHeader>
       </Card>
       <Card size="sm">
         <CardHeader class="pb-1">
           <CardDescription>Queues</CardDescription>
-          <CardTitle class="text-lg">{{ kpis.queues }}</CardTitle>
+          <CardTitle class="text-lg">{{ queueCount }}</CardTitle>
         </CardHeader>
       </Card>
       <Card size="sm">
         <CardHeader class="pb-1">
           <CardDescription>Groups</CardDescription>
-          <CardTitle class="text-lg">{{ kpis.groups }}</CardTitle>
+          <CardTitle class="text-lg">{{ groupCount }}</CardTitle>
         </CardHeader>
       </Card>
       <Card size="sm">
@@ -136,7 +134,7 @@ const clusterNodes = () => session.cluster?.nodes || [];
           <TableBody>
             <TableRow v-for="n in clusterNodes()" :key="n.id || n.addr">
               <TableCell class="font-mono text-xs">{{ n.name || n.addr }}</TableCell>
-              <TableCell>{{ n.healthy === false ? "down" : "ok" }}</TableCell>
+              <TableCell>{{ memberHealthLabel(n.healthy) }}</TableCell>
               <TableCell class="font-mono text-xs">{{ (n.led_shards || []).join(", ") || "—" }}</TableCell>
             </TableRow>
           </TableBody>
@@ -163,8 +161,8 @@ const clusterNodes = () => session.cluster?.nodes || [];
           <CardDescription>One direct webhook from the console</CardDescription>
         </CardHeader>
         <CardContent class="grid gap-2">
-          <Field label="URL"><Input v-model="pub.url" class="font-mono text-xs" /></Field>
-          <Field label="Secret"><Input v-model="pub.secret" class="font-mono" /></Field>
+          <Field label="URL"><Input v-model="pub.url" placeholder="https://example.com/webhook" class="font-mono text-xs" /></Field>
+          <Field label="Secret"><SecretInput v-model="pub.secret" /></Field>
           <Field label="Body"><Input v-model="pub.body" class="font-mono text-xs" /></Field>
         </CardContent>
         <CardFooter>

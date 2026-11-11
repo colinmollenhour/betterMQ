@@ -36,6 +36,6 @@ export async function queryCells<T>(kind: "nodes" | "shards" | "cluster" | "cata
 
 export function dataForCell<T>(res: FedResult<T> | null, cellId: string): T | null {
   if (!res?.ok) return null;
-  const hit = res.ok.find((row) => row.cell === cellId) || res.ok[0];
+  const hit = res.ok.find((row) => row.cell === cellId);
   return hit?.data ?? null;
 }

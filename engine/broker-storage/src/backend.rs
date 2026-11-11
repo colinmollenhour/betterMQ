@@ -13,6 +13,8 @@ pub enum StorageMode {
     Slate,
 }
 
+pub use broker_proto::SLATE_SINGLE_BROKER;
+
 impl StorageMode {
     pub fn from_env() -> Self {
         match std::env::var("BETTERMQ_STORAGE")
@@ -169,11 +171,30 @@ impl PartitionBackend {
         }
     }
 
-    pub fn purge_offset(&mut self, offset: u64) -> bool {
+    pub fn purge_offset(&mut self, offset: u64) -> Result<bool, LogError> {
+        Ok(self.purge_offsets(&[offset])? == 1)
+    }
+
+    /// Tombstone records durably; returns how many live records were purged.
+    pub fn purge_offsets(&mut self, offsets: &[u64]) -> Result<usize, LogError> {
         match self {
-            Self::Local(log) => log.purge_offset(offset),
+            Self::Local(log) => log.purge_offsets(offsets),
             #[cfg(feature = "slate")]
-            Self::Slate(log) => log.purge_offset(offset),
+            Self::Slate(log) => Ok(offsets
+                .iter()
+                .filter(|offset| log.purge_offset(**offset))
+                .count()),
+        }
+    }
+
+    /// Follower reconciliation; see [`PartitionLog::truncate_to`].
+    pub fn truncate_to(&mut self, offset: u64, generation: u64) -> Result<u64, LogError> {
+        match self {
+            Self::Local(log) => log.truncate_to(offset, generation),
+            #[cfg(feature = "slate")]
+            Self::Slate(_) => Err(LogError::TruncateUnsupported(
+                "slate logs are not replicated".into(),
+            )),
         }
     }
 
@@ -182,6 +203,44 @@ impl PartitionBackend {
             Self::Local(log) => log.gc_sealed_below(watermark),
             #[cfg(feature = "slate")]
             Self::Slate(_) => Ok(0),
+        }
+    }
+
+    /// First retained offset; records below it were collected.
+    pub fn base_offset(&self) -> u64 {
+        match self {
+            Self::Local(log) => log.base_offset(),
+            #[cfg(feature = "slate")]
+            Self::Slate(_) => 0,
+        }
+    }
+
+    /// Exclusive end of the prefix `gc_sealed_below(watermark)` would delete.
+    pub fn gc_boundary(&self, watermark: u64) -> u64 {
+        match self {
+            Self::Local(log) => log.gc_boundary(watermark),
+            #[cfg(feature = "slate")]
+            Self::Slate(_) => 0,
+        }
+    }
+
+    /// WAL bytes held on local disk.
+    pub fn retained_bytes(&self) -> u64 {
+        match self {
+            Self::Local(log) => log.retained_bytes(),
+            #[cfg(feature = "slate")]
+            Self::Slate(_) => 0,
+        }
+    }
+
+    /// Continue an empty or fully-below-`base` log at `base`.
+    pub fn reset_base(&mut self, base: u64) -> Result<(), LogError> {
+        match self {
+            Self::Local(log) => log.reset_base(base),
+            #[cfg(feature = "slate")]
+            Self::Slate(_) => Err(LogError::Slate(
+                "reset_base is not supported for Slate storage".into(),
+            )),
         }
     }
 

@@ -2,6 +2,7 @@
 # Backup a BetterMQ data directory (local WAL / RocksDB / managed config).
 # Usage: ./backup.sh /path/to/data [/path/to/backup.tgz]
 set -euo pipefail
+umask 077
 
 DATA_DIR="${1:?usage: backup.sh <data-dir> [backup.tgz]}"
 OUT="${2:-bettermq-backup-$(date +%Y%m%d-%H%M%S).tgz}"
@@ -12,7 +13,11 @@ if [[ ! -d "$DATA_DIR" ]]; then
 fi
 
 # Prefer offline backup (stop broker first). Live backup may miss in-flight WAL.
-tar -C "$(dirname "$DATA_DIR")" -czf "$OUT" "$(basename "$DATA_DIR")"
+# Exclusive creation prevents permissive existing files and symlink clobbering.
+set -o noclobber
+exec 3> "$OUT"
+tar -C "$(dirname "$DATA_DIR")" -czf - "$(basename "$DATA_DIR")" >&3
+exec 3>&-
 if command -v sha256sum >/dev/null 2>&1; then
   sha256sum "$OUT" > "${OUT}.sha256"
 elif command -v shasum >/dev/null 2>&1; then

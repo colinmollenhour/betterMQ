@@ -26,4 +26,17 @@ mod tests {
         assert!(sig.starts_with("t=1700000000000,v1="));
         assert_eq!(sig.len(), "t=1700000000000,v1=".len() + 64);
     }
+
+    #[test]
+    fn signature_matches_known_hmac_sha256() {
+        // Independently computed: HMAC-SHA256("secret", "1700000000000." || body).
+        assert_eq!(
+            sign_payload("secret", br#"{"a":1}"#, 1_700_000_000_000),
+            "t=1700000000000,v1=4ef2732b0d632a6897af3a6d02a6de287f60d6c5f15dabdb0ceb045a34e3c5a7"
+        );
+        assert_ne!(
+            sign_payload("other", br#"{"a":1}"#, 1_700_000_000_000),
+            sign_payload("secret", br#"{"a":1}"#, 1_700_000_000_000)
+        );
+    }
 }

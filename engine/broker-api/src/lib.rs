@@ -1,10 +1,12 @@
 //! Public HTTP surface for the BetterMQ data plane.
 
 mod admin;
+mod admin_audit;
 mod admission;
 mod auth;
 mod batch;
 mod bettermq;
+mod catalog_applier;
 mod catalog_tombstones;
 mod cluster;
 pub mod cluster_auth;
@@ -19,9 +21,15 @@ mod local_auth;
 mod metering;
 mod metrics;
 mod ops;
+mod payload_repair;
 mod publish_path;
 mod rate_limit;
+mod replica_source;
+pub mod request_id;
+mod retention;
 mod routes;
+#[cfg(test)]
+mod test_support;
 
 use axum::{extract::DefaultBodyLimit, routing::get, Json, Router};
 use broker_dispatch::{DispatchEngine, LeaseTable};
@@ -46,22 +54,30 @@ fn http_body_limit_bytes() -> usize {
     {
         return n;
     }
-    // Self-host / default: 64 MiB (was unbounded — DoS risk).
-    64 * 1024 * 1024
+    // Match the documented batch wire cap unless explicitly overridden.
+    ingest::MAX_BATCH_BYTES
 }
 
 pub use admin::{
     router as admin_router, validate_attach_url, AdminState, CellMember, CellRecord, CellRegistry,
 };
+pub use admin_audit::{AdminAuditEvent, AdminAuditLog};
 pub use catalog_tombstones::CatalogTombstones;
 pub use cluster::{
     build_cluster_status, catalog_peer_targets, enqueue_dispatch_after_publish,
     publish_with_cluster, push_catalog_to_recovered_peer, spawn_cluster_catalog_sync,
-    sync_catalog_from_peers, ClusterGossipRequest, ClusterGossipResponse, ClusterHandle as Cluster,
-    ClusterStatusResponse,
+    sync_catalog_from_peers, ClusterDlqDurability, ClusterGossipRequest, ClusterGossipResponse,
+    ClusterHandle as Cluster, ClusterStatusResponse, DispatchCursorCheckpoint, DispatchCursorEntry,
 };
 pub use gateway::GatewayOnlyState;
 pub use local_auth::{close_setup_window, open_setup_window};
+pub use metrics::{
+    record_fleet_claim_failure, record_scheduler_failure, record_shard_recovery_failure,
+    set_fenced_shards, SchedulerFailure, ShardRecoveryFailure,
+};
+pub use payload_repair::{repair_legacy_payloads, PayloadRepairReport};
+pub use retention::{compute_safe_watermark, run_retention_tick, spawn_retention_loop};
+pub use routes::ApiError;
 
 /// Reject new ingest while allowing already-admitted requests to drain.
 pub fn begin_shutdown() {
@@ -113,6 +129,7 @@ pub struct HealthResponse {
 fn into_shared(state: AppState, spawn: bool) -> Arc<AppState> {
     let shared = Arc::new(state);
     if spawn {
+        catalog_applier::spawn(shared.clone());
         bettermq::spawn_fanout_replay(shared.clone());
         bettermq::spawn_dlq_retention(shared.clone());
     }
@@ -156,6 +173,14 @@ fn data_plane_routes(shared: Arc<AppState>) -> Router<Arc<AppState>> {
             .route("/v1/ops/aggregate", get(ops::aggregate_ops_status))
             .route_layer(axum::middleware::from_fn_with_state(
                 shared.clone(),
+                admission::buffer_ingest_body,
+            ))
+            .route_layer(axum::middleware::from_fn_with_state(
+                shared.clone(),
+                catalog_applier::mutation_preflight,
+            ))
+            .route_layer(axum::middleware::from_fn_with_state(
+                shared.clone(),
                 auth::check_ingest_limits,
             ))
             .route_layer(axum::middleware::from_fn_with_state(
@@ -172,6 +197,26 @@ fn data_plane_routes(shared: Arc<AppState>) -> Router<Arc<AppState>> {
         .merge(local_auth::routes())
         .merge(infra::public_infra_routes())
         .merge(protected)
+}
+
+/// Headroom over the frame decode cap for replication envelopes.
+const INTERNAL_BODY_SLACK_BYTES: usize = 1024 * 1024;
+
+/// Body cap for `/internal/v1` (replication epochs, catch-up, forwarded
+/// publishes). Replication carries frames that were accepted under whatever
+/// ingest limit applied when they were written, so a follower whose public
+/// `BETTERMQ_MAX_HTTP_BODY_BYTES` is lower must still accept anything the
+/// frame codec can decode. Cell startup checks the replication epoch cap
+/// against this same value.
+pub fn internal_body_limit_bytes() -> usize {
+    internal_body_limit(
+        http_body_limit_bytes(),
+        broker_proto::max_frame_decode_payload_bytes(),
+    )
+}
+
+fn internal_body_limit(http_limit: usize, decode_cap: usize) -> usize {
+    http_limit.max(decode_cap.saturating_add(INTERNAL_BODY_SLACK_BYTES))
 }
 
 fn finish_router(routes: Router<Arc<AppState>>, shared: Arc<AppState>) -> Router {
@@ -216,7 +261,33 @@ pub fn internal_router(state: AppState) -> Router {
 }
 
 fn internal_cluster_routes() -> Router<Arc<AppState>> {
+    // Innermost DefaultBodyLimit wins, so this overrides finish_router's
+    // public limit for these routes on the collapsed listener too.
+    internal_cluster_route_table().layer(DefaultBodyLimit::max(internal_body_limit_bytes()))
+}
+
+fn internal_cluster_route_table() -> Router<Arc<AppState>> {
     Router::new()
+        .route(
+            "/internal/v1/cluster/catalog/activation-snapshot",
+            get(catalog_applier::activation_snapshot_endpoint),
+        )
+        .route(
+            "/internal/v1/cluster/catalog/capabilities",
+            get(catalog_applier::capabilities),
+        )
+        .route(
+            "/internal/v1/gateway/queue-topics",
+            axum::routing::post(gateway::internal_gateway_queue_topics),
+        )
+        .route(
+            "/internal/v1/readyz",
+            axum::routing::get(gateway::internal_gateway_ready),
+        )
+        .route(
+            "/internal/v1/gateway/routes",
+            axum::routing::get(gateway::internal_gateway_routes),
+        )
         .route(
             "/internal/v1/lease/claim",
             axum::routing::post(lease::lease_claim),
@@ -246,8 +317,20 @@ fn internal_cluster_routes() -> Router<Arc<AppState>> {
             axum::routing::post(cluster::internal_replicate_batch),
         )
         .route(
+            "/internal/v1/dispatch/cursors",
+            axum::routing::post(cluster::internal_dispatch_cursors),
+        )
+        .route(
             "/internal/v1/replicate/catch-up",
             axum::routing::post(cluster::internal_replicate_catch_up),
+        )
+        .route(
+            "/internal/v1/payload-blob/{tenant}/{message_id}",
+            axum::routing::get(payload_repair::internal_payload_blob),
+        )
+        .route(
+            "/internal/v1/replicate/truncate",
+            axum::routing::post(cluster::internal_replicate_truncate),
         )
         .route(
             "/internal/v1/cluster",
@@ -358,6 +441,7 @@ fn internal_cluster_routes() -> Router<Arc<AppState>> {
 /// never opens broker storage, WAL, indexes, schedules, dispatch, or archives.
 pub fn gateway_only_router(state: GatewayOnlyState) -> Router {
     let shared = Arc::new(state);
+    shared.spawn_route_refresh();
     let protected = Router::new()
         .route(
             "/v1/gateway/enqueue",
@@ -371,6 +455,7 @@ pub fn gateway_only_router(state: GatewayOnlyState) -> Router {
             "/v1/ingest/ndjson",
             axum::routing::post(gateway::gateway_only_ndjson),
         )
+        .route_layer(axum::middleware::from_fn(admission::buffer_gateway_body))
         .route_layer(axum::middleware::from_fn_with_state(
             shared.clone(),
             gateway::gateway_only_auth,
@@ -379,6 +464,7 @@ pub fn gateway_only_router(state: GatewayOnlyState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(gateway::gateway_only_ready))
         .route("/v1/gateway/status", get(gateway::gateway_only_status))
+        .route("/metrics/prometheus", get(gateway::gateway_only_metrics))
         .merge(protected)
         .layer(DefaultBodyLimit::max(ingest::MAX_BATCH_BYTES))
         .with_state(shared)
@@ -433,6 +519,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn destination_controls_report_only_confirmed_serving_node() {
+        let dir = tempdir().unwrap();
+        let state = Arc::new(test_state(&dir));
+        let axum::Json(blocked) = ops::block_host(
+            axum::extract::State(state.clone()),
+            axum::Json(ops::BlockHostRequest {
+                host: "https://example.com/hook".into(),
+                duration_ms: Some(60_000),
+            }),
+        )
+        .await
+        .unwrap();
+        let body = serde_json::to_value(blocked).unwrap();
+        assert_eq!(body["scope"], "serving_process");
+        assert_eq!(
+            body["applied_nodes"],
+            serde_json::json!([state.dispatch.process_id()])
+        );
+        let axum::Json(list) = ops::list_blocked_hosts(axum::extract::State(state.clone())).await;
+        assert_eq!(list.hosts.len(), 1);
+        assert_eq!(list.scope.applied_nodes.len(), 1);
+        let axum::Json(unblocked) = ops::unblock_host(
+            axum::extract::State(state.clone()),
+            axum::Json(ops::UnblockHostRequest {
+                host: "https://example.com".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unblocked.scope.applied_nodes,
+            vec![state.dispatch.process_id()]
+        );
+        assert!(state.dispatch.host_blocker().blocked_hosts().is_empty());
+        state.dispatch.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn node_metadata_update_preserves_saved_listener() {
+        let dir = tempdir().unwrap();
+        let mut cfg = broker_config::BetterMqConfig::template_single_local();
+        cfg.node.listen = "127.0.0.1:9123".into();
+        broker_config::save_managed_config(dir.path(), &cfg).unwrap();
+        let body = serde_json::from_value(serde_json::json!({
+            "name": "renamed", "public_url": "http://localhost:9123"
+        }))
+        .unwrap();
+        let _ = infra::infra_update_node(
+            axum::extract::State(Arc::new(test_state(&dir))),
+            axum::Json(body),
+        )
+        .await
+        .unwrap();
+        let saved = broker_config::load_managed_config(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.node.listen, "127.0.0.1:9123");
+        assert_eq!(saved.node.name, "renamed");
+    }
+
+    #[tokio::test]
+    async fn cluster_create_refuses_existing_membership_and_runtime_file() {
+        let dir = tempdir().unwrap();
+        let state = Arc::new(test_state(&dir));
+        let _ = infra::infra_cluster_create(axum::extract::State(state.clone()))
+            .await
+            .unwrap();
+        let before = std::fs::read(broker_config::managed_config_path(dir.path())).unwrap();
+        let error = infra::infra_cluster_create(axum::extract::State(state.clone()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, routes::ApiError::Conflict(_)));
+        assert_eq!(
+            before,
+            std::fs::read(broker_config::managed_config_path(dir.path())).unwrap()
+        );
+        let cfg = broker_config::BetterMqConfig::template_single_local();
+        broker_config::save_managed_config(dir.path(), &cfg).unwrap();
+        std::fs::write(dir.path().join("cluster-config.json"), "{}").unwrap();
+        let error = infra::infra_cluster_create(axum::extract::State(state))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, routes::ApiError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn live_storage_switch_is_rejected_without_changing_config() {
+        let dir = tempdir().unwrap();
+        let cfg = broker_config::BetterMqConfig::template_single_local();
+        broker_config::save_managed_config(dir.path(), &cfg).unwrap();
+        let before = std::fs::read(broker_config::managed_config_path(dir.path())).unwrap();
+        let body = serde_json::from_value(serde_json::json!({
+            "mode": "slate", "s3": { "endpoint": "https://s3.example.com", "bucket": "wal", "payloadBucket": "payload", "accessKey": "access", "secretKey": "secret", "region": "auto" }
+        })).unwrap();
+        let state = Arc::new(test_state(&dir));
+        let error =
+            infra::infra_update_storage(axum::extract::State(state.clone()), axum::Json(body))
+                .await
+                .unwrap_err();
+        assert!(matches!(error, routes::ApiError::Conflict(_)));
+        assert_eq!(
+            before,
+            std::fs::read(broker_config::managed_config_path(dir.path())).unwrap()
+        );
+        let body = serde_json::from_value(serde_json::json!({ "mode": "local" })).unwrap();
+        let _ = infra::infra_update_storage(axum::extract::State(state), axum::Json(body))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_checks_local_shard_fences_and_internal_credentials() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BETTERMQ_CLUSTER_SECRET", "readiness-test");
+        let dir = tempdir().unwrap();
+        let store = broker_local_auth::LocalAuthStore::open(dir.path()).unwrap();
+        store.setup("password1234").unwrap();
+        let mut state = test_state(&dir);
+        state.local_auth = Some(Arc::new(store));
+        let node_id = uuid::Uuid::new_v4();
+        let runtime =
+            broker_raft_meta::ClusterRuntime::from_config_only(broker_raft_meta::ClusterConfig {
+                cluster_id: uuid::Uuid::new_v4(),
+                node_id,
+                nodes: vec![broker_raft_meta::NodeConfig {
+                    id: node_id,
+                    addr: "http://localhost:1".into(),
+                    internal_url: None,
+                }],
+                generation: 1,
+                hash_version: 1,
+            });
+        runtime.record_self_alive(chrono::Utc::now().timestamp_millis());
+        state.cluster = Some(Cluster::new(runtime.clone()));
+        assert!(ops::ready_snapshot(&state).ready);
+        runtime.set_shard_ready(0, false);
+        let body = ops::ready_snapshot(&state);
+        assert!(!body.ready);
+        assert!(!body.local_shards_ready);
+        let app = internal_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/v1/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/v1/readyz")
+                    .header("x-bettermq-cluster-secret", "readiness-test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
+    }
+
+    #[tokio::test]
     async fn healthz_returns_ok() {
         let dir = tempdir().unwrap();
         let app = router(test_state(&dir));
@@ -448,6 +700,158 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn inspection_lists_page_metadata_and_read_maintained_counts() {
+        async fn get(app: &Router, path: &str) -> (StatusCode, serde_json::Value) {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            (status, value)
+        }
+        let dir = tempdir().unwrap();
+        let state = Arc::new(test_state(&dir));
+        for key in ["a", "b", "c"] {
+            let dead: broker_partition::PublishRequest =
+                serde_json::from_value(serde_json::json!({
+                    "topic": "jobs.__dlq", "routing_key": key,
+                    "payload": { "body": "hidden payload", "reason": "retries exhausted" }
+                }))
+                .unwrap();
+            state.broker.publish(dead).unwrap();
+            let delayed = serde_json::from_value(serde_json::json!({ "payload": "delayed payload", "url": "https://example.com/hook", "secret": "s", "delay_ms": 60000 })).unwrap();
+            ingest::submit_one(&state, delayed, None).await.unwrap();
+        }
+        let app = bettermq::bettermq_routes().with_state(state);
+        let (_, counts) = get(&app, "/v1/inspection/counts").await;
+        let spec: serde_json::Value = serde_json::from_str(include_str!(
+            "../../broker-server/openapi/bettermq.openapi.json"
+        ))
+        .unwrap();
+        assert_contract_fields(
+            &spec,
+            &spec["components"]["schemas"]["InspectionCounts"],
+            &counts,
+        );
+        assert_eq!(counts["delayed"], 3);
+        assert_eq!(counts["dlq"], 3);
+        assert_eq!(counts["dlq_ready"], true);
+        let (_, delayed) = get(&app, "/v1/delayed?limit=2").await;
+        assert_contract_fields(
+            &spec,
+            &spec["components"]["schemas"]["DelayedListResponse"],
+            &delayed,
+        );
+        assert_eq!(delayed["delayed"].as_array().unwrap().len(), 2);
+        assert!(delayed["delayed"][0].get("body").is_none());
+        let (_, delayed_next) = get(
+            &app,
+            &format!(
+                "/v1/delayed?limit=2&cursor={}",
+                delayed["next_cursor"].as_str().unwrap()
+            ),
+        )
+        .await;
+        assert_eq!(delayed_next["delayed"].as_array().unwrap().len(), 1);
+        assert!(delayed_next["next_cursor"].is_null());
+        assert_eq!(
+            get(&app, "/v1/delayed?cursor=!").await.0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut path = "/v1/dlq?dlq_topic=jobs.__dlq&limit=1".to_string();
+        let mut ids = std::collections::HashSet::new();
+        let mut detail_position = None;
+        loop {
+            let (status, page) = get(&app, &path).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_contract_fields(
+                &spec,
+                &spec["components"]["schemas"]["DlqListResponse"],
+                &page,
+            );
+            let rows = page["messages"].as_array().unwrap();
+            assert!(rows.len() <= 1);
+            for row in rows {
+                assert!(row.get("body").is_none());
+                assert_eq!(row["reason"], "retries exhausted");
+                assert!(ids.insert(row["message_id"].as_str().unwrap().to_string()));
+                detail_position = Some((
+                    row["partition"].as_u64().unwrap(),
+                    row["offset"].as_u64().unwrap(),
+                ));
+            }
+            let Some(cursor) = page["next_cursor"].as_str() else {
+                break;
+            };
+            assert_eq!(
+                get(
+                    &app,
+                    &format!("/v1/dlq?dlq_topic=other.__dlq&cursor={cursor}")
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+            path = format!("/v1/dlq?dlq_topic=jobs.__dlq&limit=1&cursor={cursor}");
+        }
+        assert_eq!(ids.len(), 3);
+        let (partition, offset) = detail_position.unwrap();
+        let (_, detail) = get(
+            &app,
+            &format!("/v1/dlq/message?dlq_topic=jobs.__dlq&partition={partition}&offset={offset}"),
+        )
+        .await;
+        assert_eq!(detail["body"], "hidden payload");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::delete("/v1/dlq?dlq_topic=jobs.__dlq")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(get(&app, "/v1/inspection/counts").await.1["dlq"], 0);
+    }
+
+    #[tokio::test]
+    async fn storage_api_rejects_slate_on_v2_without_saving() {
+        let dir = tempdir().unwrap();
+        let layout = broker_partition::ShardLayout {
+            version: broker_partition::LAYOUT_V2,
+            shard_count: 1,
+            route_hash_version: broker_proto::HASH_VERSION_V2,
+        };
+        std::fs::write(
+            broker_partition::ShardLayout::path(dir.path()),
+            serde_json::to_vec(&layout).unwrap(),
+        )
+        .unwrap();
+        let state = Arc::new(test_state(&dir));
+        let result = infra::infra_update_storage(
+            axum::extract::State(state),
+            Json(infra::StorageUpdateRequest {
+                mode: "slate".into(),
+                s3: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(routes::ApiError::BadRequest(message)) if message.contains("physical shard layout V2"))
+        );
+        assert!(!broker_config::managed_config_path(dir.path()).exists());
     }
 
     #[tokio::test]
@@ -468,6 +872,311 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn assert_contract_fields(
+        spec: &serde_json::Value,
+        schema: &serde_json::Value,
+        value: &serde_json::Value,
+    ) {
+        if let Some(reference) = schema["$ref"].as_str() {
+            return assert_contract_fields(
+                spec,
+                spec.pointer(reference.strip_prefix('#').unwrap()).unwrap(),
+                value,
+            );
+        }
+        if let Some(object) = value.as_object() {
+            let properties = schema["properties"]
+                .as_object()
+                .expect("object schema properties");
+            if let Some(required) = schema["required"].as_array() {
+                for field in required {
+                    assert!(
+                        object.contains_key(field.as_str().unwrap()),
+                        "missing {field}"
+                    );
+                }
+            }
+            for (key, value) in object {
+                assert!(properties.contains_key(key), "undocumented field {key}");
+                if !value.is_null() {
+                    assert_contract_fields(spec, &properties[key], value);
+                }
+            }
+        } else if let Some(array) = value.as_array() {
+            for item in array {
+                assert_contract_fields(spec, &schema["items"], item);
+            }
+        } else {
+            match schema["type"].as_str() {
+                Some("integer") => assert!(value.is_i64() || value.is_u64()),
+                Some("boolean") => assert!(value.is_boolean()),
+                Some("string") => assert!(value.is_string()),
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_ingest_router_responses_match_openapi() {
+        let spec: serde_json::Value = serde_json::from_str(include_str!(
+            "../../broker-server/openapi/bettermq.openapi.json"
+        ))
+        .unwrap();
+        let dir = tempdir().unwrap();
+        let state = test_state(&dir);
+        let group = state.broker.create_group("contract".into()).unwrap();
+        for (name, url) in [
+            ("valid", "https://example.com/hook"),
+            ("invalid", "not-a-url"),
+        ] {
+            state
+                .broker
+                .add_group_member(
+                    group.id,
+                    name.into(),
+                    url.into(),
+                    "s".into(),
+                    1,
+                    0,
+                    60,
+                    None,
+                )
+                .unwrap();
+        }
+        // Mount the real handlers without auth to isolate the wire contract.
+        let app = Router::new()
+            .route(
+                "/v1/enqueue/batch",
+                axum::routing::post(batch::batch_enqueue),
+            )
+            .merge(bettermq::bettermq_routes())
+            .with_state(Arc::new(state));
+        let bodies = [
+            (
+                "/v1/enqueue/batch",
+                serde_json::json!({"messages": [
+                    {"payload":"ok", "url":"https://example.com/hook", "secret":"s", "delay_ms":60000},
+                    {"payload":"bad", "topic":"missing"}
+                ]}),
+            ),
+            (
+                "/v1/publish",
+                serde_json::json!({"group_id": group.id, "body":"body"}),
+            ),
+        ];
+        for (path, body) in bodies {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::MULTI_STATUS);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["partial"], true);
+            let schema = &spec["paths"][path]["post"]["responses"]["207"]["content"]
+                ["application/json"]["schema"];
+            assert_contract_fields(&spec, schema, &body);
+        }
+        for path in [
+            "/v1/enqueue/batch",
+            "/v1/ingest/batch",
+            "/v1/ingest/ndjson",
+            "/v1/gateway/enqueue",
+        ] {
+            assert!(spec["paths"][path]["post"]["responses"]["207"].is_object());
+        }
+    }
+
+    #[tokio::test]
+    async fn regenerated_token_revokes_the_old_one_immediately() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(broker_local_auth::LocalAuthStore::open(dir.path()).unwrap());
+        let old = store.setup("password1234").unwrap();
+        let mut state = test_state(&dir);
+        state.local_auth = Some(store.clone());
+        let app = router(state);
+        let get = |token: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/v1/queues")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        assert_eq!(get(old.clone()).await, StatusCode::OK);
+        assert_eq!(get("x".repeat(64 * 1024)).await, StatusCode::UNAUTHORIZED);
+        let new = store.regenerate("password1234").unwrap();
+        assert_eq!(get(old).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(get(new).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn regenerate_rotates_the_token_on_configured_peers() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BETTERMQ_CLUSTER_SECRET", "rotate-secret");
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let store_a = Arc::new(broker_local_auth::LocalAuthStore::open(dir_a.path()).unwrap());
+        let store_b = Arc::new(broker_local_auth::LocalAuthStore::open(dir_b.path()).unwrap());
+        let old = store_a.setup("password1234").unwrap();
+        store_b
+            .apply_credentials(&store_a.export_credentials().unwrap().unwrap())
+            .unwrap();
+
+        let mut state_b = test_state(&dir_b);
+        state_b.local_auth = Some(store_b.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener.local_addr().unwrap();
+        let app_b = router(state_b);
+        tokio::spawn(async move { axum::serve(listener, app_b).await.unwrap() });
+
+        let mut cfg = broker_config::BetterMqConfig::template_single_local();
+        cfg.data_dir = dir_a.path().to_path_buf();
+        cfg.node.name = "a".into();
+        cfg.node.public_url = "http://127.0.0.1:1".into();
+        cfg.cluster = Some(broker_config::ClusterConfigSection {
+            enabled: true,
+            id: Some(uuid::Uuid::new_v4().to_string()),
+            nodes: vec![
+                broker_config::ClusterNode {
+                    name: "a".into(),
+                    public_url: "http://127.0.0.1:1".into(),
+                    internal_url: None,
+                },
+                broker_config::ClusterNode {
+                    name: "b".into(),
+                    public_url: format!("http://{addr_b}"),
+                    internal_url: None,
+                },
+            ],
+            shared_meta_dir: None,
+        });
+        broker_config::save_managed_config(dir_a.path(), &cfg).unwrap();
+        let mut state_a = test_state(&dir_a);
+        state_a.local_auth = Some(store_a.clone());
+        let response = router(state_a)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/local-auth/regenerate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"password":"password1234"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let new = body["token"].as_str().unwrap();
+        assert_eq!(body["propagation"]["peers"], 1, "{body}");
+        assert_eq!(body["propagation"]["applied"], 1, "{body}");
+        assert!(
+            !store_b.verify_token(&old).unwrap(),
+            "old token revoked on peer"
+        );
+        assert!(
+            store_b.verify_token(new).unwrap(),
+            "new token works on peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_ops_trims_the_secret_and_flags_unreachable_peers() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Env files and Docker secrets often end in a newline.
+        std::env::set_var("BETTERMQ_CLUSTER_SECRET", "agg-secret\n");
+        let dir_b = tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener.local_addr().unwrap();
+        let app_b = router(test_state(&dir_b));
+        tokio::spawn(async move { axum::serve(listener, app_b).await.unwrap() });
+
+        let dir_a = tempdir().unwrap();
+        let mut cfg = broker_config::BetterMqConfig::template_single_local();
+        cfg.data_dir = dir_a.path().to_path_buf();
+        cfg.node.name = "a".into();
+        cfg.node.public_url = "http://127.0.0.1:1".into();
+        cfg.cluster = Some(broker_config::ClusterConfigSection {
+            enabled: true,
+            id: Some(uuid::Uuid::new_v4().to_string()),
+            nodes: vec![
+                broker_config::ClusterNode {
+                    name: "a".into(),
+                    public_url: "http://127.0.0.1:1".into(),
+                    internal_url: None,
+                },
+                broker_config::ClusterNode {
+                    name: "b".into(),
+                    public_url: format!("http://{addr_b}"),
+                    internal_url: None,
+                },
+                broker_config::ClusterNode {
+                    name: "c".into(),
+                    public_url: "http://127.0.0.1:9".into(),
+                    internal_url: None,
+                },
+            ],
+            shared_meta_dir: None,
+        });
+        broker_config::save_managed_config(dir_a.path(), &cfg).unwrap();
+        let store = broker_local_auth::LocalAuthStore::open(dir_a.path()).unwrap();
+        let token = store.setup("password1234").unwrap();
+        let mut state_a = test_state(&dir_a);
+        state_a.local_auth = Some(Arc::new(store));
+        let response = router(state_a)
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/ops/aggregate")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let peer = |port: u16| {
+            body["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["addr"].as_str().unwrap().ends_with(&format!(":{port}")))
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(peer(addr_b.port())["reachable"], true, "{body}");
+        assert_eq!(peer(addr_b.port())["active_leases"], 0);
+        assert_eq!(peer(9)["reachable"], false, "{body}");
+        assert!(peer(9)["active_leases"].is_null());
+        assert_eq!(body["fleet"]["complete"], false);
+        assert_eq!(body["fleet"]["peers_unreachable"], 1);
     }
 
     #[tokio::test]
@@ -512,29 +1221,112 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    async fn post_setup(app: Router, body: serde_json::Value) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/local-auth/setup")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
     #[tokio::test]
-    async fn setup_during_open_window_succeeds() {
+    async fn setup_during_open_window_requires_the_setup_code() {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("BETTERMQ_ALLOW_OPEN_SETUP");
-        open_setup_window(std::time::Duration::from_secs(60));
+        std::env::remove_var("BETTERMQ_SETUP_CODE");
+        let code = open_setup_window(std::time::Duration::from_secs(60));
+        let dir = tempdir().unwrap();
+        let store = Arc::new(broker_local_auth::LocalAuthStore::open(dir.path()).unwrap());
+        let mut state = test_state(&dir);
+        state.local_auth = Some(store.clone());
+        let app = router(state);
+        let missing = post_setup(
+            app.clone(),
+            serde_json::json!({ "password": "password1234" }),
+        )
+        .await;
+        let wrong = post_setup(
+            app.clone(),
+            serde_json::json!({ "password": "password1234", "setup_code": "0000-0000-0000-0000" }),
+        )
+        .await;
+        let configured_after_bad = store.is_configured();
+        // Codes are case- and dash-insensitive so they survive retyping.
+        let typed = code.replace('-', "").to_ascii_lowercase();
+        let ok = post_setup(
+            app,
+            serde_json::json!({ "password": "password1234", "setup_code": typed }),
+        )
+        .await;
+        close_setup_window();
+        assert_eq!(missing, StatusCode::UNAUTHORIZED);
+        assert_eq!(wrong, StatusCode::UNAUTHORIZED);
+        assert!(
+            !configured_after_bad,
+            "a caller without the code must not claim the broker"
+        );
+        assert_eq!(ok, StatusCode::OK);
+        assert!(store.is_configured());
+    }
+
+    #[tokio::test]
+    async fn auth_rate_limit_is_per_client_and_returns_429() {
         let dir = tempdir().unwrap();
         let store = broker_local_auth::LocalAuthStore::open(dir.path()).unwrap();
+        store.setup("password1234").unwrap();
         let mut state = test_state(&dir);
         state.local_auth = Some(Arc::new(store));
         let app = router(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/local-auth/setup")
-                    .header("content-type", "application/json")
-                    .body(Body::from(r#"{"password":"password1234"}"#))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let attempt =
+            |peer: &'static str| {
+                let app = app.clone();
+                async move {
+                    let mut req = Request::builder()
+                        .method("POST")
+                        .uri("/v1/local-auth/regenerate")
+                        .header("content-type", "application/json")
+                        .header("x-forwarded-for", uuid::Uuid::new_v4().to_string())
+                        .body(Body::from(r#"{"password":"wrong-password"}"#))
+                        .unwrap();
+                    req.extensions_mut().insert(axum::extract::ConnectInfo(
+                        std::net::SocketAddr::new(peer.parse().unwrap(), 40000),
+                    ));
+                    app.oneshot(req).await.unwrap().status()
+                }
+            };
+        for _ in 0..5 {
+            assert_eq!(attempt("203.0.113.10").await, StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(attempt("203.0.113.10").await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            attempt("203.0.113.11").await,
+            StatusCode::BAD_REQUEST,
+            "another client is not locked out by the first one"
+        );
+    }
+
+    #[test]
+    fn setup_codes_are_random_and_readable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("BETTERMQ_SETUP_CODE");
+        let a = open_setup_window(std::time::Duration::from_secs(60));
+        let b = open_setup_window(std::time::Duration::from_secs(60));
+        std::env::set_var("BETTERMQ_SETUP_CODE", "  preset-code-1234 ");
+        let preset = open_setup_window(std::time::Duration::from_secs(60));
+        std::env::remove_var("BETTERMQ_SETUP_CODE");
         close_setup_window();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 19);
+        assert!(a
+            .chars()
+            .all(|c| c == '-' || "0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(c)));
+        assert_eq!(preset, "preset-code-1234");
     }
 
     #[tokio::test]
@@ -614,6 +1406,776 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
+    async fn admin_call(
+        app: Router,
+        method: &str,
+        uri: &str,
+        bearer: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> StatusCode {
+        let mut req = Request::builder().method(method).uri(uri);
+        if let Some(token) = bearer {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let req = match body {
+            Some(body) => req
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap();
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    fn embedded_admin(dir: &tempfile::TempDir, configure: bool) -> (AdminState, Option<String>) {
+        let store = broker_local_auth::LocalAuthStore::open(dir.path()).unwrap();
+        let token = configure.then(|| store.setup("password1234").unwrap());
+        let mut state = test_state(dir);
+        state.local_auth = Some(Arc::new(store));
+        let mut admin = AdminState::local(Arc::new(state));
+        admin.cluster_secret = None;
+        (admin, token)
+    }
+
+    #[tokio::test]
+    async fn embedded_admin_is_401_before_local_auth_setup() {
+        let dir = tempdir().unwrap();
+        let (admin, _) = embedded_admin(&dir, false);
+        let app = admin_router(admin);
+        for (method, uri, body) in [
+            ("GET", "/admin/v1/cells", None),
+            ("GET", "/admin/v1/cluster", None),
+            (
+                "POST",
+                "/admin/v1/cells",
+                Some(serde_json::json!({
+                    "id": "x", "region": "x", "controllerUrl": "http://attacker.example"
+                })),
+            ),
+            (
+                "POST",
+                "/admin/v1/gc/0",
+                Some(serde_json::json!({ "watermark": 1_000_000 })),
+            ),
+        ] {
+            assert_eq!(
+                admin_call(app.clone(), method, uri, None, body).await,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} must fail closed before setup"
+            );
+        }
+        assert_eq!(
+            admin_call(app, "GET", "/admin/v1/health", None, None).await,
+            StatusCode::OK,
+            "health stays public"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_admin_requires_local_token_or_cluster_secret() {
+        let dir = tempdir().unwrap();
+        let (mut admin, token) = embedded_admin(&dir, true);
+        let token = token.unwrap();
+        admin.cluster_secret = Some("cluster-secret".into());
+        let app = admin_router(admin);
+        assert_eq!(
+            admin_call(app.clone(), "GET", "/admin/v1/cells", None, None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            admin_call(
+                app.clone(),
+                "GET",
+                "/admin/v1/cells",
+                Some("sk_local_wrong"),
+                None
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            admin_call(app.clone(), "GET", "/admin/v1/cells", Some(&token), None).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            admin_call(app, "GET", "/admin/v1/cells", Some("cluster-secret"), None).await,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_admin_without_local_store_is_401() {
+        let dir = tempdir().unwrap();
+        let mut admin = AdminState::local(Arc::new(test_state(&dir)));
+        admin.cluster_secret = None;
+        let app = admin_router(admin);
+        assert_eq!(
+            admin_call(app, "GET", "/admin/v1/cells", Some("anything"), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_admin_fails_closed_without_cluster_secret() {
+        let mut admin = AdminState::remote("http://127.0.0.1:9".into(), CellRegistry::default());
+        admin.cluster_secret = None;
+        let app = admin_router(admin);
+        assert_eq!(
+            admin_call(app.clone(), "GET", "/admin/v1/cells", None, None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            admin_call(
+                app,
+                "POST",
+                "/admin/v1/cells",
+                None,
+                Some(serde_json::json!({
+                    "id": "x", "region": "x", "controllerUrl": "http://attacker.example"
+                })),
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_admin_accepts_only_the_cluster_secret() {
+        let mut admin = AdminState::remote("http://127.0.0.1:9".into(), CellRegistry::default());
+        admin.cluster_secret = Some("cluster-secret".into());
+        let app = admin_router(admin);
+        assert_eq!(
+            admin_call(app.clone(), "GET", "/admin/v1/cells", Some("nope"), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            admin_call(
+                app.clone(),
+                "GET",
+                "/admin/v1/cells",
+                Some("cluster-secret"),
+                None
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            admin_call(
+                app,
+                "POST",
+                "/admin/v1/cells",
+                Some("cluster-secret"),
+                Some(serde_json::json!({
+                    "id": "x", "region": "x", "controllerUrl": "http://169.254.169.254/latest?x="
+                })),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "link-local controller URLs are rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn federated_query_uses_only_the_cell_credential() {
+        use axum::routing::get;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let record = seen.clone();
+        let probe = Router::new().route(
+            "/admin/v1/nodes",
+            get(move |headers: axum::http::HeaderMap| {
+                let record = record.clone();
+                async move {
+                    record.lock().unwrap().push(
+                        headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string),
+                    );
+                    Json(serde_json::json!({ "nodes": [] }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, probe).await.unwrap() });
+
+        let mut registry = CellRegistry::default();
+        for (id, admin_token) in [("with-token", Some("sk_local_cell")), ("no-token", None)] {
+            registry.cells.push(CellRecord {
+                id: id.into(),
+                region: "r".into(),
+                controller_url: format!("http://{addr}"),
+                label: None,
+                admin_token: admin_token.map(str::to_string),
+            });
+        }
+        let mut admin = AdminState::remote("http://127.0.0.1:9".into(), registry);
+        admin.cluster_secret = Some("cluster-secret".into());
+        let response = admin_router(admin)
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/v1/cells/query/nodes")
+                    .header("authorization", "Bearer cluster-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ok"][0]["cell"], "with-token");
+        assert_eq!(body["failed"][0]["cell"], "no-token");
+        assert_eq!(body["failed"][0]["error"], "cell credential not configured");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[Some("Bearer sk_local_cell".to_string())],
+            "only the cell's own token is sent; never the caller's bearer"
+        );
+    }
+
+    #[tokio::test]
+    async fn federated_query_reports_a_hung_cell_without_hiding_healthy_ones() {
+        use axum::routing::get;
+        // Accepts connections and never answers.
+        let hung = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hung_addr = hung.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = hung.accept().await {
+                held.push(socket);
+            }
+        });
+        let healthy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthy_addr = healthy.local_addr().unwrap();
+        let app = Router::new().route(
+            "/admin/v1/nodes",
+            get(|| async { Json(serde_json::json!({ "nodes": [] })) }),
+        );
+        tokio::spawn(async move { axum::serve(healthy, app).await.unwrap() });
+
+        let mut registry = CellRegistry::default();
+        for (id, addr) in [("hung", hung_addr), ("healthy", healthy_addr)] {
+            registry.cells.push(CellRecord {
+                id: id.into(),
+                region: "r".into(),
+                controller_url: format!("http://{addr}"),
+                label: None,
+                admin_token: Some("sk_local_x".into()),
+            });
+        }
+        let mut admin = AdminState::remote("http://127.0.0.1:9".into(), registry);
+        admin.cluster_secret = Some("cluster-secret".into());
+        let started = std::time::Instant::now();
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            admin_json(
+                admin_router(admin),
+                "GET",
+                "/admin/v1/cells/query/nodes",
+                None,
+            ),
+        )
+        .await
+        .expect("federated query must not hang on one cell");
+        assert_eq!(status, StatusCode::OK);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(body["ok"][0]["cell"], "healthy", "{body}");
+        assert_eq!(body["failed"][0]["cell"], "hung", "{body}");
+        assert!(
+            body["failed"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("timed out"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_reads_come_from_the_controller_not_made_up_values() {
+        use axum::routing::{get, post};
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = seen.clone();
+        let record_gc = seen.clone();
+        let controller = Router::new()
+            .route(
+                "/admin/v1/readyz",
+                get(move |headers: axum::http::HeaderMap| {
+                    let record = record.clone();
+                    async move {
+                        record.lock().unwrap().push(
+                            headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        Json(serde_json::json!({
+                            "ready": false, "cluster_healthy": false, "auth_configured": true
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/admin/v1/gc/{shard}",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let record = record_gc.clone();
+                    async move {
+                        record.lock().unwrap().push(format!("gc {body}"));
+                        Json(serde_json::json!({ "deletedSegments": 3 }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, controller).await.unwrap() });
+
+        let mut admin = AdminState::remote(format!("http://{addr}/"), CellRegistry::default());
+        admin.cluster_secret = Some("cluster-secret".into());
+        {
+            let registry = admin.cell_registry.read();
+            assert_eq!(
+                registry.cells.len(),
+                1,
+                "controller registered as default cell"
+            );
+            assert_eq!(registry.cells[0].controller_url, format!("http://{addr}"));
+        }
+        let app = admin_router(admin);
+        let (status, body) = admin_json(app.clone(), "GET", "/admin/v1/readyz", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], "cell_credential_missing");
+
+        let (status, _) = admin_json(
+            app.clone(),
+            "POST",
+            "/admin/v1/cells",
+            Some(serde_json::json!({
+                "id": "default", "region": "default",
+                "controllerUrl": format!("http://{addr}"), "adminToken": "sk_local_ctrl"
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = admin_json(app.clone(), "GET", "/admin/v1/readyz", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["ready"], false,
+            "controller's real readiness is reported"
+        );
+        let (status, body) = admin_json(
+            app,
+            "POST",
+            "/admin/v1/gc/2",
+            Some(serde_json::json!({ "watermark": 7 })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deletedSegments"], 3);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[
+                "Bearer sk_local_ctrl".to_string(),
+                r#"gc {"watermark":7}"#.to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_reports_an_unreachable_or_missing_controller() {
+        let mut registry = CellRegistry::default();
+        registry.cells.push(CellRecord {
+            id: "default".into(),
+            region: "r".into(),
+            controller_url: "http://127.0.0.1:9".into(),
+            label: None,
+            admin_token: Some("sk_local_x".into()),
+        });
+        let mut admin = AdminState::remote("http://127.0.0.1:9".into(), registry);
+        admin.cluster_secret = Some("cluster-secret".into());
+        let (status, body) =
+            admin_json(admin_router(admin), "GET", "/admin/v1/cluster", None).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert_eq!(body["code"], "upstream_unavailable");
+
+        let mut admin = AdminState::remote_with_path(None, CellRegistry::default(), None);
+        admin.cluster_secret = Some("cluster-secret".into());
+        let (status, body) = admin_json(admin_router(admin), "GET", "/admin/v1/nodes", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "no_controller");
+    }
+
+    async fn admin_json(
+        app: Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", "Bearer cluster-secret")
+            .header("content-type", "application/json");
+        let req = req
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn cell_admin_token_is_required_kept_and_redacted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cell-registry.json");
+        let mut admin =
+            AdminState::remote_with_path(None, CellRegistry::default(), Some(path.clone()));
+        admin.cluster_secret = Some("cluster-secret".into());
+        let app = admin_router(admin);
+        let cell = |token: Option<&str>| {
+            let mut body = serde_json::json!({
+                "id": "eu", "region": "eu", "controllerUrl": "http://10.0.0.9:8080"
+            });
+            if let Some(token) = token {
+                body["adminToken"] = token.into();
+            }
+            body
+        };
+        let (status, _) =
+            admin_json(app.clone(), "POST", "/admin/v1/cells", Some(cell(None))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "new cell needs a token");
+        let (status, _) = admin_json(
+            app.clone(),
+            "POST",
+            "/admin/v1/cells",
+            Some(cell(Some("not-a-local-token"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, body) = admin_json(
+            app.clone(),
+            "POST",
+            "/admin/v1/cells",
+            Some(cell(Some("sk_local_eu"))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["cells"][0]["adminTokenConfigured"], true);
+        assert!(!body.to_string().contains("sk_local_eu"));
+        let (status, body) = admin_json(
+            app.clone(),
+            "POST",
+            "/admin/v1/cells",
+            Some(cell(Some(" "))),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "blank token on update keeps the saved one"
+        );
+        assert_eq!(body["cells"][0]["adminTokenConfigured"], true);
+        let (_, listed) = admin_json(app, "GET", "/admin/v1/cells", None).await;
+        assert_eq!(listed["cells"][0]["adminTokenConfigured"], true);
+        assert!(!listed.to_string().contains("sk_local_eu"));
+        let on_disk = CellRegistry::load(&path).unwrap();
+        assert_eq!(on_disk.cells[0].admin_token.as_deref(), Some("sk_local_eu"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    fn enroll_body(seed: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "seed_url": seed,
+            "join_token": "join_x",
+            "public_url": "http://127.0.0.1:1",
+            "node_name": "victim",
+        }))
+        .unwrap()
+    }
+
+    async fn enroll(
+        app: Router,
+        body: Vec<u8>,
+        proof: Option<String>,
+        bearer: Option<&str>,
+    ) -> StatusCode {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/infra/cluster/enroll")
+            .header("content-type", "application/json");
+        if let Some(proof) = proof {
+            req = req.header(cluster_auth::ENROLL_PROOF_HEADER, proof);
+        }
+        if let Some(token) = bearer {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        app.oneshot(req.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    fn now_ms() -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    }
+
+    /// Fake seed that answers bootstrap/register like an attacker would and
+    /// counts every request that carries the cluster-secret header.
+    async fn fake_seed(
+        proof_secret: Option<&'static str>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use axum::routing::{get, post};
+        let leaks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let leak_counter = leaks.clone();
+        let count_leak = axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let leaks = leak_counter.clone();
+                async move {
+                    if req
+                        .headers()
+                        .contains_key(cluster_auth::CLUSTER_SECRET_HEADER)
+                    {
+                        leaks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    next.run(req).await
+                }
+            },
+        );
+        let app = Router::new()
+            .route(
+                "/v1/infra/join/bootstrap",
+                get(move |headers: axum::http::HeaderMap| async move {
+                    let mut out = axum::http::HeaderMap::new();
+                    if let (Some(secret), Some(challenge)) = (
+                        proof_secret,
+                        headers
+                            .get(cluster_auth::CLUSTER_CHALLENGE_HEADER)
+                            .and_then(|v| v.to_str().ok()),
+                    ) {
+                        out.insert(
+                            cluster_auth::CLUSTER_PROOF_HEADER,
+                            cluster_auth::seed_proof(secret, challenge).unwrap().parse().unwrap(),
+                        );
+                    }
+                    (
+                        out,
+                        Json(serde_json::json!({
+                            "cluster_id": uuid::Uuid::new_v4(),
+                            "generation": 1,
+                            "nodes": [],
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/v1/infra/cluster/register",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "cluster_id": uuid::Uuid::new_v4(),
+                        "generation": 1,
+                        "nodes": [
+                            { "name": "evil", "public_url": "http://127.0.0.1:2", "id": uuid::Uuid::new_v4() },
+                            { "name": "victim", "public_url": "http://127.0.0.1:1", "id": uuid::Uuid::new_v4() },
+                        ],
+                    }))
+                }),
+            )
+            .fallback(|| async { StatusCode::NOT_FOUND })
+            .layer(count_leak);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), leaks)
+    }
+
+    fn joined_a_cluster(dir: &tempfile::TempDir) -> bool {
+        broker_config::load_managed_config(dir.path())
+            .unwrap()
+            .and_then(|cfg| cfg.cluster)
+            .is_some_and(|c| c.enabled)
+    }
+
+    #[tokio::test]
+    async fn enroll_requires_proof_or_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BETTERMQ_CLUSTER_SECRET", "enroll-secret");
+        let dir = tempdir().unwrap();
+        let store = broker_local_auth::LocalAuthStore::open(dir.path()).unwrap();
+        let mut state = test_state(&dir);
+        state.local_auth = Some(Arc::new(store));
+        let app = router(state);
+        let body = enroll_body("http://127.0.0.1:9");
+        let no_proof = enroll(app.clone(), body.clone(), None, None).await;
+        let wrong_secret = enroll(
+            app.clone(),
+            body.clone(),
+            Some(cluster_auth::sign_enroll("not-the-secret", now_ms(), &body)),
+            None,
+        )
+        .await;
+        let other_body = enroll(
+            app.clone(),
+            body.clone(),
+            Some(cluster_auth::sign_enroll("enroll-secret", now_ms(), b"{}")),
+            None,
+        )
+        .await;
+        std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
+        let no_secret = enroll(
+            app,
+            body.clone(),
+            Some(cluster_auth::sign_enroll("enroll-secret", now_ms(), &body)),
+            None,
+        )
+        .await;
+        assert_eq!(no_proof, StatusCode::UNAUTHORIZED);
+        assert_eq!(wrong_secret, StatusCode::UNAUTHORIZED);
+        assert_eq!(other_body, StatusCode::UNAUTHORIZED);
+        assert_eq!(no_secret, StatusCode::UNAUTHORIZED);
+        assert!(!joined_a_cluster(&dir));
+    }
+
+    #[tokio::test]
+    async fn enroll_on_configured_node_requires_its_api_token() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BETTERMQ_CLUSTER_SECRET", "enroll-secret");
+        let dir = tempdir().unwrap();
+        let store = broker_local_auth::LocalAuthStore::open(dir.path()).unwrap();
+        store.setup("password1234").unwrap();
+        let mut state = test_state(&dir);
+        state.local_auth = Some(Arc::new(store));
+        let app = router(state);
+        let body = enroll_body("http://127.0.0.1:9");
+        let status = enroll(
+            app,
+            body.clone(),
+            Some(cluster_auth::sign_enroll("enroll-secret", now_ms(), &body)),
+            None,
+        )
+        .await;
+        std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn join_rejects_seed_that_cannot_prove_the_cluster_secret() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        for seed_secret in [None, Some("attacker-guess")] {
+            std::env::set_var("BETTERMQ_CLUSTER_SECRET", "enroll-secret");
+            let (seed, leaks) = fake_seed(seed_secret).await;
+            let dir = tempdir().unwrap();
+            let app = router(test_state(&dir));
+            let body = enroll_body(&seed);
+            let status = enroll(
+                app,
+                body.clone(),
+                Some(cluster_auth::sign_enroll("enroll-secret", now_ms(), &body)),
+                None,
+            )
+            .await;
+            std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "seed secret {seed_secret:?}"
+            );
+            assert_eq!(leaks.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(!joined_a_cluster(&dir), "membership must not be rewritten");
+        }
+    }
+
+    #[tokio::test]
+    async fn join_refuses_a_node_already_in_a_cluster() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BETTERMQ_CLUSTER_SECRET", "enroll-secret");
+        let (seed, _) = fake_seed(Some("enroll-secret")).await;
+        let dir = tempdir().unwrap();
+        let mut cfg = broker_config::BetterMqConfig::template_single_local();
+        cfg.data_dir = dir.path().to_path_buf();
+        cfg.cluster = Some(broker_config::ClusterConfigSection {
+            enabled: true,
+            id: Some(uuid::Uuid::new_v4().to_string()),
+            nodes: vec![broker_config::ClusterNode {
+                name: cfg.node.name.clone(),
+                public_url: cfg.node.public_url.clone(),
+                internal_url: None,
+            }],
+            shared_meta_dir: None,
+        });
+        broker_config::save_managed_config(dir.path(), &cfg).unwrap();
+        let app = router(test_state(&dir));
+        let body = enroll_body(&seed);
+        let status = enroll(
+            app,
+            body.clone(),
+            Some(cluster_auth::sign_enroll("enroll-secret", now_ms(), &body)),
+            None,
+        )
+        .await;
+        std::env::remove_var("BETTERMQ_CLUSTER_SECRET");
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn internal_body_limit_ignores_a_lower_public_limit() {
+        let decode_cap = 64 * 1024 * 1024;
+        assert_eq!(
+            internal_body_limit(128 * 1024, decode_cap),
+            decode_cap + INTERNAL_BODY_SLACK_BYTES
+        );
+        assert_eq!(
+            internal_body_limit(512 * 1024 * 1024, decode_cap),
+            512 * 1024 * 1024
+        );
+        assert!(internal_body_limit_bytes() > broker_proto::max_frame_decode_payload_bytes());
+    }
+
+    #[tokio::test]
+    async fn inner_internal_body_limit_overrides_the_public_one() {
+        // Same layering as router(): internal routes carry their own limit
+        // inside finish_router's public limit.
+        async fn echo(body: axum::body::Bytes) -> String {
+            body.len().to_string()
+        }
+        let internal = Router::new()
+            .route("/internal/v1/x", axum::routing::post(echo))
+            .layer(DefaultBodyLimit::max(64 * 1024));
+        let app: Router = Router::new()
+            .route("/v1/x", axum::routing::post(echo))
+            .merge(internal)
+            .layer(DefaultBodyLimit::max(1024));
+        let send = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .body(Body::from(vec![0u8; 8 * 1024]))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+        assert_eq!(send("/internal/v1/x").await, StatusCode::OK);
+        assert_eq!(send("/v1/x").await, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     #[tokio::test]
     async fn publish_with_flow_and_no_flow_id_does_not_panic() {
         let dir = tempdir().unwrap();
@@ -641,5 +2203,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn readyz_reports_a_quarantined_shard_until_it_is_repaired() {
+        const SHARD: u32 = 40_123;
+        let dir = tempdir().unwrap();
+        let store = broker_local_auth::LocalAuthStore::open(dir.path()).unwrap();
+        store.setup("password1234").unwrap();
+        let mut state = test_state(&dir);
+        state.local_auth = Some(Arc::new(store));
+        let state = Arc::new(state);
+        assert!(ops::ready_snapshot(&state).ready);
+
+        let shard_dir = dir.path().join("quarantined-shard");
+        let open = || {
+            broker_storage::PartitionLog::open_for_shard(
+                &shard_dir,
+                broker_storage::PartitionLogConfig::default(),
+                SHARD,
+                broker_storage::WAL_FORMAT_V2,
+            )
+        };
+        {
+            let mut log = open().unwrap();
+            for body in [b"one".to_vec(), b"two".to_vec()] {
+                log.append(SHARD, record_for_ready(), body).unwrap();
+            }
+            log.sync().unwrap();
+        }
+        let wal = shard_dir.join("active.wal");
+        let good = std::fs::read(&wal).unwrap();
+        let mut bad = good.clone();
+        bad[broker_proto::epoch::EPOCH_HEADER_BYTES + 16] ^= 0xff;
+        std::fs::write(&wal, bad).unwrap();
+        assert!(open().is_err());
+
+        let snapshot = ops::ready_snapshot(&state);
+        assert!(!snapshot.ready && !snapshot.storage_healthy);
+        let fault = snapshot
+            .storage_faults
+            .iter()
+            .find(|fault| fault.shard == SHARD)
+            .expect("quarantined shard listed");
+        assert_eq!(fault.state, "quarantined");
+        let body = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            !body.contains("quarantined-shard"),
+            "no paths on /readyz: {body}"
+        );
+        let (status, _) = ops::readyz(axum::extract::State(state.clone())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        // Operator repair: restore the WAL and remove the marker.
+        std::fs::write(&wal, good).unwrap();
+        std::fs::remove_file(shard_dir.join("quarantine.json")).unwrap();
+        assert!(ops::ready_snapshot(&state).ready);
+        drop(open().unwrap());
+        assert!(ops::ready_snapshot(&state).ready);
+    }
+
+    fn record_for_ready() -> broker_proto::LogRecord {
+        broker_proto::LogRecord {
+            id: uuid::Uuid::new_v4(),
+            tenant_id: "default".into(),
+            topic: "orders".into(),
+            routing_key: "rk".into(),
+            idempotency_key: None,
+            published_at_ms: 1,
+            priority: 5,
+            flow_parallelism: None,
+            flow_key: None,
+            flow_rate: None,
+            flow_period_secs: None,
+            queue_id: None,
+            group_id: None,
+            group_member_id: None,
+            flow_profile_id: None,
+            destination_url: None,
+            destination_secret: None,
+            max_retries: 0,
+            retry_backoff: None,
+            http_method: None,
+            http_headers_json: None,
+            http_sign: None,
+            payload_ref_json: None,
+        }
     }
 }

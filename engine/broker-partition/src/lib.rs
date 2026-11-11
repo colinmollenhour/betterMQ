@@ -2,6 +2,7 @@
 
 mod blob;
 mod broker;
+mod catalog_cache;
 mod catalog_journal;
 mod flow;
 mod flows;
@@ -9,7 +10,10 @@ mod groups;
 pub mod http_delivery;
 mod layout;
 pub mod payload;
+mod payload_repair;
 mod priority;
+mod quorum;
+mod retention;
 mod shard;
 mod subscriptions;
 mod telemetry;
@@ -27,10 +31,11 @@ pub use priority::{
 };
 
 pub use broker::{
-    AppendedRecordRef, AppendedShardBatch, Broker, BrokerConfig, BrokerError,
-    CreateSubscriptionRequest, CreateSubscriptionResponse, DestinationSnapshot,
-    PreparedPublishBatch, PreparedShardBatch, PreparedShardKey, PublishRequest, PublishResponse,
-    ScheduledInfo, DEFAULT_PARTITIONS, DEFAULT_TENANT,
+    decoded_body_len, decoded_payload_len, AppendedRecordRef, AppendedShardBatch, Broker,
+    BrokerConfig, BrokerError, CreateSubscriptionRequest, CreateSubscriptionResponse,
+    DestinationSnapshot, LogId, PendingDedup, PreparedPublishBatch, PreparedShardBatch,
+    PreparedShardKey, PublishRequest, PublishResponse, QuorumStatus, ScheduledInfo,
+    TopicMessagePage, DEDUP_IN_FLIGHT_WAIT, DEFAULT_PARTITIONS, DEFAULT_TENANT,
 };
 pub use flows::{FlowProfile, FlowProfileError, FlowProfileRegistry};
 pub use groups::{DispatchGroup, GroupError, GroupMember, GroupRegistry};
@@ -41,10 +46,18 @@ pub use topic::{
     DIRECT_TOPIC,
 };
 
+pub use broker_payload::{PayloadError, PayloadPolicy, PayloadRef};
 pub use broker_storage::{DedupEntry, StoredMessage};
 pub use layout::{ShardLayout, DEFAULT_V2_SHARDS, LAYOUT_V1, LAYOUT_V2};
-pub use shard::{CommitTicket, ShardHandle};
+pub use payload_repair::{payload_repair_snapshot, record_payload_repair, PayloadRepairSnapshot};
+pub use retention::{
+    pins_by_log, record_log_retention, record_retention_error, retention_telemetry_snapshot,
+    BlobSweepReport, CollectReport, LogRetentionTelemetry, RetentionConfig, RetentionLimit,
+    RetentionStore, RetentionTelemetrySnapshot, SafeWatermark,
+};
+pub use shard::{CommitTicket, LogRetentionStatus, ShardHandle};
 pub use telemetry::{
     partition_telemetry_snapshot, PartitionTelemetrySnapshot, ShardQueueTelemetrySnapshot,
     MAX_QUEUE_TELEMETRY_SHARDS,
 };
+mod catalog_import;

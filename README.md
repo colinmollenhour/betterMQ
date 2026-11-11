@@ -4,35 +4,48 @@
 
 <img width="1200" height="630" alt="betterMQ — self-hosted HTTP message broker" src="./docs/assets/gh-banner.png" />
 
-[betterMQ.com](https://betterMQ.com) · [Install](https://betterMQ.com/install) · Open `/docs` on a running broker for the live API
+[betterMQ.com](https://betterMQ.com) · [Install this fork](./install.sh) · Open `/docs` on a running broker for the live API
 
 ---
 
 Enqueue over HTTP. Store durably. Deliver with signed callbacks. Same binary for a laptop, a 3-node cell, or a regional Cloud fleet.
 
 ```bash
-curl -fsSL https://betterMQ.com/install | bash
+curl -fsSL https://raw.githubusercontent.com/colinmollenhour/betterMQ/main/install.sh | bash
 bettermq serve
 ```
 
 Listens on **port 8080**. Panel: [http://localhost:8080/panel/](http://localhost:8080/panel/)
 
-Windows: `powershell -ExecutionPolicy Bypass -c "irm https://betterMQ.com/install.ps1 | iex"`
+Windows: `powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/colinmollenhour/betterMQ/main/install.ps1 | iex"`
 
 ---
 
 ## Features
 
 - **Push queues** — named destinations with retries and parallelism; 1:1 publish; groups (fan-out)
-- **Scheduling** — delay, cron, intervals
+- **Scheduling** — delay, cron, intervals (single node; multi-node cells return 501 for new delayed jobs and cron changes in this release)
 - **Ordering** — omit `key` for standard (high throughput); set `key` for FIFO per entity
 - **Flow control** — per-key parallelism and rate on publish
 - **Retries & DLQ** — backoff, dead-letter, idempotency keys
 - **Durable ACK** — `202` after the shard WAL commit (RF=3 in a multi-node cell)
 - **Panel** — `/panel/` plus `/admin/v1`; optional standalone `bettermq panel`
-- **One binary** — `serve` (all-in-one) or split roles: broker, gateway, dispatch, controller, panel
+- **One binary** — `serve` (all-in-one) or split roles: broker (including controller), gateway, dispatch, panel
 
 Delivery is **at-least-once**. Handlers should be idempotent.
+
+Group publishes admit at most 1,000 members and a conservative 64 MiB expanded
+memory budget (four times serialized request bytes plus 4 KiB per member).
+The outbox stores the body once, executes at most eight member attempts at a time,
+and preserves the original delivery deadline across retries and restarts.
+
+Slate storage supports only the legacy V1 shard layout. V2 cells must retain
+local storage: unsupported changes are rejected before configuration is saved,
+and incompatible persisted configurations fail explicitly at startup.
+
+Local idempotency mappings and dispatch cursors are synchronously persisted in
+RocksDB before their metadata operation succeeds; they are not rebuilt from the
+message WAL on startup. Each metadata write/batch incurs a durability barrier.
 
 ---
 
@@ -41,14 +54,17 @@ Delivery is **at-least-once**. Handlers should be idempotent.
 **Docker**
 
 ```bash
-docker run -d --name bettermq -p 8080:8080 -v bettermq-data:/data \
-  ghcr.io/bettermq/bettermq:latest serve --data-dir /data
+docker run -d --name bettermq -p 127.0.0.1:8080:8080 -v bettermq-data:/data \
+  ghcr.io/colinmollenhour/bettermq:latest serve --data-dir /data
+docker logs bettermq   # shows the one-time setup code the panel asks for
 ```
+
+The port is published on loopback. On a remote server, open the panel through an SSH tunnel (`ssh -L 8080:127.0.0.1:8080 server`) or put a TLS reverse proxy in front.
 
 **Compose**
 
 ```bash
-git clone https://github.com/betterMQ/betterMQ.git
+git clone https://github.com/colinmollenhour/betterMQ.git
 cd betterMQ/selfhost && docker compose up -d
 ```
 
@@ -63,7 +79,7 @@ cd betterMQ/selfhost && docker compose up -d
 | **API docs** | `http://localhost:8080/docs` |
 | **Railway / any host** | `https://<your-domain>/panel/` |
 
-First visit: set a panel password and copy the `sk_local_…` API token. Create a queue in the panel, then:
+First visit: enter the setup code from the startup log, set a panel password and copy the `sk_local_…` API token. Create a queue in the panel, then:
 
 ```bash
 export TOKEN=sk_local_…
@@ -89,7 +105,7 @@ Client  →  gateway?  →  brokers (WAL + RF=3 replicas)  →  dispatch  →  y
 | Command | What it is |
 |---------|------------|
 | `bettermq serve` | Default. One process: ingest, store, deliver, panel |
-| `bettermq serve --profile broker` | Warehouse only (no local delivery workers) |
+| `bettermq serve --profile broker` | Broker + controller + admin/panel (no local delivery workers) |
 | `bettermq serve --profile dispatch` | Delivery workers (`BETTERMQ_BROKER_URLS`) |
 | `bettermq serve --profile gateway` | Stateless ingest; forwards to shard leaders. **No WAL** |
 | `bettermq panel` | UI + `/admin/v1` only; `--controller` points at a cell |

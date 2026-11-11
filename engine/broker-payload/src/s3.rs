@@ -176,6 +176,16 @@ impl S3BlobStore {
         block_on_payload(self.download_blob_to_writer(reference, &mut writer))
     }
 
+    /// Remove a blob. Idempotent: a missing object is not an error.
+    pub fn delete_blob(&self, reference: &PayloadRef) -> Result<bool, PayloadError> {
+        let path = ObjectPath::from(reference.bucket_key.as_str());
+        match block_on_payload(self.store.delete(&path)) {
+            Ok(()) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(map_store_err(error)),
+        }
+    }
+
     /// Async bounded download; dispatch can forward `Bytes` without another copy.
     pub async fn get_blob_bytes(&self, reference: &PayloadRef) -> Result<Bytes, PayloadError> {
         let limit = max_blob_bytes();
