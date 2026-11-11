@@ -99,6 +99,12 @@ pub enum BrokerError {
     IdempotencyInFlight(String),
 }
 
+fn blocking_task_error(error: tokio::task::JoinError) -> BrokerError {
+    BrokerError::Storage(broker_storage::LogError::Io(std::io::Error::other(
+        error.to_string(),
+    )))
+}
+
 /// Returns `Some(generation)` when this node is leader for the shard (Slate fence).
 type ShardFenceFn = Arc<dyn Fn(u32) -> Option<u64> + Send + Sync>;
 
@@ -1256,6 +1262,25 @@ impl Broker {
         Ok(())
     }
 
+    /// Persist a completion and its gap-aware cursor in one durable metadata
+    /// epoch. The caller serializes the lane and proves `next_offset` against
+    /// its quorum-visible log before invoking this method.
+    pub fn commit_dispatch_progress(
+        &self,
+        tenant_id: &str,
+        subscription_id: &str,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
+        next_offset: u64,
+    ) -> Result<(), BrokerError> {
+        let mut batch = broker_storage::MetadataWriteBatch::default();
+        batch.mark_dispatch_complete_for(tenant_id, subscription_id, partition, offset, message_id);
+        batch.set_dispatch_offset(tenant_id, subscription_id, partition, next_offset);
+        self.inner.metadata.write_batch(batch)?;
+        Ok(())
+    }
+
     /// Whether the record `message_id` at `offset` of `topic` was delivered or
     /// dead-lettered. Identity-aware: a completion marker for a different
     /// message (offset reused after failover) is dropped and reports false; an
@@ -1401,6 +1426,46 @@ impl Broker {
             .shard_handle(topic, partition)?
             .read_range(partition, offset, 1)?;
         batch
+            .into_iter()
+            .find(|message| message.offset == offset && message.topic == topic)
+            .ok_or(BrokerError::Storage(
+                broker_storage::LogError::OffsetNotFound(offset),
+            ))
+    }
+
+    /// Async delivery read. Opening a cold shard is blocking work; warm reads
+    /// only enqueue one command and await its reply from the shard actor.
+    pub async fn read_message_async(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<StoredMessage, BrokerError> {
+        let namespace = self.inner.layout.storage_namespace(topic);
+        let warm = self
+            .inner
+            .shards
+            .read()
+            .get(namespace)
+            .and_then(|partitions| partitions.get(&partition))
+            .cloned();
+        let handle = match warm {
+            Some(handle) => handle,
+            None => {
+                let broker = self.clone();
+                let topic = topic.to_owned();
+                tokio::task::spawn_blocking(move || broker.shard_handle(&topic, partition))
+                    .await
+                    .map_err(|error| {
+                        BrokerError::Storage(broker_storage::LogError::Io(std::io::Error::other(
+                            error.to_string(),
+                        )))
+                    })??
+            }
+        };
+        handle
+            .read_range_async(partition, offset, 1)
+            .await?
             .into_iter()
             .find(|message| message.offset == offset && message.topic == topic)
             .ok_or(BrokerError::Storage(
@@ -1632,7 +1697,12 @@ impl Broker {
         loop {
             match self.try_reserve_batch_dedup(&tenant_id, &requests)? {
                 Ok(reservations) => {
-                    return self.prepare_reserved_batch(requests, reservations, None)
+                    let broker = self.clone();
+                    return tokio::task::spawn_blocking(move || {
+                        broker.prepare_reserved_batch(requests, reservations, None)
+                    })
+                    .await
+                    .map_err(blocking_task_error)?;
                 }
                 Err(in_flight) => {
                     let key = in_flight.idempotency_key.clone();
@@ -1983,7 +2053,11 @@ impl Broker {
     /// holding the same idempotency key, then returns its duplicate result.
     pub async fn publish_async(&self, req: PublishRequest) -> Result<PublishResponse, BrokerError> {
         let prepared = self.prepare_publish_batch_waiting(vec![req]).await?;
-        let (response, _) = self.publish_prepared(prepared, true)?;
+        let broker = self.clone();
+        let (response, _) =
+            tokio::task::spawn_blocking(move || broker.publish_prepared(prepared, true))
+                .await
+                .map_err(blocking_task_error)??;
         Ok(response)
     }
 
@@ -2025,7 +2099,10 @@ impl Broker {
         req: PublishRequest,
     ) -> Result<(PublishResponse, PendingDedup), BrokerError> {
         let prepared = self.prepare_publish_batch_waiting(vec![req]).await?;
-        self.publish_prepared(prepared, false)
+        let broker = self.clone();
+        tokio::task::spawn_blocking(move || broker.publish_prepared(prepared, false))
+            .await
+            .map_err(blocking_task_error)?
     }
 
     fn publish_prepared(
@@ -2552,12 +2629,38 @@ impl Broker {
         from_offset: u64,
         max_records: usize,
     ) -> Result<(Vec<StoredMessage>, u64), BrokerError> {
+        self.scan_topic_records(topic, partition, from_offset, max_records, true)
+    }
+
+    /// Same bounded scan as [`Self::scan_topic_messages`], with verified
+    /// metadata only. Empty bodies here must never be used for delivery.
+    pub fn scan_topic_metadata(
+        &self,
+        topic: &str,
+        partition: u32,
+        from_offset: u64,
+        max_records: usize,
+    ) -> Result<(Vec<StoredMessage>, u64), BrokerError> {
+        self.scan_topic_records(topic, partition, from_offset, max_records, false)
+    }
+
+    fn scan_topic_records(
+        &self,
+        topic: &str,
+        partition: u32,
+        from_offset: u64,
+        max_records: usize,
+        keep_payload: bool,
+    ) -> Result<(Vec<StoredMessage>, u64), BrokerError> {
         if max_records == 0 {
             return Ok((Vec::new(), from_offset));
         }
-        let batch =
-            self.shard_handle(topic, partition)?
-                .read_range(partition, from_offset, max_records)?;
+        let handle = self.shard_handle(topic, partition)?;
+        let batch = if keep_payload {
+            handle.read_range(partition, from_offset, max_records)?
+        } else {
+            handle.read_range_metadata(partition, from_offset, max_records)?
+        };
         let next = batch
             .last()
             .map(|message| message.offset.saturating_add(1))

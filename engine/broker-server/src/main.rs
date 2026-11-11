@@ -1268,7 +1268,14 @@ fn spawn_dispatch_backfill_loop(
             } else {
                 BACKFILL_INTERVAL
             };
-            tokio::time::sleep(wait).await;
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {},
+                _ = state.dispatch.backfill_notified() => {
+                    // Coalesce per-message notifications; never spin while a
+                    // lane is full or let dispatch compete with every ACK.
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                },
+            }
             let dispatch = state.dispatch.clone();
             // Storage scans and metadata lookups block; keep them off the
             // async workers that serve ingest and replication.
@@ -1376,40 +1383,67 @@ fn spawn_schedule_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
 
 /// Fire due crons. Only the scheduler holder calls this.
 async fn fire_due_crons(state: &Arc<AppState>, now: i64) {
-    for job in state.crons.pop_due(now) {
-        tracing::info!(cron_id = %job.id, queue = %job.request.topic, "cron tick");
-        let mut req = job.request.clone();
-        // Per-firing key: a user key alone would dedupe every later tick.
-        req.idempotency_key = Some(job.fire_idempotency_key());
-        match fire_scheduled_publish(state, req).await {
-            Ok(()) => {
-                if let Err(e) = state.crons.commit_fire(job.id) {
-                    broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
-                    tracing::warn!(error = %e, cron_id = %job.id, "cron commit_fire failed");
-                }
-            }
-            Err(failure) => {
-                broker_api::record_scheduler_failure(broker_api::SchedulerFailure::CronFire);
-                match state.crons.fail_fire(&job, failure, now) {
-                    Ok(broker_schedule::FireRetry::Retry {
-                        attempt,
-                        retry_at_ms,
-                    }) => tracing::warn!(
-                        cron_id = %job.id,
-                        attempt,
-                        retry_in_ms = retry_at_ms - now,
-                        "cron fire failed; will retry"
-                    ),
-                    Ok(broker_schedule::FireRetry::GiveUp { attempt }) => tracing::error!(
-                        cron_id = %job.id,
-                        attempt,
-                        "cron occurrence skipped: publish failed permanently"
-                    ),
-                    Err(e) => {
-                        broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
-                        tracing::warn!(error = %e, cron_id = %job.id, "cron fail_fire failed")
+    let mut due = state.crons.pop_due(now).into_iter().peekable();
+    while due.peek().is_some() {
+        let limit = Arc::new(tokio::sync::Semaphore::new(SCHEDULE_FIRE_CONCURRENCY));
+        let mut firing = tokio::task::JoinSet::new();
+        for job in due.by_ref().take(SCHEDULE_COMPLETE_BATCH) {
+            let state = state.clone();
+            let limit = limit.clone();
+            firing.spawn(async move {
+                let _permit = limit.acquire_owned().await;
+                tracing::info!(cron_id = %job.id, queue = %job.request.topic, "cron tick");
+                let mut req = job.request.clone();
+                // Per-firing key: a user key alone would dedupe every later tick.
+                req.idempotency_key = Some(job.fire_idempotency_key());
+                let outcome = fire_scheduled_publish(&state, req).await;
+                (job, outcome)
+            });
+        }
+        let mut completed = Vec::new();
+        while let Some(joined) = firing.join_next().await {
+            match joined {
+                Ok((job, Ok(()))) => completed.push(job.id),
+                Ok((job, Err(failure))) => {
+                    broker_api::record_scheduler_failure(broker_api::SchedulerFailure::CronFire);
+                    match state.crons.fail_fire(&job, failure, now) {
+                        Ok(broker_schedule::FireRetry::Retry {
+                            attempt,
+                            retry_at_ms,
+                        }) => tracing::warn!(
+                            cron_id = %job.id,
+                            attempt,
+                            retry_in_ms = retry_at_ms - now,
+                            "cron fire failed; will retry"
+                        ),
+                        Ok(broker_schedule::FireRetry::GiveUp { attempt }) => tracing::error!(
+                            cron_id = %job.id,
+                            attempt,
+                            "cron occurrence skipped: publish failed permanently"
+                        ),
+                        Err(e) => {
+                            broker_api::record_scheduler_failure(
+                                broker_api::SchedulerFailure::Persist,
+                            );
+                            tracing::warn!(error = %e, cron_id = %job.id, "cron fail_fire failed")
+                        }
                     }
                 }
+                Err(error) => {
+                    broker_api::record_scheduler_failure(broker_api::SchedulerFailure::CronFire);
+                    tracing::warn!(%error, "cron fire task failed; durable occurrence retained for restart");
+                }
+            }
+        }
+        let crons = state.crons.clone();
+        match tokio::task::spawn_blocking(move || crons.commit_fires(&completed)).await {
+            Ok(Ok(())) => {}
+            result => {
+                broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
+                tracing::warn!(
+                    ?result,
+                    "cron completion batch failed; durable occurrences retained for restart"
+                );
             }
         }
     }

@@ -5,7 +5,7 @@ use crate::meta::LogMeta;
 use broker_proto::epoch::{
     decode_epoch, encode_epoch, EpochError, EpochHeader, EPOCH_HEADER_BYTES,
 };
-use broker_proto::record::{decode_frame, encode_frame, RecordError};
+use broker_proto::record::{decode_frame, decode_frame_metadata, encode_frame, RecordError};
 use broker_proto::{LogRecord, StoredMessage};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -21,6 +21,17 @@ const SEGMENTS_DIR: &str = "segments";
 const DEFAULT_GROUP_INTERVAL_MS: u64 = 10;
 const DEFAULT_SPARSE_INDEX_STRIDE: u64 = 128;
 const DEFAULT_READER_CACHE_CAPACITY: usize = 64;
+
+fn read_dispatch_frame(
+    reader: impl Read,
+    keep_payload: bool,
+) -> Result<(LogRecord, Vec<u8>), RecordError> {
+    if keep_payload {
+        decode_frame(reader)
+    } else {
+        decode_frame_metadata(reader).map(|header| (header, Vec::new()))
+    }
+}
 
 /// How often the local WAL is forced to stable storage.
 ///
@@ -1345,6 +1356,26 @@ impl PartitionLog {
         start_offset: u64,
         max_messages: usize,
     ) -> Result<Vec<StoredMessage>, LogError> {
+        self.read_range_inner(partition, start_offset, max_messages, true)
+    }
+
+    /// Verified delivery metadata with empty payloads, for internal indexing.
+    pub fn read_range_metadata(
+        &self,
+        partition: u32,
+        start_offset: u64,
+        max_messages: usize,
+    ) -> Result<Vec<StoredMessage>, LogError> {
+        self.read_range_inner(partition, start_offset, max_messages, false)
+    }
+
+    fn read_range_inner(
+        &self,
+        partition: u32,
+        start_offset: u64,
+        max_messages: usize,
+        keep_payload: bool,
+    ) -> Result<Vec<StoredMessage>, LogError> {
         let mut out = Vec::with_capacity(max_messages.min(256));
         // Skip collected offsets and a purged run (DLQ retention purges in
         // order) without decoding them.
@@ -1352,12 +1383,18 @@ impl PartitionLog {
         if let Some(end) = self.meta.purged_offsets.run_end_from(start_offset) {
             start_offset = end;
         }
-        for segment in self
+        let first_segment = self
             .sealed_indexes
-            .iter()
-            .filter(|segment| segment.last_offset > start_offset)
-        {
-            self.read_sparse_segment(segment, partition, start_offset, max_messages, &mut out)?;
+            .partition_point(|segment| segment.last_offset <= start_offset);
+        for segment in &self.sealed_indexes[first_segment..] {
+            self.read_sparse_segment(
+                segment,
+                partition,
+                start_offset,
+                max_messages,
+                keep_payload,
+                &mut out,
+            )?;
             if out.len() >= max_messages {
                 return Ok(out);
             }
@@ -1370,7 +1407,7 @@ impl PartitionLog {
             if out.len() >= max_messages {
                 break;
             }
-            let (header, payload) = self.read_at(pos)?;
+            let (header, payload) = self.read_at(pos, keep_payload)?;
             out.push(stored_message(header, payload, partition, offset));
         }
         Ok(out)
@@ -1382,21 +1419,20 @@ impl PartitionLog {
         partition: u32,
         start_offset: u64,
         max_messages: usize,
+        keep_payload: bool,
         out: &mut Vec<StoredMessage>,
     ) -> Result<(), LogError> {
-        let point = segment
+        let point_index = segment
             .points
-            .iter()
-            .rev()
-            .find(|point| point.offset <= start_offset)
-            .unwrap_or(&segment.points[0]);
-        let mut file = self.cached_reader(&segment.path)?;
+            .partition_point(|point| point.offset <= start_offset);
+        let point = &segment.points[point_index.saturating_sub(1)];
+        let mut file = BufReader::new(self.cached_reader(&segment.path)?);
         file.seek(SeekFrom::Start(point.byte_offset))?;
         match self.manifest.wal_format_version {
             WAL_FORMAT_V1 => {
                 let mut offset = point.offset;
                 while offset < segment.last_offset && out.len() < max_messages {
-                    let (header, payload) = decode_frame(&mut file)?;
+                    let (header, payload) = read_dispatch_frame(&mut file, keep_payload)?;
                     if offset >= start_offset && !self.meta.purged_offsets.contains(offset) {
                         out.push(stored_message(header, payload, partition, offset));
                     }
@@ -1415,7 +1451,7 @@ impl PartitionLog {
                     }
                     let mut frames = Cursor::new(body);
                     for offset in epoch.first_offset..epoch.committed_hwm {
-                        let (header, payload) = decode_frame(&mut frames)?;
+                        let (header, payload) = read_dispatch_frame(&mut frames, keep_payload)?;
                         if offset >= start_offset
                             && offset < segment.last_offset
                             && !self.meta.purged_offsets.contains(offset)
@@ -1816,10 +1852,14 @@ impl PartitionLog {
         Err(LogError::OffsetNotFound(offset))
     }
 
-    fn read_at(&self, pos: &LogPosition) -> Result<(LogRecord, Vec<u8>), LogError> {
-        let mut file = self.cached_reader(&pos.path)?;
+    fn read_at(
+        &self,
+        pos: &LogPosition,
+        keep_payload: bool,
+    ) -> Result<(LogRecord, Vec<u8>), LogError> {
+        let mut file = BufReader::new(self.cached_reader(&pos.path)?);
         file.seek(SeekFrom::Start(pos.byte_offset))?;
-        decode_frame(&mut file).map_err(LogError::from)
+        read_dispatch_frame(&mut file, keep_payload).map_err(LogError::from)
     }
 
     fn cached_reader(&self, path: &Path) -> Result<File, LogError> {
@@ -2538,6 +2578,34 @@ mod tests {
         let recovered = PartitionLog::open_for_shard(dir.path(), cfg, 4, WAL_FORMAT_V2).unwrap();
         assert!(recovered.resident_index_entries() < 20);
         assert_eq!(recovered.read_range(4, 995, 10).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn metadata_reads_match_full_reads_across_formats_rolls_and_restart() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            let cfg = PartitionLogConfig {
+                segment_max_bytes: 16 * 1024,
+                ..PartitionLogConfig::default()
+            };
+            let mut log = PartitionLog::open_for_shard(dir.path(), cfg.clone(), 0, format).unwrap();
+            for _ in 0..40 {
+                log.append(0, sample_record("metadata"), vec![42; 1024])
+                    .unwrap();
+            }
+            log.sync().unwrap();
+            log.purge_offset(7).unwrap();
+            let full = log.read_range(0, 3, 100).unwrap();
+            let mut expected = full.clone();
+            for message in &mut expected {
+                message.payload.clear();
+            }
+            assert_eq!(log.read_range_metadata(0, 3, 100).unwrap(), expected);
+            drop(log);
+            let log = PartitionLog::open_for_shard(dir.path(), cfg, 0, format).unwrap();
+            assert_eq!(log.read_range_metadata(0, 3, 100).unwrap(), expected);
+            assert_eq!(log.read_range(0, 3, 100).unwrap(), full);
+        }
     }
 
     #[test]

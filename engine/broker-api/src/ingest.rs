@@ -839,29 +839,25 @@ async fn submit_local_leader_batch(
         return rejected;
     }
 
-    let mut epochs = HashMap::new();
-    for (appended, response_keys, epoch) in committed {
-        if let Err(error) = state
-            .broker
-            .finalize_prepared_batch(&mut prepared, appended, true)
-        {
+    let broker = state.broker.clone();
+    let finalized =
+        tokio::task::spawn_blocking(move || -> Result<_, broker_partition::BrokerError> {
+            let mut epochs = HashMap::new();
+            for (appended, response_keys, epoch) in committed {
+                broker.finalize_prepared_batch(&mut prepared, appended, true)?;
+                for key in response_keys {
+                    epochs.insert(key, epoch);
+                }
+            }
+            Ok((prepared.finish()?, epochs))
+        })
+        .await;
+    let (responses, epochs) = match finalized {
+        Ok(Ok(finalized)) => finalized,
+        result => {
             rejected.extend(failed_outcomes(
                 &admitted,
-                ApiError::Unavailable(format!("batch finalize failed: {error}")),
-            ));
-            return rejected;
-        }
-        for key in response_keys {
-            epochs.insert(key, epoch);
-        }
-    }
-
-    let responses = match prepared.finish() {
-        Ok(responses) => responses,
-        Err(error) => {
-            rejected.extend(failed_outcomes(
-                &admitted,
-                ApiError::Unavailable(format!("batch response finalization failed: {error}")),
+                ApiError::Unavailable(format!("batch finalization failed: {result:?}")),
             ));
             return rejected;
         }

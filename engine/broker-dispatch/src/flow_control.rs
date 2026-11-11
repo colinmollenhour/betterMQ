@@ -71,10 +71,21 @@ struct PinnedLimits {
 
 struct FlowWork {
     engine: DispatchEngine,
-    msg: Arc<StoredMessage>,
+    // The WAL owns the body. A slow/paused lane must not retain thousands of
+    // hydrated payloads (or copies of their frozen destination metadata).
+    job: crate::worker::DeliveryJob,
     backfill: bool,
     _pending_permit: tokio::sync::OwnedSemaphorePermit,
+    _lane_pending: LanePending,
     _ownership: Option<crate::worker::DeliveryOwnership>,
+}
+
+struct LanePending(Arc<AtomicU32>);
+
+impl Drop for LanePending {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, AtomicOrdering::AcqRel);
+    }
 }
 
 struct OrderedWork {
@@ -117,6 +128,10 @@ impl WorkQueue {
         let item = self.items.remove(&sequence)?;
         self.fifo.remove(&fifo_order(&item));
         self.priority.remove(&priority_order(&item));
+        if self.items.capacity() > self.items.len().saturating_mul(4).max(64) {
+            self.items
+                .shrink_to(self.items.len().saturating_mul(2).max(16));
+        }
         Some(item)
     }
 }
@@ -155,7 +170,7 @@ impl RateWindow {
         if self.max == 0 {
             return true;
         }
-        let period_ms = (self.period_secs * 1000) as i64;
+        let period_ms = self.period_secs.saturating_mul(1000).min(i64::MAX as u64) as i64;
         if now_ms.saturating_sub(self.period_start_ms) >= period_ms {
             self.period_start_ms = now_ms;
             self.count = 0;
@@ -175,9 +190,12 @@ impl RateWindow {
 }
 
 struct FlowLane {
+    base_limits: Mutex<ResolvedFlow>,
     limits: Mutex<ResolvedFlow>,
     waitlist: Mutex<WorkQueue>,
     active: AtomicU32,
+    pending: Arc<AtomicU32>,
+    pending_limit: AtomicU32,
     rate: Mutex<RateWindow>,
     paused: Mutex<bool>,
     pinned: Mutex<PinnedLimits>,
@@ -198,6 +216,18 @@ pub struct FlowController {
 }
 
 impl FlowController {
+    /// A slow lane gets a small look-ahead, not the whole broker's admission
+    /// budget. Backfill can leave its bodies on disk and service healthy lanes.
+    pub(crate) fn admission_available(&self, key: &FlowKey) -> bool {
+        let Ok(lanes) = self.lanes.try_lock() else {
+            return false;
+        };
+        lanes.get(key).is_none_or(|lane| {
+            lane.pending.load(AtomicOrdering::Acquire)
+                < lane.pending_limit.load(AtomicOrdering::Acquire)
+        })
+    }
+
     pub fn new(global_max_parallelism: Option<u32>, memory_guard: Arc<MemoryGuard>) -> Self {
         Self {
             lanes: Arc::new(Mutex::new(HashMap::new())),
@@ -274,6 +304,17 @@ impl FlowController {
             flow_key: flow_key.clone(),
         };
         let lane = self.get_or_create_lane(key, limits).await;
+        if lane
+            .pending
+            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |pending| {
+                (pending < lane.pending_limit.load(AtomicOrdering::Acquire)).then_some(pending + 1)
+            })
+            .is_err()
+        {
+            engine.record_flow_rejected();
+            return;
+        }
+        let lane_pending = LanePending(lane.pending.clone());
         let member = (msg.topic.clone(), msg.partition, msg.offset);
         let mut members = lane.members.lock().await;
         if members.contains(&member) {
@@ -281,9 +322,10 @@ impl FlowController {
         }
         let work = FlowWork {
             engine,
-            msg: Arc::new(msg),
+            job: crate::worker::DeliveryJob::live(&msg.topic, msg.partition, msg.offset, msg.id),
             backfill,
             _pending_permit: pending_permit,
+            _lane_pending: lane_pending,
             _ownership: ownership,
         };
         let mut heap = lane.waitlist.lock().await;
@@ -303,10 +345,10 @@ impl FlowController {
         }
         heap.push(OrderedWork {
             backfill: work.backfill,
-            priority: work.msg.priority,
-            published_at_ms: work.msg.published_at_ms,
-            partition: work.msg.partition,
-            offset: work.msg.offset,
+            priority: msg.priority,
+            published_at_ms: msg.published_at_ms,
+            partition: msg.partition,
+            offset: msg.offset,
             seq: ENQUEUE_SEQ.fetch_add(1, AtomicOrdering::Relaxed),
             work,
         });
@@ -316,7 +358,7 @@ impl FlowController {
 
     pub async fn get(&self, endpoint_id: Uuid, flow_key: &str) -> Option<FlowControlInfo> {
         let lane = self.lane_ref(endpoint_id, flow_key).await?;
-        Some(self.info_from_lane(&lane).await)
+        Some(self.info_from_lane(endpoint_id, &lane).await)
     }
 
     pub async fn list_keys(&self, endpoint_id: Uuid) -> Vec<FlowControlInfo> {
@@ -330,7 +372,7 @@ impl FlowController {
             .collect();
         let mut out = Vec::new();
         for lane in lanes {
-            out.push(self.info_from_lane(&lane).await);
+            out.push(self.info_from_lane(endpoint_id, &lane).await);
         }
         out
     }
@@ -457,8 +499,10 @@ impl FlowController {
             }
             if rate {
                 pin.rate = None;
+                pin.period_secs = None;
             }
             drop(pin);
+            self.apply_pins(&lane).await;
             lane.notify.notify_one();
             return true;
         }
@@ -474,14 +518,14 @@ impl FlowController {
         false
     }
 
-    async fn info_from_lane(&self, lane: &FlowLane) -> FlowControlInfo {
+    async fn info_from_lane(&self, endpoint_id: Uuid, lane: &FlowLane) -> FlowControlInfo {
         // Same lock order as apply_pins: pinned -> limits -> rate.
         let pin = lane.pinned.lock().await;
         let lim = lane.limits.lock().await;
         let rate = lane.rate.lock().await;
         FlowControlInfo {
             flow_key: lim.key.clone(),
-            endpoint_id: Uuid::nil(), // filled by caller if needed
+            endpoint_id,
             wait_list_size: lane.waitlist.lock().await.len(),
             parallelism_max: lim.parallelism,
             parallelism_count: lane.active.load(AtomicOrdering::Relaxed),
@@ -512,24 +556,19 @@ impl FlowController {
             // Update limits in place — never replace the lane (that orphans the waitlist
             // and leaks a drainer task parked on the old Notify).
             {
-                let mut el = existing.limits.lock().await;
-                el.parallelism = limits.parallelism;
-                el.rate = limits.rate;
-                el.period_secs = limits.period_secs;
-            }
-            {
-                let mut rate = existing.rate.lock().await;
-                rate.max = limits.rate;
-                rate.period_secs = limits.period_secs.max(1);
+                *existing.base_limits.lock().await = limits;
             }
             existing.notify.notify_one();
             self.apply_pins(&existing).await;
             return existing;
         }
         let lane = Arc::new(FlowLane {
+            base_limits: Mutex::new(limits.clone()),
             limits: Mutex::new(limits.clone()),
             waitlist: Mutex::new(WorkQueue::default()),
             active: AtomicU32::new(0),
+            pending: Arc::new(AtomicU32::new(0)),
+            pending_limit: AtomicU32::new(limits.parallelism.saturating_mul(2).max(16)),
             rate: Mutex::new(RateWindow::new(limits.rate, limits.period_secs)),
             paused: Mutex::new(false),
             pinned: Mutex::new(PinnedLimits {
@@ -557,18 +596,25 @@ impl FlowController {
 
     async fn apply_pins(&self, lane: &FlowLane) {
         let pin = lane.pinned.lock().await;
+        let base = lane.base_limits.lock().await.clone();
         let mut lim = lane.limits.lock().await;
+        *lim = base;
         if let Some(p) = pin.parallelism {
             lim.parallelism = p.max(1);
         }
         if let Some(r) = pin.rate {
             lim.rate = r;
-            lane.rate.lock().await.max = r;
         }
         if let Some(period) = pin.period_secs {
             lim.period_secs = period.max(1);
-            lane.rate.lock().await.period_secs = period.max(1);
         }
+        let mut rate = lane.rate.lock().await;
+        rate.max = lim.rate;
+        rate.period_secs = lim.period_secs.max(1);
+        lane.pending_limit.store(
+            lim.parallelism.saturating_mul(2).max(16),
+            AtomicOrdering::Release,
+        );
     }
 }
 
@@ -673,23 +719,33 @@ fn spawn_lane_drainer(
             tokio::spawn(async move {
                 let _global_permit = global_permit;
                 let member = (
-                    ordered.work.msg.topic.clone(),
-                    ordered.work.msg.partition,
-                    ordered.work.msg.offset,
+                    ordered.work.job.topic.clone(),
+                    ordered.work.job.partition,
+                    ordered.work.job.offset,
                 );
                 if ordered
                     .work
                     .engine
-                    .deliver_message(&ordered.work.msg)
+                    .deliver_flow_job(&ordered.work.job)
                     .await
                     .is_err()
                 {
                     ordered.work.engine.record_flow_error();
                 }
-                lane2.members.lock().await.remove(&member);
+                {
+                    let mut members = lane2.members.lock().await;
+                    members.remove(&member);
+                    if members.capacity() > members.len().saturating_mul(4).max(64) {
+                        let target = members.len().saturating_mul(2).max(16);
+                        members.shrink_to(target);
+                    }
+                }
                 lane2.active.fetch_sub(1, AtomicOrdering::Relaxed);
                 global_active2.fetch_sub(1, AtomicOrdering::Relaxed);
                 lane2.notify.notify_one();
+                // Keep ownership and the capacity permit until completion,
+                // including across awaits (do not capture only engine/job).
+                drop(ordered);
             });
         }
         let map = lanes.lock().await;
@@ -715,10 +771,11 @@ async fn evict_idle_lane(
     if Arc::strong_count(lane) != 2 || lane.active.load(AtomicOrdering::Acquire) != 0 {
         return false;
     }
-    let (Ok(waitlist), Ok(paused), Ok(pinned)) = (
+    let (Ok(waitlist), Ok(paused), Ok(pinned), Ok(rate)) = (
         lane.waitlist.try_lock(),
         lane.paused.try_lock(),
         lane.pinned.try_lock(),
+        lane.rate.try_lock(),
     ) else {
         return false;
     };
@@ -727,6 +784,12 @@ async fn evict_idle_lane(
         || pinned.parallelism.is_some()
         || pinned.rate.is_some()
         || pinned.period_secs.is_some()
+        || (rate.max > 0
+            && rate.count > 0
+            && Utc::now()
+                .timestamp_millis()
+                .saturating_sub(rate.period_start_ms)
+                < rate.period_secs.saturating_mul(1000).min(i64::MAX as u64) as i64)
     {
         return false;
     }
@@ -910,8 +973,13 @@ mod tests {
             let info = controller.get(owner, "key").await.unwrap();
             assert_eq!(info.parallelism_max, 2);
             assert_eq!(info.rate_max, 3);
+            assert_eq!(info.endpoint_id, owner);
             assert_eq!(controller.list_keys(owner).await.len(), 1);
             assert!(controller.unpin(owner, "key", true, true).await);
+            let info = controller.get(owner, "key").await.unwrap();
+            assert_eq!(info.parallelism_max, 1);
+            assert_eq!(info.rate_max, 0);
+            assert_eq!(info.rate_period_secs, 1);
             assert!(
                 !controller
                     .get(owner, "key")
@@ -956,6 +1024,40 @@ mod tests {
         .expect("unrelated lanes must remain available");
         drop(guard);
         inspection.await.unwrap();
+        for task in controller.take_drainer_tasks() {
+            task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_eviction_cannot_reset_an_unexpired_rate_budget() {
+        let controller = FlowController::new(None, Arc::new(MemoryGuard::default()));
+        let owner = Uuid::new_v4();
+        controller
+            .ensure_lane(
+                owner,
+                "hourly",
+                ResolvedFlow {
+                    key: "hourly".into(),
+                    parallelism: 1,
+                    rate: 1,
+                    period_secs: 3600,
+                },
+            )
+            .await;
+        let lane = controller.lane_ref(owner, "hourly").await.unwrap();
+        assert!(lane
+            .rate
+            .lock()
+            .await
+            .try_acquire(Utc::now().timestamp_millis()));
+        drop(lane);
+        tokio::time::sleep(IDLE_LANE_TTL * 3).await;
+        let info = controller
+            .get(owner, "hourly")
+            .await
+            .expect("unexpired quota must survive idle eviction");
+        assert_eq!(info.rate_count, 1);
         for task in controller.take_drainer_tasks() {
             task.abort();
         }

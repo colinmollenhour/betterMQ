@@ -237,6 +237,12 @@ impl HostBlocker {
             });
             state.cleared = false;
             state.failures = state.failures.saturating_add(1);
+            // Requests already in flight when the circuit opened can all time
+            // out together. They are not failed recovery probes: extending the
+            // cooldown for each one turns a 30-second outage into 15 minutes.
+            if state.blocked_until_ms.is_some_and(|until| now_ms() < until) {
+                return;
+            }
             if state.failures >= self.cfg.failures_before_block {
                 let wait = state.cooldown_ms;
                 state.blocked_until_ms = Some(now_ms() + wait as i64);
@@ -455,6 +461,26 @@ mod tests {
             hb.hosts.lock().is_empty(),
             "local clears need no retained tombstone"
         );
+    }
+
+    #[test]
+    fn concurrent_failures_do_not_extend_an_open_circuit() {
+        let hb = HostBlocker::new(HostBlockerConfig::default());
+        let url = "https://example.com/hook";
+        for _ in 0..3 {
+            hb.record_transport_failure(url);
+        }
+        let key = HostBlocker::host_key(url).unwrap();
+        let opened = hb.hosts.lock()[&key].clone();
+        for _ in 0..256 {
+            hb.record_transport_failure(url);
+        }
+        let after = hb.hosts.lock()[&key].clone();
+        assert_eq!(after.blocked_until_ms, opened.blocked_until_ms);
+        assert_eq!(after.cooldown_ms, opened.cooldown_ms);
+        hb.hosts.lock().get_mut(&key).unwrap().blocked_until_ms = Some(now_ms() - 1);
+        hb.record_transport_failure(url);
+        assert_eq!(hb.hosts.lock()[&key].cooldown_ms, opened.cooldown_ms * 2);
     }
 
     #[test]

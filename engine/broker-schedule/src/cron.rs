@@ -543,6 +543,57 @@ impl CronRegistry {
         Ok(())
     }
 
+    /// Commit a bounded batch of successful firings with one journal barrier.
+    /// Tentative positions remain untouched until that barrier succeeds, so a
+    /// crash or failed append can only replay the same deduplicated occurrence.
+    pub fn commit_fires(&self, ids: &[Uuid]) -> Result<(), CronError> {
+        let mut state = self.inner.lock();
+        let ids: std::collections::HashSet<_> = ids.iter().copied().collect();
+        let now = Utc::now().timestamp_millis();
+        let mut updates = Vec::new();
+        for (position, job) in state.file.jobs.iter().enumerate() {
+            if !ids.contains(&job.id) {
+                continue;
+            }
+            let Some(&fired_at_ms) = state.firing.get(&job.id) else {
+                continue;
+            };
+            let mut job = job.clone();
+            match next_run_for_job(&job.cron, job.every_seconds, fired_at_ms) {
+                Ok(next) => job.next_run_at_ms = next,
+                Err(error) => {
+                    tracing::warn!(cron_id = %job.id, %error, "cron has no upcoming run; pausing it");
+                    job.paused = true;
+                }
+            }
+            job.last_run_at_ms = Some(fired_at_ms);
+            job.updated_at_ms = now.max(job.updated_at_ms.saturating_add(1));
+            updates.push((position, job));
+        }
+        let records: Vec<_> = updates
+            .iter()
+            .enumerate()
+            .map(|(index, (_, job))| CronJournalRecord {
+                version: CRON_JOURNAL_VERSION,
+                sequence: state.sequence.saturating_add(index as u64 + 1),
+                command: CronCommand::Upsert { job: job.clone() },
+            })
+            .collect();
+        self.journal.append_all(&records)?;
+        if let Some(last) = records.last() {
+            state.sequence = last.sequence;
+            state.file.sequence = last.sequence;
+            state.journal_ops += records.len();
+        }
+        for (position, job) in updates {
+            state.firing.remove(&job.id);
+            state.retries.remove(&job.id);
+            state.file.jobs[position] = job;
+        }
+        self.maybe_compact(&mut state);
+        Ok(())
+    }
+
     /// Record a failed publish of a job returned by [`Self::pop_due`].
     ///
     /// On [`FireRetry::Retry`] the tentative occurrence is dropped (nothing
@@ -654,8 +705,18 @@ fn next_run_for_job(
     after_ms: i64,
 ) -> Result<i64, CronError> {
     if let Some(secs) = every_seconds {
-        let step_ms = (secs as i64).saturating_mul(1000);
-        return Ok(after_ms.saturating_add(step_ms));
+        let step_ms = i64::try_from(secs)
+            .ok()
+            .and_then(|seconds| seconds.checked_mul(1000))
+            .filter(|step| *step > 0)
+            .ok_or_else(|| {
+                CronError::InvalidSchedule(
+                    "interval is outside the representable timestamp range".into(),
+                )
+            })?;
+        return after_ms.checked_add(step_ms).ok_or_else(|| {
+            CronError::InvalidSchedule("interval has no representable next run".into())
+        });
     }
     next_run_after_cron(cron, after_ms)
 }
@@ -1085,6 +1146,56 @@ mod tests {
         reg.fail_fire(&fired, FireFailure::Transient, job.next_run_at_ms)
             .unwrap();
         assert_eq!(std::fs::read(dir.join("crons.journal")).unwrap(), before);
+    }
+
+    #[test]
+    fn bulk_completions_preserve_unpublished_occurrences_through_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = CronRegistry::open(dir.path()).unwrap();
+        let jobs: Vec<_> = (0..8)
+            .map(|_| {
+                reg.create_with_kind(
+                    ScheduleKind::Interval { every_seconds: 10 },
+                    sample_request(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let now = jobs.iter().map(|job| job.next_run_at_ms).max().unwrap();
+        let due = reg.pop_due(now);
+        reg.inner.lock().journal_ops = CRON_COMPACT_OPS - 1;
+        reg.commit_fires(&jobs[..5].iter().map(|job| job.id).collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(reg.inner.lock().journal_ops, 0);
+        drop(reg);
+        let reg = CronRegistry::open(dir.path()).unwrap();
+        let refired = reg.pop_due(now);
+        assert_eq!(refired.len(), 3);
+        for job in refired {
+            let original = due.iter().find(|original| original.id == job.id).unwrap();
+            assert_eq!(job.fire_idempotency_key(), original.fire_idempotency_key());
+        }
+        assert!(next_run_for_job("", Some(u64::MAX), now).is_err());
+        assert!(next_run_for_job("", Some(0), now).is_err());
+    }
+
+    #[test]
+    fn failed_bulk_append_cannot_publish_tentative_positions_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = CronRegistry::open(dir.path()).unwrap();
+        let job = reg
+            .create_with_kind(
+                ScheduleKind::Interval { every_seconds: 10 },
+                sample_request(),
+            )
+            .unwrap();
+        reg.pop_due(job.next_run_at_ms);
+        let journal = dir.path().join("crons.journal");
+        std::fs::rename(&journal, journal.with_extension("saved")).unwrap();
+        std::fs::create_dir(&journal).unwrap();
+        assert!(reg.commit_fires(&[job.id]).is_err());
+        assert_eq!(reg.get(job.id).unwrap().next_run_at_ms, job.next_run_at_ms);
+        assert!(reg.inner.lock().firing.contains_key(&job.id));
     }
 
     #[test]

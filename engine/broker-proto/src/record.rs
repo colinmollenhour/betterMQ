@@ -230,19 +230,36 @@ pub fn encode_frame(
             payload_len: payload.len(),
         });
     }
-    let mut body = Vec::with_capacity(12 + header_bytes.len() + payload.len());
-    body.extend_from_slice(&RECORD_MAGIC);
-    body.extend_from_slice(&(header_bytes.len() as u32).to_be_bytes());
-    body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    body.extend_from_slice(&header_bytes);
-    body.extend_from_slice(payload);
-    let checksum = crc32fast::hash(&body);
-    writer.write_all(&body)?;
+    let mut prefix = [0; 12];
+    prefix[..4].copy_from_slice(&RECORD_MAGIC);
+    prefix[4..8].copy_from_slice(&(header_bytes.len() as u32).to_be_bytes());
+    prefix[8..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&prefix);
+    crc.update(&header_bytes);
+    crc.update(payload);
+    let checksum = crc.finalize();
+    writer.write_all(&prefix)?;
+    writer.write_all(&header_bytes)?;
+    writer.write_all(payload)?;
     writer.write_all(&checksum.to_be_bytes())?;
     Ok(())
 }
 
-pub fn decode_frame(mut reader: impl Read) -> Result<(LogRecord, Vec<u8>), RecordError> {
+pub fn decode_frame(reader: impl Read) -> Result<(LogRecord, Vec<u8>), RecordError> {
+    decode_frame_inner(reader, true)
+}
+
+/// Decode and verify a complete frame without retaining its body. Dispatch
+/// indexes and cursor scans need metadata, not a second in-memory message log.
+pub fn decode_frame_metadata(reader: impl Read) -> Result<LogRecord, RecordError> {
+    decode_frame_inner(reader, false).map(|(header, _)| header)
+}
+
+fn decode_frame_inner(
+    mut reader: impl Read,
+    keep_payload: bool,
+) -> Result<(LogRecord, Vec<u8>), RecordError> {
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic)?;
     if magic != RECORD_MAGIC {
@@ -262,19 +279,32 @@ pub fn decode_frame(mut reader: impl Read) -> Result<(LogRecord, Vec<u8>), Recor
     }
 
     let header_bytes = read_exact_len(&mut reader, header_len)?;
-    let payload = read_exact_len(&mut reader, payload_len)?;
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&RECORD_MAGIC);
+    crc.update(&(header_len as u32).to_be_bytes());
+    crc.update(&(payload_len as u32).to_be_bytes());
+    crc.update(&header_bytes);
+    let payload = if keep_payload {
+        let payload = read_exact_len(&mut reader, payload_len)?;
+        crc.update(&payload);
+        payload
+    } else {
+        let mut remaining = payload_len;
+        let mut scratch = [0; 8192];
+        while remaining > 0 {
+            let count = remaining.min(scratch.len());
+            reader.read_exact(&mut scratch[..count])?;
+            crc.update(&scratch[..count]);
+            remaining -= count;
+        }
+        Vec::new()
+    };
 
     let mut checksum_bytes = [0u8; 4];
     reader.read_exact(&mut checksum_bytes)?;
     let expected = u32::from_be_bytes(checksum_bytes);
 
-    let mut body = Vec::with_capacity(12 + header_len + payload_len);
-    body.extend_from_slice(&RECORD_MAGIC);
-    body.extend_from_slice(&(header_len as u32).to_be_bytes());
-    body.extend_from_slice(&(payload_len as u32).to_be_bytes());
-    body.extend_from_slice(&header_bytes);
-    body.extend_from_slice(&payload);
-    if crc32fast::hash(&body) != expected {
+    if crc.finalize() != expected {
         return Err(RecordError::ChecksumMismatch);
     }
 
@@ -378,6 +408,29 @@ mod tests {
         buf.truncate(buf.len() - 6);
         let err = decode_frame(std::io::Cursor::new(buf)).unwrap_err();
         assert!(matches!(err, RecordError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn metadata_decode_checks_the_entire_body_and_preserves_frame_boundaries() {
+        let header = sample_header();
+        let payload = vec![42; 32 * 1024 + 3];
+        let frame = encode_frame_vec(&header, &payload).unwrap();
+        let mut both = frame.clone();
+        both.extend_from_slice(&frame);
+        let mut reader = std::io::Cursor::new(both);
+        assert_eq!(decode_frame_metadata(&mut reader).unwrap(), header);
+        assert_eq!(reader.position(), frame.len() as u64);
+        assert_eq!(decode_frame(&mut reader).unwrap().1, payload);
+        let mut damaged = frame.clone();
+        damaged[frame.len() - 5] ^= 1;
+        assert!(matches!(
+            decode_frame_metadata(damaged.as_slice()),
+            Err(RecordError::ChecksumMismatch)
+        ));
+        assert!(matches!(
+            decode_frame_metadata(&frame[..frame.len() - 5]),
+            Err(RecordError::Io(_))
+        ));
     }
 
     #[test]

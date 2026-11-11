@@ -17,7 +17,7 @@ use broker_partition::{Broker, BrokerError};
 use broker_storage::StoredMessage;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 /// Most pending offsets tracked per `(topic, partition)`. Scanning pauses
 /// (backpressure) until delivery drains the index below this.
-pub(crate) const PENDING_CAP: usize = 65_536;
+pub(crate) const PENDING_CAP: usize = 4_096;
 /// Re-check tracked entries against durable completion state this often.
 const RECHECK_EVERY: Duration = Duration::from_secs(30);
 /// Persist advanced floors at most this often.
@@ -79,7 +79,7 @@ impl FlowAdmission {
 
 #[derive(Debug, Default)]
 pub(crate) struct PendingView {
-    pub entries: Vec<PendingEntry>,
+    pub entries: Vec<Arc<PendingEntry>>,
     /// Every committed record has been examined.
     pub caught_up: bool,
 }
@@ -87,7 +87,8 @@ pub(crate) struct PendingView {
 struct PartitionScan {
     floor: u64,
     scanned_to: u64,
-    pending: BTreeMap<u64, PendingEntry>,
+    pending: BTreeMap<u64, Arc<PendingEntry>>,
+    fifo_offsets: HashMap<(String, String), BTreeSet<u64>>,
     last_recheck: Instant,
 }
 
@@ -97,7 +98,31 @@ impl PartitionScan {
             floor,
             scanned_to: floor,
             pending: BTreeMap::new(),
+            fifo_offsets: HashMap::new(),
             last_recheck: Instant::now(),
+        }
+    }
+
+    fn index_fifo(&mut self, entry: &PendingEntry) {
+        if let Some(flow) = &entry.fifo_key {
+            self.fifo_offsets
+                .entry((entry.cursor_key.clone(), flow.clone()))
+                .or_default()
+                .insert(entry.offset);
+        }
+    }
+
+    fn remove(&mut self, offset: u64) {
+        if let Some(entry) = self.pending.remove(&offset) {
+            if let Some(flow) = &entry.fifo_key {
+                let key = (entry.cursor_key.clone(), flow.clone());
+                if let Some(offsets) = self.fifo_offsets.get_mut(&key) {
+                    offsets.remove(&offset);
+                    if offsets.is_empty() {
+                        self.fifo_offsets.remove(&key);
+                    }
+                }
+            }
         }
     }
 }
@@ -305,14 +330,19 @@ impl DispatchScan {
                     entry.message_id,
                 )
             });
+            scan.fifo_offsets.clear();
+            let entries: Vec<_> = scan.pending.values().cloned().collect();
+            for entry in entries {
+                scan.index_fifo(&entry);
+            }
             scan.last_recheck = Instant::now();
         }
 
         let mut budget = record_budget;
         while scan.scanned_to < hwm && budget > 0 && scan.pending.len() < PENDING_CAP {
-            let chunk = budget.min(READ_CHUNK);
+            let chunk = budget.min(READ_CHUNK).min(PENDING_CAP - scan.pending.len());
             let (messages, next) =
-                broker.scan_topic_messages(topic, partition, scan.scanned_to, chunk)?;
+                broker.scan_topic_metadata(topic, partition, scan.scanned_to, chunk)?;
             if next <= scan.scanned_to {
                 // Nothing readable at or after this offset below the watermark.
                 scan.scanned_to = hwm;
@@ -328,22 +358,21 @@ impl DispatchScan {
                 let cursor_key = broker_partition::flow_lane_owner(&msg).to_string();
                 let tenant_id = dispatch_tenant(broker, &msg);
                 if !cursors.is_done(topic, &tenant_id, &cursor_key, msg.offset, msg.id) {
-                    scan.pending.insert(
-                        msg.offset,
-                        PendingEntry {
-                            topic: topic.to_string(),
-                            partition,
-                            offset: msg.offset,
-                            message_id: msg.id,
-                            cursor_key,
-                            tenant_id,
-                            published_at_ms: msg.published_at_ms,
-                            fifo_key: crate::worker::DispatchEngine::fifo_retry_key(&msg),
-                            queue_id: msg.queue_id,
-                            group_member_id: msg.group_member_id,
-                            flow: FlowAdmission::for_message(&msg),
-                        },
-                    );
+                    let entry = Arc::new(PendingEntry {
+                        topic: topic.to_string(),
+                        partition,
+                        offset: msg.offset,
+                        message_id: msg.id,
+                        cursor_key,
+                        tenant_id,
+                        published_at_ms: msg.published_at_ms,
+                        fifo_key: crate::worker::DispatchEngine::fifo_retry_key(&msg),
+                        queue_id: msg.queue_id,
+                        group_member_id: msg.group_member_id,
+                        flow: FlowAdmission::for_message(&msg),
+                    });
+                    scan.index_fifo(&entry);
+                    scan.pending.insert(msg.offset, entry);
                 }
             }
             scan.scanned_to = stopped_at.unwrap_or(next).min(hwm).max(scan.scanned_to);
@@ -373,8 +402,35 @@ impl DispatchScan {
             .get(&(topic.to_string(), partition))
             .cloned();
         if let Some(scan) = scan {
-            scan.lock().pending.remove(&offset);
+            scan.lock().remove(offset);
         }
+    }
+
+    /// A bounded admission queue may drop an earlier live job. Later arrivals
+    /// must not overtake that durable predecessor, even if hydration tasks
+    /// finish out of order or the earlier job has not reached a flow waitlist.
+    pub(crate) fn is_fifo_head(
+        &self,
+        broker: &Broker,
+        msg: &StoredMessage,
+    ) -> Result<bool, BrokerError> {
+        let Some(flow) = crate::worker::DispatchEngine::fifo_retry_key(msg) else {
+            return Ok(true);
+        };
+        let scan = self.partition_scan(&msg.topic, msg.partition);
+        if scan.lock().scanned_to <= msg.offset {
+            self.refresh(broker, &msg.topic, msg.partition, PENDING_CAP)?;
+        }
+        let scan = scan.lock();
+        if scan.scanned_to <= msg.offset {
+            return Ok(false);
+        }
+        let lane = broker_partition::flow_lane_owner(msg).to_string();
+        Ok(scan
+            .fifo_offsets
+            .get(&(lane, flow))
+            .and_then(|offsets| offsets.first())
+            .is_none_or(|head| *head >= msg.offset))
     }
 
     /// Drop all scan state for `partitions` (e.g. after leadership moved and

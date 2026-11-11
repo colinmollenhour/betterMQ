@@ -441,7 +441,14 @@ async fn publish_on_leader(
     };
     let epoch = replicate_if_needed(state, &mut resp, wait).await?;
     resp.commit_epoch = Some(epoch);
-    state.broker.commit_publish_dedup(pending_dedup)?;
+    if !pending_dedup.is_empty() {
+        let broker = state.broker.clone();
+        tokio::task::spawn_blocking(move || broker.commit_publish_dedup(pending_dedup))
+            .await
+            .map_err(|error| {
+                ApiError::Unavailable(format!("dedup commit task failed: {error}"))
+            })??;
+    }
     if let Some(m) = meter {
         if !resp.duplicate {
             crate::metering::record_ingest(state, m.tenant_id, body_bytes).await;

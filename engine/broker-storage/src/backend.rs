@@ -128,6 +128,26 @@ impl PartitionBackend {
         }
     }
 
+    /// Internal metadata scan: bodies are deliberately omitted, never delivered.
+    pub fn read_range_metadata(
+        &self,
+        partition: u32,
+        offset: u64,
+        max: usize,
+    ) -> Result<Vec<StoredMessage>, LogError> {
+        match self {
+            Self::Local(log) => log.read_range_metadata(partition, offset, max),
+            #[cfg(feature = "slate")]
+            Self::Slate(log) => {
+                let mut messages = log.read_range(partition, offset, max)?;
+                for message in &mut messages {
+                    message.payload = Vec::new();
+                }
+                Ok(messages)
+            }
+        }
+    }
+
     pub fn committed_hwm(&self) -> u64 {
         match self {
             Self::Local(log) => log.committed_hwm(),

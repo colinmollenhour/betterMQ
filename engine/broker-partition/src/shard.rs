@@ -40,7 +40,14 @@ enum ShardCommand {
         partition: u32,
         offset: u64,
         max: usize,
+        keep_payload: bool,
         reply: Reply<Vec<StoredMessage>>,
+    },
+    ReadRangeAsync {
+        partition: u32,
+        offset: u64,
+        max: usize,
+        reply: oneshot::Sender<Result<Vec<StoredMessage>, LogError>>,
     },
     HighWatermark {
         reply: Reply<u64>,
@@ -237,12 +244,48 @@ impl ShardHandle {
             partition,
             offset,
             max,
+            keep_payload: true,
+            reply,
+        })
+    }
+
+    pub fn read_range_metadata(
+        &self,
+        partition: u32,
+        offset: u64,
+        max: usize,
+    ) -> Result<Vec<StoredMessage>, LogError> {
+        self.call(|reply| ShardCommand::ReadRange {
+            partition,
+            offset,
+            max,
+            keep_payload: false,
             reply,
         })
     }
 
     pub fn high_watermark(&self) -> Result<u64, LogError> {
         self.call(|reply| ShardCommand::HighWatermark { reply })
+    }
+
+    /// Await the shard I/O actor without parking an async worker or allocating
+    /// a blocking-pool thread for each delivery's read.
+    pub async fn read_range_async(
+        &self,
+        partition: u32,
+        offset: u64,
+        max: usize,
+    ) -> Result<Vec<StoredMessage>, LogError> {
+        let (reply, receiver) = oneshot::channel();
+        self.send(ShardCommand::ReadRangeAsync {
+            partition,
+            offset,
+            max,
+            reply,
+        })?;
+        receiver
+            .await
+            .map_err(|_| actor_error("shard actor stopped before replying"))?
     }
     pub fn base_offset(&self) -> Result<u64, LogError> {
         self.call(|reply| ShardCommand::BaseOffset { reply })
@@ -449,12 +492,26 @@ fn process_non_commit(
             partition,
             offset,
             max,
+            keep_payload,
             reply,
         } => {
-            let _ = reply.send(backend.read_range(partition, offset, max));
+            let result = if keep_payload {
+                backend.read_range(partition, offset, max)
+            } else {
+                backend.read_range_metadata(partition, offset, max)
+            };
+            let _ = reply.send(result);
         }
         ShardCommand::HighWatermark { reply } => {
             let _ = reply.send(Ok(backend.high_watermark()));
+        }
+        ShardCommand::ReadRangeAsync {
+            partition,
+            offset,
+            max,
+            reply,
+        } => {
+            let _ = reply.send(backend.read_range(partition, offset, max));
         }
         ShardCommand::BaseOffset { reply } => {
             let _ = reply.send(Ok(backend.base_offset()));

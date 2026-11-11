@@ -297,6 +297,10 @@ impl MetadataStore {
         std::fs::create_dir_all(path)?;
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        // This is an index, not the message log. RocksDB's 64 MiB default
+        // memtable also preallocates a ~70 MiB WAL for an almost empty broker.
+        opts.set_write_buffer_size(4 * 1024 * 1024);
+        opts.set_max_write_buffer_number(2);
         let db = DB::open(&opts, path)?;
         // This metadata is not rebuilt from the message WAL. Each successful
         // mutation must survive a host crash: dedup precedes the enqueue reply,
@@ -304,6 +308,7 @@ impl MetadataStore {
         // callers amortize this barrier across one atomic metadata epoch.
         let mut sync_writes = WriteOptions::default();
         sync_writes.set_sync(true);
+        Self::migrate_completion_keys(&db, &sync_writes)?;
         let migration_ms = if let Some(bytes) = db.get(b"_meta/dedup-migration-ms")? {
             u64::from_le_bytes(bytes.try_into().map_err(|_| {
                 std::io::Error::new(
@@ -417,22 +422,21 @@ impl MetadataStore {
                                     .unwrap_or(0),
                             };
                             let next = current.max(next_offset);
+                            if next == current {
+                                continue;
+                            }
                             cursors.insert(key.clone(), next);
                             rocks_batch.put(key, next.to_le_bytes());
                             let prefix =
                                 Self::complete_prefix(&tenant_id, &subscription_id, partition);
+                            let end =
+                                Self::complete_key(&tenant_id, &subscription_id, partition, next);
                             for item in db.prefix_iterator(&prefix) {
                                 let (key, _) = item?;
-                                if !key.starts_with(&prefix) {
+                                if !key.starts_with(&prefix) || key.as_ref() >= end.as_slice() {
                                     break;
                                 }
-                                if std::str::from_utf8(&key[prefix.len()..])
-                                    .ok()
-                                    .and_then(|offset| offset.parse::<u64>().ok())
-                                    .is_some_and(|offset| offset < next)
-                                {
-                                    rocks_batch.delete(key);
-                                }
+                                rocks_batch.delete(key);
                             }
                         }
                         MetadataOperation::MarkDispatchComplete {
@@ -539,17 +543,31 @@ impl MetadataStore {
                 sync_writes,
                 control,
             } => {
-                let _mutation = control
-                    .mutation
-                    .lock()
-                    .map_err(|_| std::io::Error::other("metadata lock poisoned"))?;
                 let key = Self::dedup_key(tenant_id, idempotency_key);
                 match db.get(&key)? {
                     Some(bytes) => {
                         let entry = DedupEntry::decoded(&bytes, control.migration_ms)?;
                         if entry.expired(now_ms(), self.retention_ms) {
-                            db.delete_opt(key, sync_writes)?;
-                            Ok(None)
+                            // Healthy lookups never wait for an unrelated
+                            // delivery's fsync. Only expiration mutates; reread
+                            // under the lock so it cannot delete a fresh retry.
+                            let _mutation = control
+                                .mutation
+                                .lock()
+                                .map_err(|_| std::io::Error::other("metadata lock poisoned"))?;
+                            match db.get(&key)? {
+                                Some(bytes) => {
+                                    let current =
+                                        DedupEntry::decoded(&bytes, control.migration_ms)?;
+                                    if current.expired(now_ms(), self.retention_ms) {
+                                        db.delete_opt(key, sync_writes)?;
+                                        Ok(None)
+                                    } else {
+                                        Ok(Some(current))
+                                    }
+                                }
+                                None => Ok(None),
+                            }
                         } else {
                             Ok(Some(entry))
                         }
@@ -669,11 +687,43 @@ impl MetadataStore {
         partition: u32,
         offset: u64,
     ) -> Vec<u8> {
-        format!("dcomp:{tenant_id}:{subscription_id}:p{partition}:{offset}").into_bytes()
+        format!("dcomp2:{tenant_id}:{subscription_id}:p{partition}:{offset:020}").into_bytes()
     }
 
     fn complete_prefix(tenant_id: &str, subscription_id: &str, partition: u32) -> Vec<u8> {
-        format!("dcomp:{tenant_id}:{subscription_id}:p{partition}:").into_bytes()
+        format!("dcomp2:{tenant_id}:{subscription_id}:p{partition}:").into_bytes()
+    }
+
+    /// Decimal legacy keys sort lexically (10 before 2), requiring a full
+    /// completion-gap scan on every cursor advance. Upgrade in bounded atomic
+    /// batches; interruption leaves either representation recoverable here.
+    fn migrate_completion_keys(db: &DB, options: &WriteOptions) -> Result<(), IndexError> {
+        let mut batch = WriteBatch::default();
+        let mut count = 0;
+        for item in db.prefix_iterator(b"dcomp:") {
+            let (key, value) = item?;
+            let Some(rest) = key.strip_prefix(b"dcomp:") else {
+                break;
+            };
+            let rest = std::str::from_utf8(rest)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let (lane, offset) = rest.rsplit_once(':').ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid completion key")
+            })?;
+            let offset: u64 = offset
+                .parse()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            batch.put(format!("dcomp2:{lane}:{offset:020}"), value);
+            batch.delete(key);
+            count += 1;
+            if count % 512 == 0 {
+                db.write_opt(std::mem::take(&mut batch), options)?;
+            }
+        }
+        if !batch.is_empty() {
+            db.write_opt(batch, options)?;
+        }
+        Ok(())
     }
 
     pub fn mark_dispatch_complete(
@@ -977,6 +1027,58 @@ mod tests {
 
     fn entry(offset: u64) -> DedupEntry {
         DedupEntry::new(Uuid::new_v4(), offset, 2, "jobs".into())
+    }
+
+    #[test]
+    fn legacy_completion_upgrade_preserves_identity_and_numeric_order() {
+        let dir = tempdir().unwrap();
+        let id = Uuid::new_v4();
+        {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            let db = DB::open(&opts, dir.path()).unwrap();
+            for offset in [0, 2, 9, 10, 99, 100, u64::MAX] {
+                db.put(format!("dcomp:tenant:lane:p0:{offset}"), id.as_bytes())
+                    .unwrap();
+            }
+            db.put("dcomp:tenant:other:p0:2", [1]).unwrap();
+        }
+        let store = MetadataStore::open(dir.path()).unwrap();
+        for offset in [0, 2, 9, 10, 99, 100, u64::MAX] {
+            assert_eq!(
+                store
+                    .dispatch_completion("tenant", "lane", 0, offset)
+                    .unwrap(),
+                DispatchCompletion::Message(id)
+            );
+        }
+        store.set_dispatch_offset("tenant", "lane", 0, 10).unwrap();
+        for offset in [0, 2, 9] {
+            assert_eq!(
+                store
+                    .dispatch_completion("tenant", "lane", 0, offset)
+                    .unwrap(),
+                DispatchCompletion::Missing
+            );
+        }
+        for offset in [10, 99, 100, u64::MAX] {
+            assert_eq!(
+                store
+                    .dispatch_completion("tenant", "lane", 0, offset)
+                    .unwrap(),
+                DispatchCompletion::Message(id)
+            );
+        }
+        assert_eq!(
+            store.dispatch_completion("tenant", "other", 0, 2).unwrap(),
+            DispatchCompletion::Legacy
+        );
+        drop(store);
+        let store = MetadataStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store.dispatch_completion("tenant", "lane", 0, 100).unwrap(),
+            DispatchCompletion::Message(id)
+        );
     }
 
     #[test]
