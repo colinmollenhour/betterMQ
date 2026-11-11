@@ -15,6 +15,7 @@ members = [
     "engine/broker-local-auth",
     "engine/broker-config",
     "tools/bettermq-loadgen",
+    "tools/bettermq-bench",
     "tools/bettermq-sink",
 ]
 default-members = ["engine/broker-server"]

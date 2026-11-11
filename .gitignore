@@ -3,6 +3,7 @@
 *.pdb
 /data/
 /var/
+/bench-results/
 
 # IDE
 .idea/

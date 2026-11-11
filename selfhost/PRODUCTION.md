@@ -78,6 +78,12 @@ existing directory on the filesystem being tested (not tmpfs), then run:
 cargo test -p broker-storage --features slate metadata_microbenchmark -- --ignored --nocapture
 ```
 
+The repeatable harness for these gates lives in
+[`tools/bettermq-bench`](../tools/bettermq-bench/README.md): open-loop step ramps
+to find the sustained ceiling and where it breaks, a realistic mixed workload,
+outage/burst/crash scenarios, and CPU, memory-release and disk accounting, with a
+`compare` command for before/after runs.
+
 ## Soak and fault gates
 
 - Pull requests that change durability, admission, replication, archive, or
