@@ -11,6 +11,7 @@ use broker_partition::{dlq_topic, group_member_dlq_topic};
 use broker_partition::{Broker, PublishRequest, PublishResponse, DIRECT_TOPIC};
 use broker_proto::RetryDefaults;
 use broker_storage::StoredMessage;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -1606,6 +1607,26 @@ impl DispatchEngine {
         self.deliver_message(&msg).await
     }
 
+    async fn hydrate_delivery_message<'a>(
+        &self,
+        msg: &'a StoredMessage,
+    ) -> Result<Cow<'a, StoredMessage>, DispatchError> {
+        if msg.payload_ref_json.is_none() {
+            // Inline bodies were verified by the WAL read. Borrow them rather
+            // than retaining another full body during outbound delivery.
+            return Ok(Cow::Borrowed(msg));
+        }
+        let broker = self.broker.clone();
+        let mut hydrated = msg.clone();
+        let hydrated = tokio::task::spawn_blocking(move || {
+            broker.hydrate_message_payload(&mut hydrated)?;
+            Ok::<_, broker_partition::BrokerError>(hydrated)
+        })
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))??;
+        Ok(Cow::Owned(hydrated))
+    }
+
     pub(crate) async fn deliver_message(&self, msg: &StoredMessage) -> Result<(), DispatchError> {
         let _permit = self
             .in_flight
@@ -1691,18 +1712,20 @@ impl DispatchEngine {
                 .map_err(|error| DispatchError::Failed(error.to_string()))?;
             return Ok(());
         }
-        let mut delivery_msg = msg.clone();
-        if let Err(e) = self.broker.hydrate_message_payload(&mut delivery_msg) {
-            self.record_pressure(3);
-            debug!(
-                error = %e,
-                message_id = %msg.id,
-                "delivery deferred: could not load payload blob"
-            );
-            let job = DeliveryJob::live(msg.topic.clone(), msg.partition, msg.offset, msg.id);
-            self.defer_job(job, Duration::from_secs(10), "hydrate_failed");
-            return Ok(());
-        }
+        let delivery_msg = match self.hydrate_delivery_message(msg).await {
+            Ok(message) => message,
+            Err(e) => {
+                self.record_pressure(3);
+                debug!(
+                    error = %e,
+                    message_id = %msg.id,
+                    "delivery deferred: could not load payload blob"
+                );
+                let job = DeliveryJob::live(msg.topic.clone(), msg.partition, msg.offset, msg.id);
+                self.defer_job(job, Duration::from_secs(10), "hydrate_failed");
+                return Ok(());
+            }
+        };
 
         let outbound = build_outbound(&delivery_msg);
         let retry_key = Self::retry_key(msg);
@@ -3182,6 +3205,35 @@ mod tests {
             http_sign: Some(false),
             payload_ref_json: None,
         }
+    }
+
+    #[tokio::test]
+    async fn delivery_hydration_borrows_inline_and_verifies_external_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(broker_partition::BrokerConfig::new(dir.path().into())).unwrap();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let body = vec![0xff, 0, b'a', 0x80];
+        let inline = sample_message(body.clone(), None);
+        let borrowed = engine.hydrate_delivery_message(&inline).await.unwrap();
+        assert!(matches!(borrowed, Cow::Borrowed(_)));
+        assert_eq!(borrowed.payload.as_ptr(), inline.payload.as_ptr());
+
+        let mut external = sample_message(Vec::new(), None);
+        let reference = broker
+            .blob_store()
+            .put_blob("t", external.id, &body)
+            .unwrap();
+        external.payload_ref_json = Some(serde_json::to_string(&reference).unwrap());
+        let hydrated = engine.hydrate_delivery_message(&external).await.unwrap();
+        assert!(matches!(hydrated, Cow::Owned(_)));
+        assert_eq!(hydrated.payload, body);
+        assert!(
+            external.payload.is_empty(),
+            "the WAL reference stays immutable"
+        );
+        broker.blob_store().delete_blob(&reference).unwrap();
+        assert!(engine.hydrate_delivery_message(&external).await.is_err());
+        engine.shutdown_background().await;
     }
 
     fn split_record(record: &[u8]) -> (serde_json::Value, &[u8]) {

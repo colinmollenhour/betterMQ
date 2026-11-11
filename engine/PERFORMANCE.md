@@ -19,6 +19,10 @@ message before delivery. Warm reads await the shard I/O actor directly;
 blocking preparation, payload persistence, and completion work run outside
 async workers.
 
+Inline delivery borrows the verified message rather than cloning its body
+before building the outbound request. External-blob hydration runs on the
+blocking pool and still verifies blob integrity before delivery.
+
 Backfill shares pending metadata through reference-counted entries. Its window
 is bounded to 4,096 entries **per topic/partition**, not per process, so metadata
 memory still depends on the number of active topics and partitions. Message
