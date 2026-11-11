@@ -1931,7 +1931,8 @@ impl DispatchEngine {
         self.commit_dispatch_offset(tenant_id, topic, cursor_key, partition, offset, message_id)
             .await?;
         self.retry_state
-            .clear_offset(topic, partition, offset)
+            .clear_offset_async(topic, partition, offset)
+            .await
             .map_err(|error| DispatchError::Failed(error.to_string()))
     }
 

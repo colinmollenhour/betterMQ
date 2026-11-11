@@ -39,6 +39,8 @@ waiting. Compaction copies cached metadata under the state lock, then encodes,
 persists and rotates under the separate writer lock so cached readers do not
 wait for its fsync. DLQ preparation, local append and dedup persistence remain
 ordered around the asynchronous quorum durability step.
+Fleet ACK cleanup uses the same offload path and takes the writer lock before
+selecting retries by offset, so an in-progress append cannot escape cleanup.
 
 Backfill shares pending metadata through reference-counted entries. Its window
 is bounded to 4,096 entries **per topic/partition**, not per process, so metadata

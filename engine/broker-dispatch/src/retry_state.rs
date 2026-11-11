@@ -194,6 +194,10 @@ impl RetryState {
 
     pub(crate) fn clear(&self, key: &RetryKey) -> Result<(), RetryStateError> {
         let _guard = self.io_lock.lock();
+        self.clear_locked(key)
+    }
+
+    fn clear_locked(&self, key: &RetryKey) -> Result<(), RetryStateError> {
         if !self.state.lock().records.contains_key(key) {
             return Ok(());
         }
@@ -212,6 +216,8 @@ impl RetryState {
         partition: u32,
         offset: u64,
     ) -> Result<(), RetryStateError> {
+        // Include writers whose append has not published its cached row yet.
+        let _guard = self.io_lock.lock();
         let keys: Vec<RetryKey> = self
             .state
             .lock()
@@ -221,9 +227,22 @@ impl RetryState {
             .cloned()
             .collect();
         for key in keys {
-            self.clear(&key)?;
+            self.clear_locked(&key)?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn clear_offset_async(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<(), RetryStateError> {
+        let state = self.clone();
+        let topic = topic.to_owned();
+        broker_partition::run_blocking_io(move || state.clear_offset(&topic, partition, offset))
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
     }
 
     fn append(&self, event: RetryEvent) -> Result<(), RetryStateError> {
@@ -317,6 +336,15 @@ mod tests {
 
     #[test]
     fn async_cleanup_waits_for_the_writer_without_blocking_the_runtime() {
+        cleanup_waits_for_the_writer(false);
+    }
+
+    #[test]
+    fn async_cleanup_waits_for_the_offset_writer_without_blocking_the_runtime() {
+        cleanup_waits_for_the_writer(true);
+    }
+
+    fn cleanup_waits_for_the_writer(clear_offset: bool) {
         let dir = tempfile::tempdir().unwrap();
         let state = RetryState::open(dir.path()).unwrap();
         let key = RetryKey {
@@ -355,7 +383,13 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let mut clear = Box::pin(state.clear_async(&key));
+            let mut clear = Box::pin(async {
+                if clear_offset {
+                    state.clear_offset_async(&key.topic, key.partition, key.offset).await
+                } else {
+                    state.clear_async(&key).await
+                }
+            });
             assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut clear).await.is_err(),
                 "cleanup must await the in-progress writer without blocking the timer or treating its not-yet-visible row as absent");
             release_tx.send(()).unwrap();
