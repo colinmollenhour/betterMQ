@@ -408,21 +408,37 @@ async fn publish_on_leader(
     let body_bytes = meter
         .map(|m| m.body_bytes)
         .unwrap_or_else(|| req.payload.len() as u64);
-    // In a replicated cell the idempotency key stays reserved until quorum, so
-    // a same-key retry waits for this request instead of appending a copy.
-    let (mut resp, pending_dedup) = if state
-        .cluster
-        .as_ref()
-        .is_some_and(|c| c.runtime.config().node_count() > 1)
-        && state.broker.config().storage != StorageMode::Slate
-    {
-        state.broker.publish_defer_dedup(req).await?
-    } else {
-        (
-            state.broker.publish_async(req).await?,
-            broker_partition::PendingDedup::default(),
-        )
-    };
+    // Standalone keyed requests must use the shared commit coordinator too,
+    // rather than forcing a private fsync inside the blocking-I/O budget.
+    // Ownership transfers inside the append closure, so client cancellation
+    // cannot release a key between append, quorum and dedup persistence.
+    if state.broker.config().storage != StorageMode::Slate {
+        let owned = state.clone();
+        return state
+            .broker
+            .publish_with_completion(req, move |response, pending| async move {
+                finish_publish(&owned, response, pending, meter, body_bytes).await
+            })
+            .await?;
+    }
+    let response = state.broker.publish_async(req).await?;
+    finish_publish(
+        state,
+        response,
+        broker_partition::PendingDedup::default(),
+        meter,
+        body_bytes,
+    )
+    .await
+}
+
+async fn finish_publish(
+    state: &Arc<AppState>,
+    mut resp: PublishResponse,
+    pending_dedup: broker_partition::PendingDedup,
+    meter: Option<crate::metering::IngestMeter>,
+    body_bytes: u64,
+) -> Result<PublishResponse, ApiError> {
     let topic = resp.topic.clone();
     let wait = {
         let broker = state.broker.clone();

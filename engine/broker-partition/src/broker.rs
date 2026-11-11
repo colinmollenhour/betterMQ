@@ -2060,12 +2060,62 @@ impl Broker {
     /// [`Broker::publish`] that waits asynchronously for an in-flight request
     /// holding the same idempotency key, then returns its duplicate result.
     pub async fn publish_async(&self, req: PublishRequest) -> Result<PublishResponse, BrokerError> {
+        if self.inner.config.storage != StorageMode::Slate {
+            let broker = self.clone();
+            return self
+                .publish_with_completion(req, move |response, pending| async move {
+                    if !pending.is_empty() {
+                        if let (Some(partition), Some(offset)) =
+                            (response.partition, response.offset)
+                        {
+                            broker
+                                .wait_committed(&response.topic, partition, offset)
+                                .await?;
+                        }
+                        crate::run_blocking_io(move || broker.commit_publish_dedup(pending))
+                            .await
+                            .map_err(blocking_task_error)??;
+                    }
+                    Ok(response)
+                })
+                .await?;
+        }
         let prepared = self.prepare_publish_batch_waiting(vec![req]).await?;
         let broker = self.clone();
         let (response, _) = crate::run_blocking_io(move || broker.publish_prepared(prepared, true))
             .await
             .map_err(blocking_task_error)??;
         Ok(response)
+    }
+
+    /// Append, then run an owned asynchronous durability/finalization step.
+    /// The admitted append closure hands its reservation directly to the
+    /// completion task before returning. A cancelled caller cannot drop it
+    /// between the WAL append and durable dedup publication. No blocking-I/O
+    /// permit is retained while completion awaits local/quorum commit.
+    pub async fn publish_with_completion<T, F, Fut>(
+        &self,
+        req: PublishRequest,
+        complete: F,
+    ) -> Result<T, BrokerError>
+    where
+        T: Send + 'static,
+        F: FnOnce(PublishResponse, PendingDedup) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+    {
+        let prepared = self.prepare_publish_batch_waiting(vec![req]).await?;
+        let broker = self.clone();
+        let tenant = self.tenant();
+        let runtime = tokio::runtime::Handle::current();
+        let completion = crate::run_blocking_io(move || {
+            let (response, pending) = broker.publish_prepared(prepared, false)?;
+            Ok::<_, BrokerError>(runtime.spawn(crate::scope_tenant(tenant, async move {
+                complete(response, pending).await
+            })))
+        })
+        .await
+        .map_err(blocking_task_error)??;
+        completion.await.map_err(blocking_task_error)
     }
 
     /// Append without recording idempotency until replication quorum succeeds.
@@ -3962,6 +4012,100 @@ mod tests {
         let (epoch, _) = broker_proto::decode_epoch(&mut cursor).unwrap();
         assert_eq!(epoch.record_count, 100);
         assert_eq!(cursor.position(), wal.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn async_keyed_publish_uses_shared_commit_not_a_private_flush() {
+        let dir = tempdir().unwrap();
+        let broker = open_v2_broker(dir.path(), 1);
+        let shard = broker.shard_handle(DIRECT_TOPIC, 0).unwrap();
+        let response = broker
+            .publish_async(direct_request("async", Some("async-key".into())))
+            .await
+            .unwrap();
+        assert_eq!(
+            shard.forced_flush_count(),
+            0,
+            "async keyed requests must use commit tickets"
+        );
+        assert!(shard.committed_hwm() > response.offset.unwrap());
+        let dedup = broker
+            .inner
+            .metadata
+            .get_dedup(&broker.tenant(), "async-key")
+            .unwrap()
+            .unwrap();
+        assert_eq!(Some(dedup.message_id), response.message_id);
+        let sync = broker
+            .publish(direct_request("sync", Some("sync-key".into())))
+            .unwrap();
+        assert!(shard.committed_hwm() > sync.offset.unwrap());
+        assert!(
+            shard.forced_flush_count() > 0,
+            "synchronous callers retain their durability barrier"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_publish_callers_cannot_release_an_admitted_dedup_reservation() {
+        let dir = tempdir().unwrap();
+        let broker = open_v2_broker(dir.path(), 1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first_broker = broker.clone();
+        let first = tokio::spawn(async move {
+            let completion_broker = first_broker.clone();
+            first_broker
+                .publish_with_completion(
+                    direct_request("original", Some("owned-completion".into())),
+                    move |response, pending| async move {
+                        started_tx.send(response.message_id.unwrap()).unwrap();
+                        release_rx.await.unwrap();
+                        completion_broker
+                            .wait_committed(
+                                &response.topic,
+                                response.partition.unwrap(),
+                                response.offset.unwrap(),
+                            )
+                            .await?;
+                        crate::run_blocking_io(move || {
+                            completion_broker.commit_publish_dedup(pending)
+                        })
+                        .await
+                        .map_err(blocking_task_error)??;
+                        Ok::<_, BrokerError>(response)
+                    },
+                )
+                .await
+                .unwrap()
+        });
+        let original = started_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let retry_broker = broker.clone();
+        let mut retry = tokio::spawn(async move {
+            retry_broker
+                .publish_async(direct_request("retry", Some("owned-completion".into())))
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut retry)
+                .await
+                .is_err(),
+            "the admitted completion, not the cancelled caller, owns the key"
+        );
+        release_tx.send(()).unwrap();
+        let retry = tokio::time::timeout(Duration::from_secs(5), retry)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(retry.duplicate);
+        assert_eq!(retry.message_id, Some(original));
+        assert_eq!(
+            broker.list_topic_messages(DIRECT_TOPIC, 10).unwrap().len(),
+            1
+        );
     }
 
     #[test]

@@ -148,6 +148,8 @@ pub struct ShardHandle {
     sender: mpsc::SyncSender<ShardCommand>,
     committed_hwm: Arc<AtomicU64>,
     dlq_counts: Arc<parking_lot::RwLock<Option<DlqCounts>>>,
+    #[cfg(test)]
+    forced_flushes: AtomicU64,
 }
 
 type DlqCounts = HashMap<(String, String), usize>;
@@ -186,6 +188,8 @@ impl ShardHandle {
             sender,
             committed_hwm: Arc::new(AtomicU64::new(hwm)),
             dlq_counts: Arc::new(parking_lot::RwLock::new(None)),
+            #[cfg(test)]
+            forced_flushes: AtomicU64::new(0),
         });
         let actor_hwm = Arc::clone(&handle.committed_hwm);
         let dlq_counts = Arc::clone(&handle.dlq_counts);
@@ -326,7 +330,14 @@ impl ShardHandle {
     }
 
     pub fn flush_durable(&self) -> Result<u64, LogError> {
+        #[cfg(test)]
+        self.forced_flushes.fetch_add(1, Ordering::Relaxed);
         self.call(|reply| ShardCommand::Flush { reply })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forced_flush_count(&self) -> u64 {
+        self.forced_flushes.load(Ordering::Relaxed)
     }
 
     pub fn flush_if_due(&self) -> Result<(), LogError> {
