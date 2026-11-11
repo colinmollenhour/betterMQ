@@ -246,7 +246,7 @@ pub async fn run(id: &str, ctx: Arc<RunCtx>, index: u32, seed: u64) -> anyhow::R
                 "backlog.drain_msgs_s",
                 "Drain rate once the destination returned",
                 "msg/s",
-                held as f64 / secs.max(1e-9),
+                held.saturating_sub(trial.verifier.pending()) as f64 / secs.max(1e-9),
                 "throughput",
             )
             .headline(),
@@ -261,6 +261,13 @@ pub async fn run(id: &str, ctx: Arc<RunCtx>, index: u32, seed: u64) -> anyhow::R
         if took.is_none() {
             trial.note("The backlog had not drained within 15 minutes.");
         }
+        trial.push(lower(
+            "backlog.undelivered_after_drain",
+            "Messages still pending after the drain window",
+            "msgs",
+            trial.verifier.pending() as f64,
+            "reliability",
+        ));
     } else {
         trial.note("Scheduled messages remain pending by design; no drain phase.");
     }

@@ -132,7 +132,7 @@ pub async fn run(id: &str, ctx: Arc<RunCtx>, index: u32, seed: u64) -> anyhow::R
 
     trial.phase("drain", PhaseKind::Drain).await;
     let drained_in = trial.wait_drained_patient(Duration::from_secs(240)).await;
-    trial.end_phase().await;
+    let drain = trial.end_phase().await.expect("drain");
 
     trial.push(lower(
         "outage.ack_p99_healthy_ms",
@@ -232,7 +232,7 @@ pub async fn run(id: &str, ctx: Arc<RunCtx>, index: u32, seed: u64) -> anyhow::R
     }
     let rec_s = recovered
         .or(drained_in.map(|d| d.as_secs_f64() + recovery.dur_s))
-        .unwrap_or(post_s);
+        .unwrap_or(recovery.dur_s + drain.dur_s);
     trial.push(
         lower(
             "outage.recovery_s",

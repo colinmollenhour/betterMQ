@@ -116,33 +116,24 @@ pub fn compare(a: &RunReport, b: &RunReport, threshold: f64) -> Comparison {
         }
         // Correctness regressions are judged on the candidate alone: a run that
         // loses messages or errors must fail the gate however fast it was.
-        let was_bad = a.scenarios.iter().find(|s| s.id == sb.id).map(|s| s.status);
         if matches!(sb.status, Status::Error) {
             hard.push(format!(
                 "{}: scenario errored ({})",
                 sb.id,
                 sb.error.clone().unwrap_or_default()
             ));
-        } else if sb.status == Status::Fail && was_bad != Some(Status::Fail) {
-            hard.push(format!("{}: scenario now FAILS correctness checks", sb.id));
+        } else if sb.status == Status::Fail {
+            hard.push(format!("{}: scenario FAILS correctness checks", sb.id));
         }
         for f in sb
             .findings
             .iter()
             .filter(|f| f.severity == Severity::Critical)
         {
-            let existed = a
-                .scenarios
-                .iter()
-                .filter(|s| s.id == sb.id)
-                .flat_map(|s| s.findings.iter())
-                .any(|g| g.title == f.title);
-            if !existed {
-                hard.push(format!(
-                    "{}: new critical finding: {} ({})",
-                    sb.id, f.title, f.detail
-                ));
-            }
+            hard.push(format!(
+                "{}: critical finding: {} ({})",
+                sb.id, f.title, f.detail
+            ));
         }
         if let Some(e) = &sb.error {
             if sb.status != Status::Error {
@@ -443,6 +434,19 @@ mod tests {
         let mut gone = report(Status::Pass, vec![], 1.0);
         gone.scenarios[0].metrics.clear();
         assert!(!compare(&base, &gone, 0.1).hard_failures.is_empty());
+    }
+
+    #[test]
+    fn an_existing_correctness_failure_is_not_a_passing_baseline() {
+        let critical = Finding {
+            severity: Severity::Critical,
+            scenario: "s".into(),
+            title: "Undelivered messages".into(),
+            detail: "still pending".into(),
+        };
+        let base = report(Status::Fail, vec![critical.clone()], 100.0);
+        let candidate = report(Status::Fail, vec![critical], 50.0);
+        assert!(!compare(&base, &candidate, 0.1).hard_failures.is_empty());
     }
 
     #[test]
