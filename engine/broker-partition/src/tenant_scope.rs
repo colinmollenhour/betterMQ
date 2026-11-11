@@ -61,12 +61,15 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             for tenant in ["tenant-a", "tenant-b"] {
-                let work = scope_tenant(tenant.into(), async {
-                    crate::run_blocking_io(|| effective_tenant("default").into_owned())
+                let mut work = None;
+                scope_tenant(tenant.into(), async {
+                    work = Some(crate::run_blocking_io(|| {
+                        effective_tenant("default").into_owned()
+                    }));
                 })
                 .await;
                 // The scope is gone before this future is spawned or polled.
-                let inherited = tokio::spawn(work).await.unwrap().unwrap();
+                let inherited = tokio::spawn(work.unwrap()).await.unwrap().unwrap();
                 assert_eq!(inherited, tenant);
                 assert_eq!(
                     crate::run_blocking_io(|| effective_tenant("default").into_owned())
