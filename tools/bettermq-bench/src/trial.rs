@@ -377,10 +377,14 @@ impl Trial {
         for (what, n) in self.shared.errors.lock().iter() {
             notes.push(format!("Ingest error x{n}: {what}"));
         }
+        let mut shutdown_error = None;
         if self.broker.is_running() {
             match self.broker.stop_graceful(Duration::from_secs(90)).await {
                 Ok(d) => self.shutdown_s = self.shutdown_s.or(Some(d.as_secs_f64())),
-                Err(e) => notes.push(format!("graceful shutdown failed: {e}")),
+                Err(e) => {
+                    shutdown_error = Some(e.to_string());
+                    notes.push(format!("graceful shutdown failed: {e}"));
+                }
             }
         }
         if let Some(s) = self.shutdown_s {
@@ -477,6 +481,7 @@ impl Trial {
         ));
 
         Ok(TrialResult {
+            shutdown_error,
             index: self.index,
             seed: self.seed,
             duration_s: series.t.last().copied().unwrap_or(0.0),

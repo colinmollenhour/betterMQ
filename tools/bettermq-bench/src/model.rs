@@ -404,6 +404,9 @@ pub struct TrialResult {
     pub broker_log_warnings: u64,
     pub broker_log_errors: u64,
     pub broker_log_bytes: u64,
+    /// Structured lifecycle failure, absent in older result files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_error: Option<String>,
     /// Most frequent WARN/ERROR messages, normalised, with counts.
     #[serde(default)]
     pub broker_log_top: Vec<(String, u64)>,
