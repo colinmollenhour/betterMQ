@@ -143,6 +143,8 @@ struct CronState {
     /// Tentative occurrences popped but not yet committed: job id → fire
     /// time. Kept out of `file` so snapshots hold committed positions only.
     firing: HashMap<Uuid, i64>,
+    /// Published occurrences whose completion barrier needs another attempt.
+    completion_retries: std::collections::HashSet<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -241,6 +243,7 @@ impl CronRegistry {
                 journal_ops,
                 retries: HashMap::new(),
                 firing: HashMap::new(),
+                completion_retries: Default::default(),
             })),
             _lock: Arc::new(lock),
         })
@@ -453,6 +456,7 @@ impl CronRegistry {
         apply_command(&mut state.file, CronCommand::Delete { id });
         state.retries.remove(&id);
         state.firing.remove(&id);
+        state.completion_retries.remove(&id);
         self.maybe_compact(&mut state);
         Ok(removed)
     }
@@ -538,6 +542,7 @@ impl CronRegistry {
         self.append_command(&mut state, CronCommand::Upsert { job: job.clone() })?;
         apply_command(&mut state.file, CronCommand::Upsert { job });
         state.firing.remove(&id);
+        state.completion_retries.remove(&id);
         state.retries.remove(&id);
         self.maybe_compact(&mut state);
         Ok(())
@@ -549,6 +554,7 @@ impl CronRegistry {
     pub fn commit_fires(&self, ids: &[Uuid]) -> Result<(), CronError> {
         let mut state = self.inner.lock();
         let ids: std::collections::HashSet<_> = ids.iter().copied().collect();
+        state.completion_retries.extend(ids.iter().copied());
         let now = Utc::now().timestamp_millis();
         let mut updates = Vec::new();
         for (position, job) in state.file.jobs.iter().enumerate() {
@@ -590,8 +596,30 @@ impl CronRegistry {
             state.retries.remove(&job.id);
             state.file.jobs[position] = job;
         }
+        for id in ids {
+            state.completion_retries.remove(&id);
+        }
         self.maybe_compact(&mut state);
         Ok(())
+    }
+
+    /// Retry completion persistence without republishing successful occurrences.
+    /// A poisoned journal still requires restart; known-safe transient failures
+    /// can recover on a later scheduler tick in the same process.
+    pub fn retry_pending_completions(&self, limit: usize) -> Result<usize, CronError> {
+        let ids: Vec<_> = self
+            .inner
+            .lock()
+            .completion_retries
+            .iter()
+            .take(limit)
+            .copied()
+            .collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.commit_fires(&ids)?;
+        Ok(ids.len())
     }
 
     /// Record a failed publish of a job returned by [`Self::pop_due`].
@@ -1196,6 +1224,18 @@ mod tests {
         assert!(reg.commit_fires(&[job.id]).is_err());
         assert_eq!(reg.get(job.id).unwrap().next_run_at_ms, job.next_run_at_ms);
         assert!(reg.inner.lock().firing.contains_key(&job.id));
+        assert_eq!(reg.retry_pending_completions(0).unwrap(), 0);
+        std::fs::remove_dir(&journal).unwrap();
+        std::fs::rename(journal.with_extension("saved"), &journal).unwrap();
+        assert_eq!(reg.retry_pending_completions(256).unwrap(), 1);
+        assert!(reg.inner.lock().completion_retries.is_empty());
+        assert!(!reg.inner.lock().firing.contains_key(&job.id));
+        let next = reg.get(job.id).unwrap().next_run_at_ms;
+        assert!(next > job.next_run_at_ms);
+        assert!(reg.pop_due(job.next_run_at_ms).is_empty());
+        let due = reg.pop_due(next);
+        assert_eq!(due.len(), 1, "later occurrences recover without restarting");
+        assert_ne!(due[0].fire_idempotency_key(), job.fire_idempotency_key());
     }
 
     #[test]

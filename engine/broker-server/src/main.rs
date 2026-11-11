@@ -1375,6 +1375,18 @@ fn spawn_schedule_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
 
 /// Fire due crons. Only the scheduler holder calls this.
 async fn fire_due_crons(state: &Arc<AppState>, now: i64) {
+    let crons = state.crons.clone();
+    match broker_partition::run_blocking_io(move || {
+        crons.retry_pending_completions(SCHEDULE_COMPLETE_BATCH)
+    })
+    .await
+    {
+        Ok(Ok(_)) => {}
+        result => {
+            broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
+            tracing::warn!(?result, "cron completion retry failed");
+        }
+    }
     let mut due = state.crons.pop_due(now).into_iter().peekable();
     while due.peek().is_some() {
         let limit = Arc::new(tokio::sync::Semaphore::new(SCHEDULE_FIRE_CONCURRENCY));
@@ -1434,7 +1446,7 @@ async fn fire_due_crons(state: &Arc<AppState>, now: i64) {
                 broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
                 tracing::warn!(
                     ?result,
-                    "cron completion batch failed; durable occurrences retained for restart"
+                    "cron completion batch failed; completion retained for a later tick or restart"
                 );
             }
         }
