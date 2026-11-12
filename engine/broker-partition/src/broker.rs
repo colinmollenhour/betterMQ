@@ -1636,6 +1636,12 @@ impl Broker {
         self.inner.metadata.supports_group_commit()
     }
 
+    /// Durable local metadata write epochs (not logical completion requests).
+    /// Useful for distinguishing a bounded queue from effective group commit.
+    pub fn metadata_group_commit_epochs(&self) -> Option<u64> {
+        self.inner.metadata.group_commit_epochs()
+    }
+
     pub fn commit_metadata_batch(&self, batch: MetadataWriteBatch) -> Result<(), BrokerError> {
         self.inner.metadata.write_batch(batch)?;
         Ok(())

@@ -215,11 +215,32 @@ cleanup can stop at its boundary instead of scanning every later completion.
 Open repopulates this index from authoritative markers in bounded batches,
 including changes made by an older binary.
 
-On RocksDB and shared metadata, a completion and its gap-aware cursor use one
-durable metadata batch. Slate retains its sequential compatibility behavior.
-The cursor's owned lane lock stays with blocking I/O if its awaiting task is
-cancelled. A scan failure after HTTP success still attempts to persist the
-identity-aware completion marker for recovery.
+An uncontended completion and its gap-aware cursor use one durable metadata
+batch on RocksDB and shared metadata. Slate retains its sequential compatibility
+behavior. Keeping this path avoids an extra durability round trip for serial
+FIFO deliveries.
+
+On RocksDB, a completion that encounters a busy cursor first persists its
+identity-aware marker through the bounded grouped writer, without acquiring the
+cursor lock. Independent completions of the same lane can then share a durable
+epoch. After persistence, each continuation acquires the cursor lock and derives
+progress from durable markers. An earlier owner can consume many markers at once;
+followers skip already-consumed markers and unchanged cursor writes. No-op
+receipts retain their resource guards without entering the writer queue.
+
+This contended path can add a cursor-only write when the durable prefix advances.
+The alternative of retaining the cursor lock before writer admission limited
+each lane to one outstanding write, defeating group commit under overload. An
+in-memory speculative completion map was rejected: it would need another bounded
+recovery protocol and could not prove completion after a crash.
+
+The detached continuation owns the shutdown token and partition recovery barrier
+across both phases; queued writes and their receipts retain those guards too.
+Cancellation cannot expose a gap in the recovery barrier. Markers and cursor
+writes validate their original log incarnation at writer time, and the cursor
+never advances beyond quorum-visible records or an unfinished gap. A scan failure
+after HTTP success still attempts to persist its verified identity-aware marker
+for recovery. Existing durable formats are unchanged.
 
 ## RSS is not an HTTP concurrency counter
 
@@ -233,9 +254,10 @@ startup RSS.
 
 `bettermq_dispatch_in_flight_deliveries` preserves its historical meaning:
 **owned jobs**, including ready and flow-waiting work. It can exceed a flow's
-parallelism because of look-ahead. Use
-`bettermq_dispatch_active_http_deliveries` and the benchmark sink's observed
-concurrency checks when evaluating delivery parallelism.
+parallelism because of look-ahead. Despite its name,
+`bettermq_dispatch_active_http_deliveries` also spans completion persistence, not
+only outbound HTTP. Use the benchmark sink's observed concurrency to distinguish
+actual requests from deliveries waiting for durable completion.
 
 The [benchmark suite](../tools/bettermq-bench/README.md) describes the measurement
 protocol and environment requirements. Correctness gates reject a failing

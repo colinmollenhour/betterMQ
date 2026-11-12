@@ -2072,17 +2072,29 @@ impl DispatchEngine {
             .map_err(|error| DispatchError::Failed(error.to_string()))
     }
 
+    #[cfg(test)]
     async fn cursor_lock(
         &self,
         tenant_id: &str,
         cursor_key: &str,
         partition: u32,
     ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.cursor_mutex(tenant_id, cursor_key, partition)
+            .lock_owned()
+            .await
+    }
+
+    fn cursor_mutex(
+        &self,
+        tenant_id: &str,
+        cursor_key: &str,
+        partition: u32,
+    ) -> Arc<tokio::sync::Mutex<()>> {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         (tenant_id, cursor_key, partition).hash(&mut hasher);
         let stripe = (hasher.finish() as usize) % self.cursor_locks.len();
-        self.cursor_locks[stripe].clone().lock_owned().await
+        self.cursor_locks[stripe].clone()
     }
 
     async fn commit_dispatch_offset(
@@ -2104,62 +2116,160 @@ impl DispatchEngine {
             .clone()
             .read_owned()
             .await;
-        let lane = self.cursor_lock(tenant_id, cursor_key, partition).await;
+        let lane_mutex = self.cursor_mutex(tenant_id, cursor_key, partition);
         let engine = self.clone();
         let tenant_id = tenant_id.to_owned();
         let topic = topic.to_owned();
         let cursor_key = cursor_key.to_owned();
-        let runtime = tokio::runtime::Handle::current();
         let owned = self.broker.owned_completion_token()?;
-        let completion = broker_partition::run_blocking_io(move || {
-            // The guard travels with the I/O: cancelling the HTTP task must
-            // not unlock a lane whose durable read/compute/write is running.
-            if !engine.broker.supports_metadata_group_commit() {
+        if !self.broker.supports_metadata_group_commit() {
+            let lane = lane_mutex.lock_owned().await;
+            return broker_partition::run_blocking_io(move || {
                 let _owned = owned;
                 let _lane = lane;
                 let _recovery = recovery;
-                return engine
-                    .advance_cursor_locked(
-                        &tenant_id,
-                        &topic,
-                        &cursor_key,
-                        partition,
-                        offset,
-                        message_id,
-                    )
-                    .map(|()| None);
-            }
-            let mut progress = engine.prepare_cursor_progress(
-                &tenant_id,
-                &topic,
-                &cursor_key,
-                partition,
-                offset,
-                message_id,
-            )?;
-            // Transfer ownership before this admitted closure returns. The
-            // detached continuation and writer receipt retain the lane even
-            // when the original delivery is cancelled at either await point.
-            Ok(Some(runtime.spawn(async move {
-                let _owned = owned;
-                let _receipt = engine
-                    .broker
-                    .commit_metadata_batch_grouped(
-                        std::mem::take(&mut progress.batch),
-                        (lane, recovery),
-                    )
-                    .await?;
-                engine.finish_cursor_progress(&topic, &cursor_key, partition, offset, progress)
-            })))
-        })
-        .await
-        .map_err(|error| DispatchError::Failed(error.to_string()))??;
-        match completion {
-            Some(completion) => completion
-                .await
-                .map_err(|error| DispatchError::Failed(error.to_string()))?,
-            None => Ok(()),
+                engine.advance_cursor_locked(
+                    &tenant_id,
+                    &topic,
+                    &cursor_key,
+                    partition,
+                    offset,
+                    message_id,
+                )
+            })
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))?;
         }
+
+        // Once accepted, both phases belong to this continuation, not the HTTP
+        // waiter. Receipts retain the recovery barrier and shutdown token even
+        // if a future is dropped while a queued native write is still running.
+        let completion = tokio::spawn(async move {
+            let recovery = Arc::new(recovery);
+            let owned = Arc::new(owned);
+            let lane = match lane_mutex.clone().try_lock_owned() {
+                Ok(lane) => lane,
+                Err(_) => {
+                    // A busy cursor must not prevent independent identity
+                    // markers from entering the same durable metadata epoch.
+                    // The uncontended/FIFO path still uses one transaction.
+                    let prepare = engine.clone();
+                    let tenant = tenant_id.clone();
+                    let log = topic.clone();
+                    let key = cursor_key.clone();
+                    let marker = broker_partition::run_blocking_io(move || {
+                        prepare.prepare_completion_marker(
+                            &tenant, &log, &key, partition, offset, message_id,
+                        )
+                    })
+                    .await
+                    .map_err(|error| DispatchError::Failed(error.to_string()))??;
+                    let _receipt = engine
+                        .broker
+                        .commit_metadata_batch_grouped(
+                            marker.batch,
+                            (recovery.clone(), owned.clone()),
+                        )
+                        .await?;
+                    if let Some(stats) = marker.stats {
+                        engine.telemetry.record_completion(
+                            partition,
+                            &cursor_key,
+                            stats.cursor,
+                            stats.cursor,
+                            stats.hwm,
+                            stats.newly_completed,
+                        );
+                    }
+                    lane_mutex.lock_owned().await
+                }
+            };
+            let prepare = engine.clone();
+            let tenant = tenant_id.clone();
+            let log = topic.clone();
+            let key = cursor_key.clone();
+            let (mut progress, lane) = broker_partition::run_blocking_io(move || {
+                let progress = prepare
+                    .prepare_cursor_progress(&tenant, &log, &key, partition, offset, message_id)?;
+                Ok::<_, DispatchError>((progress, lane))
+            })
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))??;
+            let _receipt = engine
+                .broker
+                .commit_metadata_batch_grouped(
+                    std::mem::take(&mut progress.batch),
+                    (lane, recovery, owned),
+                )
+                .await?;
+            engine.finish_cursor_progress(&topic, &cursor_key, partition, offset, progress)
+        });
+        completion
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))?
+    }
+
+    /// A completion marker is independent of cursor order. Persist it before
+    /// waiting for a contended cursor, then derive progress only from durable
+    /// identities. No speculative cursor or unbounded completion map is needed.
+    fn prepare_completion_marker(
+        &self,
+        tenant_id: &str,
+        topic: &str,
+        cursor_key: &str,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
+    ) -> Result<CompletionMarker, DispatchError> {
+        let validator = self.broker.log_metadata_validator(partition)?;
+        let cursor = self
+            .broker
+            .dispatch_offset(tenant_id, cursor_key, partition)?;
+        let mut batch = broker_storage::MetadataWriteBatch::default();
+        if offset < cursor {
+            return Ok(CompletionMarker { batch, stats: None });
+        }
+        let hwm = self.broker.dispatch_hwm(topic, partition)?;
+        if offset >= hwm {
+            return Err(DispatchError::Uncommitted);
+        }
+        self.validate_completion_identity(topic, partition, offset, message_id)?;
+        let newly_completed = !self
+            .broker
+            .is_delivery_complete(topic, tenant_id, cursor_key, partition, offset, message_id)?;
+        if newly_completed {
+            batch.mark_dispatch_complete_for(tenant_id, cursor_key, partition, offset, message_id);
+            batch.validate_with(validator);
+        }
+        Ok(CompletionMarker {
+            batch,
+            stats: Some(CompletionMarkerStats {
+                cursor,
+                hwm,
+                newly_completed,
+            }),
+        })
+    }
+
+    fn validate_completion_identity(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
+    ) -> Result<(), DispatchError> {
+        let (current, _) = self
+            .broker
+            .scan_topic_metadata(topic, partition, offset, 1)?;
+        if !current
+            .iter()
+            .any(|message| message.offset == offset && message.id == message_id)
+        {
+            return Err(DispatchError::Failed(
+                "completion belongs to an obsolete WAL identity".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Body of [`Self::commit_dispatch_offset`]; the caller holds the lane lock
@@ -2189,6 +2299,7 @@ impl DispatchEngine {
         offset: u64,
         message_id: Uuid,
     ) -> Result<CursorProgress, DispatchError> {
+        let validator = self.broker.log_metadata_validator(partition)?;
         let cursor = self
             .broker
             .dispatch_offset(tenant_id, cursor_key, partition)?;
@@ -2199,26 +2310,17 @@ impl DispatchEngine {
                 error: None,
             });
         }
-        if self.broker.quorum_gating() {
-            let (current, _) = self
-                .broker
-                .scan_topic_metadata(topic, partition, offset, 1)?;
-            if !current
-                .iter()
-                .any(|message| message.offset == offset && message.id == message_id)
-            {
-                return Err(DispatchError::Failed(
-                    "completion belongs to an obsolete WAL identity".into(),
-                ));
-            }
-        }
+        self.validate_completion_identity(topic, partition, offset, message_id)?;
         let newly_completed = !self
             .broker
             .is_delivery_complete(topic, tenant_id, cursor_key, partition, offset, message_id)?;
+        let hwm = self.broker.dispatch_hwm(topic, partition)?;
+        if offset >= hwm {
+            return Err(DispatchError::Uncommitted);
+        }
         // The cursor never passes the quorum watermark: its prefix has a
         // stable identity, so a cursor skip is always safe.
         let progress = (|| -> Result<_, DispatchError> {
-            let hwm = self.broker.dispatch_hwm(topic, partition)?;
             let mut next = cursor;
             let mut next_head = None;
             const PAGE: usize = 16;
@@ -2259,9 +2361,12 @@ impl DispatchEngine {
                 // A read failure must not forget an HTTP success. Leave its
                 // identity-aware marker durable for the next backfill/restart.
                 let mut batch = broker_storage::MetadataWriteBatch::default();
-                batch.mark_dispatch_complete_for(
-                    tenant_id, cursor_key, partition, offset, message_id,
-                );
+                if newly_completed {
+                    batch.mark_dispatch_complete_for(
+                        tenant_id, cursor_key, partition, offset, message_id,
+                    );
+                }
+                batch.validate_with(validator);
                 return Ok(CursorProgress {
                     batch,
                     stats: None,
@@ -2270,8 +2375,13 @@ impl DispatchEngine {
             }
         };
         let mut batch = broker_storage::MetadataWriteBatch::default();
-        batch.mark_dispatch_complete_for(tenant_id, cursor_key, partition, offset, message_id);
-        batch.set_dispatch_offset(tenant_id, cursor_key, partition, next);
+        if newly_completed {
+            batch.mark_dispatch_complete_for(tenant_id, cursor_key, partition, offset, message_id);
+        }
+        if next != cursor {
+            batch.set_dispatch_offset(tenant_id, cursor_key, partition, next);
+        }
+        batch.validate_with(validator);
         Ok(CursorProgress {
             batch,
             stats: Some(CursorProgressStats {
@@ -2680,6 +2790,17 @@ impl DispatchEngine {
 
 /// Prefix of a DLQ record: `MAGIC`, one line of JSON metadata, then the
 /// original body bytes verbatim (binary-safe, never re-encoded or escaped).
+struct CompletionMarker {
+    batch: broker_storage::MetadataWriteBatch,
+    stats: Option<CompletionMarkerStats>,
+}
+
+struct CompletionMarkerStats {
+    cursor: u64,
+    hwm: u64,
+    newly_completed: bool,
+}
+
 struct CursorProgress {
     batch: broker_storage::MetadataWriteBatch,
     stats: Option<CursorProgressStats>,
@@ -3001,6 +3122,199 @@ mod tests {
         assert_eq!(engine.complete_recovery(0, epoch).unwrap(), Some(1));
         assert_eq!(broker.dispatch_offset(&tenant, &lane, 0).unwrap(), 0);
         assert!(!engine.is_fenced(0));
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn contended_cursor_completions_persist_together_before_cursor_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = BrokerConfig::new(dir.path().to_path_buf());
+        config.partitions = 1;
+        let broker = Broker::open(config).unwrap();
+        let messages: Vec<_> = (0..32)
+            .map(|_| publish_test_message(&broker, "https://example.com/hook"))
+            .collect();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let tenant = broker.tenant();
+        let lane = broker_partition::flow_lane_owner(&messages[0]).to_string();
+        let cursor_owner = engine.cursor_lock(&tenant, &lane, 0).await;
+        let before = broker.metadata_group_commit_epochs().unwrap();
+        let mut completions = Vec::new();
+        for msg in &messages {
+            let engine = engine.clone();
+            let tenant = tenant.clone();
+            let lane = lane.clone();
+            let msg = msg.clone();
+            completions.push(tokio::spawn(async move {
+                engine
+                    .commit_dispatch_offset(&tenant, &msg.topic, &lane, 0, msg.offset, msg.id)
+                    .await
+            }));
+        }
+        let persisted = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if messages.iter().all(|msg| {
+                    broker
+                        .is_delivery_complete(&msg.topic, &tenant, &lane, 0, msg.offset, msg.id)
+                        .unwrap()
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(persisted.is_ok(),
+            "a busy cursor must not serialize independent completion markers before they reach the grouped writer");
+        println!("32 contended completion markers persisted in {} metadata epochs before cursor ownership",
+            broker.metadata_group_commit_epochs().unwrap() - before);
+        assert_eq!(
+            broker.dispatch_offset(&tenant, &lane, 0).unwrap(),
+            0,
+            "durable markers do not advance a cursor without owning it"
+        );
+        let epoch = engine.fence_partition(0);
+        engine.set_recovery_targets(0, epoch, Vec::new());
+        assert!(
+            engine.complete_recovery(0, epoch).is_err(),
+            "recovery must wait across the marker/cursor handoff"
+        );
+        // Cancellation of an HTTP/Fleet waiter must not cancel its owned cursor
+        // continuation or drop the recovery barrier between the two phases.
+        for task in &completions {
+            task.abort();
+        }
+        drop(cursor_owner);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while broker.dispatch_offset(&tenant, &lane, 0).unwrap() != 32 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for task in completions {
+            let _ = task.await;
+        }
+        broker.close_and_drain_owned_completions().await;
+        assert!(
+            engine.cursor_recovery[0].try_write().is_ok(),
+            "all cancelled waiters' continuations must release the barrier after owned drain"
+        );
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn uncontended_cursor_completion_keeps_one_epoch_and_duplicates_need_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let msg = publish_test_message(&broker, "https://example.com/hook");
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let tenant = broker.tenant();
+        let lane = broker_partition::flow_lane_owner(&msg).to_string();
+        let before = broker.metadata_group_commit_epochs().unwrap();
+        for _ in 0..2 {
+            engine
+                .commit_dispatch_offset(
+                    &tenant,
+                    &msg.topic,
+                    &lane,
+                    msg.partition,
+                    msg.offset,
+                    msg.id,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                broker.metadata_group_commit_epochs().unwrap(),
+                before + 1,
+                "FIFO success needs one durable epoch; an already-consumed marker needs no write"
+            );
+        }
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn marker_only_completion_survives_reopen_without_skipping_an_unfinished_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = BrokerConfig::new(dir.path().to_path_buf());
+        config.partitions = 1;
+        let broker = Broker::open(config.clone()).unwrap();
+        let messages: Vec<_> = (0..4)
+            .map(|_| publish_test_message(&broker, "https://example.com/hook"))
+            .collect();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let tenant = broker.tenant();
+        let lane = broker_partition::flow_lane_owner(&messages[0]).to_string();
+        for msg in &messages[1..] {
+            let marker = engine
+                .prepare_completion_marker(&tenant, &msg.topic, &lane, 0, msg.offset, msg.id)
+                .unwrap();
+            broker
+                .commit_metadata_batch_grouped(marker.batch, ())
+                .await
+                .unwrap();
+        }
+        assert_eq!(broker.dispatch_offset(&tenant, &lane, 0).unwrap(), 0);
+        engine.shutdown_background().await;
+        drop(engine);
+        drop(broker);
+        let broker = Broker::open(config).unwrap();
+        for msg in &messages[1..] {
+            assert!(broker
+                .is_delivery_complete(&msg.topic, &tenant, &lane, 0, msg.offset, msg.id)
+                .unwrap());
+        }
+        assert!(!broker
+            .is_delivery_complete(&messages[0].topic, &tenant, &lane, 0, 0, messages[0].id)
+            .unwrap());
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        engine
+            .commit_dispatch_offset(&tenant, &messages[0].topic, &lane, 0, 0, messages[0].id)
+            .await
+            .unwrap();
+        assert_eq!(broker.dispatch_offset(&tenant, &lane, 0).unwrap(), 4);
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn queued_completion_marker_rejects_a_replaced_log_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let msg = publish_test_message(&broker, "https://example.com/hook");
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let tenant = broker.tenant();
+        let lane = broker_partition::flow_lane_owner(&msg).to_string();
+        let marker = engine
+            .prepare_completion_marker(
+                &tenant,
+                &msg.topic,
+                &lane,
+                msg.partition,
+                msg.offset,
+                msg.id,
+            )
+            .unwrap();
+        broker
+            .truncate_replica_log(&msg.topic, msg.partition, msg.offset, 7)
+            .unwrap();
+        assert!(broker.commit_metadata_batch_grouped(marker.batch, ()).await.is_err(),
+            "writer-time incarnation validation must reject an old marker even after preparation succeeded");
+        assert_eq!(
+            broker
+                .dispatch_offset(&tenant, &lane, msg.partition)
+                .unwrap(),
+            0
+        );
+        assert!(engine
+            .prepare_completion_marker(
+                &tenant,
+                &msg.topic,
+                &lane,
+                msg.partition,
+                msg.offset,
+                msg.id
+            )
+            .is_err());
         engine.shutdown_background().await;
     }
 

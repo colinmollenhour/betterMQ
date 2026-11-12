@@ -145,6 +145,12 @@ impl MetadataWriter {
         held: Box<dyn Send>,
     ) -> Result<MetadataWriteReceipt, IndexError> {
         self.check_ready()?;
+        // A follower completion may find that an earlier cursor owner already
+        // consumed its durable marker. Preserve its resource receipt without
+        // queuing a no-op behind unrelated fsyncs or inheriting their failures.
+        if batch.operations.is_empty() {
+            return Ok(MetadataWriteReceipt { _held: held });
+        }
         let (reply, receiver) = oneshot::channel();
         self.sender
             .as_ref()
