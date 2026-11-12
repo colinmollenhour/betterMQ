@@ -1058,16 +1058,20 @@ impl DispatchEngine {
         if targets.is_empty() {
             return false;
         }
-        let deadline = Instant::now() + BACKFILL_PASS_BUDGET;
-        let start = self.backfill_rotation.load(Ordering::Relaxed) % targets.len();
+        let scan_deadline = Instant::now() + BACKFILL_PASS_BUDGET / 2;
+        let start = self.backfill_rotation.fetch_add(1, Ordering::Relaxed) % targets.len();
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut enqueued = 0u64;
         let mut more = false;
         let mut paused = HashMap::new();
         let mut observed = HashSet::new();
-        'targets: for step in 0..targets.len() {
+        let mut ready = std::collections::VecDeque::new();
+        // Collect bounded metadata views first so every scanned log can compete
+        // for one flow's shared budget. Reserve half the pass for admission:
+        // spending the whole budget scanning would starve delivery on cold logs.
+        for step in 0..targets.len() {
             let index = (start + step) % targets.len();
-            if Instant::now() >= deadline {
+            if Instant::now() >= scan_deadline {
                 self.backfill_rotation.store(index, Ordering::Relaxed);
                 more = true;
                 break;
@@ -1087,100 +1091,115 @@ impl DispatchEngine {
             };
             more |= !view.caught_up;
             let hwm = self.broker.committed_hwm(topic, *partition).unwrap_or(0);
-            for entry in view.entries {
-                if Instant::now() >= deadline {
-                    self.backfill_rotation.store(index, Ordering::Relaxed);
-                    more = true;
-                    break 'targets;
-                }
-                if self.workers_enabled
-                    && self.in_flight_jobs.lock().contains_key(&(
-                        entry.topic.clone(),
-                        entry.partition,
-                        entry.offset,
-                    ))
-                {
+            if !view.entries.is_empty() {
+                ready.push_back((index, hwm, view.entries.into_iter()));
+            }
+        }
+        // One record per view per turn, not one complete partition at a time.
+        // A shared flow must keep multiple partition cursors making progress so
+        // durable completion writes can still group across those cursors.
+        // Start this budget after the reads: a single slow storage call must
+        // not make every subsequent pass discard the work it just discovered.
+        let deadline = Instant::now() + BACKFILL_PASS_BUDGET / 2;
+        while let Some((index, hwm, mut entries)) = ready.pop_front() {
+            let Some(entry) = entries.next() else {
+                continue;
+            };
+            if !entries.as_slice().is_empty() {
+                ready.push_back((index, hwm, entries));
+            }
+            if Instant::now() >= deadline {
+                self.backfill_rotation.store(index + 1, Ordering::Relaxed);
+                more = true;
+                break;
+            }
+            if self.workers_enabled
+                && self.in_flight_jobs.lock().contains_key(&(
+                    entry.topic.clone(),
+                    entry.partition,
+                    entry.offset,
+                ))
+            {
+                continue;
+            }
+            // Backlog telemetry also on broker-only (fleet) brokers, which
+            // deliver nothing themselves and so never enqueue.
+            if observed.insert((entry.partition, entry.cursor_key.clone())) {
+                self.observe_pending_entry(&entry, hwm);
+            }
+            if !self.workers_enabled {
+                continue;
+            }
+            let key = (entry.topic.clone(), entry.partition, entry.offset);
+            if self
+                .deferred
+                .lock()
+                .keys
+                .get(&key)
+                .is_some_and(|(due, _)| *due > tokio::time::Instant::now())
+            {
+                continue;
+            }
+            if entry
+                .host_key
+                .as_deref()
+                .is_some_and(|host| self.host_blocker.is_host_key_blocked(host))
+            {
+                continue;
+            }
+            if entry.queue_id.is_some_and(|id| {
+                *paused.entry((false, id)).or_insert_with(|| {
+                    self.broker
+                        .get_queue_by_id(id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|queue| queue.paused)
+                })
+            }) || entry.group_member_id.is_some_and(|id| {
+                *paused.entry((true, id)).or_insert_with(|| {
+                    self.broker
+                        .get_group_member(id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|member| member.paused)
+                })
+            }) {
+                continue;
+            }
+            // A due-later retry is owned by the defer scheduler; re-enqueueing
+            // it (or offsets fenced behind it) would only churn the queue.
+            if self
+                .blocking_entry_retry(&entry)
+                .is_some_and(|record| record.due_at_ms > now_ms)
+            {
+                continue;
+            }
+            if self.high_tx.capacity() == 0 || self.job_capacity.available_permits() == 0 {
+                self.backfill_rotation.store(index + 1, Ordering::Relaxed);
+                more = true;
+                break;
+            }
+            // Reserve the flow's look-ahead synchronously. Merely checking
+            // the async lane counter here can enqueue a whole window before
+            // any hydration task updates it, then churn on rejection.
+            let admission = if let Some(flow) = &entry.flow {
+                let Some(permit) = self.flow.try_admit(&flow.key, flow.parallelism) else {
                     continue;
-                }
-                // Backlog telemetry also on broker-only (fleet) brokers, which
-                // deliver nothing themselves and so never enqueue.
-                if observed.insert((entry.partition, entry.cursor_key.clone())) {
-                    self.observe_pending_entry(&entry, hwm);
-                }
-                if !self.workers_enabled {
-                    continue;
-                }
-                let key = (entry.topic.clone(), entry.partition, entry.offset);
-                if self
-                    .deferred
-                    .lock()
-                    .keys
-                    .get(&key)
-                    .is_some_and(|(due, _)| *due > tokio::time::Instant::now())
-                {
-                    continue;
-                }
-                if entry
-                    .host_key
-                    .as_deref()
-                    .is_some_and(|host| self.host_blocker.is_host_key_blocked(host))
-                {
-                    continue;
-                }
-                if entry.queue_id.is_some_and(|id| {
-                    *paused.entry((false, id)).or_insert_with(|| {
-                        self.broker
-                            .get_queue_by_id(id)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|queue| queue.paused)
-                    })
-                }) || entry.group_member_id.is_some_and(|id| {
-                    *paused.entry((true, id)).or_insert_with(|| {
-                        self.broker
-                            .get_group_member(id)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|member| member.paused)
-                    })
-                }) {
-                    continue;
-                }
-                // A due-later retry is owned by the defer scheduler; re-enqueueing
-                // it (or offsets fenced behind it) would only churn the queue.
-                if self
-                    .blocking_entry_retry(&entry)
-                    .is_some_and(|record| record.due_at_ms > now_ms)
-                {
-                    continue;
-                }
-                if self.high_tx.capacity() == 0 || self.job_capacity.available_permits() == 0 {
-                    self.backfill_rotation.store(index, Ordering::Relaxed);
-                    more = true;
-                    break 'targets;
-                }
-                // Reserve the flow's look-ahead synchronously. Merely checking
-                // the async lane counter here can enqueue a whole window before
-                // any hydration task updates it, then churn on rejection.
-                let admission = if let Some(flow) = &entry.flow {
-                    let Some(permit) = self.flow.try_admit(&flow.key, flow.parallelism) else {
-                        continue;
-                    };
-                    Some(permit)
-                } else {
-                    None
                 };
-                if self.enqueue_admitted(
-                    DeliveryJob::live(
-                        entry.topic.clone(),
-                        entry.partition,
-                        entry.offset,
-                        entry.message_id,
-                    ),
-                    admission,
-                ) {
-                    enqueued += 1;
-                }
+                Some(permit)
+            } else {
+                None
+            };
+            if self.enqueue_admitted(
+                DeliveryJob::live(
+                    entry.topic.clone(),
+                    entry.partition,
+                    entry.offset,
+                    entry.message_id,
+                ),
+                admission,
+            ) {
+                enqueued += 1;
             }
         }
         if enqueued > 0 {
@@ -3144,6 +3163,79 @@ mod tests {
         );
         engine.shutdown_background().await;
         assert!(engine.in_flight_jobs.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn parallel_backfill_shares_a_flow_window_across_partition_cursors() {
+        for single_partition in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = BrokerConfig::new(dir.path().to_owned());
+            config.partitions = 4;
+            let broker = Broker::open(config).unwrap();
+            let mut published = [0usize; 4];
+            let mut first = None;
+            for n in 0..512 {
+                let response = broker.publish(serde_json::from_value(serde_json::json!({
+                "url": "https://example.com/hook", "secret": "secret", "payload": "body",
+                "routing_key": if single_partition { "one-route".to_string() } else { format!("route-{n}") },
+                "flow": {"key": "shared", "parallelism": 32},
+            })).unwrap()).unwrap();
+                published[response.partition.unwrap() as usize] += 1;
+                first.get_or_insert(response);
+            }
+            if !single_partition {
+                assert!(published.iter().all(|count| *count >= 64));
+            }
+            broker.flush_wal().unwrap();
+            let first = first.unwrap();
+            let message = broker
+                .read_message(
+                    &first.topic,
+                    first.partition.unwrap(),
+                    first.offset.unwrap(),
+                )
+                .unwrap();
+            let owner = broker_partition::flow_lane_owner(&message);
+            let leading = Arc::new(AtomicBool::new(false));
+            let check = leading.clone();
+            let engine = DispatchEngine::new_with_controls(
+                broker,
+                DispatchConfig::default(),
+                true,
+                None,
+                Some(Arc::new(move |_| check.load(Ordering::Acquire))),
+            );
+            engine
+                .flow
+                .ensure_lane(
+                    owner,
+                    "shared",
+                    broker_partition::ResolvedFlow {
+                        key: "shared".into(),
+                        parallelism: 32,
+                        rate: 0,
+                        period_secs: 1,
+                    },
+                )
+                .await;
+            engine.flow.pause(owner, "shared").await;
+            leading.store(true, Ordering::Release);
+            engine.backfill_pending();
+            let mut admitted = [0usize; 4];
+            for (_, partition, _) in engine.in_flight_jobs.lock().keys() {
+                admitted[*partition as usize] += 1;
+            }
+            let expected = if single_partition {
+                let mut counts = [0; 4];
+                counts[first.partition.unwrap() as usize] = 64;
+                counts
+            } else {
+                [16, 16, 16, 16]
+            };
+            assert_eq!(admitted, expected,
+            "share the window across active logs without imposing a per-partition quota on a lone active log");
+            engine.shutdown_background().await;
+        }
     }
 
     #[tokio::test]

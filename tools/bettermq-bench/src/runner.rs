@@ -240,6 +240,10 @@ pub fn merge(reports: Vec<RunReport>) -> anyhow::Result<RunReport> {
     let mut by_id: std::collections::BTreeMap<String, ScenarioResult> =
         out.scenarios.drain(..).map(|s| (s.id.clone(), s)).collect();
     for r in iter {
+        anyhow::ensure!(
+            out.meta.broker_sha256 == r.meta.broker_sha256,
+            "cannot merge different broker fingerprints; pool each build separately"
+        );
         if out.calibration.is_none() {
             out.calibration = r.calibration.clone();
         }
@@ -257,6 +261,8 @@ pub fn merge(reports: Vec<RunReport>) -> anyhow::Result<RunReport> {
         for sc in r.scenarios {
             match by_id.get_mut(&sc.id) {
                 Some(existing) => {
+                    anyhow::ensure!(existing.params == sc.params,
+                        "cannot merge scenario {} with different parameters; pool matching workloads separately", sc.id);
                     existing.trials.extend(sc.trials);
                     if let Some(e) = sc.error {
                         existing.error = Some(match existing.error.take() {
@@ -565,5 +571,27 @@ mod tests {
         let mut interrupted = rep(2.0);
         interrupted.meta.finished_at.clear();
         assert!(merge(vec![rep(1.0), interrupted]).is_err());
+    }
+
+    #[test]
+    fn merge_rejects_different_broker_fingerprints_and_diagnostic_step_limits() {
+        let mut a = rep(1.0);
+        let mut b = rep(2.0);
+        a.meta.broker_sha256 = "build-a".into();
+        b.meta.broker_sha256 = "build-b".into();
+        assert!(merge(vec![a, b])
+            .unwrap_err()
+            .to_string()
+            .contains("fingerprints"));
+        let mut a = rep(1.0);
+        let mut b = rep(2.0);
+        a.scenarios[0]
+            .params
+            .insert("steps_max".into(), "12".into());
+        b.scenarios[0].params.insert("steps_max".into(), "1".into());
+        assert!(merge(vec![a, b])
+            .unwrap_err()
+            .to_string()
+            .contains("different parameters"));
     }
 }

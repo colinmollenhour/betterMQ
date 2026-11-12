@@ -25,6 +25,20 @@ other backfill passes and live work. Merely observing the async lane's pending
 count allowed a whole ready window to enter before hydration ran, producing
 repeated native reads and millions of rejections under overload.
 
+Backfill offers one record per scanned log per turn when filling those budgets.
+Allowing the first partition to take a whole shared flow window would serialize
+its completions behind one cursor and defeat cross-partition metadata group
+commit. Round-robin admission keeps the cursor owners progressing together. A
+lone active log can still fill the whole window; there is no permanent
+per-partition quota or timer-limited scheduling quantum.
+
+The cost is temporary vectors of shared metadata references for the logs scanned
+in a pass, not another metadata or payload copy. The nominal two-second pass
+budget is split between scanning and admission. Admission gets its own budget
+after the reads so one slow storage call cannot repeatedly consume the pass
+without scheduling the work it discovered. A single storage call can still
+overrun the scan budget; later passes rotate the starting log.
+
 Flow waitlists retain WAL references and ordering metadata, not payloads or
 copies of the engine's clients and configuration. Workers reload the immutable
 message before delivery. Warm reads await the shard I/O actor directly;

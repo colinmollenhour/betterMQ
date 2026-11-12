@@ -52,6 +52,8 @@ pub struct RunCtx {
     pub rate_scale: f64,
     /// Multiplies every scenario's durations.
     pub time_scale: f64,
+    /// Optional diagnostic step limit; profile defaults are unchanged.
+    pub ramp_steps: Option<u8>,
     pub extra_env: Vec<(String, String)>,
 }
 

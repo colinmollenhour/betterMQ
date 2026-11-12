@@ -132,6 +132,9 @@ struct RunArgs {
     /// Multiply every duration.
     #[arg(long, default_value_t = 1.0)]
     time_scale: f64,
+    /// Limit ingest/e2e ramps to this many steps (1-15; diagnostic runs).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=15))]
+    ramp_steps: Option<u8>,
     /// SLO: ACK p99 limit in ms.
     #[arg(long, default_value_t = 50.0)]
     slo_ack_p99_ms: f64,
@@ -373,6 +376,7 @@ fn run_cmd(args: RunArgs) -> anyhow::Result<()> {
         keep_data: args.keep_data,
         rate_scale: args.rate_scale,
         time_scale: args.time_scale,
+        ramp_steps: args.ramp_steps,
         extra_env,
     });
     let plan = runner::RunPlan {
@@ -404,4 +408,33 @@ fn run_cmd(args: RunArgs) -> anyhow::Result<()> {
         "benchmark interrupted; partial results were saved but are not a completed run"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_ramp_step_limit_is_optional_and_validated_before_running() {
+        let Cmd::Run(defaults) = Cli::try_parse_from(["bettermq-bench", "run"])
+            .unwrap()
+            .command
+        else {
+            panic!("run command");
+        };
+        assert_eq!(defaults.ramp_steps, None);
+        let Cmd::Run(diagnostic) =
+            Cli::try_parse_from(["bettermq-bench", "run", "--ramp-steps", "1"])
+                .unwrap()
+                .command
+        else {
+            panic!("run command");
+        };
+        assert_eq!(diagnostic.ramp_steps, Some(1));
+        for invalid in ["0", "16", "not-a-number"] {
+            assert!(
+                Cli::try_parse_from(["bettermq-bench", "run", "--ramp-steps", invalid]).is_err()
+            );
+        }
+    }
 }
