@@ -218,8 +218,12 @@ pub struct PartitionRecoveryTarget {
     pub epoch: Uuid,
     pub logs: Vec<(String, u64)>,
 }
-type InFlightSet =
-    Arc<parking_lot::Mutex<HashMap<(String, u32, u64), tokio::sync::OwnedSemaphorePermit>>>;
+struct AdmittedJob {
+    _capacity: tokio::sync::OwnedSemaphorePermit,
+    flow: Option<crate::flow_control::FlowAdmissionPermit>,
+}
+
+type InFlightSet = Arc<parking_lot::Mutex<HashMap<(String, u32, u64), AdmittedJob>>>;
 
 #[derive(Debug)]
 struct DeferredJob {
@@ -280,10 +284,14 @@ pub(crate) struct DeliveryOwnership {
     notify: Arc<Notify>,
     backfill_notify: Arc<Notify>,
     lease: Option<LeaseDrop>,
+    pub(crate) flow_admission: Option<crate::flow_control::FlowAdmissionPermit>,
 }
 
 impl Drop for DeliveryOwnership {
     fn drop(&mut self) {
+        // Early returns may still own the pre-hydration flow reservation.
+        // Release it before announcing that backfill can use the capacity.
+        drop(self.flow_admission.take());
         self.jobs.lock().remove(&self.key);
         self.notify.notify_waiters();
         self.backfill_notify.notify_one();
@@ -889,14 +897,22 @@ impl DispatchEngine {
     }
 
     pub fn enqueue(&self, job: DeliveryJob) {
+        self.enqueue_admitted(job, None);
+    }
+
+    fn enqueue_admitted(
+        &self,
+        job: DeliveryJob,
+        flow: Option<crate::flow_control::FlowAdmissionPermit>,
+    ) -> bool {
         if !self.workers_enabled
             || self.stop.load(Ordering::Relaxed)
             || self.draining.load(Ordering::Acquire)
         {
-            return;
+            return false;
         }
         if !self.shard_leader(job.partition) {
-            return;
+            return false;
         }
         let key = (job.topic.clone(), job.partition, job.offset);
         if self
@@ -906,23 +922,32 @@ impl DispatchEngine {
             .get(&key)
             .is_some_and(|(due, _)| *due > tokio::time::Instant::now())
         {
-            return;
+            return false;
         }
         {
             let mut inflight = self.in_flight_jobs.lock();
             if inflight.contains_key(&key) {
-                return;
+                return false;
             }
             // One budget spans ready, hydration, flow waitlists and active
             // delivery, rather than allowing each stage to fill independently.
             let Ok(permit) = self.job_capacity.clone().try_acquire_owned() else {
                 self.telemetry.record_queue_rejected();
-                return;
+                return false;
             };
-            inflight.insert(key, permit);
+            inflight.insert(
+                key,
+                AdmittedJob {
+                    _capacity: permit,
+                    flow,
+                },
+            );
         }
         match self.high_tx.try_send(job) {
-            Ok(()) => self.telemetry.record_queue_enqueue(),
+            Ok(()) => {
+                self.telemetry.record_queue_enqueue();
+                true
+            }
             Err(mpsc::error::TrySendError::Full(job)) => {
                 self.telemetry.record_queue_rejected();
                 self.in_flight_jobs
@@ -930,12 +955,14 @@ impl DispatchEngine {
                     .remove(&(job.topic, job.partition, job.offset));
                 self.record_pressure(0);
                 self.backfill_notify.notify_one();
+                false
             }
             Err(mpsc::error::TrySendError::Closed(job)) => {
                 self.telemetry.record_queue_rejected();
                 self.in_flight_jobs
                     .lock()
                     .remove(&(job.topic, job.partition, job.offset));
+                false
             }
         }
     }
@@ -1075,14 +1102,6 @@ impl DispatchEngine {
                 {
                     continue;
                 }
-                if self.workers_enabled
-                    && entry
-                        .flow
-                        .as_ref()
-                        .is_some_and(|flow| !self.flow.admission_available(&flow.key))
-                {
-                    continue;
-                }
                 // Backlog telemetry also on broker-only (fleet) brokers, which
                 // deliver nothing themselves and so never enqueue.
                 if observed.insert((entry.partition, entry.cursor_key.clone())) {
@@ -1140,13 +1159,28 @@ impl DispatchEngine {
                     more = true;
                     break 'targets;
                 }
-                self.enqueue(DeliveryJob::live(
-                    entry.topic.clone(),
-                    entry.partition,
-                    entry.offset,
-                    entry.message_id,
-                ));
-                enqueued += 1;
+                // Reserve the flow's look-ahead synchronously. Merely checking
+                // the async lane counter here can enqueue a whole window before
+                // any hydration task updates it, then churn on rejection.
+                let admission = if let Some(flow) = &entry.flow {
+                    let Some(permit) = self.flow.try_admit(&flow.key, flow.parallelism) else {
+                        continue;
+                    };
+                    Some(permit)
+                } else {
+                    None
+                };
+                if self.enqueue_admitted(
+                    DeliveryJob::live(
+                        entry.topic.clone(),
+                        entry.partition,
+                        entry.offset,
+                        entry.message_id,
+                    ),
+                    admission,
+                ) {
+                    enqueued += 1;
+                }
             }
         }
         if enqueued > 0 {
@@ -1250,9 +1284,10 @@ impl DispatchEngine {
                         tasks.spawn(async move {
                             let _permit = permit;
                             let key = (job.topic.clone(), job.partition, job.offset);
+                            let flow_admission = engine.in_flight_jobs.lock().get_mut(&key).and_then(|job| job.flow.take());
                             let ownership = DeliveryOwnership { key,
                                 jobs: engine.in_flight_jobs.clone(), notify: engine.drain_notify.clone(),
-                                backfill_notify: engine.backfill_notify.clone(), lease: None };
+                                backfill_notify: engine.backfill_notify.clone(), lease: None, flow_admission };
                             tokio::select! {
                                 _ = cancellation.cancelled() => {},
                                 result = engine.deliver_job(job, ownership) => if let Err(e) = result {
@@ -3037,6 +3072,78 @@ mod tests {
         assert_eq!(engine.deferred.lock().jobs.len(), 1);
         engine.shutdown_background().await;
         assert!(engine.deferred.lock().jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backfill_reserves_parallel_flow_capacity_before_hydration_can_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = BrokerConfig::new(dir.path().to_owned());
+        config.partitions = 1;
+        let broker = Broker::open(config).unwrap();
+        for n in 0..128 {
+            broker.publish(serde_json::from_value(serde_json::json!({
+                "url": "https://example.com/hook", "secret": "secret", "payload": "body",
+                "routing_key": "route", "flow": {"key": format!("lane-{}", n % 2), "parallelism": 2},
+            })).unwrap()).unwrap();
+        }
+        broker.flush_wal().unwrap();
+        let first = broker.read_message(DIRECT_TOPIC, 0, 0).unwrap();
+        let owner = broker_partition::flow_lane_owner(&first);
+        let leading = Arc::new(AtomicBool::new(false));
+        let check = leading.clone();
+        let engine = DispatchEngine::new_with_controls(
+            broker,
+            DispatchConfig::default(),
+            true,
+            None,
+            Some(Arc::new(move |_| check.load(Ordering::Acquire))),
+        );
+        for n in 0..2 {
+            let key = format!("lane-{n}");
+            engine
+                .flow
+                .ensure_lane(
+                    owner,
+                    &key,
+                    broker_partition::ResolvedFlow {
+                        key: key.clone(),
+                        parallelism: 2,
+                        rate: 0,
+                        period_secs: 1,
+                    },
+                )
+                .await;
+            engine.flow.pause(owner, &key).await;
+        }
+        leading.store(true, Ordering::Release);
+        // A current-thread runtime cannot run hydration until this synchronous
+        // pass returns. Looking only at the async lane's current pending count
+        // therefore admits the entire backlog instead of its two small budgets.
+        engine.backfill_pending();
+        assert_eq!(
+            engine.in_flight_jobs.lock().len(),
+            32,
+            "each parallel flow must reserve its 16 slots before queue submission"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.flow.pending_count().await != 32 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..20 {
+            engine.backfill_pending();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(engine.in_flight_jobs.lock().len(), 32);
+        assert_eq!(
+            engine.telemetry_snapshot().queue_rejected,
+            0,
+            "paused parallel flows must not cycle through hydration and rejection"
+        );
+        engine.shutdown_background().await;
+        assert!(engine.in_flight_jobs.lock().is_empty());
     }
 
     #[tokio::test]

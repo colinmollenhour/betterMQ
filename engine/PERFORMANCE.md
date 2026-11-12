@@ -10,8 +10,20 @@ checks still apply before a delivery can advance its cursor.
 
 One process-wide job budget covers ready work, hydration, flow waiting, and
 active delivery. A parallel flow also has a smaller look-ahead of
-`max(16, 2 × parallelism)` admitted jobs. This prevents one blocked destination
-from filling every stage independently.
+`max(16, 2 × parallelism)` admitted jobs. Backfill reserves that flow quota
+synchronously before queue submission, not after asynchronous hydration. Live
+work takes the same quota once its immutable flow metadata is known. The owned
+permit spans preparation, flow waiting, and delivery, and is released before
+notifying backfill of available capacity.
+
+This uses a small atomic gate per live flow, with a weak registry that releases
+historical keys after lane eviction. Operator pins update the same gate. Already
+admitted work is not revoked by a lower limit, but new admission waits for its
+quota. An offset replacement with different flow metadata cannot reuse the old
+flow's permit. Per-pass counter estimates were rejected: they would still race
+other backfill passes and live work. Merely observing the async lane's pending
+count allowed a whole ready window to enter before hydration ran, producing
+repeated native reads and millions of rejections under overload.
 
 Flow waitlists retain WAL references and ordering metadata, not payloads or
 copies of the engine's clients and configuration. Workers reload the immutable
