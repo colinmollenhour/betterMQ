@@ -49,6 +49,19 @@ Inline delivery borrows the verified message rather than cloning its body
 before building the outbound request. External-blob hydration runs on the
 blocking pool and still verifies blob integrity before delivery.
 
+The segment reader cache shares descriptors, not seek positions. Each reader
+has a logical offset; Unix reads use positional I/O. Other platforms synchronize
+each seek/read pair on that descriptor, which serializes individual reads but
+keeps reader positions independent. Cache eviction releases its reference;
+existing readers retain their descriptor until finished.
+
+Cloning `File` was rejected because cloned handles share an operating-system
+file cursor: one reader can move another between seek and decode. Reopening a
+file for every frame would restore isolation at the cost of repeated opens.
+Shared descriptor ownership avoids both extra opens and descriptor duplication.
+Tests cover interleaved seeks, concurrent payload/metadata reads in active and
+sealed V1/V2 logs, checked seek arithmetic, and the synchronized fallback.
+
 Blocking preparation, reads, and journal I/O share a process-wide budget of 32 operations
 (`BETTERMQ_BLOCKING_IO_CONCURRENCY` overrides it). Callers wait asynchronously
 before submitting to Tokio's blocking pool, rather than creating hundreds of

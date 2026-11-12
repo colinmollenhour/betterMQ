@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::info;
@@ -135,8 +135,72 @@ struct SegmentIndex {
     points: Vec<SparsePoint>,
 }
 
+/// Cache the descriptor, never its seek position. `File::try_clone` shares an
+/// open-file-description cursor, so independent read calls must use offsets.
+struct CachedFile {
+    file: File,
+    #[cfg(any(not(unix), test))]
+    seek_lock: Mutex<()>,
+}
+
+impl CachedFile {
+    fn read_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_at(&self.file, bytes, offset)
+        }
+        #[cfg(not(unix))]
+        {
+            self.read_at_with_seek_lock(bytes, offset)
+        }
+    }
+
+    // Portable fallback: seek and read are one synchronized operation. Logical
+    // positions still belong to readers, not this descriptor. Also exercised on
+    // Unix in tests, rather than leaving the compatibility path untested.
+    #[cfg(any(not(unix), test))]
+    fn read_at_with_seek_lock(&self, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
+        let _seek = self
+            .seek_lock
+            .lock()
+            .map_err(|_| io::Error::other("cached reader lock poisoned"))?;
+        let mut file = &self.file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read(bytes)
+    }
+}
+
+struct SegmentReader {
+    source: Arc<CachedFile>,
+    position: u64,
+}
+
+impl Read for SegmentReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let count = self.source.read_at(bytes, self.position)?;
+        self.position = self
+            .position
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "reader offset overflow"))?;
+        Ok(count)
+    }
+}
+
+impl Seek for SegmentReader {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let next = match from {
+            SeekFrom::Start(position) => Some(position),
+            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+            SeekFrom::End(delta) => self.source.file.metadata()?.len().checked_add_signed(delta),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid reader seek"))?;
+        self.position = next;
+        Ok(next)
+    }
+}
+
 struct ReaderCache {
-    files: HashMap<PathBuf, File>,
+    files: HashMap<PathBuf, Arc<CachedFile>>,
     order: VecDeque<PathBuf>,
     capacity: usize,
 }
@@ -155,18 +219,28 @@ impl ReaderCache {
         }
     }
 
-    fn clone_reader(&mut self, path: &Path) -> io::Result<File> {
+    fn clone_reader(&mut self, path: &Path) -> io::Result<SegmentReader> {
         if !self.files.contains_key(path) {
             while self.files.len() >= self.capacity {
                 if let Some(evicted) = self.order.pop_front() {
                     self.files.remove(&evicted);
                 }
             }
-            self.files.insert(path.to_path_buf(), File::open(path)?);
+            self.files.insert(
+                path.to_path_buf(),
+                Arc::new(CachedFile {
+                    file: File::open(path)?,
+                    #[cfg(any(not(unix), test))]
+                    seek_lock: Mutex::new(()),
+                }),
+            );
         }
         self.order.retain(|cached| cached != path);
         self.order.push_back(path.to_path_buf());
-        self.files.get(path).expect("reader inserted").try_clone()
+        Ok(SegmentReader {
+            source: self.files.get(path).expect("reader inserted").clone(),
+            position: 0,
+        })
     }
 
     fn remove(&mut self, path: &Path) {
@@ -1900,7 +1974,7 @@ impl PartitionLog {
         read_dispatch_frame(&mut file, keep_payload).map_err(LogError::from)
     }
 
-    fn cached_reader(&self, path: &Path) -> Result<File, LogError> {
+    fn cached_reader(&self, path: &Path) -> Result<SegmentReader, LogError> {
         let mut cache = self
             .reader_cache
             .lock()
@@ -2208,6 +2282,126 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    #[test]
+    fn cached_readers_do_not_share_seek_positions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("readers");
+        std::fs::write(&path, b"AAAABBBB").unwrap();
+        let mut cache = ReaderCache::new();
+        let mut first = cache.clone_reader(&path).unwrap();
+        let mut second = cache.clone_reader(&path).unwrap();
+        assert!(
+            Arc::ptr_eq(&first.source, &second.source),
+            "readers reuse the cached descriptor without another dup/open"
+        );
+        first.seek(SeekFrom::Start(0)).unwrap();
+        second.seek(SeekFrom::Start(4)).unwrap();
+        let mut bytes = [0u8; 4];
+        first.read_exact(&mut bytes).unwrap();
+        assert_eq!(
+            &bytes, b"AAAA",
+            "a cached clone must not change another reader's position"
+        );
+        second.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"BBBB");
+        assert_eq!(first.seek(SeekFrom::End(-2)).unwrap(), 6);
+        assert_eq!(first.seek(SeekFrom::Current(-2)).unwrap(), 4);
+        assert!(first.seek(SeekFrom::Current(-5)).is_err());
+        assert_eq!(
+            first.stream_position().unwrap(),
+            4,
+            "an invalid seek preserves the old position"
+        );
+        first.seek(SeekFrom::Start(u64::MAX)).unwrap();
+        assert!(first.seek(SeekFrom::Current(1)).is_err());
+        first.seek(SeekFrom::End(0)).unwrap();
+        assert_eq!(first.read(&mut bytes).unwrap(), 0);
+        cache.remove(&path);
+        // An evicted descriptor remains valid while an existing reader owns it.
+        second.seek(SeekFrom::Start(0)).unwrap();
+        second.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"AAAA");
+    }
+
+    #[test]
+    fn portable_cached_reader_fallback_serializes_seek_and_read() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("portable-readers");
+        std::fs::write(&path, b"AAAABBBB").unwrap();
+        let mut cache = ReaderCache::new();
+        let first = cache.clone_reader(&path).unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for n in 0..8 {
+                let source = &first.source;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let offset = if n % 2 == 0 { 0 } else { 4 };
+                    let expected = if offset == 0 { b"AAAA" } else { b"BBBB" };
+                    for _ in 0..128 {
+                        let mut bytes = [0; 4];
+                        assert_eq!(
+                            source.read_at_with_seek_lock(&mut bytes, offset).unwrap(),
+                            4
+                        );
+                        assert_eq!(&bytes, expected);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn concurrent_partition_reads_keep_payload_and_metadata_at_the_requested_offsets() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            for sealed in [false, true] {
+                let dir = tempdir().unwrap();
+                let mut log = PartitionLog::open_for_shard(
+                    dir.path(),
+                    PartitionLogConfig::default(),
+                    0,
+                    format,
+                )
+                .unwrap();
+                let ids: Vec<_> = (0..64)
+                    .map(|n| {
+                        let record = sample_record("reads");
+                        let id = record.id;
+                        log.append(0, record, format!("body-{n}").into_bytes())
+                            .unwrap();
+                        id
+                    })
+                    .collect();
+                log.sync().unwrap();
+                if sealed {
+                    log.roll_segment().unwrap();
+                }
+                let barrier = std::sync::Barrier::new(8);
+                std::thread::scope(|scope| {
+                    for n in 0..8 {
+                        let log = &log;
+                        let ids = &ids;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            for step in 0..128 {
+                                let offset = ((step * 17 + n * 7) % 64) as u64;
+                                let payload = log.read_range(0, offset, 1).unwrap();
+                                assert_eq!(payload[0].offset, offset);
+                                assert_eq!(payload[0].id, ids[offset as usize]);
+                                assert_eq!(payload[0].payload, format!("body-{offset}").as_bytes());
+                                let metadata = log.read_range_metadata(0, offset, 1).unwrap();
+                                assert_eq!(metadata[0].id, ids[offset as usize]);
+                                assert!(metadata[0].payload.is_empty());
+                            }
+                        });
+                    }
+                });
+            }
+        }
+    }
 
     fn sample_record(topic: &str) -> LogRecord {
         LogRecord {
