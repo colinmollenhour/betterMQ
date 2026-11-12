@@ -294,6 +294,12 @@ async fn replicate_if_needed(
     resp: &mut PublishResponse,
     local_durable: impl std::future::Future<Output = Result<u64, ApiError>>,
 ) -> Result<u64, ApiError> {
+    let publish_fence = resp.publish_fence.clone();
+    if let Some(fence) = &publish_fence {
+        fence
+            .validate()
+            .map_err(|error| ApiError::Unavailable(error.to_string()))?;
+    }
     if state.broker.config().storage == StorageMode::Slate {
         return local_durable.await;
     }
@@ -312,7 +318,10 @@ async fn replicate_if_needed(
     let Some(frame) = resp.replication_frame.take() else {
         return local_durable.await;
     };
-    let leader_generation = cluster.runtime.shard_generation(partition);
+    let leader_generation = publish_fence
+        .as_ref()
+        .and_then(|fence| fence.generation())
+        .unwrap_or_else(|| cluster.runtime.shard_generation(partition));
     let batch = ReplicateBatchRequest::new(
         state.broker.tenant(),
         resp.topic.clone(),
@@ -333,6 +342,11 @@ async fn replicate_if_needed(
         .await
     {
         Ok(outcome) => {
+            if let Some(fence) = &publish_fence {
+                fence
+                    .validate()
+                    .map_err(|error| ApiError::Unavailable(error.to_string()))?;
+            }
             if !cluster.runtime.is_leader_for_shard(partition)
                 || cluster.runtime.shard_generation(partition) != leader_generation
             {
@@ -342,7 +356,17 @@ async fn replicate_if_needed(
             // and only after the watermark is persisted.
             state
                 .broker
-                .record_quorum_commit(&resp.topic, partition, offset, offset.saturating_add(1))
+                .record_quorum_commit_checked(
+                    &resp.topic,
+                    partition,
+                    offset,
+                    offset.saturating_add(1),
+                    || {
+                        publish_fence
+                            .as_ref()
+                            .map_or(Ok(()), |fence| fence.validate())
+                    },
+                )
                 .map_err(|e| {
                     ApiError::ReplicationFailed(format!("persist quorum watermark: {e}"))
                 })?;
@@ -396,7 +420,14 @@ impl broker_dispatch::DlqDurability for ClusterDlqDurability {
             let durability = async {
                 replicate_if_needed(&state, response, local).await?;
                 if let (Some(partition), Some(offset)) = (response.partition, response.offset) {
-                    wait_publish_visible(&state, &response.topic, partition, offset).await?;
+                    wait_publish_visible(
+                        &state,
+                        &response.topic,
+                        partition,
+                        offset,
+                        response.publish_fence.as_ref(),
+                    )
+                    .await?;
                 }
                 response.replication_frame = None;
                 Ok::<_, ApiError>(())
@@ -416,6 +447,30 @@ async fn publish_on_leader(
     req: PublishRequest,
     meter: Option<crate::metering::IngestMeter>,
 ) -> Result<PublishResponse, ApiError> {
+    // Forwarding already happened. Never hold a stripe while asking a remote
+    // publishing leader to acquire it again, or reserve a local key first.
+    let producer_key = if state.broker.shared_producer_admission() {
+        req.idempotency_key.clone()
+    } else {
+        None
+    };
+    let producer_locks = state
+        .broker
+        .lock_shared_producers(producer_key.iter().cloned().collect())
+        .await?;
+    if let Some(key) = &producer_key {
+        if let Some(response) =
+            crate::producer_admission::lookup(state, key, producer_locks.clone()).await?
+        {
+            return Ok(response);
+        }
+    }
+    if let Some(cluster) = &state.cluster {
+        let partition = shard_for_request(state, &req);
+        if !cluster.runtime.is_leader_for_shard(partition) {
+            return Err(BrokerError::NotShardLeader(partition).into());
+        }
+    }
     let body_bytes = meter
         .map(|m| m.body_bytes)
         .unwrap_or_else(|| req.payload.len() as u64);
@@ -428,7 +483,14 @@ async fn publish_on_leader(
         return state
             .broker
             .publish_with_completion(req, move |response, pending| async move {
-                finish_publish(&owned, response, pending, meter, body_bytes).await
+                let response = finish_publish(&owned, response, pending, meter, body_bytes).await?;
+                if let Some(key) = producer_key {
+                    owned
+                        .broker
+                        .commit_shared_publish(&key, &response, producer_locks)
+                        .await?;
+                }
+                Ok::<_, ApiError>(response)
             })
             .await?;
     }
@@ -483,7 +545,14 @@ async fn finish_publish(
     }
     resp.commit_epoch = Some(durability?);
     if let (Some(partition), Some(offset)) = (resp.partition, resp.offset) {
-        wait_publish_visible(state, &resp.topic, partition, offset).await?;
+        wait_publish_visible(
+            state,
+            &resp.topic,
+            partition,
+            offset,
+            resp.publish_fence.as_ref(),
+        )
+        .await?;
     }
     if let Some(m) = meter {
         if !resp.duplicate {
@@ -504,14 +573,26 @@ pub(crate) async fn wait_publish_visible(
     topic: &str,
     partition: u32,
     offset: u64,
+    publish_fence: Option<&broker_partition::PublishFence>,
 ) -> Result<(), ApiError> {
+    let validate = || -> Result<(), ApiError> {
+        if let Some(fence) = publish_fence {
+            fence
+                .validate()
+                .map_err(|error| ApiError::Unavailable(error.to_string()))?;
+        }
+        Ok(())
+    };
+    validate()?;
     if !state.broker.quorum_gating() {
         return Ok(());
     }
     let Some(cluster) = &state.cluster else {
         return Ok(());
     };
-    let generation = cluster.runtime.shard_generation(partition);
+    let generation = publish_fence
+        .and_then(|fence| fence.generation())
+        .unwrap_or_else(|| cluster.runtime.shard_generation(partition));
     let visible = state
         .broker
         .wait_quorum_visible(topic, partition, offset.saturating_add(1));
@@ -520,6 +601,7 @@ pub(crate) async fn wait_publish_visible(
     tokio::pin!(timeout);
     let mut ownership = tokio::time::interval(Duration::from_millis(50));
     loop {
+        validate()?;
         if !cluster.runtime.is_leader_for_shard(partition)
             || cluster.runtime.shard_generation(partition) != generation
         {
@@ -528,6 +610,7 @@ pub(crate) async fn wait_publish_visible(
         tokio::select! {
             result = &mut visible => {
                 result?;
+                validate()?;
                 if !cluster.runtime.is_leader_for_shard(partition) || cluster.runtime.shard_generation(partition) != generation {
                     return Err(BrokerError::NotShardLeader(partition).into());
                 }
@@ -1823,9 +1906,20 @@ pub async fn internal_replicate(
             "replicate frame tenant does not match request tenant".into(),
         ));
     }
-    state
-        .broker
-        .append_replicated_frame(&body.topic, body.partition, &frame, Some(body.offset))?;
+    let validate =
+        replica_metadata_validator(&state, body.partition, body.leader_generation, None)?;
+    let mut identity = Some(
+        state
+            .broker
+            .pending_replica_identity(body.partition, body.offset)?,
+    );
+    state.broker.append_replicated_frame_pinned(
+        &body.topic,
+        body.partition,
+        &frame,
+        body.offset,
+        identity.as_ref().expect("replica receipt registered"),
+    )?;
     state
         .broker
         .wait_committed(&body.topic, body.partition, body.offset)
@@ -1833,12 +1927,32 @@ pub async fn internal_replicate(
     if header.idempotency_key.is_some() {
         preserve_replica_keys(
             &state.broker,
-            body.topic.clone(),
             body.partition,
-            body.offset,
-            body.offset.saturating_add(1),
+            vec![(body.offset, header)],
+            validate.clone(),
+            identity.take(),
         )
         .await?;
+    }
+    if let Some(cluster) = &state.cluster {
+        let stream = cluster.replication.progress_stream(&body.topic);
+        cluster
+            .replication
+            .follower_fence()
+            .record_ack_checked(
+                &stream,
+                body.partition,
+                body.leader_generation,
+                body.offset.saturating_add(1),
+                || validate().map_err(|error| error.to_string()),
+            )
+            .map_err(|error| {
+                ApiError::Unavailable(format!("could not persist replica fence: {error}"))
+            })?;
+    }
+    validate().map_err(|error| ApiError::Unavailable(error.to_string()))?;
+    if let Some(identity) = identity {
+        identity.mark_durable();
     }
     Ok(StatusCode::OK)
 }
@@ -1847,28 +1961,57 @@ pub async fn internal_replicate(
 /// retention may later collect the source frames while the key TTL is live.
 async fn preserve_replica_keys(
     broker: &broker_partition::Broker,
-    topic: String,
     partition: u32,
-    from: u64,
-    end: u64,
+    headers: Vec<(u64, broker_proto::LogRecord)>,
+    validate: broker_storage::MetadataValidator,
+    identity: Option<broker_partition::PendingIdentity>,
 ) -> Result<(), ApiError> {
     let owned = broker.clone();
     broker
         .spawn_owned(async move {
-            let mut next = from;
-            while next < end {
-                let broker = owned.clone();
-                let topic = topic.clone();
-                next = broker_partition::run_blocking_io(move || {
-                    broker.recover_dedup_page(&topic, partition, next, end)
-                })
-                .await
-                .map_err(|error| ApiError::Unavailable(error.to_string()))??;
+            broker_partition::run_blocking_io(move || {
+                owned.persist_replica_keys(partition, headers, validate)
+            })
+            .await
+            .map_err(|error| ApiError::Unavailable(error.to_string()))??;
+            if let Some(identity) = &identity {
+                identity.mark_durable();
             }
             Ok::<_, ApiError>(())
         })?
         .await
         .map_err(|error| ApiError::Unavailable(error.to_string()))?
+}
+
+fn replica_metadata_validator(
+    state: &AppState,
+    partition: u32,
+    generation: u64,
+    leader: Option<Uuid>,
+) -> Result<broker_storage::MetadataValidator, ApiError> {
+    let local = state.broker.log_metadata_validator(partition)?;
+    let runtime = state
+        .cluster
+        .as_ref()
+        .map(|cluster| cluster.runtime.clone());
+    let incarnation = runtime
+        .as_ref()
+        .map(|runtime| runtime.shard_incarnation(partition));
+    Ok(Arc::new(move || {
+        local()?;
+        if let Some(runtime) = &runtime {
+            if runtime.shard_generation(partition) != generation
+                || Some(runtime.shard_incarnation(partition)) != incarnation
+                || leader
+                    .is_some_and(|leader| runtime.elect_leader_for_shard(partition) != Some(leader))
+            {
+                return Err(broker_storage::IndexError::Validation(
+                    "replica ownership changed".into(),
+                ));
+            }
+        }
+        Ok(())
+    }))
 }
 
 fn validate_replication_epoch(
@@ -1954,8 +2097,14 @@ pub async fn internal_replicate_batch(
     // An empty epoch topic denotes a V2 physical-shard epoch containing several
     // logical topics; each validated frame then carries its authoritative topic.
     let mut frame_topics = Vec::with_capacity(body.frames.len());
-    let mut has_keys = false;
-    for frame in &body.frames {
+    let mut key_headers = Vec::new();
+    let validate = replica_metadata_validator(
+        &state,
+        body.partition,
+        body.leader_epoch,
+        Some(body.leader_id),
+    )?;
+    for (index, frame) in body.frames.iter().enumerate() {
         let (header, _) = broker_proto::decode_frame(std::io::Cursor::new(frame))
             .map_err(|e| ApiError::BadRequest(format!("invalid frame: {e}")))?;
         if !body.topic.is_empty() && header.topic != body.topic {
@@ -1968,8 +2117,10 @@ pub async fn internal_replicate_batch(
                 "replicate frame tenant does not match epoch tenant".into(),
             ));
         }
-        has_keys |= header.idempotency_key.is_some();
-        frame_topics.push(header.topic);
+        frame_topics.push(header.topic.clone());
+        if header.idempotency_key.is_some() {
+            key_headers.push((body.first_offset + index as u64, header));
+        }
     }
 
     let node_id = state
@@ -1978,6 +2129,11 @@ pub async fn internal_replicate_batch(
         .map(|cluster| cluster.runtime.config().node_id)
         .ok_or_else(|| ApiError::BadRequest("cluster mode not enabled".into()))?;
     let commit_topic = frame_topics.first().cloned().unwrap_or_default();
+    let mut identity = Some(
+        state
+            .broker
+            .pending_replica_identity(body.partition, body.first_offset)?,
+    );
     // Concurrent leader pushes can arrive out of order. Give an earlier epoch a
     // moment to land before rejecting this one as a gap.
     let deadline = std::time::Instant::now() + REORDER_WAIT;
@@ -1993,10 +2149,13 @@ pub async fn internal_replicate_batch(
     for (i, (frame, topic)) in body.frames.iter().zip(&frame_topics).enumerate() {
         let offset = body.first_offset + i as u64;
         last_offset = offset;
-        match state
-            .broker
-            .append_replicated_frame(topic, body.partition, frame, Some(offset))
-        {
+        match state.broker.append_replicated_frame_pinned(
+            topic,
+            body.partition,
+            frame,
+            offset,
+            identity.as_ref().expect("replica receipt registered"),
+        ) {
             Ok(_) => {}
             Err(broker_partition::BrokerError::Storage(
                 broker_storage::LogError::OffsetMismatch { have, want },
@@ -2021,29 +2180,34 @@ pub async fn internal_replicate_batch(
         .broker
         .wait_committed(&commit_topic, body.partition, last_offset)
         .await?;
-    if has_keys {
+    if !key_headers.is_empty() {
         preserve_replica_keys(
             &state.broker,
-            commit_topic,
             body.partition,
-            body.first_offset,
-            last_offset.saturating_add(1),
+            key_headers,
+            validate.clone(),
+            identity.take(),
         )
         .await?;
     }
     if let Some(cluster) = &state.cluster {
         validate_replication_epoch(&cluster.runtime, &body)?;
         let stream = cluster.replication.progress_stream(&body.topic);
-        if let Err(error) = cluster.replication.follower_fence().record_ack(
+        if let Err(error) = cluster.replication.follower_fence().record_ack_checked(
             &stream,
             body.partition,
             body.leader_epoch,
-            durable_hwm,
+            body.end_offset()
+                .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+            || validate().map_err(|error| error.to_string()),
         ) {
             return Err(ApiError::Unavailable(format!(
                 "could not persist replica fence: {error}"
             )));
         }
+    }
+    if let Some(identity) = identity {
+        identity.mark_durable();
     }
     Ok(Json(ReplicateBatchAck {
         node_id,
@@ -2084,27 +2248,39 @@ pub async fn internal_replicate_truncate(
     )?;
     let local_end = state.broker.committed_hwm(&body.topic, body.partition)?;
     let stream = cluster.replication.progress_stream(&body.topic);
-    cluster
+    let log_end = match cluster
         .replication
         .follower_fence()
-        .check_truncate(
+        .with_truncate(
             &stream,
             body.partition,
             body.leader_epoch,
             body.to_offset,
             local_end,
+            || {
+                validate_leader_epoch(
+                    &cluster.runtime,
+                    body.partition,
+                    body.leader_id,
+                    body.leader_epoch,
+                )?;
+                state
+                    .broker
+                    .truncate_replica_log(
+                        &body.topic,
+                        body.partition,
+                        body.to_offset,
+                        body.leader_epoch,
+                    )
+                    .map_err(ApiError::from)
+            },
         )
-        .map_err(ApiError::Conflict)?;
-    let log_end = match state.broker.truncate_replica_log(
-        &body.topic,
-        body.partition,
-        body.to_offset,
-        body.leader_epoch,
-    ) {
+        .map_err(ApiError::Conflict)?
+    {
         Ok(end) => end,
-        Err(broker_partition::BrokerError::Storage(
+        Err(ApiError::Broker(broker_partition::BrokerError::Storage(
             broker_storage::LogError::TruncateUnsupported(reason),
-        )) => {
+        ))) => {
             tracing::error!(
                 partition = body.partition,
                 topic = %body.topic,
@@ -2114,7 +2290,7 @@ pub async fn internal_replicate_truncate(
             );
             return Ok((StatusCode::NOT_IMPLEMENTED, reason).into_response());
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(error),
     };
     Ok(Json(ReplicateTruncateResponse {
         node_id: cluster.runtime.config().node_id,

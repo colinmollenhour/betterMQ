@@ -42,6 +42,9 @@ impl BrokerLogSource {
 }
 
 impl broker_replication::ReplicaLogSource for BrokerLogSource {
+    fn shards(&self) -> Vec<u32> {
+        (0..self.broker.layout().shard_count).collect()
+    }
     fn tenant(&self) -> String {
         self.broker.tenant()
     }
@@ -74,7 +77,7 @@ impl broker_replication::ReplicaLogSource for BrokerLogSource {
         max: usize,
     ) -> Result<Vec<(u64, Vec<u8>)>, String> {
         self.broker
-            .replication_frames(stream, shard, from, max)
+            .namespace_replication_frames(stream, shard, from, max, 8 * 1024 * 1024)
             .map_err(|error| error.to_string())
     }
 }

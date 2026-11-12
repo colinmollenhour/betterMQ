@@ -431,6 +431,7 @@ async fn catch_up_shard(
             });
         }
         if page.base_offset > local_leo {
+            state.broker.check_gc_identity_coverage(&state.broker.log_id(&topic, shard), page.base_offset).map_err(|error| CatchUpError::Retryable(format!("{topic}/{shard}: collected-prefix identity coverage is unknown; refusing to skip producer keys: {error}")))?;
             // The source already collected everything this node is missing
             // below its base (all of it delivered under a committed GC
             // watermark). Everything held locally is below that base, so
@@ -520,7 +521,7 @@ fn ensure_recovery_owner(
     shard: u32,
     generation: u64,
 ) -> Result<(), CatchUpError> {
-    if !cluster.runtime.is_recovery_leader_for_shard(shard)
+    if !cluster.runtime.is_elected_leader_for_shard(shard)
         || cluster.runtime.shard_generation(shard) != generation
     {
         return Err(CatchUpError::Retryable(format!(
@@ -675,7 +676,7 @@ pub fn spawn_cluster_health_monitor(
         // placement commits below can never delay liveness observations.
         let _health = AbortOnDrop(tokio::spawn(peer_health_loop(runtime.clone(), client)));
 
-        let mut prev_leaders: HashMap<u32, Uuid> = HashMap::new();
+        let mut prev_leaders: HashMap<u32, (Uuid, u64)> = HashMap::new();
         let mut repair_ticks = 0u64;
         let mut prev_peer_alive: HashMap<Uuid, bool> = HashMap::new();
         let mut interval = tokio::time::interval(HEALTH_INTERVAL);
@@ -733,15 +734,18 @@ pub fn spawn_cluster_health_monitor(
                     Some(id) => id,
                     None => continue,
                 };
-                let was = prev_leaders.insert(shard, leader);
+                let generation = runtime.shard_generation(shard);
+                let was = prev_leaders.insert(shard, (leader, generation));
                 if leader == node_id {
                     led_shards.push(shard);
                 }
-                if leader == node_id && was != Some(node_id) {
+                if leader == node_id && was != Some((node_id, generation)) {
                     runtime.set_shard_ready(shard, false);
                     gained_shards.push(shard);
                 }
-                if was == Some(node_id) && leader != node_id {
+                if was.is_some_and(|(id, old_generation)| {
+                    id == node_id && (leader != node_id || old_generation != generation)
+                }) {
                     lost_shards.push(shard);
                 }
             }
@@ -759,10 +763,15 @@ pub fn spawn_cluster_health_monitor(
                 // Quorum-gated cells: no dispatch on a taken-over shard until its
                 // tail is re-verified on minISR and cursors are reconciled.
                 let gated = state.broker.quorum_gating();
-                if gated {
-                    for shard in &gained_shards {
-                        dispatch.fence_partition(*shard);
-                    }
+                let mut recovery_epochs = HashMap::new();
+                for shard in &gained_shards {
+                    let epoch = if gated {
+                        dispatch.fence_partition(*shard)
+                    } else {
+                        Uuid::new_v4()
+                    };
+                    runtime.begin_shard_recovery(*shard, epoch, runtime.shard_generation(*shard));
+                    recovery_epochs.insert(*shard, epoch);
                 }
                 sync_catalog_from_peers(&state).await;
                 let mut caught_up = Vec::new();
@@ -791,13 +800,25 @@ pub fn spawn_cluster_health_monitor(
                             if gated {
                                 dispatch.set_recovery_targets(
                                     shard,
+                                    recovery_epochs[&shard],
                                     crate::quorum_repair::recovery_targets(&state, shard),
+                                );
+                                runtime.mark_shard_verifying(
+                                    shard,
+                                    recovery_epochs[&shard],
+                                    generation,
                                 );
                             }
                             // Recovery can prove the prefix under elected/lease
                             // ownership while ingest remains fenced.
                             if !gated {
-                                runtime.set_shard_ready(shard, true);
+                                let epoch = recovery_epochs[&shard];
+                                if !runtime.mark_shard_verifying(shard, epoch, generation)
+                                    || !runtime.finish_shard_recovery(shard, epoch, generation)
+                                {
+                                    prev_leaders.remove(&shard);
+                                    continue;
+                                }
                             }
                             caught_up.push(shard);
                         }

@@ -533,6 +533,7 @@ dependencies = [
  "broker-proto",
  "broker-storage",
  "chrono",
+ "crc32fast",
  "object_store",
  "parking_lot",
  "serde",

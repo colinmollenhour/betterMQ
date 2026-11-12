@@ -181,7 +181,7 @@ jobs:
 
       - name: replicated HTTP ingest and SIGKILL failover gate
         timeout-minutes: 10
-        run: cargo test -p broker-server --test replicated_http -- --ignored --nocapture
+        run: cargo test -p broker-server --test replicated_http -- --ignored --nocapture --test-threads=1
 
       - name: ingest microbenches (smoke)
         run: cargo bench -p broker-proto --bench encode -- --sample-size 10

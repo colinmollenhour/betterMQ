@@ -190,6 +190,7 @@ mod tests {
 
     fn progress(peer: Uuid, topic: &str, in_sync: bool, lag: u64) -> ReplicaProgress {
         ReplicaProgress {
+            fence: Default::default(),
             peer_id: peer,
             topic: topic.into(),
             partition: 3,

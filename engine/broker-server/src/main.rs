@@ -628,6 +628,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     };
 
     let mut broker_cfg = BrokerConfig::new(settings.data_dir.clone());
+    broker_cfg.local_replica_identities = settings.cluster_enabled;
     broker_cfg.storage = match settings.storage {
         broker_config::StorageMode::Local => StorageMode::Local,
         broker_config::StorageMode::Slate => StorageMode::Slate,
@@ -671,7 +672,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         broker.enable_quorum_gating();
     }
     if let Some(ref c) = cluster {
-        if broker.quorum_gating() {
+        if c.runtime.config().node_count() > 1 || storage == StorageMode::Slate {
             for shard in 0..broker.shard_count() {
                 c.runtime.set_shard_ready(shard, false);
             }
@@ -699,9 +700,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             );
         }
         let cluster = c.clone();
-        broker.set_shard_leader_check(Arc::new(move |p| {
+        broker.set_shard_authority_check(Arc::new(move |p| {
             if cluster.catalog_ready() && cluster.runtime.is_leader_for_shard(p) {
-                Some(cluster.runtime.shard_generation(p))
+                Some((
+                    cluster.runtime.shard_generation(p),
+                    cluster.runtime.shard_incarnation(p),
+                ))
             } else {
                 None
             }

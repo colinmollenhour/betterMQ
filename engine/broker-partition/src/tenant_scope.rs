@@ -25,6 +25,10 @@ where
     REQUEST_TENANT.scope(tenant_id, fut).await
 }
 
+pub(crate) fn with_tenant<R>(tenant_id: &str, operation: impl FnOnce() -> R) -> R {
+    REQUEST_TENANT.sync_scope(tenant_id.to_owned(), operation)
+}
+
 /// Capture request identity before a future is handed to another task/thread.
 /// `sync_scope` restores the blocking thread's previous value on return/panic.
 pub(crate) fn inherit_request_tenant<R: Send + 'static>(

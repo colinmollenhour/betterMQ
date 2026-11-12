@@ -14,6 +14,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod group_commit;
+mod reverse_index;
 pub use group_commit::MetadataWriteReceipt;
 use group_commit::MetadataWriter;
 
@@ -33,18 +34,61 @@ pub enum IndexError {
     Json(#[from] serde_json::Error),
     #[error("metadata outcome uncertain: {0}")]
     Uncertain(String),
+    #[error("dedup identity changed before conditional commit")]
+    DedupConflict,
+    #[error("metadata ownership validation failed: {0}")]
+    Validation(String),
     #[cfg(feature = "slate")]
     #[error("slate index error: {0}")]
     Slate(#[from] SlateIndexError),
 }
 
-#[derive(Debug, Default)]
+pub type MetadataValidator = std::sync::Arc<dyn Fn() -> Result<(), IndexError> + Send + Sync>;
+
+impl IndexError {
+    pub fn is_dedup_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::DedupConflict | Self::Shared(SharedIndexError::DedupConflict)
+        )
+    }
+    pub fn is_conditional_failure(&self) -> bool {
+        self.is_dedup_conflict()
+            || matches!(
+                self,
+                Self::Validation(_) | Self::Shared(SharedIndexError::Validation(_))
+            )
+    }
+}
+
+#[derive(Default)]
 pub struct MetadataWriteBatch {
     operations: Vec<MetadataOperation>,
+    validators: Vec<MetadataValidator>,
+}
+
+impl std::fmt::Debug for MetadataWriteBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataWriteBatch")
+            .field("operations", &self.operations)
+            .field("validators", &self.validators.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum MetadataOperation {
+    DeleteDedupIf {
+        tenant_id: String,
+        key: String,
+        expected: DedupEntry,
+    },
+    ComparePutDedup {
+        tenant_id: String,
+        key: String,
+        entry: DedupEntry,
+        expected: Option<Uuid>,
+    },
     PutDedup {
         tenant_id: String,
         key: String,
@@ -72,6 +116,36 @@ pub(crate) enum MetadataOperation {
 }
 
 impl MetadataWriteBatch {
+    pub fn validate_with(&mut self, validator: MetadataValidator) {
+        self.validators.push(validator);
+    }
+
+    pub fn compare_put_dedup(
+        &mut self,
+        tenant_id: impl Into<String>,
+        key: impl Into<String>,
+        entry: DedupEntry,
+        expected: Option<Uuid>,
+    ) {
+        self.operations.push(MetadataOperation::ComparePutDedup {
+            tenant_id: tenant_id.into(),
+            key: key.into(),
+            entry,
+            expected,
+        });
+    }
+    pub fn delete_dedup_if(
+        &mut self,
+        tenant_id: impl Into<String>,
+        key: impl Into<String>,
+        expected: DedupEntry,
+    ) {
+        self.operations.push(MetadataOperation::DeleteDedupIf {
+            tenant_id: tenant_id.into(),
+            key: key.into(),
+            expected,
+        });
+    }
     fn estimated_bytes(&self) -> usize {
         self.operations.iter().fold(0usize, |bytes, operation| {
             let strings = match operation {
@@ -79,11 +153,18 @@ impl MetadataWriteBatch {
                     tenant_id,
                     key,
                     entry,
+                }
+                | MetadataOperation::ComparePutDedup {
+                    tenant_id,
+                    key,
+                    entry,
+                    ..
                 } => tenant_id
                     .len()
                     .saturating_add(key.len())
                     .saturating_add(entry.topic.len()),
-                MetadataOperation::DeleteDedup { tenant_id, key } => {
+                MetadataOperation::DeleteDedup { tenant_id, key }
+                | MetadataOperation::DeleteDedupIf { tenant_id, key, .. } => {
                     tenant_id.len().saturating_add(key.len())
                 }
                 MetadataOperation::SetDispatchOffset {
@@ -195,6 +276,19 @@ pub struct DedupEntry {
     pub inserted_at_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DedupRecord {
+    pub tenant_id: String,
+    pub key: String,
+    pub entry: DedupEntry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DedupPage {
+    pub records: Vec<DedupRecord>,
+    pub next: Option<(String, String)>,
+}
+
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -225,6 +319,12 @@ pub(crate) fn dedup_retention_ms() -> Result<u64, IndexError> {
 }
 
 impl DedupEntry {
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.message_id == other.message_id
+            && self.offset == other.offset
+            && self.partition == other.partition
+            && self.topic == other.topic
+    }
     pub fn new(message_id: Uuid, offset: u64, partition: u32, topic: String) -> Self {
         Self {
             message_id,
@@ -280,6 +380,7 @@ struct RocksControl {
     sweep_cursor: Mutex<Vec<u8>>,
     operations: AtomicU64,
     migration_ms: u64,
+    reverse_ready: std::sync::atomic::AtomicBool,
 }
 
 enum MetaBackend {
@@ -330,6 +431,14 @@ impl MetadataStore {
                 });
             }
         }
+        Self::open_local(path)
+    }
+
+    /// Explicit node-local index, independent of a configured shared cursor
+    /// store. Replica WAL identities must never be invalidated by another
+    /// replica's divergent local tail.
+    pub fn open_local(path: impl AsRef<Path>) -> Result<Self, IndexError> {
+        let retention_ms = dedup_retention_ms()?;
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
         let mut opts = Options::default();
@@ -365,6 +474,7 @@ impl MetadataStore {
             sweep_cursor: Mutex::new(Vec::new()),
             operations: AtomicU64::new(0),
             migration_ms,
+            reverse_ready: std::sync::atomic::AtomicBool::new(false),
         });
         let direct = Self {
             backend: MetaBackend::Rocks {
@@ -385,6 +495,24 @@ impl MetadataStore {
             retention_ms,
             writer: Some(writer),
         })
+    }
+
+    pub fn is_shared(&self) -> bool {
+        matches!(self.backend, MetaBackend::Shared(_))
+    }
+
+    pub fn try_lock_producers(
+        &self,
+        tenant: &str,
+        keys: &[String],
+    ) -> Result<Option<crate::ProducerLocks>, IndexError> {
+        self.check_ready()?;
+        match &self.backend {
+            MetaBackend::Shared(store) => Ok(store.try_lock_producers(tenant, keys)?),
+            _ => Err(IndexError::Validation(
+                "global producer admission requires shared metadata".into(),
+            )),
+        }
     }
 
     /// Dedup + dispatch cursors on the same object store as Slate messages (HA M3).
@@ -490,23 +618,83 @@ impl MetadataStore {
                     .mutation
                     .lock()
                     .map_err(|_| std::io::Error::other("metadata mutation lock poisoned"))?;
+                for validate in &batch.validators {
+                    validate()?;
+                }
                 let mut rocks_batch = WriteBatch::default();
+                let mut dedup = std::collections::HashMap::<Vec<u8>, Option<DedupEntry>>::new();
                 let mut cursors = std::collections::HashMap::<Vec<u8>, u64>::new();
                 let mut completions = Vec::new();
                 for operation in batch.operations {
                     match operation {
+                        MetadataOperation::DeleteDedupIf {
+                            tenant_id,
+                            key,
+                            expected,
+                        } => {
+                            let key = Self::dedup_key(&tenant_id, &key);
+                            let current = match dedup.get(&key) {
+                                Some(entry) => entry.clone(),
+                                None => db
+                                    .get(&key)?
+                                    .map(|bytes| DedupEntry::decoded(&bytes, control.migration_ms))
+                                    .transpose()?,
+                            };
+                            if current
+                                .as_ref()
+                                .is_some_and(|entry| entry.same_identity(&expected))
+                            {
+                                rocks_batch.delete(&key);
+                                dedup.insert(key, None);
+                            }
+                        }
+                        MetadataOperation::ComparePutDedup {
+                            tenant_id,
+                            key,
+                            mut entry,
+                            expected,
+                        } => {
+                            let retention = dedup_retention_ms()?;
+                            let key = Self::dedup_key(&tenant_id, &key);
+                            let current = match dedup.get(&key) {
+                                Some(entry) => entry.clone(),
+                                None => db
+                                    .get(&key)?
+                                    .map(|bytes| DedupEntry::decoded(&bytes, control.migration_ms))
+                                    .transpose()?
+                                    .filter(|entry| !entry.expired(now_ms(), retention)),
+                            };
+                            if current
+                                .as_ref()
+                                .is_some_and(|current| current.same_identity(&entry))
+                            {
+                                continue;
+                            }
+                            if current.as_ref().map(|entry| entry.message_id) != expected {
+                                return Err(IndexError::DedupConflict);
+                            }
+                            if entry.inserted_at_ms == 0 {
+                                entry.inserted_at_ms = now_ms();
+                            }
+                            rocks_batch.put(&key, entry.encoded()?);
+                            dedup.insert(key, Some(entry));
+                        }
                         MetadataOperation::PutDedup {
                             tenant_id,
                             key,
                             mut entry,
-                        } => rocks_batch.put(Self::dedup_key(&tenant_id, &key), {
+                        } => {
                             if entry.inserted_at_ms == 0 {
                                 entry.inserted_at_ms = now_ms();
                             }
-                            entry.encoded()?
-                        }),
+                            let key = Self::dedup_key(&tenant_id, &key);
+                            rocks_batch.put(&key, entry.encoded()?);
+                            dedup.insert(key, Some(entry));
+                        }
                         MetadataOperation::DeleteDedup { tenant_id, key } => {
-                            rocks_batch.delete(Self::dedup_key(&tenant_id, &key))
+                            let key = Self::dedup_key(&tenant_id, &key);
+                            rocks_batch.delete(&key);
+                            dedup.insert(key, None);
                         }
                         MetadataOperation::SetDispatchOffset {
                             tenant_id,
@@ -589,19 +777,65 @@ impl MetadataStore {
                         }
                     }
                 }
+                // Derived UUID lookups share primary writer ordering. A lazy
+                // initial build must not miss keys inserted afterwards.
+                if control.reverse_ready.load(Ordering::Acquire) {
+                    for (key, entry) in &dedup {
+                        if let Some(value) = db.get(key)? {
+                            let old = DedupEntry::decoded(&value, control.migration_ms)?;
+                            rocks_batch.delete(Self::reverse_key(old.message_id, key));
+                        }
+                        if let Some(entry) = entry {
+                            rocks_batch.put(Self::reverse_key(entry.message_id, key), []);
+                        }
+                    }
+                }
                 db.write_opt(rocks_batch, sync_writes)?;
                 self.sweep_rocks(db, sync_writes, control, logical_requests)
                     .map_err(|error| IndexError::Uncertain(error.to_string()))?;
                 Ok(())
             }
             MetaBackend::Shared(store) => {
-                store.apply_batch(batch.operations)?;
+                store.apply_batch_validated(batch.operations, batch.validators)?;
                 Ok(())
             }
             #[cfg(feature = "slate")]
             MetaBackend::Slate(_) => {
+                for validate in &batch.validators {
+                    validate()?;
+                }
                 for operation in batch.operations {
                     match operation {
+                        MetadataOperation::DeleteDedupIf {
+                            tenant_id,
+                            key,
+                            expected,
+                        } => {
+                            if self
+                                .get_dedup(&tenant_id, &key)?
+                                .is_some_and(|entry| entry.same_identity(&expected))
+                            {
+                                self.delete_dedup(&tenant_id, &key)?;
+                            }
+                        }
+                        MetadataOperation::ComparePutDedup {
+                            tenant_id,
+                            key,
+                            entry,
+                            expected,
+                        } => {
+                            let current = self.get_dedup(&tenant_id, &key)?;
+                            if current
+                                .as_ref()
+                                .is_some_and(|current| current.same_identity(&entry))
+                            {
+                                continue;
+                            }
+                            if current.as_ref().map(|entry| entry.message_id) != expected {
+                                return Err(IndexError::DedupConflict);
+                            }
+                            self.put_dedup(&tenant_id, &key, &entry)?;
+                        }
                         MetadataOperation::PutDedup {
                             tenant_id,
                             key,
@@ -646,6 +880,65 @@ impl MetadataStore {
         format!("dedup:{tenant_id}:{idempotency_key}").into_bytes()
     }
 
+    /// Bounded ordered scan of the authoritative TTL index, including keys
+    /// whose WAL frames have already been collected. Cursor counts scanned
+    /// rows, so expired entries cannot create a nonadvancing empty page.
+    pub fn dedup_page(&self, after: Option<(String, String)>) -> Result<DedupPage, IndexError> {
+        self.check_ready()?;
+        match &self.backend {
+            MetaBackend::Shared(store) => Ok(store.dedup_page(after)?),
+            #[cfg(feature = "slate")]
+            MetaBackend::Slate(_) => Err(IndexError::Validation(
+                "local-WAL dedup export is not supported by Slate".into(),
+            )),
+            MetaBackend::Rocks { db, control, .. } => {
+                let start = after
+                    .as_ref()
+                    .map(|(tenant, key)| Self::dedup_key(tenant, key))
+                    .unwrap_or_else(|| b"dedup:".to_vec());
+                let mut records = Vec::new();
+                let mut count = 0usize;
+                let mut bytes = 0usize;
+                for row in db.iterator(rocksdb::IteratorMode::From(
+                    &start,
+                    rocksdb::Direction::Forward,
+                )) {
+                    let (key, value) = row?;
+                    if !key.starts_with(b"dedup:") {
+                        break;
+                    }
+                    if after.is_some() && key.as_ref() <= start.as_slice() {
+                        continue;
+                    }
+                    let key_text = std::str::from_utf8(&key[6..]).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    })?;
+                    let (tenant, producer_key) = key_text.split_once(':').ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed dedup key")
+                    })?;
+                    let next = Some((tenant.to_owned(), producer_key.to_owned()));
+                    count += 1;
+                    bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
+                    let entry = DedupEntry::decoded(&value, control.migration_ms)?;
+                    if !entry.expired(now_ms(), self.retention_ms) {
+                        records.push(DedupRecord {
+                            tenant_id: tenant.to_owned(),
+                            key: producer_key.to_owned(),
+                            entry,
+                        });
+                    }
+                    if count >= 256 || bytes >= 4 * 1024 * 1024 {
+                        return Ok(DedupPage { records, next });
+                    }
+                }
+                Ok(DedupPage {
+                    records,
+                    next: None,
+                })
+            }
+        }
+    }
+
     pub fn get_dedup(
         &self,
         tenant_id: &str,
@@ -687,7 +980,10 @@ impl MetadataStore {
                                     let current =
                                         DedupEntry::decoded(&bytes, control.migration_ms)?;
                                     if current.expired(now_ms(), self.retention_ms) {
-                                        db.delete_opt(key, sync_writes)?;
+                                        let mut batch = WriteBatch::default();
+                                        batch.delete(Self::reverse_key(current.message_id, &key));
+                                        batch.delete(key);
+                                        db.write_opt(batch, sync_writes)?;
                                         Ok(None)
                                     } else {
                                         Ok(Some(current))
@@ -702,6 +998,18 @@ impl MetadataStore {
                     None => Ok(None),
                 }
             }
+        }
+    }
+
+    pub fn confirmed_dedup(
+        &self,
+        tenant: &str,
+        key: &str,
+    ) -> Result<Option<DedupEntry>, IndexError> {
+        self.check_ready()?;
+        match &self.backend {
+            MetaBackend::Shared(store) => Ok(store.confirmed_dedup(tenant, key)?),
+            _ => self.get_dedup(tenant, key),
         }
     }
 
@@ -1189,6 +1497,7 @@ impl MetadataStore {
             }
             let entry = DedupEntry::decoded(&value, control.migration_ms)?;
             if entry.expired(now_ms(), self.retention_ms) {
+                batch.delete(Self::reverse_key(entry.message_id, &key));
                 batch.delete(&key);
             } else if value.len() == 36 {
                 batch.put(&key, entry.encoded()?);

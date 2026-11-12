@@ -73,15 +73,27 @@ async fn start_cluster(count: usize) -> Vec<Node> {
             .await
             .unwrap();
         let cluster = Cluster::new(runtime);
+        broker.enable_quorum_gating();
+        for shard in 0..broker.shard_count() {
+            cluster.runtime.set_shard_ready(shard, false);
+        }
+        cluster
+            .attach_local_log(broker.clone(), dir.path())
+            .unwrap();
         let rt = cluster.runtime.clone();
-        broker.set_shard_leader_check(Arc::new(move |p| {
-            rt.is_leader_for_shard(p).then(|| rt.shard_generation(p))
+        broker.set_shard_authority_check(Arc::new(move |p| {
+            rt.is_leader_for_shard(p)
+                .then(|| (rt.shard_generation(p), rt.shard_incarnation(p)))
         }));
         let rt = cluster.runtime.clone();
         let leases = LeaseTable::new();
-        let dispatch = DispatchEngine::new(broker.clone(), DispatchConfig::default())
-            .with_leases(leases.clone())
-            .with_shard_leader_check(Arc::new(move |p| rt.is_leader_for_shard(p)));
+        let dispatch = DispatchEngine::new_with_controls(
+            broker.clone(),
+            DispatchConfig::default(),
+            true,
+            Some(leases.clone()),
+            Some(Arc::new(move |p| rt.is_leader_for_shard(p))),
+        );
         let state = Arc::new(AppState {
             schedule: ScheduleQueue::open(dir.path()).unwrap(),
             crons: CronRegistry::open(dir.path()).unwrap(),
@@ -99,14 +111,20 @@ async fn start_cluster(count: usize) -> Vec<Node> {
             #[cfg(feature = "cloud")]
             control_plane: None,
         });
+        state
+            .dispatch
+            .set_dlq_durability(Arc::new(broker_api::ClusterDlqDurability::new(&state)));
         let app = broker_api::router((*state).clone());
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
+        let repair = crate::quorum_repair::spawn_quorum_repair(cluster.clone(), state.clone());
+        let checkpoints =
+            crate::quorum_repair::spawn_cursor_checkpoints(cluster.clone(), state.clone());
         let monitor = spawn_cluster_health_monitor(cluster, dispatch, state.clone());
         started.push(Node {
             state,
-            tasks: vec![server, monitor],
+            tasks: vec![server, monitor, repair, checkpoints],
             _dir: dir,
         });
     }
@@ -207,7 +225,7 @@ async fn publish_on(node: &Node, hook: &MockServer, payload: &str) -> PublishRes
     };
     let response = broker_api::publish_with_cluster(&node.state, request, None)
         .await
-        .expect("quorum-acknowledged publish");
+        .unwrap_or_else(|error| panic!("quorum-acknowledged publish {payload}: {error:?}"));
     broker_api::enqueue_dispatch_after_publish(&node.state, &response);
     response
 }

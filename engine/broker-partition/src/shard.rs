@@ -41,6 +41,7 @@ enum ShardCommand {
         offset: u64,
         max: usize,
         keep_payload: bool,
+        include_purged: bool,
         reply: Reply<Vec<StoredMessage>>,
     },
     ReadRangeAsync {
@@ -249,6 +250,7 @@ impl ShardHandle {
             offset,
             max,
             keep_payload: true,
+            include_purged: false,
             reply,
         })
     }
@@ -264,12 +266,29 @@ impl ShardHandle {
             offset,
             max,
             keep_payload: false,
+            include_purged: false,
             reply,
         })
     }
 
     pub fn high_watermark(&self) -> Result<u64, LogError> {
         self.call(|reply| ShardCommand::HighWatermark { reply })
+    }
+
+    pub fn read_raw_metadata(
+        &self,
+        partition: u32,
+        offset: u64,
+        max: usize,
+    ) -> Result<Vec<StoredMessage>, LogError> {
+        self.call(|reply| ShardCommand::ReadRange {
+            partition,
+            offset,
+            max,
+            keep_payload: false,
+            include_purged: true,
+            reply,
+        })
     }
 
     /// Await the shard I/O actor without parking an async worker or allocating
@@ -504,9 +523,12 @@ fn process_non_commit(
             offset,
             max,
             keep_payload,
+            include_purged,
             reply,
         } => {
-            let result = if keep_payload {
+            let result = if include_purged {
+                backend.read_raw_metadata(partition, offset, max)
+            } else if keep_payload {
                 backend.read_range(partition, offset, max)
             } else {
                 backend.read_range_metadata(partition, offset, max)
@@ -682,6 +704,7 @@ mod tests {
             http_headers_json: None,
             http_sign: None,
             payload_ref_json: None,
+            dedup_inserted_at_ms: None,
         }
     }
 

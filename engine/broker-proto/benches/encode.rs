@@ -27,6 +27,7 @@ fn sample() -> LogRecord {
         http_headers_json: None,
         http_sign: None,
         payload_ref_json: None,
+        dedup_inserted_at_ms: None,
     }
 }
 

@@ -156,6 +156,19 @@ impl PartitionBackend {
         }
     }
 
+    pub fn read_raw_metadata(
+        &self,
+        partition: u32,
+        offset: u64,
+        max: usize,
+    ) -> Result<Vec<StoredMessage>, LogError> {
+        match self {
+            Self::Local(log) => log.read_raw_metadata(partition, offset, max),
+            #[cfg(feature = "slate")]
+            Self::Slate(_) => self.read_range_metadata(partition, offset, max),
+        }
+    }
+
     pub fn is_dirty(&self) -> bool {
         match self {
             Self::Local(log) => log.is_dirty(),

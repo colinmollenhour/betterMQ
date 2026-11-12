@@ -244,6 +244,9 @@ impl ApiError {
                 ("invalid_request", false, None)
             }
             Self::Broker(BrokerError::NotShardLeader(_)) => ("not_shard_leader", true, None),
+            Self::Broker(BrokerError::Index(error)) if error.is_conditional_failure() => {
+                ("ownership_changed", true, Some(100))
+            }
             Self::Broker(BrokerError::DedupQuorumPending(_)) => ("quorum_pending", true, Some(100)),
             Self::Broker(_) => ("internal_error", true, None),
         };
@@ -385,6 +388,11 @@ impl IntoResponse for ApiError {
                 })),
             )
                 .into_response(),
+            ApiError::Broker(BrokerError::Index(error)) if error.is_conditional_failure() => {
+                let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":"ownership_changed", "code":"ownership_changed", "retryable":true, "message":error.to_string()}))).into_response();
+                response.headers_mut().insert("retry-after", axum::http::HeaderValue::from_static("1"));
+                response
+            }
             ApiError::Broker(BrokerError::DedupQuorumPending(key)) => {
                 let mut response = (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
                     "error": "quorum_pending", "code": "quorum_pending", "retryable": true,

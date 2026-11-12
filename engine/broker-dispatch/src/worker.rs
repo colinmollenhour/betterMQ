@@ -206,6 +206,18 @@ pub enum LeasedFailure {
 type ShardLeaderFn = Arc<dyn Fn(u32) -> bool + Send + Sync>;
 /// `(topic, committed watermark at takeover)` logs to verify before unfencing.
 type RecoveryTargets = Vec<(String, u64)>;
+
+#[derive(Clone)]
+struct Recovery {
+    epoch: Uuid,
+    targets: Option<RecoveryTargets>,
+}
+
+pub struct PartitionRecoveryTarget {
+    pub partition: u32,
+    pub epoch: Uuid,
+    pub logs: Vec<(String, u64)>,
+}
 type InFlightSet =
     Arc<parking_lot::Mutex<HashMap<(String, u32, u64), tokio::sync::OwnedSemaphorePermit>>>;
 
@@ -350,7 +362,7 @@ pub struct DispatchState {
     /// Partitions taken over but not yet verified: dispatch is fenced until
     /// each `(topic, target)` log is quorum-verified up to `target` (`None`
     /// while the local log is still being caught up).
-    recovering: Arc<parking_lot::Mutex<HashMap<u32, Option<RecoveryTargets>>>>,
+    recovering: Arc<parking_lot::Mutex<HashMap<u32, Recovery>>>,
     dlq_durability: Arc<std::sync::OnceLock<Arc<dyn DlqDurability>>>,
 }
 
@@ -409,7 +421,15 @@ impl DispatchEngine {
         let scan = crate::scan::DispatchScan::open(Some(&broker.config().data_dir));
         let recovering = if broker.quorum_gating() && is_shard_leader.is_some() {
             (0..broker.layout().shard_count)
-                .map(|partition| (partition, None))
+                .map(|partition| {
+                    (
+                        partition,
+                        Recovery {
+                            epoch: Uuid::new_v4(),
+                            targets: None,
+                        },
+                    )
+                })
                 .collect()
         } else {
             HashMap::new()
@@ -737,21 +757,42 @@ impl DispatchEngine {
     /// Stop dispatch for `partition` (this node is taking it over). It stays
     /// fenced until [`DispatchEngine::set_recovery_targets`] names the logs
     /// to verify and [`DispatchEngine::complete_recovery`] reconciles cursors.
-    pub fn fence_partition(&self, partition: u32) {
-        self.recovering.lock().entry(partition).or_insert(None);
+    pub fn fence_partition(&self, partition: u32) -> Uuid {
+        let epoch = Uuid::new_v4();
+        self.recovering.lock().insert(
+            partition,
+            Recovery {
+                epoch,
+                targets: None,
+            },
+        );
+        epoch
     }
 
     /// After catch-up: dispatch stays fenced until every `(topic, target)` log
     /// is quorum-verified up to `target` (its committed watermark now).
     /// Identity-less completion markers above the current quorum watermark
     /// stop counting from here on.
-    pub fn set_recovery_targets(&self, partition: u32, targets: Vec<(String, u64)>) {
+    pub fn set_recovery_targets(
+        &self,
+        partition: u32,
+        epoch: Uuid,
+        targets: Vec<(String, u64)>,
+    ) -> bool {
+        let mut recovering = self.recovering.lock();
+        let Some(recovery) = recovering
+            .get_mut(&partition)
+            .filter(|recovery| recovery.epoch == epoch)
+        else {
+            return false;
+        };
         for (topic, _) in &targets {
             if let Err(error) = self.broker.freeze_legacy_completion_trust(topic, partition) {
                 warn!(%error, %topic, partition, "freeze legacy completion trust failed");
             }
         }
-        self.recovering.lock().insert(partition, Some(targets));
+        recovery.targets = Some(targets);
+        true
     }
 
     pub fn is_fenced(&self, partition: u32) -> bool {
@@ -759,18 +800,23 @@ impl DispatchEngine {
     }
 
     /// Fenced partitions whose catch-up finished, with their targets.
-    pub fn recovery_targets(&self) -> Vec<(u32, Vec<(String, u64)>)> {
+    pub fn recovery_targets(&self) -> Vec<PartitionRecoveryTarget> {
         let mut out: Vec<_> = self
             .recovering
             .lock()
             .iter()
-            .filter_map(|(partition, targets)| {
-                targets
+            .filter_map(|(partition, recovery)| {
+                recovery
+                    .targets
                     .as_ref()
-                    .map(|targets| (*partition, targets.clone()))
+                    .map(|targets| PartitionRecoveryTarget {
+                        partition: *partition,
+                        epoch: recovery.epoch,
+                        logs: targets.clone(),
+                    })
             })
             .collect();
-        out.sort_by_key(|(partition, _)| *partition);
+        out.sort_by_key(|target| target.partition);
         out
     }
 
@@ -778,7 +824,11 @@ impl DispatchEngine {
     /// lane cursor of `partition` to the quorum watermark of its log (a cursor
     /// above it could skip an offset that now holds a different record),
     /// rescan, and lift the fence. Returns how many cursors were clamped.
-    pub fn complete_recovery(&self, partition: u32) -> Result<usize, DispatchError> {
+    pub fn complete_recovery(
+        &self,
+        partition: u32,
+        epoch: Uuid,
+    ) -> Result<Option<usize>, DispatchError> {
         let barrier = self
             .cursor_recovery
             .get(partition as usize)
@@ -788,8 +838,14 @@ impl DispatchEngine {
         let _rewind = barrier.try_write().map_err(|_| {
             DispatchError::Failed("cursor completions are still draining before recovery".into())
         })?;
-        let Some(Some(targets)) = self.recovering.lock().get(&partition).cloned() else {
-            return Ok(0);
+        let mut recovering = self.recovering.lock();
+        let Some(targets) = recovering
+            .get(&partition)
+            .filter(|recovery| recovery.epoch == epoch)
+            .and_then(|recovery| recovery.targets.as_ref())
+            .cloned()
+        else {
+            return Ok(None);
         };
         for (topic, target) in &targets {
             let quorum = self.broker.quorum_hwm(topic, partition)?;
@@ -810,12 +866,12 @@ impl DispatchEngine {
             }
         }
         self.scan.reset_partitions(&[partition]);
-        self.recovering.lock().remove(&partition);
+        recovering.remove(&partition);
         info!(
             partition,
             clamped, "dispatch recovery complete; partition unfenced"
         );
-        Ok(clamped)
+        Ok(Some(clamped))
     }
 
     /// Topic whose log a lane cursor counts offsets in.
@@ -2264,17 +2320,89 @@ impl DispatchEngine {
     ) -> Result<(), DispatchError> {
         let engine = self.clone();
         let owned = msg.clone();
-        let prepared = broker_partition::run_blocking_io(move || engine.prepare_dlq(owned, reason))
+        self.broker
+            .spawn_owned(async move { engine.move_to_dlq_owned(owned, reason).await })?
             .await
-            .map_err(|error| DispatchError::Failed(error.to_string()))??;
-        let Some((mut response, pending)) = prepared else {
-            return Ok(());
+            .map_err(|error| DispatchError::Failed(error.to_string()))?
+    }
+
+    /// Register ownership before native preparation can append. Dropping the
+    /// caller's waiter must not drop a successful append's reservation before
+    /// its durability and producer identity have settled.
+    async fn move_to_dlq_owned(
+        &self,
+        msg: StoredMessage,
+        reason: String,
+    ) -> Result<(), DispatchError> {
+        let topic = msg.topic.clone();
+        let id = msg.id;
+        let producer_key = format!(
+            "dlq:{}:{}:{}:{}",
+            msg.topic, msg.partition, msg.offset, msg.id
+        );
+        let producer_locks = if self.broker.shared_producer_admission() {
+            let locks = self
+                .broker
+                .lock_shared_producers(vec![producer_key.clone()])
+                .await?;
+            if self
+                .broker
+                .shared_committed_publish(&producer_key)
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+            if let Some(hint) = self
+                .broker
+                .legacy_shared_publish_hint(&producer_key)
+                .await?
+            {
+                let broker = self.broker.clone();
+                let key = producer_key.clone();
+                let verified = broker_partition::run_blocking_io(move || {
+                    broker.verify_legacy_shared_publish(&key, &hint)
+                })
+                .await
+                .map_err(|error| DispatchError::Failed(error.to_string()))??;
+                if let Some(entry) = verified {
+                    if self
+                        .broker
+                        .adopt_shared_publish(&producer_key, entry, locks.clone())
+                        .await?
+                        .is_some()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            locks
+        } else {
+            None
         };
+        let engine = self.clone();
+        let native_locks = producer_locks.clone();
+        let (mut response, pending) = broker_partition::run_blocking_io(move || {
+            let _native_locks = native_locks;
+            engine.prepare_dlq(msg, reason)
+        })
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))??;
         let durability = self.dlq_durability();
-        durability.make_durable(&mut response).await?;
-        // Publish the dedup mapping only after the DLQ record is quorum-durable.
-        self.broker.commit_publish_dedup_async(pending).await?;
-        debug!(queue = %msg.topic, message_id = %msg.id, "message moved to DLQ");
+        let result = durability.make_durable(&mut response).await;
+        // Keep a locally durable identity even if quorum is pending. It remains
+        // unacknowledgeable until verified, but a retry must not append another
+        // DLQ record for the same source message.
+        if let (Some(partition), Some(offset)) = (response.partition, response.offset) {
+            if self.broker.committed_hwm(&response.topic, partition)? > offset {
+                self.broker.commit_publish_dedup_async(pending).await?;
+            }
+        }
+        result?;
+        self.broker
+            .commit_shared_publish(&producer_key, &response, producer_locks)
+            .await?;
+        debug!(queue = %topic, message_id = %id, "message moved to DLQ");
         Ok(())
     }
 
@@ -2282,7 +2410,7 @@ impl DispatchEngine {
         &self,
         mut msg: StoredMessage,
         reason: String,
-    ) -> Result<Option<(PublishResponse, broker_partition::PendingDedup)>, DispatchError> {
+    ) -> Result<(PublishResponse, broker_partition::PendingDedup), DispatchError> {
         self.broker
             .hydrate_message_payload(&mut msg)
             .map_err(DispatchError::Broker)?;
@@ -2331,7 +2459,7 @@ impl DispatchEngine {
         if response.duplicate {
             if self.dlq_record_durable(&response)? {
                 warn!(queue = %msg.topic, message_id = %msg.id, "message already in DLQ");
-                return Ok(None);
+                return Ok((response, pending));
             }
             // Dedup hits are verified below the quorum watermark, so this is a
             // safety net: append again without the key (a duplicate DLQ record
@@ -2340,7 +2468,7 @@ impl DispatchEngine {
             again.idempotency_key = None;
             (response, pending) = self.broker.publish_to_shard(again, msg.partition)?;
         }
-        Ok(Some((response, pending)))
+        Ok((response, pending))
     }
 
     fn record_http_result(
@@ -2784,18 +2912,18 @@ mod tests {
         let tenant = broker.tenant();
         let lane = Uuid::new_v4().to_string();
         broker.set_dispatch_offset(&tenant, &lane, 0, 7).unwrap();
-        engine.fence_partition(0);
-        engine.set_recovery_targets(0, Vec::new());
+        let epoch = engine.fence_partition(0);
+        engine.set_recovery_targets(0, epoch, Vec::new());
         // This guard is carried through the same durable writer receipt as
         // precomputed completion batches, even if their caller is cancelled.
         let receipt = engine.cursor_recovery[0].clone().read_owned().await;
         let mut stale = broker_storage::MetadataWriteBatch::default();
         stale.set_dispatch_offset(&tenant, &lane, 0, 9);
-        assert!(engine.complete_recovery(0).is_err());
+        assert!(engine.complete_recovery(0, epoch).is_err());
         assert!(engine.is_fenced(0));
         broker.commit_metadata_batch(stale).unwrap();
         drop(receipt);
-        assert_eq!(engine.complete_recovery(0).unwrap(), 1);
+        assert_eq!(engine.complete_recovery(0, epoch).unwrap(), Some(1));
         assert_eq!(broker.dispatch_offset(&tenant, &lane, 0).unwrap(), 0);
         assert!(!engine.is_fenced(0));
         engine.shutdown_background().await;
@@ -3497,6 +3625,7 @@ mod tests {
             http_headers_json: headers,
             http_sign: Some(false),
             payload_ref_json: None,
+            dedup_inserted_at_ms: None,
         }
     }
 
@@ -3569,6 +3698,95 @@ mod tests {
         );
         assert_eq!(records[0].tenant_id, "tenant-a");
         engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_dlq_waiter_retains_the_native_append_and_key_until_owned_completion() {
+        struct GatedDurability {
+            broker: Broker,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            fail: bool,
+        }
+        impl DlqDurability for GatedDurability {
+            fn make_durable<'a>(
+                &'a self,
+                response: &'a mut PublishResponse,
+            ) -> futures_util::future::BoxFuture<'a, Result<(), DispatchError>> {
+                Box::pin(async move {
+                    self.broker
+                        .wait_committed(
+                            &response.topic,
+                            response.partition.unwrap(),
+                            response.offset.unwrap(),
+                        )
+                        .await?;
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    if self.fail {
+                        Err(DispatchError::Failed(
+                            "quorum temporarily unavailable".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        }
+        for fail in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let broker =
+                Broker::open(broker_partition::BrokerConfig::new(dir.path().into())).unwrap();
+            let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+            let durability = Arc::new(GatedDurability {
+                broker: broker.clone(),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                fail,
+            });
+            engine.set_dlq_durability(durability.clone());
+            let mut message = sample_message(b"body".to_vec(), None);
+            message.tenant_id = broker.tenant();
+            let caller_engine = engine.clone();
+            let caller_message = message.clone();
+            let caller = tokio::spawn(async move {
+                caller_engine.move_to_dlq(&caller_message, "rejected").await
+            });
+            tokio::time::timeout(Duration::from_secs(5), durability.entered.notified())
+                .await
+                .unwrap();
+            caller.abort();
+            let _ = caller.await;
+            assert!(
+                engine
+                    .prepare_dlq(message.clone(), "retry while owned".into())
+                    .is_err(),
+                "the original native append still owns its key"
+            );
+            durability.release.notify_one();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                broker.close_and_drain_owned_completions(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                engine
+                    .prepare_dlq(message.clone(), "retry after completion".into())
+                    .unwrap()
+                    .0
+                    .duplicate,
+                "even a quorum failure retains the locally durable original identity"
+            );
+            assert_eq!(
+                broker
+                    .list_topic_messages(&dlq_topic(&message.topic), 10)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            engine.shutdown_background().await;
+        }
     }
 
     fn split_record(record: &[u8]) -> (serde_json::Value, &[u8]) {

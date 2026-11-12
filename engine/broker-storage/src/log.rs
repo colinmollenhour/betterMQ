@@ -120,6 +120,13 @@ struct SparsePoint {
     byte_offset: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadMode {
+    Payload,
+    Metadata,
+    RawMetadata,
+}
+
 #[derive(Debug, Clone)]
 struct SegmentIndex {
     path: PathBuf,
@@ -712,7 +719,7 @@ impl PartitionLog {
             let frame_start = byte_pos;
             match decode_frame(&mut reader) {
                 Ok((_header, _payload)) => {
-                    if !self.meta.purged_offsets.contains(next_offset) {
+                    {
                         self.index.insert(
                             next_offset,
                             LogPosition {
@@ -822,7 +829,7 @@ impl PartitionLog {
                     };
                     return Err(self.quarantine(path, next_offset, error));
                 }
-                if !self.meta.purged_offsets.contains(next_offset) {
+                {
                     self.index.insert(
                         next_offset,
                         LogPosition {
@@ -1033,6 +1040,7 @@ impl PartitionLog {
             http_headers_json: header.http_headers_json.clone(),
             http_sign: header.http_sign,
             payload_ref_json: header.payload_ref_json.clone(),
+            dedup_inserted_at_ms: header.dedup_inserted_at_ms,
         })
     }
 
@@ -1114,6 +1122,7 @@ impl PartitionLog {
             http_headers_json: header.http_headers_json.clone(),
             http_sign: header.http_sign,
             payload_ref_json: header.payload_ref_json.clone(),
+            dedup_inserted_at_ms: header.dedup_inserted_at_ms,
         };
         Ok((stored, frame))
     }
@@ -1201,6 +1210,7 @@ impl PartitionLog {
                 http_headers_json: header.http_headers_json.clone(),
                 http_sign: header.http_sign,
                 payload_ref_json: header.payload_ref_json.clone(),
+                dedup_inserted_at_ms: header.dedup_inserted_at_ms,
             };
             offset += 1;
             out.push((stored, frame));
@@ -1359,7 +1369,7 @@ impl PartitionLog {
         start_offset: u64,
         max_messages: usize,
     ) -> Result<Vec<StoredMessage>, LogError> {
-        self.read_range_inner(partition, start_offset, max_messages, true)
+        self.read_range_inner(partition, start_offset, max_messages, ReadMode::Payload)
     }
 
     /// Verified delivery metadata with empty payloads, for internal indexing.
@@ -1369,7 +1379,18 @@ impl PartitionLog {
         start_offset: u64,
         max_messages: usize,
     ) -> Result<Vec<StoredMessage>, LogError> {
-        self.read_range_inner(partition, start_offset, max_messages, false)
+        self.read_range_inner(partition, start_offset, max_messages, ReadMode::Metadata)
+    }
+
+    /// Identity recovery includes tombstoned records while their raw bytes are
+    /// retained. Normal delivery/inspection continues to hide those records.
+    pub fn read_raw_metadata(
+        &self,
+        partition: u32,
+        start_offset: u64,
+        max_messages: usize,
+    ) -> Result<Vec<StoredMessage>, LogError> {
+        self.read_range_inner(partition, start_offset, max_messages, ReadMode::RawMetadata)
     }
 
     fn read_range_inner(
@@ -1377,13 +1398,20 @@ impl PartitionLog {
         partition: u32,
         start_offset: u64,
         max_messages: usize,
-        keep_payload: bool,
+        mode: ReadMode,
     ) -> Result<Vec<StoredMessage>, LogError> {
+        let keep_payload = mode == ReadMode::Payload;
+        let include_purged = mode == ReadMode::RawMetadata;
         let mut out = Vec::with_capacity(max_messages.min(256));
         // Skip collected offsets and a purged run (DLQ retention purges in
         // order) without decoding them.
         let mut start_offset = start_offset.max(self.meta.base_offset);
-        if let Some(end) = self.meta.purged_offsets.run_end_from(start_offset) {
+        if let Some(end) = self
+            .meta
+            .purged_offsets
+            .run_end_from(start_offset)
+            .filter(|_| !include_purged)
+        {
             start_offset = end;
         }
         let first_segment = self
@@ -1395,7 +1423,7 @@ impl PartitionLog {
                 partition,
                 start_offset,
                 max_messages,
-                keep_payload,
+                mode,
                 &mut out,
             )?;
             if out.len() >= max_messages {
@@ -1407,6 +1435,9 @@ impl PartitionLog {
             return Ok(out);
         }
         for (&offset, pos) in self.index.range(start_offset..end) {
+            if !include_purged && self.meta.purged_offsets.contains(offset) {
+                continue;
+            }
             if out.len() >= max_messages {
                 break;
             }
@@ -1422,9 +1453,11 @@ impl PartitionLog {
         partition: u32,
         start_offset: u64,
         max_messages: usize,
-        keep_payload: bool,
+        mode: ReadMode,
         out: &mut Vec<StoredMessage>,
     ) -> Result<(), LogError> {
+        let keep_payload = mode == ReadMode::Payload;
+        let include_purged = mode == ReadMode::RawMetadata;
         let point_index = segment
             .points
             .partition_point(|point| point.offset <= start_offset);
@@ -1436,7 +1469,9 @@ impl PartitionLog {
                 let mut offset = point.offset;
                 while offset < segment.last_offset && out.len() < max_messages {
                     let (header, payload) = read_dispatch_frame(&mut file, keep_payload)?;
-                    if offset >= start_offset && !self.meta.purged_offsets.contains(offset) {
+                    if offset >= start_offset
+                        && (include_purged || !self.meta.purged_offsets.contains(offset))
+                    {
                         out.push(stored_message(header, payload, partition, offset));
                     }
                     offset += 1;
@@ -1457,7 +1492,7 @@ impl PartitionLog {
                         let (header, payload) = read_dispatch_frame(&mut frames, keep_payload)?;
                         if offset >= start_offset
                             && offset < segment.last_offset
-                            && !self.meta.purged_offsets.contains(offset)
+                            && (include_purged || !self.meta.purged_offsets.contains(offset))
                         {
                             out.push(stored_message(header, payload, partition, offset));
                             if out.len() >= max_messages {
@@ -1727,9 +1762,9 @@ impl PartitionLog {
             self.meta.purged_offsets = previous;
             return Err(error.into());
         }
-        for offset in &purged {
-            self.index.remove(offset);
-        }
+        // Keep positions only for this bounded active segment until roll, so
+        // identity recovery can read purged headers without rescanning the WAL
+        // from zero on every page. All ordinary readers filter tombstones.
         Ok(purged.len())
     }
 
@@ -2164,6 +2199,7 @@ fn stored_message(
         http_headers_json: header.http_headers_json,
         http_sign: header.http_sign,
         payload_ref_json: header.payload_ref_json,
+        dedup_inserted_at_ms: header.dedup_inserted_at_ms,
     }
 }
 
@@ -2198,6 +2234,7 @@ mod tests {
             http_headers_json: None,
             http_sign: None,
             payload_ref_json: None,
+            dedup_inserted_at_ms: None,
         }
     }
 

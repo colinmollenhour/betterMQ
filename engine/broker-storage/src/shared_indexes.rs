@@ -69,6 +69,10 @@ pub enum SharedIndexError {
     Capacity,
     #[error("shared metadata configuration: {0}")]
     Configuration(String),
+    #[error("dedup identity changed before conditional commit")]
+    DedupConflict,
+    #[error("shared metadata ownership validation failed: {0}")]
+    Validation(String),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -92,9 +96,15 @@ enum Operation {
     ClearDispatchComplete(CursorKey, u64),
 }
 
-impl From<MetadataOperation> for Operation {
-    fn from(value: MetadataOperation) -> Self {
-        match value {
+impl TryFrom<MetadataOperation> for Operation {
+    type Error = SharedIndexError;
+    fn try_from(value: MetadataOperation) -> Result<Self, Self::Error> {
+        Ok(match value {
+            MetadataOperation::ComparePutDedup { .. } | MetadataOperation::DeleteDedupIf { .. } => {
+                return Err(SharedIndexError::Configuration(
+                    "conditional dedup operation was not evaluated".into(),
+                ))
+            }
             MetadataOperation::PutDedup {
                 tenant_id,
                 key,
@@ -123,7 +133,7 @@ impl From<MetadataOperation> for Operation {
                 offset,
                 message_id: Some(id),
             } => Self::MarkDispatchCompleteFor((tenant_id, subscription_id, partition), offset, id),
-        }
+        })
     }
 }
 
@@ -141,7 +151,9 @@ struct Snapshot {
 
 #[derive(Default)]
 struct Index {
-    dedup: HashMap<DedupKey, DedupEntry>,
+    dedup: std::collections::BTreeMap<DedupKey, DedupEntry>,
+    // Enabled only for stripped-header legacy export, not ordinary cursors.
+    reverse: Option<HashMap<Uuid, BTreeSet<DedupKey>>>,
     dispatch: HashMap<CursorKey, u64>,
     completed: HashMap<CursorKey, BTreeSet<u64>>,
     completed_ids: HashMap<CursorKey, BTreeMap<u64, Uuid>>,
@@ -165,15 +177,23 @@ impl Index {
         match op {
             Operation::PutDedup(key, entry) => {
                 if let Some(old) = self.dedup.remove(&key) {
+                    self.remove_reverse(old.message_id, &key);
                     self.bytes = self.bytes.saturating_sub(Self::weight(&key, &old));
                 } else {
                     self.entry_count += 1;
                 }
                 self.bytes += Self::weight(&key, &entry);
+                if let Some(reverse) = &mut self.reverse {
+                    reverse
+                        .entry(entry.message_id)
+                        .or_default()
+                        .insert(key.clone());
+                }
                 self.dedup.insert(key, entry);
             }
             Operation::DeleteDedup(key) => {
                 if let Some(old) = self.dedup.remove(&key) {
+                    self.remove_reverse(old.message_id, &key);
                     self.bytes = self.bytes.saturating_sub(Self::weight(&key, &old));
                     self.entry_count -= 1;
                 }
@@ -266,6 +286,17 @@ impl Index {
             }
         }
     }
+
+    fn remove_reverse(&mut self, id: Uuid, key: &DedupKey) {
+        if let Some(reverse) = &mut self.reverse {
+            if let Some(keys) = reverse.get_mut(&id) {
+                keys.remove(key);
+                if keys.is_empty() {
+                    reverse.remove(&id);
+                }
+            }
+        }
+    }
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             dedup: self
@@ -320,6 +351,9 @@ impl Index {
     }
     fn expire(&mut self, retention: u64) {
         let now = crate::indexes::now_ms();
+        // Expiration bypasses apply(); rebuild only this optional producer
+        // view, never on ordinary cursor/completion updates.
+        self.reverse = None;
         self.dedup.retain(|_, entry| !entry.expired(now, retention));
         self.recount();
     }
@@ -584,6 +618,14 @@ fn injected_io(_: &str) -> std::io::Result<()> {
 }
 
 impl SharedMetadataStore {
+    pub(crate) fn try_lock_producers(
+        &self,
+        tenant: &str,
+        keys: &[String],
+    ) -> Result<Option<crate::ProducerLocks>, SharedIndexError> {
+        self.check_ready()?;
+        crate::producer_locks::try_lock(&self.dir, tenant, keys)
+    }
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, SharedIndexError> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
@@ -835,8 +877,92 @@ impl SharedMetadataStore {
         file.sync_data()?;
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn apply_batch(&self, ops: Vec<MetadataOperation>) -> Result<(), SharedIndexError> {
-        self.commit(ops.into_iter().map(Into::into).collect())
+        self.apply_batch_validated(ops, Vec::new())
+    }
+    pub(crate) fn apply_batch_validated(
+        &self,
+        ops: Vec<MetadataOperation>,
+        validators: Vec<crate::indexes::MetadataValidator>,
+    ) -> Result<(), SharedIndexError> {
+        self.locked(|cache| {
+            for validate in validators {
+                validate().map_err(|error| SharedIndexError::Validation(error.to_string()))?;
+            }
+            let mut dedup = HashMap::<DedupKey, Option<DedupEntry>>::new();
+            let mut converted = Vec::with_capacity(ops.len());
+            for op in ops {
+                match op {
+                    MetadataOperation::DeleteDedupIf {
+                        tenant_id,
+                        key,
+                        expected,
+                    } => {
+                        let key = (tenant_id, key);
+                        let current = dedup
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| cache.index.dedup.get(&key).cloned());
+                        if current.is_some_and(|entry| entry.same_identity(&expected)) {
+                            dedup.insert(key.clone(), None);
+                            converted.push(Operation::DeleteDedup(key));
+                        }
+                    }
+                    MetadataOperation::ComparePutDedup {
+                        tenant_id,
+                        key,
+                        mut entry,
+                        expected,
+                    } => {
+                        let key = (tenant_id, key);
+                        let current = dedup
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| cache.index.dedup.get(&key).cloned())
+                            .filter(|entry| {
+                                !entry.expired(crate::indexes::now_ms(), self.retention)
+                            });
+                        if current
+                            .as_ref()
+                            .is_some_and(|current| current.same_identity(&entry))
+                        {
+                            continue;
+                        }
+                        if current.as_ref().map(|entry| entry.message_id) != expected {
+                            return Err(SharedIndexError::DedupConflict);
+                        }
+                        if entry.inserted_at_ms == 0 {
+                            entry.inserted_at_ms = crate::indexes::now_ms();
+                        }
+                        dedup.insert(key.clone(), Some(entry.clone()));
+                        converted.push(Operation::PutDedup(key, entry));
+                    }
+                    MetadataOperation::PutDedup {
+                        tenant_id,
+                        key,
+                        mut entry,
+                    } => {
+                        if entry.inserted_at_ms == 0 {
+                            entry.inserted_at_ms = crate::indexes::now_ms();
+                        }
+                        let key = (tenant_id, key);
+                        dedup.insert(key.clone(), Some(entry.clone()));
+                        converted.push(Operation::PutDedup(key, entry));
+                    }
+                    MetadataOperation::DeleteDedup { tenant_id, key } => {
+                        let key = (tenant_id, key);
+                        dedup.insert(key.clone(), None);
+                        converted.push(Operation::DeleteDedup(key));
+                    }
+                    op => converted.push(op.try_into()?),
+                }
+            }
+            if converted.is_empty() {
+                return Ok(());
+            }
+            self.commit_locked(cache, converted)
+        })
     }
     fn commit(&self, mut ops: Vec<Operation>) -> Result<(), SharedIndexError> {
         if ops.is_empty() {
@@ -1032,6 +1158,72 @@ impl SharedMetadataStore {
                 .cloned())
         })
     }
+
+    /// A different process may have observed an uncertain append before its
+    /// fdatasync failed. A committed-directory hit must establish its own
+    /// durability barrier before acknowledging that row, not merely read it.
+    pub(crate) fn confirmed_dedup(
+        &self,
+        tenant: &str,
+        key: &str,
+    ) -> Result<Option<DedupEntry>, SharedIndexError> {
+        self.locked(|cache| {
+            let entry = cache
+                .index
+                .dedup
+                .get(&(tenant.into(), key.into()))
+                .filter(|entry| !entry.expired(crate::indexes::now_ms(), self.retention))
+                .cloned();
+            if entry.is_some() {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(self.log_path(cache.generation))?
+                    .sync_data()?;
+                sync_dir(&self.dir)?;
+            }
+            Ok(entry)
+        })
+    }
+
+    pub fn dedup_page(
+        &self,
+        after: Option<(String, String)>,
+    ) -> Result<crate::indexes::DedupPage, SharedIndexError> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.locked(|cache| {
+            let mut records = Vec::new();
+            let mut count = 0usize;
+            let mut bytes = 0usize;
+            for ((tenant, key), entry) in cache
+                .index
+                .dedup
+                .range((after.map(Excluded).unwrap_or(Unbounded), Unbounded))
+            {
+                let next = Some((tenant.clone(), key.clone()));
+                count += 1;
+                bytes = bytes
+                    .saturating_add(tenant.len())
+                    .saturating_add(key.len())
+                    .saturating_add(entry.topic.len())
+                    .saturating_add(128);
+                if !entry.expired(crate::indexes::now_ms(), self.retention) {
+                    records.push(crate::indexes::DedupRecord {
+                        tenant_id: tenant.clone(),
+                        key: key.clone(),
+                        entry: entry.clone(),
+                    });
+                }
+                if count >= 256 || bytes >= 4 * 1024 * 1024 {
+                    return Ok(crate::indexes::DedupPage { records, next });
+                }
+            }
+            Ok(crate::indexes::DedupPage {
+                records,
+                next: None,
+            })
+        })
+    }
     pub fn put_dedup(
         &self,
         tenant: &str,
@@ -1042,6 +1234,45 @@ impl SharedMetadataStore {
             (tenant.into(), key.into()),
             entry.clone(),
         )])
+    }
+
+    pub fn dedup_for_message(
+        &self,
+        id: Uuid,
+    ) -> Result<Vec<crate::indexes::DedupRecord>, SharedIndexError> {
+        self.locked(|cache| {
+            if cache.index.reverse.is_none() {
+                let mut reverse = HashMap::<Uuid, BTreeSet<DedupKey>>::new();
+                for (key, entry) in &cache.index.dedup {
+                    reverse
+                        .entry(entry.message_id)
+                        .or_default()
+                        .insert(key.clone());
+                }
+                cache.index.reverse = Some(reverse);
+            }
+            let mut records = Vec::new();
+            if let Some(keys) = cache
+                .index
+                .reverse
+                .as_ref()
+                .and_then(|reverse| reverse.get(&id))
+            {
+                for key in keys {
+                    if let Some(entry) = cache.index.dedup.get(key).filter(|entry| {
+                        entry.message_id == id
+                            && !entry.expired(crate::indexes::now_ms(), self.retention)
+                    }) {
+                        records.push(crate::indexes::DedupRecord {
+                            tenant_id: key.0.clone(),
+                            key: key.1.clone(),
+                            entry: entry.clone(),
+                        });
+                    }
+                }
+            }
+            Ok(records)
+        })
     }
     pub fn delete_dedup(&self, tenant: &str, key: &str) -> Result<(), SharedIndexError> {
         self.commit(vec![Operation::DeleteDedup((tenant.into(), key.into()))])

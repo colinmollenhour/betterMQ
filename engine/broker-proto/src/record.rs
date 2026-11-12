@@ -122,6 +122,10 @@ pub struct LogRecord {
     /// JSON `PayloadRef` when body stored in object store (CP3b).
     #[serde(default)]
     pub payload_ref_json: Option<String>,
+    /// Optional frame-header trailer for migrated producer TTLs. Skipped in
+    /// the historical bincode struct so older readers still decode all fields.
+    #[serde(skip)]
+    pub dedup_inserted_at_ms: Option<u64>,
 }
 
 /// Pre-priority on-disk header (read compatibility).
@@ -137,8 +141,19 @@ struct LogRecordLegacy {
 
 impl LogRecord {
     pub fn decode_bytes(bytes: &[u8]) -> Result<Self, bincode_next::error::DecodeError> {
-        match crate::codec::decode::<Self>(bytes) {
-            Ok(r) => Ok(r),
+        match bincode_next::serde::decode_from_slice::<Self, _>(
+            bytes,
+            bincode_next::config::legacy(),
+        ) {
+            Ok((mut r, used)) => {
+                if let Some(trailer) = bytes[used..].strip_prefix(b"BMQIDTTL") {
+                    r.dedup_inserted_at_ms =
+                        Some(u64::from_le_bytes(trailer.try_into().map_err(|_| {
+                            bincode_next::error::DecodeError::Other("invalid producer TTL trailer")
+                        })?));
+                }
+                Ok(r)
+            }
             Err(_) => {
                 let leg: LogRecordLegacy = crate::codec::decode(bytes)?;
                 Ok(Self {
@@ -165,6 +180,7 @@ impl LogRecord {
                     http_headers_json: None,
                     http_sign: None,
                     payload_ref_json: None,
+                    dedup_inserted_at_ms: None,
                 })
             }
         }
@@ -184,6 +200,8 @@ pub struct StoredMessage {
     /// Internal only: preserve the existing consumer JSON representation.
     #[serde(skip)]
     pub idempotency_key: Option<String>,
+    #[serde(skip)]
+    pub dedup_inserted_at_ms: Option<u64>,
     pub payload: Vec<u8>,
     pub published_at_ms: i64,
     pub priority: u8,
@@ -225,7 +243,11 @@ pub fn encode_frame(
     payload: &[u8],
     writer: &mut impl Write,
 ) -> Result<(), RecordError> {
-    let header_bytes = crate::codec::encode(header)?;
+    let mut header_bytes = crate::codec::encode(header)?;
+    if let Some(timestamp) = header.dedup_inserted_at_ms {
+        header_bytes.extend_from_slice(b"BMQIDTTL");
+        header_bytes.extend_from_slice(&timestamp.to_le_bytes());
+    }
     if header_bytes.len() > MAX_FRAME_HEADER_BYTES
         || payload.len() > max_frame_decode_payload_bytes()
     {
@@ -359,6 +381,7 @@ mod tests {
             http_headers_json: None,
             http_sign: None,
             payload_ref_json: None,
+            dedup_inserted_at_ms: None,
         }
     }
 
@@ -371,6 +394,33 @@ mod tests {
         let (h, p) = decode_frame(std::io::Cursor::new(buf)).unwrap();
         assert_eq!(h, header);
         assert_eq!(p, payload);
+    }
+
+    #[test]
+    fn migrated_producer_ttl_trailer_preserves_old_bincode_prefix_and_public_json() {
+        let mut header = sample_header();
+        let original = crate::codec::encode(&header).unwrap();
+        assert_eq!(LogRecord::decode_bytes(&original).unwrap(), header);
+        header.dedup_inserted_at_ms = Some(1_700_000_123_456);
+        // The old struct's binary prefix is byte-for-byte unchanged.
+        assert_eq!(crate::codec::encode(&header).unwrap(), original);
+        let frame = encode_frame_vec(&header, b"body").unwrap();
+        let (decoded, body) = decode_frame(std::io::Cursor::new(frame)).unwrap();
+        assert_eq!(decoded, header);
+        assert_eq!(body, b"body");
+        let mut legacy_readable = original;
+        legacy_readable.extend_from_slice(b"BMQIDTTL");
+        legacy_readable.extend_from_slice(&header.dedup_inserted_at_ms.unwrap().to_le_bytes());
+        let old: LogRecord = crate::codec::decode(&legacy_readable).unwrap();
+        assert_eq!(old.id, header.id);
+        assert_eq!(old.dedup_inserted_at_ms, None);
+        assert!(!serde_json::to_value(&header)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("dedup_inserted_at_ms"));
+        legacy_readable.pop();
+        assert!(LogRecord::decode_bytes(&legacy_readable).is_err());
     }
 
     #[test]

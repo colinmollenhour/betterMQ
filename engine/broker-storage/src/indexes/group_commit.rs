@@ -276,6 +276,9 @@ fn run(
             batch
                 .operations
                 .extend(intent.batch.operations.iter().cloned());
+            batch
+                .validators
+                .extend(intent.batch.validators.iter().cloned());
         }
         #[cfg(test)]
         if let Some((started, release)) = gate.lock().unwrap().take() {
@@ -329,10 +332,14 @@ fn run(
             }
             continue;
         }
-        let error = result.err().map(|error| error.to_string());
+        let error = result.err();
         for intent in group {
             let result = match &error {
-                Some(message) => Err(unavailable(message.clone())),
+                Some(IndexError::DedupConflict) => Err(IndexError::DedupConflict),
+                Some(IndexError::Validation(message)) => {
+                    Err(IndexError::Validation(message.clone()))
+                }
+                Some(error) => Err(unavailable(error.to_string())),
                 None => Ok(MetadataWriteReceipt { _held: intent.held }),
             };
             let _ = intent.reply.send(result);

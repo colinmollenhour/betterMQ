@@ -534,6 +534,7 @@ async fn ingest_one_admitted(
             delay_ms,
         )?;
         return Ok(PublishResponse {
+            publish_fence: None,
             message_id: None,
             topic: req.topic,
             partition: None,
@@ -689,6 +690,99 @@ async fn submit_admitted_local_batch(
     guards: Vec<crate::admission::InFlightGuard>,
     started: Instant,
 ) -> Vec<IngestOutcome> {
+    if !state.broker.shared_producer_admission() {
+        return submit_native_local_batch(state, ingest, admitted, requests, guards, started, None)
+            .await;
+    }
+    // Only locally-led records reach this path. Acquire all unique stripes
+    // before native preparation, once for the entire operation (no recursion).
+    let keys: Vec<_> = requests
+        .iter()
+        .filter_map(|request| request.idempotency_key.clone())
+        .collect();
+    let producer_locks = match state.broker.lock_shared_producers(keys).await {
+        Ok(locks) => locks,
+        Err(error) => return failed_outcomes(&admitted, error.into()),
+    };
+    let mut existing = Vec::new();
+    let mut fresh_requests = Vec::new();
+    let mut fresh_admitted = Vec::new();
+    let mut fresh_keys = HashMap::new();
+    for (request, admission) in requests.into_iter().zip(admitted) {
+        if let Some(key) = &request.idempotency_key {
+            match crate::producer_admission::lookup(state, key, producer_locks.clone()).await {
+                Ok(Some(response)) => {
+                    existing.push(IngestOutcome {
+                        index: admission.0,
+                        topic: admission.1,
+                        result: Ok(response),
+                    });
+                    continue;
+                }
+                Ok(None) => {
+                    fresh_keys.insert(admission.0, key.clone());
+                }
+                Err(error) => {
+                    existing.extend(failed_outcomes(&[admission], error));
+                    continue;
+                }
+            }
+        }
+        fresh_admitted.push(admission);
+        fresh_requests.push(request);
+    }
+    if !fresh_requests.is_empty() {
+        let mut outcomes = submit_native_local_batch(
+            state,
+            ingest,
+            fresh_admitted,
+            fresh_requests,
+            guards,
+            started,
+            producer_locks.clone(),
+        )
+        .await;
+        let commits: Vec<_> = outcomes
+            .iter()
+            .filter_map(|outcome| {
+                Some((
+                    fresh_keys.get(&outcome.index)?.as_str(),
+                    outcome.result.as_ref().ok()?,
+                ))
+            })
+            .collect();
+        let committed = if commits.is_empty() {
+            Ok(())
+        } else {
+            state
+                .broker
+                .commit_shared_publishes(&commits, producer_locks)
+                .await
+        };
+        if let Err(error) = committed {
+            let message = error.to_string();
+            for outcome in &mut outcomes {
+                if fresh_keys.contains_key(&outcome.index) && outcome.result.is_ok() {
+                    outcome.result = Err(ApiError::Unavailable(message.clone()));
+                }
+            }
+        }
+        existing.extend(outcomes);
+    }
+    existing.sort_by_key(|outcome| outcome.index);
+    existing
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_native_local_batch(
+    state: &Arc<AppState>,
+    ingest: Option<crate::metering::IngestAuth>,
+    admitted: Vec<(usize, String, usize)>,
+    requests: Vec<PublishRequest>,
+    guards: Vec<crate::admission::InFlightGuard>,
+    started: Instant,
+    producer_locks: Option<Arc<broker_storage::ProducerLocks>>,
+) -> Vec<IngestOutcome> {
     let mut rejected = Vec::new();
 
     let mut prepared = match state.broker.prepare_publish_batch_waiting(requests).await {
@@ -702,7 +796,9 @@ async fn submit_admitted_local_batch(
     let mut append_tasks = JoinSet::new();
     for shard_batch in prepared.take_shard_batches() {
         let broker = state.broker.clone();
+        let producer_locks = producer_locks.clone();
         append_tasks.spawn(broker_partition::run_blocking_io(move || {
+            let _producer_locks = producer_locks;
             broker.append_prepared_batch(shard_batch)
         }));
     }
@@ -726,6 +822,7 @@ async fn submit_admitted_local_batch(
         && state.broker.config().storage != StorageMode::Slate;
     let mut commit_tasks = JoinSet::new();
     for appended in appended_batches {
+        let publish_fence = appended.publish_fence();
         let Some(last_offset) = appended.last_offset() else {
             continue;
         };
@@ -777,7 +874,10 @@ async fn submit_admitted_local_batch(
                     epoch_topic,
                     first_rec.partition,
                     cluster.runtime.config().node_id,
-                    cluster.runtime.shard_generation(first_rec.partition),
+                    publish_fence
+                        .as_ref()
+                        .and_then(|fence| fence.generation())
+                        .unwrap_or(0),
                     first_rec.offset,
                     chunk
                         .iter()
@@ -793,7 +893,10 @@ async fn submit_admitted_local_batch(
             }
             let replication = cluster.replication.clone();
             let runtime = cluster.runtime.clone();
-            let generation = runtime.shard_generation(partition);
+            let generation = publish_fence
+                .as_ref()
+                .and_then(|fence| fence.generation())
+                .unwrap_or(0);
             let wait_topic = topic;
             let quorum_broker = state.broker.clone();
             commit_tasks.spawn(async move {
@@ -803,6 +906,11 @@ async fn submit_admitted_local_batch(
                     }
                     let mut committed_hwm = 0;
                     for request in requests {
+                        if let Some(fence) = &publish_fence {
+                            fence.validate().map_err(|error| {
+                                broker_replication::ReplicateError::InvalidEpoch(error.to_string())
+                            })?;
+                        }
                         let epoch_first = request.first_offset;
                         let epoch_last = request.last_offset()?;
                         let broker = broker.clone();
@@ -832,13 +940,23 @@ async fn submit_admitted_local_batch(
                             ));
                         }
                         // Dispatch sees the epoch only once it is quorum-durable and
+                        if let Some(fence) = &publish_fence {
+                            fence.validate().map_err(|error| {
+                                broker_replication::ReplicateError::InvalidEpoch(error.to_string())
+                            })?;
+                        }
                         // the watermark is persisted.
                         quorum_broker
-                            .record_quorum_commit(
+                            .record_quorum_commit_checked(
                                 &wait_topic,
                                 partition,
                                 epoch_first,
                                 epoch_last.saturating_add(1),
+                                || {
+                                    publish_fence
+                                        .as_ref()
+                                        .map_or(Ok(()), |fence| fence.validate())
+                                },
                             )
                             .map_err(|error| {
                                 broker_replication::ReplicateError::InvalidEpoch(format!(
@@ -896,6 +1014,7 @@ async fn submit_admitted_local_batch(
     let broker = state.broker.clone();
     let finalized =
         broker_partition::run_blocking_io(move || -> Result<_, broker_partition::BrokerError> {
+            let _producer_locks = producer_locks;
             let mut epochs = HashMap::new();
             for (appended, response_keys, epoch) in committed {
                 broker.finalize_prepared_batch(&mut prepared, appended, true)?;
@@ -927,6 +1046,11 @@ async fn submit_admitted_local_batch(
     // Verify each distinct log end, not merely each epoch's individual ACKs.
     let mut visible_ends = HashMap::<(String, u32), u64>::new();
     for response in &responses {
+        if let Some(fence) = &response.publish_fence {
+            if let Err(error) = fence.validate() {
+                return failed_outcomes(&admitted, ApiError::Unavailable(error.to_string()));
+            }
+        }
         if let (Some(partition), Some(offset)) = (response.partition, response.offset) {
             let end = visible_ends
                 .entry((response.topic.clone(), partition))
@@ -935,14 +1059,34 @@ async fn submit_admitted_local_batch(
         }
     }
     for ((topic, partition), offset) in visible_ends {
-        if let Err(error) =
-            crate::cluster::wait_publish_visible(state, &topic, partition, offset).await
+        if let Err(error) = crate::cluster::wait_publish_visible(
+            state,
+            &topic,
+            partition,
+            offset,
+            responses
+                .iter()
+                .find(|response| {
+                    response.partition == Some(partition)
+                        && response.topic == topic
+                        && response.offset == Some(offset)
+                })
+                .and_then(|response| response.publish_fence.as_ref()),
+        )
+        .await
         {
             return failed_outcomes(&admitted, error);
         }
     }
 
     let latency = started.elapsed();
+    for response in &responses {
+        if let Some(fence) = &response.publish_fence {
+            if let Err(error) = fence.validate() {
+                return failed_outcomes(&admitted, ApiError::Unavailable(error.to_string()));
+            }
+        }
+    }
     for ((index, topic, body_bytes), mut response) in admitted.into_iter().zip(responses) {
         response.replication_frame = None;
         if let Some(partition) = response.partition {

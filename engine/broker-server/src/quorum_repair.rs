@@ -64,6 +64,22 @@ async fn verify_tail(
     generation: u64,
 ) -> Result<u64, String> {
     let broker = &state.broker;
+    let incarnation = cluster.runtime.shard_incarnation(shard);
+    let local = broker
+        .log_metadata_validator(shard)
+        .map_err(|error| error.to_string())?;
+    let validate = || {
+        local()?;
+        if !cluster.runtime.is_recovery_leader_for_shard(shard)
+            || cluster.runtime.shard_generation(shard) != generation
+            || cluster.runtime.shard_incarnation(shard) != incarnation
+        {
+            return Err(broker_storage::IndexError::Validation(
+                "quorum verification ownership changed".into(),
+            ));
+        }
+        Ok(())
+    };
     let mut quorum = broker
         .quorum_hwm(topic, shard)
         .map_err(|e| format!("read quorum watermark: {e}"))?;
@@ -81,6 +97,13 @@ async fn verify_tail(
         if quorum >= committed {
             break;
         }
+        if broker
+            .committed_hwm(topic, shard)
+            .map_err(|error| error.to_string())?
+            < committed
+        {
+            return Err("local committed prefix changed during verification".into());
+        }
         let frames = broker
             .namespace_replication_frames(topic, shard, quorum, VERIFY_RECORDS, VERIFY_BYTES)
             .map_err(|e| format!("read frames at {quorum}: {e}"))?;
@@ -90,13 +113,19 @@ async fn verify_tail(
             // there is nothing at them to deliver or to prove.
             None => {
                 quorum = broker
-                    .record_quorum_commit(topic, shard, quorum, committed)
+                    .record_quorum_commit_checked(topic, shard, quorum, committed, validate)
                     .map_err(|e| e.to_string())?;
                 continue;
             }
             Some(first) if first > quorum => {
                 quorum = broker
-                    .record_quorum_commit(topic, shard, quorum, first.min(committed))
+                    .record_quorum_commit_checked(
+                        topic,
+                        shard,
+                        quorum,
+                        first.min(committed),
+                        validate,
+                    )
                     .map_err(|e| e.to_string())?;
                 continue;
             }
@@ -130,7 +159,7 @@ async fn verify_tail(
             return Err("shard recovery ownership changed during replication".into());
         }
         quorum = broker
-            .record_quorum_commit(topic, shard, quorum, end)
+            .record_quorum_commit_checked(topic, shard, quorum, end, validate)
             .map_err(|e| e.to_string())?;
     }
     Ok(quorum)
@@ -144,8 +173,12 @@ pub fn spawn_quorum_repair(cluster: Cluster, state: Arc<AppState>) -> tokio::tas
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let recovering: HashMap<u32, Vec<(String, u64)>> =
-                state.dispatch.recovery_targets().into_iter().collect();
+            let recovering: HashMap<u32, _> = state
+                .dispatch
+                .recovery_targets()
+                .into_iter()
+                .map(|target| (target.partition, (target.epoch, target.logs)))
+                .collect();
             for shard in 0..state.broker.layout().shard_count {
                 if !cluster.runtime.is_recovery_leader_for_shard(shard) {
                     continue;
@@ -189,7 +222,7 @@ pub fn spawn_quorum_repair(cluster: Cluster, state: Arc<AppState>) -> tokio::tas
                         }
                     }
                 }
-                if let Some(targets) = recovering.get(&shard) {
+                if let Some((epoch, targets)) = recovering.get(&shard) {
                     let verified = targets.iter().all(|(topic, target)| {
                         state
                             .broker
@@ -219,8 +252,42 @@ pub fn spawn_quorum_repair(cluster: Cluster, state: Arc<AppState>) -> tokio::tas
                             let broker = state.broker.clone();
                             let topic = topic.clone();
                             let target = *target;
+                            let runtime = cluster.runtime.clone();
+                            let epoch = *epoch;
+                            let local = broker.log_metadata_validator(shard);
+                            let Ok(local) = local else {
+                                recovery_error = Some("log rewrite in progress".into());
+                                break;
+                            };
+                            let validator: broker_storage::MetadataValidator =
+                                Arc::new(move || {
+                                    local()?;
+                                    if !runtime.is_recovery_leader_for_shard(shard)
+                                        || runtime.shard_generation(shard) != generation
+                                        || runtime.shard_incarnation(shard) != epoch
+                                    {
+                                        return Err(broker_storage::IndexError::Validation(
+                                            "recovery incarnation changed".into(),
+                                        ));
+                                    }
+                                    Ok(())
+                                });
                             match broker_partition::run_blocking_io(move || {
-                                broker.recover_dedup_page(&topic, shard, next, target)
+                                broker.check_gc_identity_base(&broker.log_id(&topic, shard))?;
+                                if next == 0 {
+                                    broker.seed_legacy_replica_identities(
+                                        &broker.log_id(&topic, shard),
+                                        target,
+                                        validator.clone(),
+                                    )?;
+                                }
+                                broker.recover_dedup_page(
+                                    &topic,
+                                    shard,
+                                    next,
+                                    target,
+                                    Some(validator),
+                                )
                             })
                             .await
                             {
@@ -245,15 +312,20 @@ pub fn spawn_quorum_repair(cluster: Cluster, state: Arc<AppState>) -> tokio::tas
                     {
                         continue;
                     }
-                    match state.dispatch.complete_recovery(shard) {
-                        Ok(clamped) => {
+                    match state.dispatch.complete_recovery(shard, *epoch) {
+                        Ok(Some(clamped)) => {
                             if !cluster.runtime.is_recovery_leader_for_shard(shard)
                                 || cluster.runtime.shard_generation(shard) != generation
                             {
                                 state.dispatch.fence_partition(shard);
                                 continue;
                             }
-                            cluster.runtime.set_shard_ready(shard, true);
+                            if !cluster
+                                .runtime
+                                .finish_shard_recovery(shard, *epoch, generation)
+                            {
+                                continue;
+                            }
                             info!(
                                 shard,
                                 clamped, "takeover verified on minISR; dispatch resumed"
@@ -263,6 +335,7 @@ pub fn spawn_quorum_repair(cluster: Cluster, state: Arc<AppState>) -> tokio::tas
                                 tokio::task::spawn_blocking(move || dispatch.backfill_pending())
                                     .await;
                         }
+                        Ok(None) => {}
                         Err(error) => warn!(shard, %error, "dispatch recovery failed"),
                     }
                 }
@@ -573,11 +646,20 @@ mod tests {
         Arc::get_mut(&mut state).unwrap().cluster = Some(cluster.clone());
         let (topic, partition) = publish(&state.broker);
         let target = state.broker.committed_hwm(&topic, partition).unwrap();
-        cluster.runtime.set_shard_ready(partition, false);
-        state.dispatch.fence_partition(partition);
+        let epoch = state.dispatch.fence_partition(partition);
+        cluster.runtime.begin_shard_recovery(
+            partition,
+            epoch,
+            cluster.runtime.shard_generation(partition),
+        );
         state
             .dispatch
-            .set_recovery_targets(partition, vec![(topic.clone(), target)]);
+            .set_recovery_targets(partition, epoch, vec![(topic.clone(), target)]);
+        assert!(cluster.runtime.mark_shard_verifying(
+            partition,
+            epoch,
+            cluster.runtime.shard_generation(partition)
+        ));
         assert!(!cluster.runtime.is_leader_for_shard(partition));
         assert!(cluster.runtime.is_recovery_leader_for_shard(partition));
         let repair = spawn_quorum_repair(cluster.clone(), state.clone());
