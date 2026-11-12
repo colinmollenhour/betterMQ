@@ -9,7 +9,7 @@ checks still apply before a delivery can advance its cursor.
 ## Separate admitted work from the durable backlog
 
 One process-wide job budget covers ready work, hydration, flow waiting, and
-active delivery. A slow flow also has a smaller look-ahead of
+active delivery. A parallel flow also has a smaller look-ahead of
 `max(16, 2 × parallelism)` admitted jobs. This prevents one blocked destination
 from filling every stage independently.
 
@@ -88,6 +88,16 @@ Checking only the flow waitlist would let later arrivals overtake it. The
 pending scan therefore indexes FIFO heads, and delivery waits for earlier
 durable work of the same lane. Group topics participate in backfill too, so
 fan-out records remain recoverable after overflow or restart.
+
+Strict-FIFO backfill admits only the durable head of each key. Live arrivals
+check the same index before entering a flow waitlist. Successors remain in the
+WAL rather than repeatedly consuming queue capacity, native reads, and deferred
+timers while their predecessor runs. Once completion metadata is durable,
+removing the old head hands the next indexed head directly to ordinary bounded
+admission. This avoids imposing the backfill loop's 25 ms notification debounce
+on every serial delivery. A full admission budget or an unindexed successor
+still falls back to recoverable backfill; no payloads or unbounded successor
+queues are added.
 
 Live fan-out publishing and outbox replay share an execution registry. Failed
 claims never create cleanup guards: dropping an eagerly constructed guard while

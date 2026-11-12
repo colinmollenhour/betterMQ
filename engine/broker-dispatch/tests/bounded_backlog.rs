@@ -75,7 +75,7 @@ async fn saturated_fifo_lane_drains_without_loss_duplicates_or_overtaking() {
             .await
             .unwrap()
             .wait_list_size
-            < 16
+            < 1
         {
             tokio::task::yield_now().await;
         }

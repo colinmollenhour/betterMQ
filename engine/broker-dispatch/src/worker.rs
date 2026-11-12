@@ -1046,17 +1046,18 @@ impl DispatchEngine {
                 break;
             }
             let (topic, partition) = &targets[index];
-            let view =
-                match self
-                    .scan
-                    .refresh(&self.broker, topic, *partition, BACKFILL_RECORD_BUDGET)
-                {
-                    Ok(view) => view,
-                    Err(error) => {
-                        warn!(%error, %topic, partition, "dispatch backfill scan failed");
-                        continue;
-                    }
-                };
+            let view = match self.scan.refresh_ready(
+                &self.broker,
+                topic,
+                *partition,
+                BACKFILL_RECORD_BUDGET,
+            ) {
+                Ok(view) => view,
+                Err(error) => {
+                    warn!(%error, %topic, partition, "dispatch backfill scan failed");
+                    continue;
+                }
+            };
             more |= !view.caught_up;
             let hwm = self.broker.committed_hwm(topic, *partition).unwrap_or(0);
             for entry in view.entries {
@@ -1677,6 +1678,12 @@ impl DispatchEngine {
         }
 
         let limits = broker_partition::ResolvedFlow::for_delivery(&msg.routing_key, &msg);
+        // A live notification can arrive after its predecessor was dropped by
+        // bounded admission. Keep that successor in the WAL, not a flow waitlist
+        // or a 100ms timer loop. Completing the durable head admits the next one.
+        if !self.fifo_ready(&msg).await? {
+            return Ok(());
+        }
         let lane_owner = broker_partition::flow_lane_owner(&msg);
         self.flow
             .submit_owned(self.clone(), lane_owner, msg, limits, Some(ownership))
@@ -1690,25 +1697,28 @@ impl DispatchEngine {
                 .read_message_async(&job.topic, job.partition, job.offset)
                 .await?,
         );
-        let fifo_ready = if Self::fifo_retry_key(&msg).is_some() {
-            let broker = self.broker.clone();
-            let scan = self.scan.clone();
-            let msg = msg.clone();
-            broker_partition::run_blocking_io(move || scan.is_fifo_head(&broker, &msg))
-                .await
-                .map_err(|error| DispatchError::Failed(error.to_string()))??
-        } else {
-            true
-        };
-        if !fifo_ready {
-            self.defer_job(
-                DeliveryJob::live(&msg.topic, msg.partition, msg.offset, msg.id),
-                Duration::from_millis(100),
-                "fifo_predecessor",
-            );
+        if !self.fifo_ready(&msg).await? {
             return Ok(());
         }
         self.deliver_message(&msg).await
+    }
+
+    async fn fifo_ready(&self, msg: &StoredMessage) -> Result<bool, DispatchError> {
+        if let Some(flow_key) = Self::fifo_retry_key(msg) {
+            let broker = self.broker.clone();
+            let scan = self.scan.clone();
+            let job = DeliveryJob::live(&msg.topic, msg.partition, msg.offset, msg.id);
+            let flow = crate::flow_control::FlowKey {
+                endpoint_id: broker_partition::flow_lane_owner(msg),
+                flow_key,
+            };
+            broker_partition::run_blocking_io(move || scan.is_fifo_head(&broker, &job, &flow))
+                .await
+                .map_err(|error| DispatchError::Failed(error.to_string()))?
+                .map_err(DispatchError::from)
+        } else {
+            Ok(true)
+        }
     }
 
     async fn hydrate_delivery_message<'a>(
@@ -2232,7 +2242,7 @@ impl DispatchEngine {
         if let Some(error) = progress.error {
             return Err(error);
         }
-        self.scan.mark_done(topic, partition, offset);
+        let successor = self.scan.mark_done(topic, partition, offset);
         if let Some(stats) = progress.stats {
             self.telemetry.record_completion(
                 partition,
@@ -2244,6 +2254,17 @@ impl DispatchEngine {
             );
             self.telemetry
                 .advance_pending_head(partition, cursor_key, stats.next, stats.next_head);
+        }
+        if let Some(next) = successor {
+            // Bypass the coalesced backfill cadence on a serial hot key. This
+            // still uses ordinary bounded admission and deadline/leader checks;
+            // if full, the WAL and backfill retain ownership of the work.
+            self.enqueue(DeliveryJob::live(
+                &next.topic,
+                next.partition,
+                next.offset,
+                next.message_id,
+            ));
         }
         Ok(())
     }

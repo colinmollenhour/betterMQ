@@ -113,7 +113,18 @@ impl PartitionScan {
         }
     }
 
-    fn remove(&mut self, offset: u64) {
+    fn is_fifo_head(&self, entry: &PendingEntry) -> bool {
+        entry.fifo_key.as_ref().is_none_or(|flow| {
+            self.fifo_offsets
+                .get(&(entry.cursor_key.clone(), flow.clone()))
+                .and_then(|offsets| offsets.first())
+                .is_none_or(|head| *head == entry.offset)
+        })
+    }
+
+    /// Removing a completed head makes exactly one same-key successor ready.
+    /// Return its bounded metadata reference for completion-driven admission.
+    fn remove(&mut self, offset: u64) -> Option<Arc<PendingEntry>> {
         if let Some(entry) = self.pending.remove(&offset) {
             if let Some(flow) = &entry.fifo_key {
                 let key = (entry.cursor_key.clone(), flow.clone());
@@ -121,10 +132,13 @@ impl PartitionScan {
                     offsets.remove(&offset);
                     if offsets.is_empty() {
                         self.fifo_offsets.remove(&key);
+                    } else if let Some(next) = offsets.first() {
+                        return self.pending.get(next).cloned();
                     }
                 }
             }
         }
+        None
     }
 }
 
@@ -311,6 +325,30 @@ impl DispatchScan {
         partition: u32,
         record_budget: usize,
     ) -> Result<PendingView, BrokerError> {
+        self.refresh_inner(broker, topic, partition, record_budget, false)
+    }
+
+    /// Local push workers need only strict-FIFO heads, not every successor that
+    /// would immediately fail its durable predecessor check. Fleet inspection
+    /// retains the full pending view via `refresh`.
+    pub(crate) fn refresh_ready(
+        &self,
+        broker: &Broker,
+        topic: &str,
+        partition: u32,
+        record_budget: usize,
+    ) -> Result<PendingView, BrokerError> {
+        self.refresh_inner(broker, topic, partition, record_budget, true)
+    }
+
+    fn refresh_inner(
+        &self,
+        broker: &Broker,
+        topic: &str,
+        partition: u32,
+        record_budget: usize,
+        heads_only: bool,
+    ) -> Result<PendingView, BrokerError> {
         // Only quorum-visible records are indexed (dispatch gate).
         let hwm = broker.dispatch_hwm(topic, partition)?;
         let scan = self.partition_scan(topic, partition);
@@ -391,7 +429,12 @@ impl DispatchScan {
             .unwrap_or(scan.scanned_to);
         scan.floor = floor;
         let caught_up = scan.scanned_to >= hwm;
-        let entries = scan.pending.values().cloned().collect();
+        let entries = scan
+            .pending
+            .values()
+            .filter(|entry| !heads_only || scan.is_fifo_head(entry))
+            .cloned()
+            .collect();
         drop(scan);
         let mut floors = self.floors.lock();
         floors.set((topic.to_string(), partition), floor);
@@ -400,15 +443,21 @@ impl DispatchScan {
     }
 
     /// Forget a pending offset once it is delivered or dead-lettered.
-    pub(crate) fn mark_done(&self, topic: &str, partition: u32, offset: u64) {
+    pub(crate) fn mark_done(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Option<Arc<PendingEntry>> {
         let scan = self
             .partitions
             .lock()
             .get(&(topic.to_string(), partition))
             .cloned();
         if let Some(scan) = scan {
-            scan.lock().remove(offset);
+            return scan.lock().remove(offset);
         }
+        None
     }
 
     /// A bounded admission queue may drop an earlier live job. Later arrivals
@@ -417,25 +466,22 @@ impl DispatchScan {
     pub(crate) fn is_fifo_head(
         &self,
         broker: &Broker,
-        msg: &StoredMessage,
+        job: &crate::worker::DeliveryJob,
+        flow: &FlowKey,
     ) -> Result<bool, BrokerError> {
-        let Some(flow) = crate::worker::DispatchEngine::fifo_retry_key(msg) else {
-            return Ok(true);
-        };
-        let scan = self.partition_scan(&msg.topic, msg.partition);
-        if scan.lock().scanned_to <= msg.offset {
-            self.refresh(broker, &msg.topic, msg.partition, PENDING_CAP)?;
+        let scan = self.partition_scan(&job.topic, job.partition);
+        if scan.lock().scanned_to <= job.offset {
+            self.refresh_ready(broker, &job.topic, job.partition, PENDING_CAP)?;
         }
         let scan = scan.lock();
-        if scan.scanned_to <= msg.offset {
+        if scan.scanned_to <= job.offset {
             return Ok(false);
         }
-        let lane = broker_partition::flow_lane_owner(msg).to_string();
         Ok(scan
             .fifo_offsets
-            .get(&(lane, flow))
+            .get(&(flow.endpoint_id.to_string(), flow.flow_key.clone()))
             .and_then(|offsets| offsets.first())
-            .is_none_or(|head| *head >= msg.offset))
+            .is_none_or(|head| *head >= job.offset))
     }
 
     /// Drop all scan state for `partitions` (e.g. after leadership moved and
