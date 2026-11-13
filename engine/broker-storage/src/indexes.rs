@@ -654,7 +654,7 @@ impl MetadataStore {
                             mut entry,
                             expected,
                         } => {
-                            let retention = dedup_retention_ms()?;
+                            let retention = self.retention_ms;
                             let key = Self::dedup_key(&tenant_id, &key);
                             let current = match dedup.get(&key) {
                                 Some(entry) => entry.clone(),
@@ -791,9 +791,20 @@ impl MetadataStore {
                     }
                 }
                 db.write_opt(rocks_batch, sync_writes)?;
-                self.sweep_rocks(db, sync_writes, control, logical_requests)
-                    .map_err(|error| IndexError::Uncertain(error.to_string()))?;
-                Ok(())
+                // The primary batch is already durable. Only a storage failure in
+                // the follow-up sweep makes the store's state uncertain; a stale
+                // or undecodable row must not fence the writer or fail callers
+                // whose writes committed.
+                match self.sweep_rocks(db, sync_writes, control, logical_requests) {
+                    Err(error @ IndexError::Rocks(_)) => {
+                        Err(IndexError::Uncertain(error.to_string()))
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "metadata expiry sweep skipped");
+                        Ok(())
+                    }
+                    Ok(()) => Ok(()),
+                }
             }
             MetaBackend::Shared(store) => {
                 store.apply_batch_validated(batch.operations, batch.validators)?;

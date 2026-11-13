@@ -57,8 +57,22 @@ for ((t = 0; t < TRIALS; t++)); do
 done
 
 for side in a b; do
-  files=("$OUT"/runs/$side/*/results.json)
+  # Failed or interrupted invocations can leave partial results.json files;
+  # merge rejects unfinished runs, so pool only completed invocations.
+  files=()
+  for marker in "$OUT"/runs/$side/*/.ab-complete; do
+    [[ -e "$marker" ]] && files+=("$(dirname "$marker")/results.json")
+  done
+  if [[ ${#files[@]} -eq 0 ]]; then
+    echo "no completed invocations for side $side; rerun to resume" >&2
+    incomplete=1
+    continue
+  fi
   "$BENCH" merge "${files[@]}" --out "$OUT/$side"
 done
+if [[ -n "${incomplete:-}" ]]; then
+  echo "skipping comparison: a side has no completed invocations" >&2
+  exit 0
+fi
 "$BENCH" compare "$OUT/a" "$OUT/b" --out "$OUT/compare.md" || true
 echo "done: $OUT/compare.md"

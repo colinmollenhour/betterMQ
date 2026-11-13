@@ -17,7 +17,7 @@ use broker_partition::{Broker, BrokerError};
 use broker_storage::StoredMessage;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -111,15 +111,6 @@ impl PartitionScan {
                 .or_default()
                 .insert(entry.offset);
         }
-    }
-
-    fn is_fifo_head(&self, entry: &PendingEntry) -> bool {
-        entry.fifo_key.as_ref().is_none_or(|flow| {
-            self.fifo_offsets
-                .get(&(entry.cursor_key.clone(), flow.clone()))
-                .and_then(|offsets| offsets.first())
-                .is_none_or(|head| *head == entry.offset)
-        })
     }
 
     /// Removing a completed head makes exactly one same-key successor ready.
@@ -429,11 +420,21 @@ impl DispatchScan {
             .unwrap_or(scan.scanned_to);
         scan.floor = floor;
         let caught_up = scan.scanned_to >= hwm;
+        // Non-head FIFO successors are exactly the non-first offsets of each
+        // FIFO set; collect those once instead of cloning lookup keys per entry.
+        let successors: HashSet<u64> = if heads_only {
+            scan.fifo_offsets
+                .values()
+                .flat_map(|offsets| offsets.iter().skip(1).copied())
+                .collect()
+        } else {
+            HashSet::new()
+        };
         let entries = scan
             .pending
-            .values()
-            .filter(|entry| !heads_only || scan.is_fifo_head(entry))
-            .cloned()
+            .iter()
+            .filter(|(offset, _)| !successors.contains(offset))
+            .map(|(_, entry)| entry.clone())
             .collect();
         drop(scan);
         let mut floors = self.floors.lock();
