@@ -23,6 +23,7 @@ pub struct QuorumWatermark {
     /// Legacy (identity-less) completion markers are trusted only below this.
     trusted_legacy_below: AtomicU64,
     state: parking_lot::Mutex<QuorumState>,
+    changed: tokio::sync::Notify,
 }
 
 struct QuorumState {
@@ -58,11 +59,24 @@ impl QuorumWatermark {
                 hwm,
                 proven: BTreeMap::new(),
             }),
+            changed: tokio::sync::Notify::new(),
         })
     }
 
     pub fn get(&self) -> u64 {
         self.exposed.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_for(&self, end: u64) {
+        loop {
+            let changed = self.changed.notified();
+            // notify_waiters also wakes not-yet-polled Notified futures created
+            // before the notification, avoiding a check/register lost wakeup.
+            if self.get() >= end {
+                return;
+            }
+            changed.await;
+        }
     }
 
     pub fn trusted_legacy_below(&self) -> u64 {
@@ -89,17 +103,18 @@ impl QuorumWatermark {
         let entry = state.proven.entry(start).or_insert(end);
         *entry = (*entry).max(end);
         let mut next = state.hwm;
-        while let Some((&range_start, &range_end)) = state.proven.iter().next() {
+        for (&range_start, &range_end) in &state.proven {
             if range_start > next {
                 break;
             }
             next = next.max(range_end);
-            state.proven.remove(&range_start);
         }
         if next > state.hwm {
             broker_storage::atomic_write_file(&self.path, &next.to_le_bytes())?;
             state.hwm = next;
             self.exposed.store(next, Ordering::Release);
+            state.proven.retain(|start, _| *start > next);
+            self.changed.notify_waiters();
         }
         Ok(state.hwm)
     }

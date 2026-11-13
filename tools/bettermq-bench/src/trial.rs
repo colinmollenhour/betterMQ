@@ -52,6 +52,8 @@ pub struct RunCtx {
     pub rate_scale: f64,
     /// Multiplies every scenario's durations.
     pub time_scale: f64,
+    /// Optional diagnostic step limit; profile defaults are unchanged.
+    pub ramp_steps: Option<u8>,
     pub extra_env: Vec<(String, String)>,
 }
 
@@ -334,6 +336,11 @@ impl Trial {
         };
 
         let streams = self.verifier.all();
+        let confirmed_dlq = if streams.is_empty() || !self.broker.is_running() {
+            Ok(0)
+        } else {
+            self.api.confirm_dead_letters(&self.verifier).await
+        };
         let mut integrity = Integrity {
             loss_expected_zero: !self.allow_undelivered,
             ..Default::default()
@@ -344,7 +351,7 @@ impl Trial {
             integrity.duplicate_deliveries += s.dups.load(Ordering::Relaxed);
             integrity.order_violations += s.inversions.load(Ordering::Relaxed);
             integrity.order_violations_after_retry += s.inversions_retry.load(Ordering::Relaxed);
-            integrity.lost += s.count_lost();
+            integrity.lost += s.count_unaccounted();
             integrity.malformed += s.out_of_range.load(Ordering::Relaxed);
         }
         integrity.malformed += self.shared.c.sink_malformed.load(Ordering::Relaxed);
@@ -361,26 +368,22 @@ impl Trial {
         }
 
         let mut notes = std::mem::take(&mut self.notes);
-        // Messages the broker gave up on after exhausting retries sit in the
-        // DLQ: they are accounted for, not lost.
-        if integrity.lost > 0 && self.broker.is_running() {
-            let perm: u64 = streams.iter().map(|s| s.perm.load(Ordering::Relaxed)).sum();
-            let exhausted = self.api.dlq_total().await.saturating_sub(perm);
-            if exhausted > 0 {
-                let moved = exhausted.min(integrity.lost);
-                integrity.lost -= moved;
-                notes.push(format!(
-                    "{moved} acknowledged messages exhausted their retries and are in the dead-letter queue (not counted as lost)."
-                ));
-            }
+        if let Ok(confirmed_dlq) = &confirmed_dlq {
+            notes.push(format!(
+                "{confirmed_dlq} dead-letter records were read back and matched to individual source deliveries."
+            ));
         }
         for (what, n) in self.shared.errors.lock().iter() {
             notes.push(format!("Ingest error x{n}: {what}"));
         }
+        let mut shutdown_error = None;
         if self.broker.is_running() {
             match self.broker.stop_graceful(Duration::from_secs(90)).await {
                 Ok(d) => self.shutdown_s = self.shutdown_s.or(Some(d.as_secs_f64())),
-                Err(e) => notes.push(format!("graceful shutdown failed: {e}")),
+                Err(e) => {
+                    shutdown_error = Some(e.to_string());
+                    notes.push(format!("graceful shutdown failed: {e}"));
+                }
             }
         }
         if let Some(s) = self.shutdown_s {
@@ -394,6 +397,9 @@ impl Trial {
             ));
         }
         self.sink.shutdown();
+        // Inspection errors still fail the trial, but only after its broker and
+        // sink have been stopped; dropping their task handles is not shutdown.
+        confirmed_dlq.context("final DLQ accounting failed")?;
 
         let log_path = self.dir.join("broker.log");
         let (warns, errs, bytes, top) = log_stats(&log_path);
@@ -477,6 +483,7 @@ impl Trial {
         ));
 
         Ok(TrialResult {
+            shutdown_error,
             index: self.index,
             seed: self.seed,
             duration_s: series.t.last().copied().unwrap_or(0.0),

@@ -110,6 +110,7 @@ async fn catch_up_reconciling_tail(
     state: &AppState,
     shard: u32,
 ) -> Result<(), CatchUpError> {
+    let generation = cluster.runtime.shard_generation(shard);
     let mut reconciled = 0;
     loop {
         let error = match catch_up_shard(cluster, state, shard).await {
@@ -119,6 +120,7 @@ async fn catch_up_reconciling_tail(
         let Some((topic, to_offset)) = error.reconcile_target() else {
             return Err(error);
         };
+        ensure_recovery_owner(cluster, shard, generation)?;
         if reconciled >= MAX_TAIL_RECONCILIATIONS {
             return Err(error);
         }
@@ -351,6 +353,8 @@ async fn catch_up_shard(
     state: &AppState,
     shard: u32,
 ) -> Result<(), CatchUpError> {
+    let generation = cluster.runtime.shard_generation(shard);
+    ensure_recovery_owner(cluster, shard, generation)?;
     // Probe the shard's replica set directly instead of trusting this node's
     // health view: a briefly "dead" replica may hold acknowledged records.
     let node_id = cluster.runtime.config().node_id;
@@ -379,7 +383,9 @@ async fn catch_up_shard(
         };
         let mut answered = Vec::new();
         let mut failed = HashSet::new();
-        for (peer, result) in probe_replicas(cluster, &peers, &request).await {
+        let answers = probe_replicas(cluster, &peers, &request).await;
+        ensure_recovery_owner(cluster, shard, generation)?;
+        for (peer, result) in answers {
             match result {
                 Ok(range) => answered.push((peer.internal_base().to_owned(), range)),
                 Err(error) => {
@@ -425,6 +431,7 @@ async fn catch_up_shard(
             });
         }
         if page.base_offset > local_leo {
+            state.broker.check_gc_identity_coverage(&state.broker.log_id(&topic, shard), page.base_offset).map_err(|error| CatchUpError::Retryable(format!("{topic}/{shard}: collected-prefix identity coverage is unknown; refusing to skip producer keys: {error}")))?;
             // The source already collected everything this node is missing
             // below its base (all of it delivered under a committed GC
             // watermark). Everything held locally is below that base, so
@@ -449,6 +456,7 @@ async fn catch_up_shard(
         }
 
         loop {
+            ensure_recovery_owner(cluster, shard, generation)?;
             let mut last_appended = None;
             for frame in &page.frames {
                 state
@@ -476,6 +484,7 @@ async fn catch_up_shard(
                     .wait_committed(&topic, shard, offset)
                     .await
                     .map_err(|e| format!("{topic}/{shard}: fsync catch-up page: {e}"))?;
+                ensure_recovery_owner(cluster, shard, generation)?;
             }
             local_leo = state
                 .broker
@@ -503,6 +512,21 @@ async fn catch_up_shard(
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+fn ensure_recovery_owner(
+    cluster: &Cluster,
+    shard: u32,
+    generation: u64,
+) -> Result<(), CatchUpError> {
+    if !cluster.runtime.is_elected_leader_for_shard(shard)
+        || cluster.runtime.shard_generation(shard) != generation
+    {
+        return Err(CatchUpError::Retryable(format!(
+            "shard {shard}: recovery ownership changed"
+        )));
     }
     Ok(())
 }
@@ -652,7 +676,7 @@ pub fn spawn_cluster_health_monitor(
         // placement commits below can never delay liveness observations.
         let _health = AbortOnDrop(tokio::spawn(peer_health_loop(runtime.clone(), client)));
 
-        let mut prev_leaders: HashMap<u32, Uuid> = HashMap::new();
+        let mut prev_leaders: HashMap<u32, (Uuid, u64)> = HashMap::new();
         let mut repair_ticks = 0u64;
         let mut prev_peer_alive: HashMap<Uuid, bool> = HashMap::new();
         let mut interval = tokio::time::interval(HEALTH_INTERVAL);
@@ -710,15 +734,18 @@ pub fn spawn_cluster_health_monitor(
                     Some(id) => id,
                     None => continue,
                 };
-                let was = prev_leaders.insert(shard, leader);
+                let generation = runtime.shard_generation(shard);
+                let was = prev_leaders.insert(shard, (leader, generation));
                 if leader == node_id {
                     led_shards.push(shard);
                 }
-                if leader == node_id && was != Some(node_id) {
+                if leader == node_id && was != Some((node_id, generation)) {
                     runtime.set_shard_ready(shard, false);
                     gained_shards.push(shard);
                 }
-                if was == Some(node_id) && leader != node_id {
+                if was.is_some_and(|(id, old_generation)| {
+                    id == node_id && (leader != node_id || old_generation != generation)
+                }) {
                     lost_shards.push(shard);
                 }
             }
@@ -736,19 +763,33 @@ pub fn spawn_cluster_health_monitor(
                 // Quorum-gated cells: no dispatch on a taken-over shard until its
                 // tail is re-verified on minISR and cursors are reconciled.
                 let gated = state.broker.quorum_gating();
-                if gated {
-                    for shard in &gained_shards {
-                        dispatch.fence_partition(*shard);
-                    }
+                let mut recovery_epochs = HashMap::new();
+                for shard in &gained_shards {
+                    let epoch = if gated {
+                        dispatch.fence_partition(*shard)
+                    } else {
+                        Uuid::new_v4()
+                    };
+                    runtime.begin_shard_recovery(*shard, epoch, runtime.shard_generation(*shard));
+                    recovery_epochs.insert(*shard, epoch);
                 }
                 sync_catalog_from_peers(&state).await;
                 let mut caught_up = Vec::new();
                 for shard in gained_shards {
+                    let generation = runtime.shard_generation(shard);
+                    if ensure_recovery_owner(&cluster, shard, generation).is_err() {
+                        prev_leaders.remove(&shard);
+                        continue;
+                    }
                     match recover_gained_shard(&cluster, &state, shard).await {
                         Ok(()) => {
                             // Legacy blob references must be repaired before
                             // the shard serves; unrepairable ones stay deferred.
                             let repair = broker_api::repair_legacy_payloads(&state, shard).await;
+                            if ensure_recovery_owner(&cluster, shard, generation).is_err() {
+                                prev_leaders.remove(&shard);
+                                continue;
+                            }
                             if repair.unresolved > 0 {
                                 warn!(
                                     shard,
@@ -759,10 +800,26 @@ pub fn spawn_cluster_health_monitor(
                             if gated {
                                 dispatch.set_recovery_targets(
                                     shard,
+                                    recovery_epochs[&shard],
                                     crate::quorum_repair::recovery_targets(&state, shard),
                                 );
+                                runtime.mark_shard_verifying(
+                                    shard,
+                                    recovery_epochs[&shard],
+                                    generation,
+                                );
                             }
-                            runtime.set_shard_ready(shard, true);
+                            // Recovery can prove the prefix under elected/lease
+                            // ownership while ingest remains fenced.
+                            if !gated {
+                                let epoch = recovery_epochs[&shard];
+                                if !runtime.mark_shard_verifying(shard, epoch, generation)
+                                    || !runtime.finish_shard_recovery(shard, epoch, generation)
+                                {
+                                    prev_leaders.remove(&shard);
+                                    continue;
+                                }
+                            }
                             caught_up.push(shard);
                         }
                         Err(error) => {
@@ -792,7 +849,7 @@ pub fn spawn_cluster_health_monitor(
                 if !caught_up.is_empty() && gated {
                     info!(
                         shards = ?caught_up,
-                        "failover catch-up complete; ingest open, dispatch waits for quorum verification"
+                        "failover catch-up complete; ingest and dispatch wait for quorum verification"
                     );
                 } else if !caught_up.is_empty() {
                     info!(shards = ?caught_up, "failover catch-up complete; shards unfenced");
@@ -939,6 +996,11 @@ mod tests {
             generation: 1,
             hash_version: 1,
         }));
+        for peer in peer_ids {
+            cluster
+                .runtime
+                .record_peer_alive(peer, Utc::now().timestamp_millis());
+        }
         let broker = Broker::open(broker_partition::BrokerConfig::new(dir.path().into())).unwrap();
         let state = Arc::new(AppState {
             schedule: broker_schedule::ScheduleQueue::open(dir.path()).unwrap(),

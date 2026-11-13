@@ -10,6 +10,59 @@ pub struct Api {
     token: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{extract::Query, routing::get, Json, Router};
+    use std::collections::HashMap;
+
+    async fn server(repeated_cursor: bool) -> (Api, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/v1/dlq/sources", get(|| async {
+                Json(json!([{"dlq_topic":"q.__dlq", "count":null}]))
+            }))
+            .route("/v1/dlq", get(move |Query(query): Query<HashMap<String, String>>| async move {
+                assert_eq!(query["include_body"], "true");
+                assert_eq!(query["dlq_topic"], "q.__dlq");
+                if repeated_cursor {
+                    return Json(json!({"messages":[], "next_cursor":"same"}));
+                }
+                let (sequence, next) = if query.contains_key("cursor") { (1, None) } else { (0, Some("page-2")) };
+                Json(json!({
+                    "messages":[{"body":json!({"s":0,"n":sequence}).to_string(), "body_encoding":"utf8"}],
+                    "next_cursor":next
+                }))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (Api::new(reqwest::Client::new(), &base, None), task)
+    }
+
+    #[tokio::test]
+    async fn dead_letter_accounting_reads_every_page_even_without_counts() {
+        let (api, server) = server(false).await;
+        let verifier = crate::verify::Verifier::default();
+        let stream = verifier.register("q", 3, 0, false);
+        for seq in 0..3 {
+            stream.mark_acked(seq);
+        }
+        assert_eq!(api.confirm_dead_letters(&verifier).await.unwrap(), 2);
+        assert_eq!(stream.count_unaccounted(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dead_letter_accounting_rejects_nonadvancing_pagination() {
+        let (api, server) = server(true).await;
+        let result = api
+            .confirm_dead_letters(&crate::verify::Verifier::default())
+            .await;
+        assert!(result.unwrap_err().to_string().contains("did not advance"));
+        server.abort();
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct QueueSpec {
     pub name: String,
@@ -140,6 +193,54 @@ impl Api {
                 .unwrap_or(0),
             Err(_) => 0,
         }
+    }
+
+    /// Read back paginated DLQ rows, not just approximate aggregate counts.
+    /// Errors are fatal to final correctness accounting, never treated as zero.
+    pub async fn confirm_dead_letters(
+        &self,
+        verifier: &crate::verify::Verifier,
+    ) -> anyhow::Result<u64> {
+        let sources = self.get("/v1/dlq/sources").await?;
+        let sources = sources
+            .as_array()
+            .or_else(|| sources["sources"].as_array())
+            .context("invalid DLQ source response")?;
+        let mut confirmed = 0;
+        for source in sources {
+            let topic = source["dlq_topic"]
+                .as_str()
+                .context("DLQ source has no topic")?;
+            let mut cursors = std::collections::HashSet::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let mut request = self.req(reqwest::Method::GET, "/v1/dlq").query(&[
+                    ("dlq_topic", topic),
+                    ("include_body", "true"),
+                    ("limit", "64"),
+                ]);
+                if let Some(cursor) = &cursor {
+                    request = request.query(&[("cursor", cursor)]);
+                }
+                let page = self.send(request, "read back dead letters").await?;
+                for row in page["messages"]
+                    .as_array()
+                    .context("DLQ page has no messages")?
+                {
+                    verifier.confirm_dlq_message(row)?;
+                    confirmed += 1;
+                }
+                let Some(next) = page["next_cursor"].as_str() else {
+                    break;
+                };
+                anyhow::ensure!(
+                    cursors.insert(next.to_owned()),
+                    "DLQ pagination did not advance"
+                );
+                cursor = Some(next.to_owned());
+            }
+        }
+        Ok(confirmed)
     }
 
     pub async fn metrics_text(&self) -> Option<String> {

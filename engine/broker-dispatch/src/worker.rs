@@ -11,8 +11,8 @@ use broker_partition::{dlq_topic, group_member_dlq_topic};
 use broker_partition::{Broker, PublishRequest, PublishResponse, DIRECT_TOPIC};
 use broker_proto::RetryDefaults;
 use broker_storage::StoredMessage;
-use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -206,7 +206,24 @@ pub enum LeasedFailure {
 type ShardLeaderFn = Arc<dyn Fn(u32) -> bool + Send + Sync>;
 /// `(topic, committed watermark at takeover)` logs to verify before unfencing.
 type RecoveryTargets = Vec<(String, u64)>;
-type InFlightSet = Arc<parking_lot::Mutex<HashSet<(String, u32, u64)>>>;
+
+#[derive(Clone)]
+struct Recovery {
+    epoch: Uuid,
+    targets: Option<RecoveryTargets>,
+}
+
+pub struct PartitionRecoveryTarget {
+    pub partition: u32,
+    pub epoch: Uuid,
+    pub logs: Vec<(String, u64)>,
+}
+struct AdmittedJob {
+    _capacity: tokio::sync::OwnedSemaphorePermit,
+    flow: Option<crate::flow_control::FlowAdmissionPermit>,
+}
+
+type InFlightSet = Arc<parking_lot::Mutex<HashMap<(String, u32, u64), AdmittedJob>>>;
 
 #[derive(Debug)]
 struct DeferredJob {
@@ -215,26 +232,43 @@ struct DeferredJob {
     job: DeliveryJob,
 }
 
-impl PartialEq for DeferredJob {
-    fn eq(&self, other: &Self) -> bool {
-        self.due == other.due && self.sequence == other.sequence
-    }
+#[derive(Default)]
+struct DeferredQueue {
+    jobs: BTreeMap<(tokio::time::Instant, u64), DeliveryJob>,
+    keys: HashMap<(String, u32, u64), (tokio::time::Instant, u64)>,
 }
 
-impl Eq for DeferredJob {}
-
-impl PartialOrd for DeferredJob {
-    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-        Some(self.cmp(other))
+impl DeferredQueue {
+    fn insert(&mut self, deferred: DeferredJob, cap: usize) -> bool {
+        let key = (
+            deferred.job.topic.clone(),
+            deferred.job.partition,
+            deferred.job.offset,
+        );
+        let due = (deferred.due, deferred.sequence);
+        if let Some(previous) = self.keys.get(&key) {
+            if previous.0 <= deferred.due {
+                return true;
+            }
+            self.jobs.remove(previous);
+        } else if self.keys.len() >= cap {
+            // These are wakeups, not authoritative work: the durable scan
+            // retains every pending delivery even when this cache is full.
+            return false;
+        }
+        self.keys.insert(key, due);
+        self.jobs.insert(due, deferred.job);
+        true
     }
-}
 
-impl Ord for DeferredJob {
-    fn cmp(&self, other: &Self) -> CmpOrdering {
-        other
-            .due
-            .cmp(&self.due)
-            .then_with(|| other.sequence.cmp(&self.sequence))
+    fn pop_due(&mut self, now: tokio::time::Instant) -> Option<DeliveryJob> {
+        if self.jobs.first_key_value()?.0 .0 > now {
+            return None;
+        }
+        let (_, job) = self.jobs.pop_first()?;
+        self.keys
+            .remove(&(job.topic.clone(), job.partition, job.offset));
+        Some(job)
     }
 }
 
@@ -248,13 +282,19 @@ pub(crate) struct DeliveryOwnership {
     key: (String, u32, u64),
     jobs: InFlightSet,
     notify: Arc<Notify>,
+    backfill_notify: Arc<Notify>,
     lease: Option<LeaseDrop>,
+    pub(crate) flow_admission: Option<crate::flow_control::FlowAdmissionPermit>,
 }
 
 impl Drop for DeliveryOwnership {
     fn drop(&mut self) {
+        // Early returns may still own the pre-hydration flow reservation.
+        // Release it before announcing that backfill can use the capacity.
+        drop(self.flow_admission.take());
         self.jobs.lock().remove(&self.key);
         self.notify.notify_waiters();
+        self.backfill_notify.notify_one();
     }
 }
 
@@ -280,20 +320,30 @@ impl Drop for LeaseDrop {
 
 #[derive(Clone)]
 pub struct DispatchEngine {
+    inner: Arc<DispatchState>,
+}
+
+/// Shared engine state. Delivery jobs carry one Arc rather than cloning every
+/// client, registry, path, configuration vector and synchronization handle.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct DispatchState {
     broker: Broker,
     config: DispatchConfig,
     client: reqwest::Client,
     long_client: reqwest::Client,
     high_tx: mpsc::Sender<DeliveryJob>,
-    defer_tx: mpsc::Sender<DeferredJob>,
+    deferred: Arc<parking_lot::Mutex<DeferredQueue>>,
+    defer_notify: Arc<Notify>,
     pub flow: FlowController,
     in_flight_jobs: InFlightSet,
-    is_shard_leader: Option<ShardLeaderFn>,
+    job_capacity: Arc<Semaphore>,
+    is_shard_leader: Arc<parking_lot::RwLock<Option<ShardLeaderFn>>>,
     host_blocker: Arc<HostBlocker>,
     memory_guard: Arc<MemoryGuard>,
     in_flight: Arc<Semaphore>,
     /// Shared lease table — same CAS path as fleet claim API.
-    leases: Option<crate::lease::LeaseTable>,
+    leases: Arc<parking_lot::RwLock<Option<crate::lease::LeaseTable>>>,
     local_holder: String,
     workers_enabled: bool,
     stop: Arc<AtomicBool>,
@@ -301,22 +351,43 @@ pub struct DispatchEngine {
     stop_notify: Arc<Notify>,
     active_http: Arc<AtomicU64>,
     drain_notify: Arc<Notify>,
+    backfill_notify: Arc<Notify>,
     defer_sequence: Arc<AtomicU64>,
     retry_state: RetryState,
     lifecycle: LifecycleStore,
     telemetry: Arc<crate::telemetry::DispatchTelemetry>,
     pressure_logs: Arc<PressureLogs>,
     background: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
+    delivery_tasks: tokio_util::task::TaskTracker,
+    cancellation: tokio_util::sync::CancellationToken,
     scan: crate::scan::DispatchScan,
     backfill_rotation: Arc<AtomicUsize>,
     claim_rates: crate::lease::ClaimRates,
     /// Striped per-lane locks around cursor advancement (see `commit_dispatch_offset`).
-    cursor_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
+    cursor_locks: Arc<Vec<Arc<tokio::sync::Mutex<()>>>>,
+    /// A rewind must drain precomputed and queued progress for its partition.
+    cursor_recovery: Arc<Vec<Arc<tokio::sync::RwLock<()>>>>,
     /// Partitions taken over but not yet verified: dispatch is fenced until
     /// each `(topic, target)` log is quorum-verified up to `target` (`None`
     /// while the local log is still being caught up).
-    recovering: Arc<parking_lot::Mutex<HashMap<u32, Option<RecoveryTargets>>>>,
+    recovering: Arc<parking_lot::Mutex<HashMap<u32, Recovery>>>,
     dlq_durability: Arc<std::sync::OnceLock<Arc<dyn DlqDurability>>>,
+}
+
+impl std::ops::Deref for DispatchEngine {
+    type Target = DispatchState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for DispatchEngine {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // Builders retain their original per-handle semantics when a handle
+        // has already been cloned; live synchronization state stays shared.
+        Arc::make_mut(&mut self.inner)
+    }
 }
 
 impl DispatchEngine {
@@ -330,8 +401,19 @@ impl DispatchEngine {
     }
 
     fn new_with_mode(broker: Broker, config: DispatchConfig, workers_enabled: bool) -> Self {
+        Self::new_with_controls(broker, config, workers_enabled, None, None)
+    }
+
+    /// Install lease/leadership controls before recovery can enqueue any work.
+    /// A replicated cell starts fenced until its quorum recovery completes.
+    pub fn new_with_controls(
+        broker: Broker,
+        config: DispatchConfig,
+        workers_enabled: bool,
+        leases: Option<crate::lease::LeaseTable>,
+        is_shard_leader: Option<ShardLeaderFn>,
+    ) -> Self {
         let (high_tx, high_rx) = mpsc::channel(dispatch_queue_cap());
-        let (defer_tx, defer_rx) = mpsc::channel(dispatch_queue_cap());
         let config_clone = config.clone();
         let memory_guard = Arc::new(MemoryGuard::new(config_clone.memory_guard.clone()));
         // Apply fleet long-wait tier when set (Phase E).
@@ -345,57 +427,86 @@ impl DispatchEngine {
         let lifecycle = LifecycleStore::open(&broker.config().data_dir)
             .expect("open durable dispatch lifecycle state");
         let scan = crate::scan::DispatchScan::open(Some(&broker.config().data_dir));
+        let recovering = if broker.quorum_gating() && is_shard_leader.is_some() {
+            (0..broker.layout().shard_count)
+                .map(|partition| {
+                    (
+                        partition,
+                        Recovery {
+                            epoch: Uuid::new_v4(),
+                            targets: None,
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let engine = Self {
-            broker,
-            config,
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(2))
-                .timeout(Duration::from_secs(config_clone.http_timeout_secs))
-                .redirect(reqwest::redirect::Policy::none())
-                .dns_resolver(Arc::new(crate::egress::PolicyResolver))
-                .no_proxy()
-                .build()
-                .expect("reqwest short client"),
-            long_client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(2))
-                .timeout(Duration::from_secs(long_secs))
-                .redirect(reqwest::redirect::Policy::none())
-                .dns_resolver(Arc::new(crate::egress::PolicyResolver))
-                .no_proxy()
-                .build()
-                .expect("reqwest long client"),
-            high_tx,
-            defer_tx,
-            flow: FlowController::new(global_max, memory_guard.clone()),
-            in_flight_jobs: Arc::new(parking_lot::Mutex::new(HashSet::new())),
-            is_shard_leader: None,
-            host_blocker: Arc::new(HostBlocker::new(config_clone.host_blocker.clone())),
-            memory_guard,
-            in_flight: Arc::new(Semaphore::new(dispatch_max_in_flight())),
-            leases: None,
-            local_holder: format!("local-{}", Uuid::new_v4()),
-            workers_enabled,
-            stop: Arc::new(AtomicBool::new(false)),
-            draining: Arc::new(AtomicBool::new(false)),
-            stop_notify: Arc::new(Notify::new()),
-            active_http: Arc::new(AtomicU64::new(0)),
-            drain_notify: Arc::new(Notify::new()),
-            defer_sequence: Arc::new(AtomicU64::new(0)),
-            retry_state,
-            lifecycle,
-            telemetry: Arc::new(crate::telemetry::DispatchTelemetry::new()),
-            pressure_logs: Arc::new(PressureLogs::default()),
-            background: Arc::new(parking_lot::Mutex::new(Vec::new())),
-            scan,
-            backfill_rotation: Arc::new(AtomicUsize::new(0)),
-            claim_rates: crate::lease::ClaimRates::default(),
-            cursor_locks: Arc::new(
-                (0..CURSOR_LOCK_STRIPES)
-                    .map(|_| tokio::sync::Mutex::new(()))
-                    .collect(),
-            ),
-            recovering: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            dlq_durability: Arc::new(std::sync::OnceLock::new()),
+            inner: Arc::new(DispatchState {
+                cursor_recovery: Arc::new(
+                    (0..broker.shard_count())
+                        .map(|_| Arc::new(tokio::sync::RwLock::new(())))
+                        .collect(),
+                ),
+                broker,
+                config,
+                client: reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(2))
+                    .timeout(Duration::from_secs(config_clone.http_timeout_secs))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .dns_resolver(Arc::new(crate::egress::PolicyResolver))
+                    .no_proxy()
+                    .build()
+                    .expect("reqwest short client"),
+                long_client: reqwest::Client::builder()
+                    .connect_timeout(Duration::from_secs(2))
+                    .timeout(Duration::from_secs(long_secs))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .dns_resolver(Arc::new(crate::egress::PolicyResolver))
+                    .no_proxy()
+                    .build()
+                    .expect("reqwest long client"),
+                high_tx,
+                deferred: Arc::new(parking_lot::Mutex::new(DeferredQueue::default())),
+                defer_notify: Arc::new(Notify::new()),
+                flow: FlowController::new(global_max, memory_guard.clone()),
+                in_flight_jobs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                job_capacity: Arc::new(Semaphore::new(
+                    dispatch_queue_cap().min(Semaphore::MAX_PERMITS),
+                )),
+                is_shard_leader: Arc::new(parking_lot::RwLock::new(is_shard_leader)),
+                host_blocker: Arc::new(HostBlocker::new(config_clone.host_blocker.clone())),
+                memory_guard,
+                in_flight: Arc::new(Semaphore::new(dispatch_max_in_flight())),
+                leases: Arc::new(parking_lot::RwLock::new(leases)),
+                local_holder: format!("local-{}", Uuid::new_v4()),
+                workers_enabled,
+                stop: Arc::new(AtomicBool::new(false)),
+                draining: Arc::new(AtomicBool::new(false)),
+                stop_notify: Arc::new(Notify::new()),
+                active_http: Arc::new(AtomicU64::new(0)),
+                drain_notify: Arc::new(Notify::new()),
+                backfill_notify: Arc::new(Notify::new()),
+                defer_sequence: Arc::new(AtomicU64::new(0)),
+                retry_state,
+                lifecycle,
+                telemetry: Arc::new(crate::telemetry::DispatchTelemetry::new()),
+                pressure_logs: Arc::new(PressureLogs::default()),
+                background: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                delivery_tasks: tokio_util::task::TaskTracker::new(),
+                cancellation: tokio_util::sync::CancellationToken::new(),
+                scan,
+                backfill_rotation: Arc::new(AtomicUsize::new(0)),
+                claim_rates: crate::lease::ClaimRates::default(),
+                cursor_locks: Arc::new(
+                    (0..CURSOR_LOCK_STRIPES)
+                        .map(|_| Arc::new(tokio::sync::Mutex::new(())))
+                        .collect(),
+                ),
+                recovering: Arc::new(parking_lot::Mutex::new(recovering)),
+                dlq_durability: Arc::new(std::sync::OnceLock::new()),
+            }),
         };
         if let Some(handle) = engine.memory_guard.spawn_monitor() {
             engine.background.lock().push(handle);
@@ -403,7 +514,7 @@ impl DispatchEngine {
         engine.finish_committed_dlq_transitions();
         if workers_enabled {
             engine.spawn_workers(high_rx);
-            engine.spawn_defer_scheduler(defer_rx);
+            engine.spawn_defer_scheduler();
             engine.replay_lifecycle_state();
             engine.replay_retry_state();
         } else {
@@ -413,8 +524,8 @@ impl DispatchEngine {
         engine
     }
 
-    pub fn with_leases(mut self, leases: crate::lease::LeaseTable) -> Self {
-        self.leases = Some(leases);
+    pub fn with_leases(self, leases: crate::lease::LeaseTable) -> Self {
+        *self.leases.write() = Some(leases);
         self
     }
 
@@ -469,6 +580,7 @@ impl DispatchEngine {
     /// is still alive. Prevents Tokio's "context was found, but it is being shutdown".
     pub async fn shutdown_background(&self) {
         self.stop();
+        self.cancellation.cancel();
         self.memory_guard.stop();
         let mut handles: Vec<_> = std::mem::take(&mut *self.background.lock());
         handles.extend(self.flow.take_drainer_tasks());
@@ -479,6 +591,22 @@ impl DispatchEngine {
             let _ = handle.await;
         }
         self.flow.discard_pending().await;
+        self.delivery_tasks.close();
+        self.delivery_tasks.wait().await;
+        self.in_flight_jobs.lock().clear();
+        *self.deferred.lock() = DeferredQueue::default();
+        self.telemetry.reset_queue();
+    }
+
+    pub(crate) fn spawn_delivery(
+        &self,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        self.delivery_tasks.spawn(future);
+    }
+
+    pub(crate) fn delivery_cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.cancellation.clone()
     }
 
     fn active_http_guard(&self) -> ActiveHttpGuard {
@@ -504,6 +632,12 @@ impl DispatchEngine {
 
     pub(crate) fn record_flow_rejected(&self) {
         self.telemetry.record_queue_rejected();
+        self.backfill_notify.notify_one();
+    }
+
+    /// Coalesced wakeup when live dispatch drops work or capacity is released.
+    pub async fn backfill_notified(&self) {
+        self.backfill_notify.notified().await;
     }
 
     /// WAL records that log retention must keep: pending retries, DLQ
@@ -523,7 +657,7 @@ impl DispatchEngine {
             )
             .map(|key| (key.topic, key.partition, key.offset))
             .collect();
-        if let Some(leases) = &self.leases {
+        if let Some(leases) = &*self.leases.read() {
             pins.extend(
                 leases
                     .snapshot_for_status()
@@ -613,8 +747,8 @@ impl DispatchEngine {
     }
 
     /// Only dispatch/backfill partitions where this node is shard leader (CP7a).
-    pub fn with_shard_leader_check(mut self, check: ShardLeaderFn) -> Self {
-        self.is_shard_leader = Some(check);
+    pub fn with_shard_leader_check(self, check: ShardLeaderFn) -> Self {
+        *self.is_shard_leader.write() = Some(check);
         self
     }
 
@@ -622,6 +756,7 @@ impl DispatchEngine {
         !self.is_fenced(partition)
             && self
                 .is_shard_leader
+                .read()
                 .as_ref()
                 .map(|f| f(partition))
                 .unwrap_or(true)
@@ -630,21 +765,42 @@ impl DispatchEngine {
     /// Stop dispatch for `partition` (this node is taking it over). It stays
     /// fenced until [`DispatchEngine::set_recovery_targets`] names the logs
     /// to verify and [`DispatchEngine::complete_recovery`] reconciles cursors.
-    pub fn fence_partition(&self, partition: u32) {
-        self.recovering.lock().entry(partition).or_insert(None);
+    pub fn fence_partition(&self, partition: u32) -> Uuid {
+        let epoch = Uuid::new_v4();
+        self.recovering.lock().insert(
+            partition,
+            Recovery {
+                epoch,
+                targets: None,
+            },
+        );
+        epoch
     }
 
     /// After catch-up: dispatch stays fenced until every `(topic, target)` log
     /// is quorum-verified up to `target` (its committed watermark now).
     /// Identity-less completion markers above the current quorum watermark
     /// stop counting from here on.
-    pub fn set_recovery_targets(&self, partition: u32, targets: Vec<(String, u64)>) {
+    pub fn set_recovery_targets(
+        &self,
+        partition: u32,
+        epoch: Uuid,
+        targets: Vec<(String, u64)>,
+    ) -> bool {
+        let mut recovering = self.recovering.lock();
+        let Some(recovery) = recovering
+            .get_mut(&partition)
+            .filter(|recovery| recovery.epoch == epoch)
+        else {
+            return false;
+        };
         for (topic, _) in &targets {
             if let Err(error) = self.broker.freeze_legacy_completion_trust(topic, partition) {
                 warn!(%error, %topic, partition, "freeze legacy completion trust failed");
             }
         }
-        self.recovering.lock().insert(partition, Some(targets));
+        recovery.targets = Some(targets);
+        true
     }
 
     pub fn is_fenced(&self, partition: u32) -> bool {
@@ -652,18 +808,23 @@ impl DispatchEngine {
     }
 
     /// Fenced partitions whose catch-up finished, with their targets.
-    pub fn recovery_targets(&self) -> Vec<(u32, Vec<(String, u64)>)> {
+    pub fn recovery_targets(&self) -> Vec<PartitionRecoveryTarget> {
         let mut out: Vec<_> = self
             .recovering
             .lock()
             .iter()
-            .filter_map(|(partition, targets)| {
-                targets
+            .filter_map(|(partition, recovery)| {
+                recovery
+                    .targets
                     .as_ref()
-                    .map(|targets| (*partition, targets.clone()))
+                    .map(|targets| PartitionRecoveryTarget {
+                        partition: *partition,
+                        epoch: recovery.epoch,
+                        logs: targets.clone(),
+                    })
             })
             .collect();
-        out.sort_by_key(|(partition, _)| *partition);
+        out.sort_by_key(|target| target.partition);
         out
     }
 
@@ -671,9 +832,28 @@ impl DispatchEngine {
     /// lane cursor of `partition` to the quorum watermark of its log (a cursor
     /// above it could skip an offset that now holds a different record),
     /// rescan, and lift the fence. Returns how many cursors were clamped.
-    pub fn complete_recovery(&self, partition: u32) -> Result<usize, DispatchError> {
-        let Some(Some(targets)) = self.recovering.lock().get(&partition).cloned() else {
-            return Ok(0);
+    pub fn complete_recovery(
+        &self,
+        partition: u32,
+        epoch: Uuid,
+    ) -> Result<Option<usize>, DispatchError> {
+        let barrier = self
+            .cursor_recovery
+            .get(partition as usize)
+            .ok_or_else(|| DispatchError::Failed("invalid recovery partition".into()))?;
+        // Do not block a runtime thread on async continuations; repair retries
+        // while fenced if an old completion still owns a metadata receipt.
+        let _rewind = barrier.try_write().map_err(|_| {
+            DispatchError::Failed("cursor completions are still draining before recovery".into())
+        })?;
+        let mut recovering = self.recovering.lock();
+        let Some(targets) = recovering
+            .get(&partition)
+            .filter(|recovery| recovery.epoch == epoch)
+            .and_then(|recovery| recovery.targets.as_ref())
+            .cloned()
+        else {
+            return Ok(None);
         };
         for (topic, target) in &targets {
             let quorum = self.broker.quorum_hwm(topic, partition)?;
@@ -694,12 +874,12 @@ impl DispatchEngine {
             }
         }
         self.scan.reset_partitions(&[partition]);
-        self.recovering.lock().remove(&partition);
+        recovering.remove(&partition);
         info!(
             partition,
             clamped, "dispatch recovery complete; partition unfenced"
         );
-        Ok(clamped)
+        Ok(Some(clamped))
     }
 
     /// Topic whose log a lane cursor counts offsets in.
@@ -717,36 +897,72 @@ impl DispatchEngine {
     }
 
     pub fn enqueue(&self, job: DeliveryJob) {
+        self.enqueue_admitted(job, None);
+    }
+
+    fn enqueue_admitted(
+        &self,
+        job: DeliveryJob,
+        flow: Option<crate::flow_control::FlowAdmissionPermit>,
+    ) -> bool {
         if !self.workers_enabled
             || self.stop.load(Ordering::Relaxed)
             || self.draining.load(Ordering::Acquire)
         {
-            return;
+            return false;
         }
         if !self.shard_leader(job.partition) {
-            return;
+            return false;
         }
         let key = (job.topic.clone(), job.partition, job.offset);
+        if self
+            .deferred
+            .lock()
+            .keys
+            .get(&key)
+            .is_some_and(|(due, _)| *due > tokio::time::Instant::now())
+        {
+            return false;
+        }
         {
             let mut inflight = self.in_flight_jobs.lock();
-            if !inflight.insert(key.clone()) {
-                return;
+            if inflight.contains_key(&key) {
+                return false;
             }
+            // One budget spans ready, hydration, flow waitlists and active
+            // delivery, rather than allowing each stage to fill independently.
+            let Ok(permit) = self.job_capacity.clone().try_acquire_owned() else {
+                self.telemetry.record_queue_rejected();
+                return false;
+            };
+            inflight.insert(
+                key,
+                AdmittedJob {
+                    _capacity: permit,
+                    flow,
+                },
+            );
         }
         match self.high_tx.try_send(job) {
-            Ok(()) => self.telemetry.record_queue_enqueue(),
+            Ok(()) => {
+                self.telemetry.record_queue_enqueue();
+                true
+            }
             Err(mpsc::error::TrySendError::Full(job)) => {
                 self.telemetry.record_queue_rejected();
                 self.in_flight_jobs
                     .lock()
                     .remove(&(job.topic, job.partition, job.offset));
                 self.record_pressure(0);
+                self.backfill_notify.notify_one();
+                false
             }
             Err(mpsc::error::TrySendError::Closed(job)) => {
                 self.telemetry.record_queue_rejected();
                 self.in_flight_jobs
                     .lock()
                     .remove(&(job.topic, job.partition, job.offset));
+                false
             }
         }
     }
@@ -766,8 +982,11 @@ impl DispatchEngine {
         self.telemetry
             .record_committed_range(to_offset.saturating_sub(from_offset));
         for offset in from_offset..to_offset {
-            if let Ok(msg) = self.broker.read_message(topic, partition, offset) {
-                self.observe_pending(&msg, to_offset);
+            // Fleet-only brokers have no local worker to seed this view.
+            if !self.workers_enabled {
+                if let Ok(msg) = self.broker.read_message(topic, partition, offset) {
+                    self.observe_pending(&msg, to_offset);
+                }
             }
             self.enqueue(DeliveryJob::live(
                 topic.to_string(),
@@ -776,6 +995,7 @@ impl DispatchEngine {
                 message_id,
             ));
         }
+        self.backfill_notify.notify_one();
     }
 
     pub(crate) fn broker(&self) -> &Broker {
@@ -793,6 +1013,11 @@ impl DispatchEngine {
         if let Ok(queues) = self.broker.list_endpoints() {
             for q in queues {
                 topics.insert(q.topic);
+            }
+        }
+        if let Ok(groups) = self.broker.list_groups() {
+            for group in groups {
+                topics.insert(broker_partition::group_topic(group.id));
             }
         }
         let mut topics: Vec<String> = topics
@@ -833,58 +1058,147 @@ impl DispatchEngine {
         if targets.is_empty() {
             return false;
         }
-        let deadline = Instant::now() + BACKFILL_PASS_BUDGET;
-        let start = self.backfill_rotation.load(Ordering::Relaxed) % targets.len();
+        let scan_deadline = Instant::now() + BACKFILL_PASS_BUDGET / 2;
+        let start = self.backfill_rotation.fetch_add(1, Ordering::Relaxed) % targets.len();
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut enqueued = 0u64;
         let mut more = false;
-        'targets: for step in 0..targets.len() {
+        let mut paused = HashMap::new();
+        let mut observed = HashSet::new();
+        let mut ready = std::collections::VecDeque::new();
+        // Collect bounded metadata views first so every scanned log can compete
+        // for one flow's shared budget. Reserve half the pass for admission:
+        // spending the whole budget scanning would starve delivery on cold logs.
+        for step in 0..targets.len() {
             let index = (start + step) % targets.len();
-            if Instant::now() >= deadline {
+            if Instant::now() >= scan_deadline {
                 self.backfill_rotation.store(index, Ordering::Relaxed);
                 more = true;
                 break;
             }
             let (topic, partition) = &targets[index];
-            let view =
-                match self
-                    .scan
-                    .refresh(&self.broker, topic, *partition, BACKFILL_RECORD_BUDGET)
-                {
-                    Ok(view) => view,
-                    Err(error) => {
-                        warn!(%error, %topic, partition, "dispatch backfill scan failed");
-                        continue;
-                    }
-                };
+            let view = match self.scan.refresh_ready(
+                &self.broker,
+                topic,
+                *partition,
+                BACKFILL_RECORD_BUDGET,
+            ) {
+                Ok(view) => view,
+                Err(error) => {
+                    warn!(%error, %topic, partition, "dispatch backfill scan failed");
+                    continue;
+                }
+            };
             more |= !view.caught_up;
             let hwm = self.broker.committed_hwm(topic, *partition).unwrap_or(0);
-            for entry in view.entries {
-                // Backlog telemetry also on broker-only (fleet) brokers, which
-                // deliver nothing themselves and so never enqueue.
+            if !view.entries.is_empty() {
+                ready.push_back((index, hwm, view.entries.into_iter()));
+            }
+        }
+        // One record per view per turn, not one complete partition at a time.
+        // A shared flow must keep multiple partition cursors making progress so
+        // durable completion writes can still group across those cursors.
+        // Start this budget after the reads: a single slow storage call must
+        // not make every subsequent pass discard the work it just discovered.
+        let deadline = Instant::now() + BACKFILL_PASS_BUDGET / 2;
+        while let Some((index, hwm, mut entries)) = ready.pop_front() {
+            let Some(entry) = entries.next() else {
+                continue;
+            };
+            if !entries.as_slice().is_empty() {
+                ready.push_back((index, hwm, entries));
+            }
+            if Instant::now() >= deadline {
+                self.backfill_rotation.store(index + 1, Ordering::Relaxed);
+                more = true;
+                break;
+            }
+            if self.workers_enabled
+                && self.in_flight_jobs.lock().contains_key(&(
+                    entry.topic.clone(),
+                    entry.partition,
+                    entry.offset,
+                ))
+            {
+                continue;
+            }
+            // Backlog telemetry also on broker-only (fleet) brokers, which
+            // deliver nothing themselves and so never enqueue.
+            if observed.insert((entry.partition, entry.cursor_key.clone())) {
                 self.observe_pending_entry(&entry, hwm);
-                if !self.workers_enabled {
+            }
+            if !self.workers_enabled {
+                continue;
+            }
+            let key = (entry.topic.clone(), entry.partition, entry.offset);
+            if self
+                .deferred
+                .lock()
+                .keys
+                .get(&key)
+                .is_some_and(|(due, _)| *due > tokio::time::Instant::now())
+            {
+                continue;
+            }
+            if entry
+                .host_key
+                .as_deref()
+                .is_some_and(|host| self.host_blocker.is_host_key_blocked(host))
+            {
+                continue;
+            }
+            if entry.queue_id.is_some_and(|id| {
+                *paused.entry((false, id)).or_insert_with(|| {
+                    self.broker
+                        .get_queue_by_id(id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|queue| queue.paused)
+                })
+            }) || entry.group_member_id.is_some_and(|id| {
+                *paused.entry((true, id)).or_insert_with(|| {
+                    self.broker
+                        .get_group_member(id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|member| member.paused)
+                })
+            }) {
+                continue;
+            }
+            // A due-later retry is owned by the defer scheduler; re-enqueueing
+            // it (or offsets fenced behind it) would only churn the queue.
+            if self
+                .blocking_entry_retry(&entry)
+                .is_some_and(|record| record.due_at_ms > now_ms)
+            {
+                continue;
+            }
+            if self.high_tx.capacity() == 0 || self.job_capacity.available_permits() == 0 {
+                self.backfill_rotation.store(index + 1, Ordering::Relaxed);
+                more = true;
+                break;
+            }
+            // Reserve the flow's look-ahead synchronously. Merely checking
+            // the async lane counter here can enqueue a whole window before
+            // any hydration task updates it, then churn on rejection.
+            let admission = if let Some(flow) = &entry.flow {
+                let Some(permit) = self.flow.try_admit(&flow.key, flow.parallelism) else {
                     continue;
-                }
-                // A due-later retry is owned by the defer scheduler; re-enqueueing
-                // it (or offsets fenced behind it) would only churn the queue.
-                if self
-                    .blocking_entry_retry(&entry)
-                    .is_some_and(|record| record.due_at_ms > now_ms)
-                {
-                    continue;
-                }
-                if self.high_tx.capacity() == 0 {
-                    self.backfill_rotation.store(index, Ordering::Relaxed);
-                    more = true;
-                    break 'targets;
-                }
-                self.enqueue(DeliveryJob::live(
-                    entry.topic,
+                };
+                Some(permit)
+            } else {
+                None
+            };
+            if self.enqueue_admitted(
+                DeliveryJob::live(
+                    entry.topic.clone(),
                     entry.partition,
                     entry.offset,
                     entry.message_id,
-                ));
+                ),
+                admission,
+            ) {
                 enqueued += 1;
             }
         }
@@ -984,15 +1298,21 @@ impl DispatchEngine {
                                 break;
                             }
                         };
-                        tokio::spawn(async move {
+                        let tasks = engine.delivery_tasks.clone();
+                        let cancellation = engine.cancellation.clone();
+                        tasks.spawn(async move {
                             let _permit = permit;
                             let key = (job.topic.clone(), job.partition, job.offset);
+                            let flow_admission = engine.in_flight_jobs.lock().get_mut(&key).and_then(|job| job.flow.take());
                             let ownership = DeliveryOwnership { key,
-                                jobs: engine.in_flight_jobs.clone(), notify: engine.drain_notify.clone(), lease: None };
-                            let result = engine.deliver_job(job, ownership).await;
-                            if let Err(e) = result {
+                                jobs: engine.in_flight_jobs.clone(), notify: engine.drain_notify.clone(),
+                                backfill_notify: engine.backfill_notify.clone(), lease: None, flow_admission };
+                            tokio::select! {
+                                _ = cancellation.cancelled() => {},
+                                result = engine.deliver_job(job, ownership) => if let Err(e) = result {
                                 engine.record_pressure(3);
                                 debug!(error = %e, "delivery job failed");
+                                },
                             }
                         });
                     }
@@ -1002,39 +1322,33 @@ impl DispatchEngine {
         self.background.lock().push(handle);
     }
 
-    fn spawn_defer_scheduler(&self, mut rx: mpsc::Receiver<DeferredJob>) {
+    fn spawn_defer_scheduler(&self) {
         let this = self.clone();
         let handle = tokio::spawn(async move {
-            let mut heap = BinaryHeap::<DeferredJob>::new();
             loop {
-                if let Some(next) = heap.peek() {
-                    let due = next.due;
+                let due = this
+                    .deferred
+                    .lock()
+                    .jobs
+                    .first_key_value()
+                    .map(|(key, _)| key.0);
+                if let Some(due) = due {
                     tokio::select! {
                         _ = this.stop_notify.notified() => break,
-                        incoming = rx.recv() => {
-                            match incoming {
-                                Some(job) => heap.push(job),
-                                None => break,
-                            }
-                        }
+                        _ = this.defer_notify.notified() => {},
                         _ = tokio::time::sleep_until(due) => {
                             let now = tokio::time::Instant::now();
-                            while heap.peek().is_some_and(|job| job.due <= now) {
-                                if let Some(job) = heap.pop() {
-                                    this.enqueue(job.job);
-                                }
+                            loop {
+                                let job = this.deferred.lock().pop_due(now);
+                                let Some(job) = job else { break };
+                                this.enqueue(job);
                             }
                         }
                     }
                 } else {
                     tokio::select! {
                         _ = this.stop_notify.notified() => break,
-                        incoming = rx.recv() => {
-                            match incoming {
-                                Some(job) => heap.push(job),
-                                None => break,
-                            }
-                        }
+                        _ = this.defer_notify.notified() => {},
                     }
                 }
             }
@@ -1194,13 +1508,21 @@ impl DispatchEngine {
             })
     }
 
+    #[cfg(test)]
     fn clear_retry(&self, msg: &StoredMessage) -> Result<(), DispatchError> {
         self.retry_state
             .clear(&Self::retry_key(msg))
             .map_err(|error| DispatchError::Failed(error.to_string()))
     }
 
-    fn schedule_retry(
+    async fn clear_retry_async(&self, msg: &StoredMessage) -> Result<(), DispatchError> {
+        self.retry_state
+            .clear_async(&Self::retry_key(msg))
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))
+    }
+
+    async fn schedule_retry(
         &self,
         msg: &StoredMessage,
         attempts: u32,
@@ -1208,7 +1530,8 @@ impl DispatchEngine {
         reason: String,
     ) -> Result<(), DispatchError> {
         let delay_ms = delay_ms.max(1);
-        self.persist_retry(msg, attempts, delay_ms, reason)?;
+        self.persist_retry_async(msg, attempts, delay_ms, reason)
+            .await?;
         self.telemetry.record_retry_scheduled();
         self.defer_job(
             DeliveryJob::live(msg.topic.clone(), msg.partition, msg.offset, msg.id),
@@ -1218,6 +1541,27 @@ impl DispatchEngine {
         Ok(())
     }
 
+    fn retry_record(
+        msg: &StoredMessage,
+        attempts: u32,
+        delay_ms: u64,
+        reason: String,
+    ) -> RetryRecord {
+        let delay_ms = delay_ms.max(1);
+        let due_at_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_add(delay_ms.min(i64::MAX as u64) as i64);
+        RetryRecord {
+            key: Self::retry_key(msg),
+            cursor_key: broker_partition::flow_lane_owner(msg).to_string(),
+            fifo_key: Self::fifo_retry_key(msg),
+            attempts,
+            due_at_ms,
+            last_error: reason,
+        }
+    }
+
+    #[cfg(test)]
     fn persist_retry(
         &self,
         msg: &StoredMessage,
@@ -1225,21 +1569,23 @@ impl DispatchEngine {
         delay_ms: u64,
         reason: String,
     ) -> Result<(), DispatchError> {
-        let delay_ms = delay_ms.max(1);
-        let due_at_ms = chrono::Utc::now()
-            .timestamp_millis()
-            .saturating_add(delay_ms as i64);
         self.retry_state
-            .schedule(RetryRecord {
-                key: Self::retry_key(msg),
-                cursor_key: broker_partition::flow_lane_owner(msg).to_string(),
-                fifo_key: Self::fifo_retry_key(msg),
-                attempts,
-                due_at_ms,
-                last_error: reason,
-            })
+            .schedule(Self::retry_record(msg, attempts, delay_ms, reason))
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
         Ok(())
+    }
+
+    async fn persist_retry_async(
+        &self,
+        msg: &StoredMessage,
+        attempts: u32,
+        delay_ms: u64,
+        reason: String,
+    ) -> Result<(), DispatchError> {
+        self.retry_state
+            .schedule_async(Self::retry_record(msg, attempts, delay_ms, reason))
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))
     }
 
     /// Re-enqueue after a delay without advancing the dispatch cursor (pause / host block).
@@ -1259,19 +1605,11 @@ impl DispatchEngine {
             sequence: self.defer_sequence.fetch_add(1, Ordering::Relaxed),
             job,
         };
-        match self.defer_tx.try_send(deferred) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(job)) => {
-                self.telemetry.record_defer_rejected();
-                self.record_pressure(2);
-                debug!(
-                    topic = %job.job.topic,
-                    offset = job.job.offset,
-                    reason,
-                    "defer scheduler full; relying on durable backfill"
-                );
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        if self.deferred.lock().insert(deferred, dispatch_queue_cap()) {
+            self.defer_notify.notify_one();
+        } else {
+            self.telemetry.record_defer_rejected();
+            self.record_pressure(2);
         }
     }
 
@@ -1284,14 +1622,15 @@ impl DispatchEngine {
             return Ok(());
         }
         // Lease seam: skip if already claimed by fleet/another worker.
-        if let Some(leases) = &self.leases {
+        if let Some(leases) = &*self.leases.read() {
             if leases.is_offset_leased(&job.topic, job.partition, job.offset) {
                 return Ok(());
             }
         }
         let msg = match self
             .broker
-            .read_message(&job.topic, job.partition, job.offset)
+            .read_message_async(&job.topic, job.partition, job.offset)
+            .await
         {
             Ok(m) => m,
             Err(e) => {
@@ -1309,6 +1648,7 @@ impl DispatchEngine {
         // Quorum-gated in a cell: never deliver a record before it is known
         // to survive failover.
         let committed_hwm = self.broker.dispatch_hwm(&job.topic, job.partition)?;
+        self.observe_pending(&msg, committed_hwm);
         if job.offset >= committed_hwm {
             self.defer_job(job, Duration::from_millis(250), "awaiting_commit");
             return Ok(());
@@ -1330,7 +1670,8 @@ impl DispatchEngine {
             }
         }
 
-        let lease_id = if let Some(leases) = &self.leases {
+        let leases = self.leases.read().clone();
+        let lease_id = if let Some(leases) = &leases {
             let id = Uuid::new_v4();
             let claimed = crate::lease::ClaimedJob {
                 lease_id: id,
@@ -1353,7 +1694,7 @@ impl DispatchEngine {
             None
         };
         ownership.lease = Some(LeaseDrop {
-            leases: self.leases.clone(),
+            leases,
             lease_id,
             holder: self.local_holder.clone(),
         });
@@ -1391,17 +1732,67 @@ impl DispatchEngine {
         }
 
         let limits = broker_partition::ResolvedFlow::for_delivery(&msg.routing_key, &msg);
+        // A live notification can arrive after its predecessor was dropped by
+        // bounded admission. Keep that successor in the WAL, not a flow waitlist
+        // or a 100ms timer loop. Completing the durable head admits the next one.
+        if !self.fifo_ready(&msg).await? {
+            return Ok(());
+        }
         let lane_owner = broker_partition::flow_lane_owner(&msg);
         self.flow
-            .submit_owned(
-                self.clone(),
-                lane_owner,
-                msg.clone(),
-                limits,
-                Some(ownership),
-            )
+            .submit_owned(self.clone(), lane_owner, msg, limits, Some(ownership))
             .await;
         Ok(())
+    }
+
+    pub(crate) async fn deliver_flow_job(&self, job: &DeliveryJob) -> Result<(), DispatchError> {
+        let msg = Arc::new(
+            self.broker
+                .read_message_async(&job.topic, job.partition, job.offset)
+                .await?,
+        );
+        if !self.fifo_ready(&msg).await? {
+            return Ok(());
+        }
+        self.deliver_message(&msg).await
+    }
+
+    async fn fifo_ready(&self, msg: &StoredMessage) -> Result<bool, DispatchError> {
+        if let Some(flow_key) = Self::fifo_retry_key(msg) {
+            let broker = self.broker.clone();
+            let scan = self.scan.clone();
+            let job = DeliveryJob::live(&msg.topic, msg.partition, msg.offset, msg.id);
+            let flow = crate::flow_control::FlowKey {
+                endpoint_id: broker_partition::flow_lane_owner(msg),
+                flow_key,
+            };
+            broker_partition::run_blocking_io(move || scan.is_fifo_head(&broker, &job, &flow))
+                .await
+                .map_err(|error| DispatchError::Failed(error.to_string()))?
+                .map_err(DispatchError::from)
+        } else {
+            Ok(true)
+        }
+    }
+
+    async fn hydrate_delivery_message<'a>(
+        &self,
+        msg: &'a StoredMessage,
+    ) -> Result<Cow<'a, StoredMessage>, DispatchError> {
+        if msg.payload_ref_json.is_none() {
+            // Inline bodies were verified by the WAL read. Borrow them rather
+            // than retaining another full body during outbound delivery.
+            return Ok(Cow::Borrowed(msg));
+        }
+        let broker = self.broker.clone();
+        let mut hydrated = msg.clone();
+        let hydrated = broker_partition::run_blocking_io(move || {
+            broker.hydrate_message_payload(&mut hydrated)?;
+            Ok::<_, broker_partition::BrokerError>(hydrated)
+        })
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))??;
+        Ok(Cow::Owned(hydrated))
     }
 
     pub(crate) async fn deliver_message(&self, msg: &StoredMessage) -> Result<(), DispatchError> {
@@ -1485,22 +1876,25 @@ impl DispatchEngine {
             )
             .await?;
             self.lifecycle
-                .clear(&Self::retry_key(msg))
+                .clear_async(&Self::retry_key(msg))
+                .await
                 .map_err(|error| DispatchError::Failed(error.to_string()))?;
             return Ok(());
         }
-        let mut delivery_msg = msg.clone();
-        if let Err(e) = self.broker.hydrate_message_payload(&mut delivery_msg) {
-            self.record_pressure(3);
-            debug!(
-                error = %e,
-                message_id = %msg.id,
-                "delivery deferred: could not load payload blob"
-            );
-            let job = DeliveryJob::live(msg.topic.clone(), msg.partition, msg.offset, msg.id);
-            self.defer_job(job, Duration::from_secs(10), "hydrate_failed");
-            return Ok(());
-        }
+        let delivery_msg = match self.hydrate_delivery_message(msg).await {
+            Ok(message) => message,
+            Err(e) => {
+                self.record_pressure(3);
+                debug!(
+                    error = %e,
+                    message_id = %msg.id,
+                    "delivery deferred: could not load payload blob"
+                );
+                let job = DeliveryJob::live(msg.topic.clone(), msg.partition, msg.offset, msg.id);
+                self.defer_job(job, Duration::from_secs(10), "hydrate_failed");
+                return Ok(());
+            }
+        };
 
         let outbound = build_outbound(&delivery_msg);
         let retry_key = Self::retry_key(msg);
@@ -1532,7 +1926,7 @@ impl DispatchEngine {
             } else {
                 &self.client
             };
-            let response = apply_to_reqwest(http, url, outbound.clone()).send().await;
+            let response = apply_to_reqwest(http, url, outbound).send().await;
             self.record_http_result(&response, started.elapsed());
             let mut requested_retry_after_ms = None;
 
@@ -1540,7 +1934,7 @@ impl DispatchEngine {
                 Ok(resp) if resp.status().is_success() => {
                     self.host_blocker.record_success_async(url).await;
                     discard_body_capped(resp).await;
-                    self.clear_retry(msg)?;
+                    self.clear_retry_async(msg).await?;
                     self.commit_dispatch_offset(
                         &tenant_id,
                         &msg.topic,
@@ -1582,7 +1976,7 @@ impl DispatchEngine {
                             .and_then(|s| s.parse::<u64>().ok())
                             .map(|secs| {
                                 let cap = self.config.retry_defaults.backoff.max_ms;
-                                (secs * 1000).min(cap)
+                                secs.saturating_mul(1000).min(cap)
                             })
                     });
                     discard_body_capped(resp).await;
@@ -1655,7 +2049,8 @@ impl DispatchEngine {
         let delay_ms = requested_retry_after_ms
             .unwrap_or(backoff)
             .min(backoff_cfg.max_ms);
-        self.schedule_retry(msg, attempt, delay_ms, last_failure)?;
+        self.schedule_retry(msg, attempt, delay_ms, last_failure)
+            .await?;
         Ok(())
     }
 
@@ -1672,21 +2067,34 @@ impl DispatchEngine {
         self.commit_dispatch_offset(tenant_id, topic, cursor_key, partition, offset, message_id)
             .await?;
         self.retry_state
-            .clear_offset(topic, partition, offset)
+            .clear_offset_async(topic, partition, offset)
+            .await
             .map_err(|error| DispatchError::Failed(error.to_string()))
     }
 
+    #[cfg(test)]
     async fn cursor_lock(
         &self,
         tenant_id: &str,
         cursor_key: &str,
         partition: u32,
-    ) -> tokio::sync::MutexGuard<'_, ()> {
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.cursor_mutex(tenant_id, cursor_key, partition)
+            .lock_owned()
+            .await
+    }
+
+    fn cursor_mutex(
+        &self,
+        tenant_id: &str,
+        cursor_key: &str,
+        partition: u32,
+    ) -> Arc<tokio::sync::Mutex<()>> {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         (tenant_id, cursor_key, partition).hash(&mut hasher);
         let stripe = (hasher.finish() as usize) % self.cursor_locks.len();
-        self.cursor_locks[stripe].lock().await
+        self.cursor_locks[stripe].clone()
     }
 
     async fn commit_dispatch_offset(
@@ -1701,8 +2109,167 @@ impl DispatchEngine {
         // Completions of one lane run concurrently; serialise the
         // read-compute-write so a slower task cannot write a cursor computed
         // from an older read over a newer one.
-        let _lane = self.cursor_lock(tenant_id, cursor_key, partition).await;
-        self.advance_cursor_locked(tenant_id, topic, cursor_key, partition, offset, message_id)
+        let recovery = self
+            .cursor_recovery
+            .get(partition as usize)
+            .ok_or_else(|| DispatchError::Failed("invalid cursor partition".into()))?
+            .clone()
+            .read_owned()
+            .await;
+        let lane_mutex = self.cursor_mutex(tenant_id, cursor_key, partition);
+        let engine = self.clone();
+        let tenant_id = tenant_id.to_owned();
+        let topic = topic.to_owned();
+        let cursor_key = cursor_key.to_owned();
+        let owned = self.broker.owned_completion_token()?;
+        if !self.broker.supports_metadata_group_commit() {
+            let lane = lane_mutex.lock_owned().await;
+            return broker_partition::run_blocking_io(move || {
+                let _owned = owned;
+                let _lane = lane;
+                let _recovery = recovery;
+                engine.advance_cursor_locked(
+                    &tenant_id,
+                    &topic,
+                    &cursor_key,
+                    partition,
+                    offset,
+                    message_id,
+                )
+            })
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))?;
+        }
+
+        // Once accepted, both phases belong to this continuation, not the HTTP
+        // waiter. Receipts retain the recovery barrier and shutdown token even
+        // if a future is dropped while a queued native write is still running.
+        let completion = tokio::spawn(async move {
+            let recovery = Arc::new(recovery);
+            let owned = Arc::new(owned);
+            let lane = match lane_mutex.clone().try_lock_owned() {
+                Ok(lane) => lane,
+                Err(_) => {
+                    // A busy cursor must not prevent independent identity
+                    // markers from entering the same durable metadata epoch.
+                    // The uncontended/FIFO path still uses one transaction.
+                    let prepare = engine.clone();
+                    let tenant = tenant_id.clone();
+                    let log = topic.clone();
+                    let key = cursor_key.clone();
+                    let marker = broker_partition::run_blocking_io(move || {
+                        prepare.prepare_completion_marker(
+                            &tenant, &log, &key, partition, offset, message_id,
+                        )
+                    })
+                    .await
+                    .map_err(|error| DispatchError::Failed(error.to_string()))??;
+                    let _receipt = engine
+                        .broker
+                        .commit_metadata_batch_grouped(
+                            marker.batch,
+                            (recovery.clone(), owned.clone()),
+                        )
+                        .await?;
+                    if let Some(stats) = marker.stats {
+                        engine.telemetry.record_completion(
+                            partition,
+                            &cursor_key,
+                            stats.cursor,
+                            stats.cursor,
+                            stats.hwm,
+                            stats.newly_completed,
+                        );
+                    }
+                    lane_mutex.lock_owned().await
+                }
+            };
+            let prepare = engine.clone();
+            let tenant = tenant_id.clone();
+            let log = topic.clone();
+            let key = cursor_key.clone();
+            let (mut progress, lane) = broker_partition::run_blocking_io(move || {
+                let progress = prepare
+                    .prepare_cursor_progress(&tenant, &log, &key, partition, offset, message_id)?;
+                Ok::<_, DispatchError>((progress, lane))
+            })
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))??;
+            let _receipt = engine
+                .broker
+                .commit_metadata_batch_grouped(
+                    std::mem::take(&mut progress.batch),
+                    (lane, recovery, owned),
+                )
+                .await?;
+            engine.finish_cursor_progress(&topic, &cursor_key, partition, offset, progress)
+        });
+        completion
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))?
+    }
+
+    /// A completion marker is independent of cursor order. Persist it before
+    /// waiting for a contended cursor, then derive progress only from durable
+    /// identities. No speculative cursor or unbounded completion map is needed.
+    fn prepare_completion_marker(
+        &self,
+        tenant_id: &str,
+        topic: &str,
+        cursor_key: &str,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
+    ) -> Result<CompletionMarker, DispatchError> {
+        let validator = self.broker.log_metadata_validator(partition)?;
+        let cursor = self
+            .broker
+            .dispatch_offset(tenant_id, cursor_key, partition)?;
+        let mut batch = broker_storage::MetadataWriteBatch::default();
+        if offset < cursor {
+            return Ok(CompletionMarker { batch, stats: None });
+        }
+        let hwm = self.broker.dispatch_hwm(topic, partition)?;
+        if offset >= hwm {
+            return Err(DispatchError::Uncommitted);
+        }
+        self.validate_completion_identity(topic, partition, offset, message_id)?;
+        let newly_completed = !self
+            .broker
+            .is_delivery_complete(topic, tenant_id, cursor_key, partition, offset, message_id)?;
+        if newly_completed {
+            batch.mark_dispatch_complete_for(tenant_id, cursor_key, partition, offset, message_id);
+            batch.validate_with(validator);
+        }
+        Ok(CompletionMarker {
+            batch,
+            stats: Some(CompletionMarkerStats {
+                cursor,
+                hwm,
+                newly_completed,
+            }),
+        })
+    }
+
+    fn validate_completion_identity(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
+    ) -> Result<(), DispatchError> {
+        let (current, _) = self
+            .broker
+            .scan_topic_metadata(topic, partition, offset, 1)?;
+        if !current
+            .iter()
+            .any(|message| message.offset == offset && message.id == message_id)
+        {
+            return Err(DispatchError::Failed(
+                "completion belongs to an obsolete WAL identity".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Body of [`Self::commit_dispatch_offset`]; the caller holds the lane lock
@@ -1716,72 +2283,153 @@ impl DispatchEngine {
         offset: u64,
         message_id: Uuid,
     ) -> Result<(), DispatchError> {
+        let mut progress = self
+            .prepare_cursor_progress(tenant_id, topic, cursor_key, partition, offset, message_id)?;
+        self.broker
+            .commit_metadata_batch(std::mem::take(&mut progress.batch))?;
+        self.finish_cursor_progress(topic, cursor_key, partition, offset, progress)
+    }
+
+    fn prepare_cursor_progress(
+        &self,
+        tenant_id: &str,
+        topic: &str,
+        cursor_key: &str,
+        partition: u32,
+        offset: u64,
+        message_id: Uuid,
+    ) -> Result<CursorProgress, DispatchError> {
+        let validator = self.broker.log_metadata_validator(partition)?;
         let cursor = self
             .broker
             .dispatch_offset(tenant_id, cursor_key, partition)?;
         if offset < cursor {
-            self.scan.mark_done(topic, partition, offset);
-            return Ok(());
+            return Ok(CursorProgress {
+                batch: Default::default(),
+                stats: None,
+                error: None,
+            });
         }
+        self.validate_completion_identity(topic, partition, offset, message_id)?;
         let newly_completed = !self
             .broker
             .is_delivery_complete(topic, tenant_id, cursor_key, partition, offset, message_id)?;
-        // Persist completion first, with the message identity, so a marker can
-        // never be mistaken for a different record reusing this offset.
-        self.broker
-            .mark_dispatch_complete_for(tenant_id, cursor_key, partition, offset, message_id)?;
+        let hwm = self.broker.dispatch_hwm(topic, partition)?;
+        if offset >= hwm {
+            return Err(DispatchError::Uncommitted);
+        }
         // The cursor never passes the quorum watermark: its prefix has a
         // stable identity, so a cursor skip is always safe.
-        let hwm = self.broker.dispatch_hwm(topic, partition)?;
-        let mut next = cursor;
-        const PAGE: usize = 256;
-        'scan: while next < hwm {
-            let messages = self
-                .broker
-                .list_topic_messages_from(topic, partition, next, PAGE)?;
-            if messages.is_empty() {
-                next = hwm;
-                break;
-            }
-            let count = messages.len();
-            for msg in messages {
-                if msg.offset >= hwm {
+        let progress = (|| -> Result<_, DispatchError> {
+            let mut next = cursor;
+            let mut next_head = None;
+            const PAGE: usize = 16;
+            'scan: while next < hwm {
+                let (messages, scanned_to) = self
+                    .broker
+                    .scan_topic_metadata(topic, partition, next, PAGE)?;
+                if scanned_to <= next {
                     next = hwm;
-                    break 'scan;
+                    break;
                 }
-                next = msg.offset.saturating_add(1);
-                if broker_partition::flow_lane_owner(&msg).to_string() != cursor_key {
-                    continue;
+                for msg in messages {
+                    if msg.offset >= hwm {
+                        next = hwm;
+                        break 'scan;
+                    }
+                    if broker_partition::flow_lane_owner(&msg).to_string() != cursor_key {
+                        continue;
+                    }
+                    let just_completed = msg.offset == offset && msg.id == message_id;
+                    if !just_completed
+                        && !self.broker.is_delivery_complete(
+                            topic, tenant_id, cursor_key, partition, msg.offset, msg.id,
+                        )?
+                    {
+                        next = msg.offset;
+                        next_head = Some((msg.offset, msg.published_at_ms));
+                        break 'scan;
+                    }
                 }
-                if !self.broker.is_delivery_complete(
-                    topic, tenant_id, cursor_key, partition, msg.offset, msg.id,
-                )? {
-                    next = msg.offset;
-                    break 'scan;
-                }
+                next = scanned_to.min(hwm);
             }
-            if count < PAGE {
-                next = hwm;
-                break;
+            Ok((hwm, next, next_head))
+        })();
+        let (hwm, next, next_head) = match progress {
+            Ok(progress) => progress,
+            Err(error) => {
+                // A read failure must not forget an HTTP success. Leave its
+                // identity-aware marker durable for the next backfill/restart.
+                let mut batch = broker_storage::MetadataWriteBatch::default();
+                if newly_completed {
+                    batch.mark_dispatch_complete_for(
+                        tenant_id, cursor_key, partition, offset, message_id,
+                    );
+                }
+                batch.validate_with(validator);
+                return Ok(CursorProgress {
+                    batch,
+                    stats: None,
+                    error: Some(error),
+                });
             }
-        }
-        if next > cursor {
-            self.broker
-                .set_dispatch_offset(tenant_id, cursor_key, partition, next)?;
-        }
-        self.scan.mark_done(topic, partition, offset);
-        self.telemetry
-            .record_completion(partition, cursor_key, cursor, next, hwm, newly_completed);
-        let next_head = if next < hwm {
-            self.broker
-                .read_message(topic, partition, next)
-                .ok()
-                .map(|msg| (msg.offset, msg.published_at_ms))
-        } else {
-            None
         };
-        self.telemetry
-            .advance_pending_head(partition, cursor_key, next, next_head);
+        let mut batch = broker_storage::MetadataWriteBatch::default();
+        if newly_completed {
+            batch.mark_dispatch_complete_for(tenant_id, cursor_key, partition, offset, message_id);
+        }
+        if next != cursor {
+            batch.set_dispatch_offset(tenant_id, cursor_key, partition, next);
+        }
+        batch.validate_with(validator);
+        Ok(CursorProgress {
+            batch,
+            stats: Some(CursorProgressStats {
+                cursor,
+                next,
+                hwm,
+                newly_completed,
+                next_head,
+            }),
+            error: None,
+        })
+    }
+
+    fn finish_cursor_progress(
+        &self,
+        topic: &str,
+        cursor_key: &str,
+        partition: u32,
+        offset: u64,
+        progress: CursorProgress,
+    ) -> Result<(), DispatchError> {
+        if let Some(error) = progress.error {
+            return Err(error);
+        }
+        let successor = self.scan.mark_done(topic, partition, offset);
+        if let Some(stats) = progress.stats {
+            self.telemetry.record_completion(
+                partition,
+                cursor_key,
+                stats.cursor,
+                stats.next,
+                stats.hwm,
+                stats.newly_completed,
+            );
+            self.telemetry
+                .advance_pending_head(partition, cursor_key, stats.next, stats.next_head);
+        }
+        if let Some(next) = successor {
+            // Bypass the coalesced backfill cadence on a serial hot key. This
+            // still uses ordinary bounded admission and deadline/leader checks;
+            // if full, the WAL and backfill retain ownership of the work.
+            self.enqueue(DeliveryJob::live(
+                &next.topic,
+                next.partition,
+                next.offset,
+                next.message_id,
+            ));
+        }
         Ok(())
     }
 
@@ -1794,20 +2442,21 @@ impl DispatchEngine {
         let source = Self::retry_key(msg);
         let cursor_key = broker_partition::flow_lane_owner(msg).to_string();
         self.lifecycle
-            .prepare(DlqTransition {
+            .prepare_async(DlqTransition {
                 source: source.clone(),
                 cursor_key: cursor_key.clone(),
                 reason: reason.clone(),
                 phase: DlqPhase::Prepared,
                 updated_at_ms: chrono::Utc::now().timestamp_millis(),
             })
+            .await
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
         self.telemetry.record_dlq_prepared();
         if let Err(error) = self.move_to_dlq(msg, reason).await {
             self.telemetry.record_dlq_failure();
             return Err(error);
         }
-        if let Err(error) = self.lifecycle.mark_dlq_committed(&source) {
+        if let Err(error) = self.lifecycle.mark_dlq_committed_async(&source).await {
             self.telemetry.record_dlq_failure();
             return Err(DispatchError::Failed(error.to_string()));
         }
@@ -1819,7 +2468,7 @@ impl DispatchEngine {
         };
         // DLQ record durable → clear the retry → advance the cursor. A crash
         // in between is finished at startup from the committed transition.
-        self.clear_retry(msg)?;
+        self.clear_retry_async(msg).await?;
         self.commit_dispatch_offset(
             &tenant,
             &msg.topic,
@@ -1830,7 +2479,8 @@ impl DispatchEngine {
         )
         .await?;
         self.lifecycle
-            .clear(&source)
+            .clear_async(&source)
+            .await
             .map_err(|error| DispatchError::Failed(error.to_string()))?;
         Ok(())
     }
@@ -1840,7 +2490,112 @@ impl DispatchEngine {
         msg: &StoredMessage,
         reason: impl Into<String>,
     ) -> Result<(), DispatchError> {
-        let mut msg = msg.clone();
+        let tenant = if msg.tenant_id.is_empty() {
+            self.broker.tenant()
+        } else {
+            msg.tenant_id.clone()
+        };
+        broker_partition::scope_tenant(tenant, self.move_to_dlq_scoped(msg, reason.into())).await
+    }
+
+    async fn move_to_dlq_scoped(
+        &self,
+        msg: &StoredMessage,
+        reason: String,
+    ) -> Result<(), DispatchError> {
+        let engine = self.clone();
+        let owned = msg.clone();
+        self.broker
+            .spawn_owned(async move { engine.move_to_dlq_owned(owned, reason).await })?
+            .await
+            .map_err(|error| DispatchError::Failed(error.to_string()))?
+    }
+
+    /// Register ownership before native preparation can append. Dropping the
+    /// caller's waiter must not drop a successful append's reservation before
+    /// its durability and producer identity have settled.
+    async fn move_to_dlq_owned(
+        &self,
+        msg: StoredMessage,
+        reason: String,
+    ) -> Result<(), DispatchError> {
+        let topic = msg.topic.clone();
+        let id = msg.id;
+        let producer_key = format!(
+            "dlq:{}:{}:{}:{}",
+            msg.topic, msg.partition, msg.offset, msg.id
+        );
+        let producer_locks = if self.broker.shared_producer_admission() {
+            let locks = self
+                .broker
+                .lock_shared_producers(vec![producer_key.clone()])
+                .await?;
+            if self
+                .broker
+                .shared_committed_publish(&producer_key)
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+            if let Some(hint) = self
+                .broker
+                .legacy_shared_publish_hint(&producer_key)
+                .await?
+            {
+                let broker = self.broker.clone();
+                let key = producer_key.clone();
+                let verified = broker_partition::run_blocking_io(move || {
+                    broker.verify_legacy_shared_publish(&key, &hint)
+                })
+                .await
+                .map_err(|error| DispatchError::Failed(error.to_string()))??;
+                if let Some(entry) = verified {
+                    if self
+                        .broker
+                        .adopt_shared_publish(&producer_key, entry, locks.clone())
+                        .await?
+                        .is_some()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            locks
+        } else {
+            None
+        };
+        let engine = self.clone();
+        let native_locks = producer_locks.clone();
+        let (mut response, pending) = broker_partition::run_blocking_io(move || {
+            let _native_locks = native_locks;
+            engine.prepare_dlq(msg, reason)
+        })
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))??;
+        let durability = self.dlq_durability();
+        let result = durability.make_durable(&mut response).await;
+        // Keep a locally durable identity even if quorum is pending. It remains
+        // unacknowledgeable until verified, but a retry must not append another
+        // DLQ record for the same source message.
+        if let (Some(partition), Some(offset)) = (response.partition, response.offset) {
+            if self.broker.committed_hwm(&response.topic, partition)? > offset {
+                self.broker.commit_publish_dedup_async(pending).await?;
+            }
+        }
+        result?;
+        self.broker
+            .commit_shared_publish(&producer_key, &response, producer_locks)
+            .await?;
+        debug!(queue = %topic, message_id = %id, "message moved to DLQ");
+        Ok(())
+    }
+
+    fn prepare_dlq(
+        &self,
+        mut msg: StoredMessage,
+        reason: String,
+    ) -> Result<(PublishResponse, broker_partition::PendingDedup), DispatchError> {
         self.broker
             .hydrate_message_payload(&mut msg)
             .map_err(DispatchError::Broker)?;
@@ -1848,7 +2603,6 @@ impl DispatchEngine {
             (Some(gid), Some(mid)) => group_member_dlq_topic(gid, mid),
             _ => dlq_topic(&msg.topic),
         };
-        let reason = reason.into();
         let record = {
             use base64::Engine;
             base64::engine::general_purpose::STANDARD.encode(dlq_record(&msg, &reason))
@@ -1890,7 +2644,7 @@ impl DispatchEngine {
         if response.duplicate {
             if self.dlq_record_durable(&response)? {
                 warn!(queue = %msg.topic, message_id = %msg.id, "message already in DLQ");
-                return Ok(());
+                return Ok((response, pending));
             }
             // Dedup hits are verified below the quorum watermark, so this is a
             // safety net: append again without the key (a duplicate DLQ record
@@ -1899,17 +2653,7 @@ impl DispatchEngine {
             again.idempotency_key = None;
             (response, pending) = self.broker.publish_to_shard(again, msg.partition)?;
         }
-        let durability = self.dlq_durability();
-        durability.make_durable(&mut response).await?;
-        // Record the key only once the DLQ record is quorum-durable; dropping
-        // `pending` on an error above releases it unrecorded.
-        self.broker.commit_publish_dedup(pending)?;
-        debug!(
-            queue = %msg.topic,
-            message_id = %msg.id,
-            "message moved to DLQ"
-        );
-        Ok(())
+        Ok((response, pending))
     }
 
     fn record_http_result(
@@ -1968,7 +2712,10 @@ impl DispatchEngine {
         reason: &str,
         retry_after_ms: u64,
     ) -> Result<LeasedFailure, DispatchError> {
-        let msg = self.broker.read_message(topic, partition, offset)?;
+        let msg = self
+            .broker
+            .read_message_async(topic, partition, offset)
+            .await?;
         let attempts = self
             .retry_state
             .get(&Self::retry_key(&msg))
@@ -1988,7 +2735,8 @@ impl DispatchEngine {
             return Ok(LeasedFailure::DeadLettered);
         }
         let delay_ms = retry_after_ms.max(1);
-        self.persist_retry(&msg, attempts, delay_ms, reason.to_string())?;
+        self.persist_retry_async(&msg, attempts, delay_ms, reason.to_string())
+            .await?;
         self.telemetry.record_retry_scheduled();
         Ok(LeasedFailure::RetryScheduled { attempts, delay_ms })
     }
@@ -2024,9 +2772,13 @@ impl DispatchEngine {
         offset: u64,
         reason: &str,
     ) -> Result<(), DispatchError> {
-        let msgs = self
-            .broker
-            .list_topic_messages_from(topic, partition, offset, 8)?;
+        let broker = self.broker.clone();
+        let topic = topic.to_owned();
+        let msgs = broker_partition::run_blocking_io(move || {
+            broker.list_topic_messages_from(&topic, partition, offset, 8)
+        })
+        .await
+        .map_err(|error| DispatchError::Failed(error.to_string()))??;
         let Some(msg) = msgs.into_iter().find(|m| m.offset == offset) else {
             return Err(DispatchError::Failed(
                 "message not found for dead-letter".into(),
@@ -2038,6 +2790,31 @@ impl DispatchEngine {
 
 /// Prefix of a DLQ record: `MAGIC`, one line of JSON metadata, then the
 /// original body bytes verbatim (binary-safe, never re-encoded or escaped).
+struct CompletionMarker {
+    batch: broker_storage::MetadataWriteBatch,
+    stats: Option<CompletionMarkerStats>,
+}
+
+struct CompletionMarkerStats {
+    cursor: u64,
+    hwm: u64,
+    newly_completed: bool,
+}
+
+struct CursorProgress {
+    batch: broker_storage::MetadataWriteBatch,
+    stats: Option<CursorProgressStats>,
+    error: Option<DispatchError>,
+}
+
+struct CursorProgressStats {
+    cursor: u64,
+    next: u64,
+    hwm: u64,
+    newly_completed: bool,
+    next_head: Option<(u64, i64)>,
+}
+
 pub const DLQ_RECORD_MAGIC: &[u8] = b"BMQDLQ1\n";
 
 /// Bytes a DLQ record may add on top of the original body. Ingest limits
@@ -2182,6 +2959,57 @@ mod tests {
     use broker_partition::BrokerConfig;
 
     #[test]
+    fn deferred_wakeups_are_unique_bounded_and_earliest_first() {
+        let mut queue = DeferredQueue::default();
+        let now = tokio::time::Instant::now();
+        let id = Uuid::new_v4();
+        for sequence in 0..10_000 {
+            queue.insert(
+                DeferredJob {
+                    due: now + Duration::from_secs(30),
+                    sequence,
+                    job: DeliveryJob::live("jobs", 0, 1, id),
+                },
+                2,
+            );
+        }
+        assert_eq!(queue.jobs.len(), 1);
+        queue.insert(
+            DeferredJob {
+                due: now,
+                sequence: 10_000,
+                job: DeliveryJob::live("jobs", 0, 1, id),
+            },
+            2,
+        );
+        queue.insert(
+            DeferredJob {
+                due: now + Duration::from_secs(1),
+                sequence: 10_001,
+                job: DeliveryJob::live("jobs", 0, 2, id),
+            },
+            2,
+        );
+        queue.insert(
+            DeferredJob {
+                due: now,
+                sequence: 10_002,
+                job: DeliveryJob::live("jobs", 0, 3, id),
+            },
+            2,
+        );
+        assert_eq!(queue.jobs.len(), 2);
+        assert_eq!(queue.pop_due(now).unwrap().offset, 1);
+        assert!(queue.pop_due(now).is_none());
+        assert_eq!(
+            queue.pop_due(now + Duration::from_secs(1)).unwrap().offset,
+            2
+        );
+        assert!(queue.keys.is_empty());
+        assert!(queue.jobs.is_empty());
+    }
+
+    #[test]
     fn pressure_logs_are_aggregated_and_destination_credentials_are_redacted() {
         let logs = PressureLogs::default();
         assert_eq!(logs.record(0, 30_000), Some([1, 0, 0, 0]));
@@ -2213,6 +3041,561 @@ mod tests {
                 response.offset.unwrap(),
             )
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn obsolete_completion_cannot_erase_or_replace_the_current_identity_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let message = publish_test_message(&broker, "https://example.com/hook");
+        broker.enable_quorum_gating();
+        broker
+            .record_quorum_commit(&message.topic, message.partition, 0, message.offset + 1)
+            .unwrap();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let tenant = broker.tenant();
+        let lane = broker_partition::flow_lane_owner(&message).to_string();
+        let old = Uuid::new_v4();
+        broker
+            .mark_dispatch_complete_for(
+                &tenant,
+                &lane,
+                message.partition,
+                message.offset,
+                message.id,
+            )
+            .unwrap();
+        assert!(!broker
+            .is_delivery_complete(
+                &message.topic,
+                &tenant,
+                &lane,
+                message.partition,
+                message.offset,
+                old
+            )
+            .unwrap());
+        assert!(engine
+            .commit_dispatch_offset(
+                &tenant,
+                &message.topic,
+                &lane,
+                message.partition,
+                message.offset,
+                old
+            )
+            .await
+            .is_err());
+        assert!(broker
+            .is_delivery_complete(
+                &message.topic,
+                &tenant,
+                &lane,
+                message.partition,
+                message.offset,
+                message.id
+            )
+            .unwrap());
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn recovery_rewind_waits_for_precomputed_metadata_progress_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        broker.enable_quorum_gating();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let tenant = broker.tenant();
+        let lane = Uuid::new_v4().to_string();
+        broker.set_dispatch_offset(&tenant, &lane, 0, 7).unwrap();
+        let epoch = engine.fence_partition(0);
+        engine.set_recovery_targets(0, epoch, Vec::new());
+        // This guard is carried through the same durable writer receipt as
+        // precomputed completion batches, even if their caller is cancelled.
+        let receipt = engine.cursor_recovery[0].clone().read_owned().await;
+        let mut stale = broker_storage::MetadataWriteBatch::default();
+        stale.set_dispatch_offset(&tenant, &lane, 0, 9);
+        assert!(engine.complete_recovery(0, epoch).is_err());
+        assert!(engine.is_fenced(0));
+        broker.commit_metadata_batch(stale).unwrap();
+        drop(receipt);
+        assert_eq!(engine.complete_recovery(0, epoch).unwrap(), Some(1));
+        assert_eq!(broker.dispatch_offset(&tenant, &lane, 0).unwrap(), 0);
+        assert!(!engine.is_fenced(0));
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn contended_cursor_completions_persist_together_before_cursor_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = BrokerConfig::new(dir.path().to_path_buf());
+        config.partitions = 1;
+        let broker = Broker::open(config).unwrap();
+        let messages: Vec<_> = (0..32)
+            .map(|_| publish_test_message(&broker, "https://example.com/hook"))
+            .collect();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let tenant = broker.tenant();
+        let lane = broker_partition::flow_lane_owner(&messages[0]).to_string();
+        let cursor_owner = engine.cursor_lock(&tenant, &lane, 0).await;
+        let before = broker.metadata_group_commit_epochs().unwrap();
+        let mut completions = Vec::new();
+        for msg in &messages {
+            let engine = engine.clone();
+            let tenant = tenant.clone();
+            let lane = lane.clone();
+            let msg = msg.clone();
+            completions.push(tokio::spawn(async move {
+                engine
+                    .commit_dispatch_offset(&tenant, &msg.topic, &lane, 0, msg.offset, msg.id)
+                    .await
+            }));
+        }
+        let persisted = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if messages.iter().all(|msg| {
+                    broker
+                        .is_delivery_complete(&msg.topic, &tenant, &lane, 0, msg.offset, msg.id)
+                        .unwrap()
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(persisted.is_ok(),
+            "a busy cursor must not serialize independent completion markers before they reach the grouped writer");
+        println!("32 contended completion markers persisted in {} metadata epochs before cursor ownership",
+            broker.metadata_group_commit_epochs().unwrap() - before);
+        assert_eq!(
+            broker.dispatch_offset(&tenant, &lane, 0).unwrap(),
+            0,
+            "durable markers do not advance a cursor without owning it"
+        );
+        let epoch = engine.fence_partition(0);
+        engine.set_recovery_targets(0, epoch, Vec::new());
+        assert!(
+            engine.complete_recovery(0, epoch).is_err(),
+            "recovery must wait across the marker/cursor handoff"
+        );
+        // Cancellation of an HTTP/Fleet waiter must not cancel its owned cursor
+        // continuation or drop the recovery barrier between the two phases.
+        for task in &completions {
+            task.abort();
+        }
+        drop(cursor_owner);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while broker.dispatch_offset(&tenant, &lane, 0).unwrap() != 32 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for task in completions {
+            let _ = task.await;
+        }
+        broker.close_and_drain_owned_completions().await;
+        assert!(
+            engine.cursor_recovery[0].try_write().is_ok(),
+            "all cancelled waiters' continuations must release the barrier after owned drain"
+        );
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn uncontended_cursor_completion_keeps_one_epoch_and_duplicates_need_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let msg = publish_test_message(&broker, "https://example.com/hook");
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let tenant = broker.tenant();
+        let lane = broker_partition::flow_lane_owner(&msg).to_string();
+        let before = broker.metadata_group_commit_epochs().unwrap();
+        for _ in 0..2 {
+            engine
+                .commit_dispatch_offset(
+                    &tenant,
+                    &msg.topic,
+                    &lane,
+                    msg.partition,
+                    msg.offset,
+                    msg.id,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                broker.metadata_group_commit_epochs().unwrap(),
+                before + 1,
+                "FIFO success needs one durable epoch; an already-consumed marker needs no write"
+            );
+        }
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn marker_only_completion_survives_reopen_without_skipping_an_unfinished_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = BrokerConfig::new(dir.path().to_path_buf());
+        config.partitions = 1;
+        let broker = Broker::open(config.clone()).unwrap();
+        let messages: Vec<_> = (0..4)
+            .map(|_| publish_test_message(&broker, "https://example.com/hook"))
+            .collect();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let tenant = broker.tenant();
+        let lane = broker_partition::flow_lane_owner(&messages[0]).to_string();
+        for msg in &messages[1..] {
+            let marker = engine
+                .prepare_completion_marker(&tenant, &msg.topic, &lane, 0, msg.offset, msg.id)
+                .unwrap();
+            broker
+                .commit_metadata_batch_grouped(marker.batch, ())
+                .await
+                .unwrap();
+        }
+        assert_eq!(broker.dispatch_offset(&tenant, &lane, 0).unwrap(), 0);
+        engine.shutdown_background().await;
+        drop(engine);
+        drop(broker);
+        let broker = Broker::open(config).unwrap();
+        for msg in &messages[1..] {
+            assert!(broker
+                .is_delivery_complete(&msg.topic, &tenant, &lane, 0, msg.offset, msg.id)
+                .unwrap());
+        }
+        assert!(!broker
+            .is_delivery_complete(&messages[0].topic, &tenant, &lane, 0, 0, messages[0].id)
+            .unwrap());
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        engine
+            .commit_dispatch_offset(&tenant, &messages[0].topic, &lane, 0, 0, messages[0].id)
+            .await
+            .unwrap();
+        assert_eq!(broker.dispatch_offset(&tenant, &lane, 0).unwrap(), 4);
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn queued_completion_marker_rejects_a_replaced_log_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let msg = publish_test_message(&broker, "https://example.com/hook");
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let tenant = broker.tenant();
+        let lane = broker_partition::flow_lane_owner(&msg).to_string();
+        let marker = engine
+            .prepare_completion_marker(
+                &tenant,
+                &msg.topic,
+                &lane,
+                msg.partition,
+                msg.offset,
+                msg.id,
+            )
+            .unwrap();
+        broker
+            .truncate_replica_log(&msg.topic, msg.partition, msg.offset, 7)
+            .unwrap();
+        assert!(broker.commit_metadata_batch_grouped(marker.batch, ()).await.is_err(),
+            "writer-time incarnation validation must reject an old marker even after preparation succeeded");
+        assert_eq!(
+            broker
+                .dispatch_offset(&tenant, &lane, msg.partition)
+                .unwrap(),
+            0
+        );
+        assert!(engine
+            .prepare_completion_marker(
+                &tenant,
+                &msg.topic,
+                &lane,
+                msg.partition,
+                msg.offset,
+                msg.id
+            )
+            .is_err());
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn builder_controls_reach_handles_already_owned_by_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let engine = DispatchEngine::new_broker_only(broker, DispatchConfig::default());
+        let worker = engine.clone();
+        let engine = engine
+            .with_leases(crate::lease::LeaseTable::new())
+            .with_shard_leader_check(Arc::new(|_| false));
+        assert!(!worker.shard_leader(0));
+        assert!(worker.leases.read().is_some());
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn startup_replay_obeys_controls_installed_before_workers_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let msg = publish_test_message(&broker, "http://169.254.169.254/hook");
+        let retry = RetryState::open(dir.path()).unwrap();
+        retry
+            .schedule(RetryRecord {
+                key: DispatchEngine::retry_key(&msg),
+                cursor_key: broker_partition::flow_lane_owner(&msg).to_string(),
+                fifo_key: None,
+                attempts: 1,
+                due_at_ms: 0,
+                last_error: "retry after restart".into(),
+            })
+            .unwrap();
+        drop(retry);
+        let engine = DispatchEngine::new_with_controls(
+            broker,
+            DispatchConfig::default(),
+            true,
+            Some(crate::lease::LeaseTable::new()),
+            Some(Arc::new(|_| false)),
+        );
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        engine.backfill_pending();
+        assert_eq!(engine.telemetry_snapshot().dlq_committed, 0, "follower replay must not attempt or dead-letter deliveries before leadership is established");
+        assert_eq!(engine.telemetry_snapshot().in_flight_deliveries, 0);
+        assert!(engine
+            .retry_state
+            .get(&DispatchEngine::retry_key(&msg))
+            .is_some());
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn backfill_and_live_notifications_do_not_churn_deferred_host_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let msg = publish_test_message(&broker, "https://blocked.example/hook");
+        let engine = DispatchEngine::new(broker, DispatchConfig::default());
+        engine
+            .host_blocker
+            .block_manual("https://blocked.example", 60_000);
+        for _ in 0..5 {
+            engine.backfill_pending();
+        }
+        assert_eq!(
+            engine.telemetry_snapshot().deferred_jobs,
+            0,
+            "blocked hosts are filtered before admission"
+        );
+        let job = DeliveryJob::live(&msg.topic, msg.partition, msg.offset, msg.id);
+        engine.enqueue(job.clone());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.telemetry_snapshot().deferred_jobs == 0
+                || !engine.in_flight_jobs.lock().is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..100 {
+            engine.enqueue(job.clone());
+            engine.backfill_pending();
+        }
+        assert_eq!(engine.telemetry_snapshot().deferred_jobs, 1);
+        assert_eq!(engine.deferred.lock().jobs.len(), 1);
+        engine.shutdown_background().await;
+        assert!(engine.deferred.lock().jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backfill_reserves_parallel_flow_capacity_before_hydration_can_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = BrokerConfig::new(dir.path().to_owned());
+        config.partitions = 1;
+        let broker = Broker::open(config).unwrap();
+        for n in 0..128 {
+            broker.publish(serde_json::from_value(serde_json::json!({
+                "url": "https://example.com/hook", "secret": "secret", "payload": "body",
+                "routing_key": "route", "flow": {"key": format!("lane-{}", n % 2), "parallelism": 2},
+            })).unwrap()).unwrap();
+        }
+        broker.flush_wal().unwrap();
+        let first = broker.read_message(DIRECT_TOPIC, 0, 0).unwrap();
+        let owner = broker_partition::flow_lane_owner(&first);
+        let leading = Arc::new(AtomicBool::new(false));
+        let check = leading.clone();
+        let engine = DispatchEngine::new_with_controls(
+            broker,
+            DispatchConfig::default(),
+            true,
+            None,
+            Some(Arc::new(move |_| check.load(Ordering::Acquire))),
+        );
+        for n in 0..2 {
+            let key = format!("lane-{n}");
+            engine
+                .flow
+                .ensure_lane(
+                    owner,
+                    &key,
+                    broker_partition::ResolvedFlow {
+                        key: key.clone(),
+                        parallelism: 2,
+                        rate: 0,
+                        period_secs: 1,
+                    },
+                )
+                .await;
+            engine.flow.pause(owner, &key).await;
+        }
+        leading.store(true, Ordering::Release);
+        // A current-thread runtime cannot run hydration until this synchronous
+        // pass returns. Looking only at the async lane's current pending count
+        // therefore admits the entire backlog instead of its two small budgets.
+        engine.backfill_pending();
+        assert_eq!(
+            engine.in_flight_jobs.lock().len(),
+            32,
+            "each parallel flow must reserve its 16 slots before queue submission"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.flow.pending_count().await != 32 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        for _ in 0..20 {
+            engine.backfill_pending();
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(engine.in_flight_jobs.lock().len(), 32);
+        assert_eq!(
+            engine.telemetry_snapshot().queue_rejected,
+            0,
+            "paused parallel flows must not cycle through hydration and rejection"
+        );
+        engine.shutdown_background().await;
+        assert!(engine.in_flight_jobs.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn parallel_backfill_shares_a_flow_window_across_partition_cursors() {
+        for single_partition in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = BrokerConfig::new(dir.path().to_owned());
+            config.partitions = 4;
+            let broker = Broker::open(config).unwrap();
+            let mut published = [0usize; 4];
+            let mut first = None;
+            for n in 0..512 {
+                let response = broker.publish(serde_json::from_value(serde_json::json!({
+                "url": "https://example.com/hook", "secret": "secret", "payload": "body",
+                "routing_key": if single_partition { "one-route".to_string() } else { format!("route-{n}") },
+                "flow": {"key": "shared", "parallelism": 32},
+            })).unwrap()).unwrap();
+                published[response.partition.unwrap() as usize] += 1;
+                first.get_or_insert(response);
+            }
+            if !single_partition {
+                assert!(published.iter().all(|count| *count >= 64));
+            }
+            broker.flush_wal().unwrap();
+            let first = first.unwrap();
+            let message = broker
+                .read_message(
+                    &first.topic,
+                    first.partition.unwrap(),
+                    first.offset.unwrap(),
+                )
+                .unwrap();
+            let owner = broker_partition::flow_lane_owner(&message);
+            let leading = Arc::new(AtomicBool::new(false));
+            let check = leading.clone();
+            let engine = DispatchEngine::new_with_controls(
+                broker,
+                DispatchConfig::default(),
+                true,
+                None,
+                Some(Arc::new(move |_| check.load(Ordering::Acquire))),
+            );
+            engine
+                .flow
+                .ensure_lane(
+                    owner,
+                    "shared",
+                    broker_partition::ResolvedFlow {
+                        key: "shared".into(),
+                        parallelism: 32,
+                        rate: 0,
+                        period_secs: 1,
+                    },
+                )
+                .await;
+            engine.flow.pause(owner, "shared").await;
+            leading.store(true, Ordering::Release);
+            engine.backfill_pending();
+            let mut admitted = [0usize; 4];
+            for (_, partition, _) in engine.in_flight_jobs.lock().keys() {
+                admitted[*partition as usize] += 1;
+            }
+            let expected = if single_partition {
+                let mut counts = [0; 4];
+                counts[first.partition.unwrap() as usize] = 64;
+                counts
+            } else {
+                [16, 16, 16, 16]
+            };
+            assert_eq!(admitted, expected,
+            "share the window across active logs without imposing a per-partition quota on a lone active log");
+            engine.shutdown_background().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn group_backfill_recovers_fanout_records_without_live_notifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        let group = broker.create_group("partners".into()).unwrap();
+        let member = broker
+            .add_group_member(
+                group.id,
+                "partner".into(),
+                "https://example.com/hook".into(),
+                "secret".into(),
+                1,
+                0,
+                1,
+                None,
+            )
+            .unwrap();
+        let base = serde_json::from_value(serde_json::json!({ "payload": "fanout" })).unwrap();
+        let request = broker.group_member_publish_request(group.id, &member, &base);
+        let response = broker.publish(request).unwrap();
+        broker.flush_wal().unwrap();
+        let engine = DispatchEngine::new_broker_only(broker, DispatchConfig::default());
+        assert!(engine.dispatch_topics().contains(&response.topic));
+        let pending = engine
+            .scan
+            .refresh(
+                engine.broker(),
+                &response.topic,
+                response.partition.unwrap(),
+                64,
+            )
+            .unwrap();
+        assert_eq!(pending.entries.len(), 1);
+        assert_eq!(pending.entries[0].group_member_id, Some(member.id));
+        assert!(
+            engine
+                .telemetry_snapshot()
+                .shards
+                .iter()
+                .map(|shard| shard.completion_gap_records)
+                .sum::<u64>()
+                > 0
+        );
+        engine.shutdown_background().await;
     }
 
     #[tokio::test]
@@ -2411,10 +3794,8 @@ mod tests {
     async fn global_capacity_case(pause_waiter: bool) {
         let dir = tempfile::tempdir().unwrap();
         let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
-        let mut first = publish_test_message(&broker, "https://example.com/one");
-        let mut second = publish_test_message(&broker, "https://example.com/two");
-        first.destination_url = Some("http://169.254.169.254/".into());
-        second.destination_url = first.destination_url.clone();
+        let first = publish_test_message(&broker, "http://169.254.169.254/one");
+        let second = publish_test_message(&broker, "http://169.254.169.254/two");
         let mut engine = DispatchEngine::new_broker_only(broker, DispatchConfig::default());
         engine.in_flight = Arc::new(Semaphore::new(0));
         engine.flow = FlowController::new(Some(1), engine.memory_guard.clone());
@@ -2752,6 +4133,7 @@ mod tests {
 
     fn sample_message(payload: Vec<u8>, headers: Option<String>) -> StoredMessage {
         StoredMessage {
+            idempotency_key: None,
             id: Uuid::new_v4(),
             tenant_id: "t".into(),
             topic: "orders".into(),
@@ -2777,6 +4159,167 @@ mod tests {
             http_headers_json: headers,
             http_sign: Some(false),
             payload_ref_json: None,
+            dedup_inserted_at_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_hydration_borrows_inline_and_verifies_external_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(broker_partition::BrokerConfig::new(dir.path().into())).unwrap();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        let body = vec![0xff, 0, b'a', 0x80];
+        let inline = sample_message(body.clone(), None);
+        let borrowed = engine.hydrate_delivery_message(&inline).await.unwrap();
+        assert!(matches!(borrowed, Cow::Borrowed(_)));
+        assert_eq!(borrowed.payload.as_ptr(), inline.payload.as_ptr());
+
+        let mut external = sample_message(Vec::new(), None);
+        let reference = broker
+            .blob_store()
+            .put_blob("t", external.id, &body)
+            .unwrap();
+        external.payload_ref_json = Some(serde_json::to_string(&reference).unwrap());
+        let hydrated = engine.hydrate_delivery_message(&external).await.unwrap();
+        assert!(matches!(hydrated, Cow::Owned(_)));
+        assert_eq!(hydrated.payload, body);
+        assert!(
+            external.payload.is_empty(),
+            "the WAL reference stays immutable"
+        );
+        broker.blob_store().delete_blob(&reference).unwrap();
+        assert!(engine.hydrate_delivery_message(&external).await.is_err());
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn dead_lettering_keeps_the_stored_tenant_across_io_handoffs() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(broker_partition::BrokerConfig::new(dir.path().into())).unwrap();
+        let response = broker_partition::scope_tenant("tenant-a".into(), async {
+            broker
+                .publish_async(
+                    serde_json::from_value(serde_json::json!({
+                        "url": "http://127.0.0.1:1/hook", "secret": "secret", "payload": "body"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap()
+        })
+        .await;
+        broker.flush_wal().unwrap();
+        let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+        for _ in 0..2 {
+            // No request scope exists on background delivery workers.
+            engine
+                .dead_letter_offset(
+                    &response.topic,
+                    response.partition.unwrap(),
+                    response.offset.unwrap(),
+                    "rejected",
+                )
+                .await
+                .unwrap();
+        }
+        let records = broker
+            .list_topic_messages(&dlq_topic(&response.topic), 10)
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "the scoped DLQ key must suppress a second move"
+        );
+        assert_eq!(records[0].tenant_id, "tenant-a");
+        engine.shutdown_background().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_dlq_waiter_retains_the_native_append_and_key_until_owned_completion() {
+        struct GatedDurability {
+            broker: Broker,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+            fail: bool,
+        }
+        impl DlqDurability for GatedDurability {
+            fn make_durable<'a>(
+                &'a self,
+                response: &'a mut PublishResponse,
+            ) -> futures_util::future::BoxFuture<'a, Result<(), DispatchError>> {
+                Box::pin(async move {
+                    self.broker
+                        .wait_committed(
+                            &response.topic,
+                            response.partition.unwrap(),
+                            response.offset.unwrap(),
+                        )
+                        .await?;
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    if self.fail {
+                        Err(DispatchError::Failed(
+                            "quorum temporarily unavailable".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        }
+        for fail in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let broker =
+                Broker::open(broker_partition::BrokerConfig::new(dir.path().into())).unwrap();
+            let engine = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
+            let durability = Arc::new(GatedDurability {
+                broker: broker.clone(),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                fail,
+            });
+            engine.set_dlq_durability(durability.clone());
+            let mut message = sample_message(b"body".to_vec(), None);
+            message.tenant_id = broker.tenant();
+            let caller_engine = engine.clone();
+            let caller_message = message.clone();
+            let caller = tokio::spawn(async move {
+                caller_engine.move_to_dlq(&caller_message, "rejected").await
+            });
+            tokio::time::timeout(Duration::from_secs(5), durability.entered.notified())
+                .await
+                .unwrap();
+            caller.abort();
+            let _ = caller.await;
+            assert!(
+                engine
+                    .prepare_dlq(message.clone(), "retry while owned".into())
+                    .is_err(),
+                "the original native append still owns its key"
+            );
+            durability.release.notify_one();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                broker.close_and_drain_owned_completions(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                engine
+                    .prepare_dlq(message.clone(), "retry after completion".into())
+                    .unwrap()
+                    .0
+                    .duplicate,
+                "even a quorum failure retains the locally durable original identity"
+            );
+            assert_eq!(
+                broker
+                    .list_topic_messages(&dlq_topic(&message.topic), 10)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            engine.shutdown_background().await;
         }
     }
 

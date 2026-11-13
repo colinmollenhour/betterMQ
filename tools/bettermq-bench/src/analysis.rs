@@ -211,6 +211,13 @@ pub fn trial_findings(ctx: &FindingCtx<'_>) -> Vec<Finding> {
         })
     };
     if let Some(i) = &t.integrity {
+        if i.accepted == 0 && t.series.values(col::OFFERED).iter().any(|rate| *rate > 0.0) {
+            add(
+                Severity::Critical,
+                "No offered messages were acknowledged",
+                "The run offered ingest work but received no successful acknowledgements; zero acknowledged loss is not a successful trial.".into(),
+            );
+        }
         if i.lost > 0 && i.loss_expected_zero {
             add(
                 Severity::Critical,
@@ -256,7 +263,7 @@ pub fn trial_findings(ctx: &FindingCtx<'_>) -> Vec<Finding> {
                 })
                 .collect();
             add(
-                Severity::Warn,
+                Severity::Critical,
                 "Queue parallelism exceeded",
                 format!(
                     "Destinations saw more simultaneous deliveries than configured: {}.",
@@ -285,6 +292,13 @@ pub fn trial_findings(ctx: &FindingCtx<'_>) -> Vec<Finding> {
                 ),
             );
         }
+    }
+    if let Some(error) = &t.shutdown_error {
+        add(
+            Severity::Critical,
+            "Graceful shutdown failed",
+            error.clone(),
+        );
     }
     if t.broker_log_errors > 0 {
         add(
@@ -532,5 +546,54 @@ mod tests {
             .iter()
             .any(|f| f.severity == Severity::Critical && f.title.contains("never delivered")));
         assert!(f.iter().any(|f| f.title.contains("FIFO")));
+    }
+
+    #[test]
+    fn zero_acknowledgements_are_not_a_clean_integrity_result() {
+        let mut trial = TrialResult {
+            integrity: Some(Integrity::default()),
+            ..Default::default()
+        };
+        trial
+            .series
+            .cols
+            .insert(col::OFFERED.into(), vec![Some(50.0)]);
+        let findings = trial_findings(&FindingCtx {
+            scenario: "x",
+            trial: &trial,
+        });
+        assert!(findings
+            .iter()
+            .any(|finding| finding.severity == Severity::Critical
+                && finding.title.contains("acknowledged")));
+        trial.series.cols.clear();
+        assert!(trial_findings(&FindingCtx {
+            scenario: "idle",
+            trial: &trial
+        })
+        .is_empty());
+    }
+
+    #[test]
+    fn parallelism_and_shutdown_failures_are_critical() {
+        let trial = TrialResult {
+            integrity: Some(Integrity {
+                concurrency_violations: 1,
+                ..Default::default()
+            }),
+            shutdown_error: Some("broker required SIGKILL".into()),
+            ..Default::default()
+        };
+        let findings = trial_findings(&FindingCtx {
+            scenario: "x",
+            trial: &trial,
+        });
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| finding.severity == Severity::Critical)
+                .count(),
+            2
+        );
     }
 }

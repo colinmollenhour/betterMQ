@@ -55,6 +55,35 @@ correctness: a candidate scenario that errors or fails, a new critical finding
 (lost messages, FIFO violations), or a metric that vanished or became
 non-finite, however fast it was.
 
+Interrupted runs keep partial results but exit unsuccessfully; `merge` rejects
+unfinished inputs and comparison gates reject unfinished candidates or missing
+scenarios. The interleaved `scripts/ab.sh` helper resumes only invocations with
+both results and a successful completion marker, never a partial results file.
+`merge` also rejects different broker fingerprints or different parameters for
+the same scenario, so a diagnostic workload cannot silently become a baseline
+trial.
+
+### Fixed-step overload diagnostics
+
+Adaptive ramps stop after failed latency steps or a missed drain deadline. A
+repeat with the same seed can therefore accept fewer records and never reach
+the pressure that exposed an earlier failure. Use a bounded high-rate step to
+test that case without changing the normal profile or weakening its deadlines:
+
+```bash
+target/release/bettermq-bench run --profile standard --scenarios ingest-single \
+  --ramp-steps 1 --rate-scale 48 --repeats 1 --seed 20275939 \
+  --out bench-results/overload-diagnostic --keep-data
+```
+
+`--ramp-steps` accepts 1–15 and applies only to ingest and end-to-end ramps. When
+omitted, profile defaults are unchanged. This example offers 12,000 messages/s
+for one standard 15-second step after warmup. Check the actual acknowledged
+volume and final delivery/DLQ disposition in `results.json`; offered volume alone
+does not establish equivalent pressure. A passing bounded step is only a lower
+bound, not a measured saturation point. Keep these diagnostic reports separate
+from standard comparative baselines.
+
 ## Profiles
 
 | Profile | Purpose | Trials | Approx. time (all scenarios) |
@@ -116,6 +145,10 @@ engine.
 - **Verification ledger.** Every payload carries a stream/sequence header. The
   sink keeps a byte per message (about 2 MB per million) to detect loss,
   duplicates, per-key order inversions and over-parallelism with no locks.
+  Final accounting reads every DLQ page and matches each record to its source
+  stream, sequence, and fan-out member. A permanent HTTP rejection alone is not
+  proof of a dead letter; duplicate or unrelated DLQ rows cannot hide another
+  missing delivery. Failed inspection or nonadvancing pagination fails the trial.
 - **SLO.** A load step passes when ACK p99, error rate and achieved/offered are
   within limits (`--slo-ack-p99-ms`, `--slo-delivery-p99-ms`). The sustained
   ceiling is the last passing step before the first failure.

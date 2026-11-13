@@ -5,13 +5,13 @@ use crate::meta::LogMeta;
 use broker_proto::epoch::{
     decode_epoch, encode_epoch, EpochError, EpochHeader, EPOCH_HEADER_BYTES,
 };
-use broker_proto::record::{decode_frame, encode_frame, RecordError};
+use broker_proto::record::{decode_frame, decode_frame_metadata, encode_frame, RecordError};
 use broker_proto::{LogRecord, StoredMessage};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::info;
@@ -21,6 +21,17 @@ const SEGMENTS_DIR: &str = "segments";
 const DEFAULT_GROUP_INTERVAL_MS: u64 = 10;
 const DEFAULT_SPARSE_INDEX_STRIDE: u64 = 128;
 const DEFAULT_READER_CACHE_CAPACITY: usize = 64;
+
+fn read_dispatch_frame(
+    reader: impl Read,
+    keep_payload: bool,
+) -> Result<(LogRecord, Vec<u8>), RecordError> {
+    if keep_payload {
+        decode_frame(reader)
+    } else {
+        decode_frame_metadata(reader).map(|header| (header, Vec::new()))
+    }
+}
 
 /// How often the local WAL is forced to stable storage.
 ///
@@ -109,6 +120,13 @@ struct SparsePoint {
     byte_offset: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadMode {
+    Payload,
+    Metadata,
+    RawMetadata,
+}
+
 #[derive(Debug, Clone)]
 struct SegmentIndex {
     path: PathBuf,
@@ -117,8 +135,72 @@ struct SegmentIndex {
     points: Vec<SparsePoint>,
 }
 
+/// Cache the descriptor, never its seek position. `File::try_clone` shares an
+/// open-file-description cursor, so independent read calls must use offsets.
+struct CachedFile {
+    file: File,
+    #[cfg(any(not(unix), test))]
+    seek_lock: Mutex<()>,
+}
+
+impl CachedFile {
+    fn read_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_at(&self.file, bytes, offset)
+        }
+        #[cfg(not(unix))]
+        {
+            self.read_at_with_seek_lock(bytes, offset)
+        }
+    }
+
+    // Portable fallback: seek and read are one synchronized operation. Logical
+    // positions still belong to readers, not this descriptor. Also exercised on
+    // Unix in tests, rather than leaving the compatibility path untested.
+    #[cfg(any(not(unix), test))]
+    fn read_at_with_seek_lock(&self, bytes: &mut [u8], offset: u64) -> io::Result<usize> {
+        let _seek = self
+            .seek_lock
+            .lock()
+            .map_err(|_| io::Error::other("cached reader lock poisoned"))?;
+        let mut file = &self.file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read(bytes)
+    }
+}
+
+struct SegmentReader {
+    source: Arc<CachedFile>,
+    position: u64,
+}
+
+impl Read for SegmentReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let count = self.source.read_at(bytes, self.position)?;
+        self.position = self
+            .position
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "reader offset overflow"))?;
+        Ok(count)
+    }
+}
+
+impl Seek for SegmentReader {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let next = match from {
+            SeekFrom::Start(position) => Some(position),
+            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+            SeekFrom::End(delta) => self.source.file.metadata()?.len().checked_add_signed(delta),
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid reader seek"))?;
+        self.position = next;
+        Ok(next)
+    }
+}
+
 struct ReaderCache {
-    files: HashMap<PathBuf, File>,
+    files: HashMap<PathBuf, Arc<CachedFile>>,
     order: VecDeque<PathBuf>,
     capacity: usize,
 }
@@ -137,18 +219,28 @@ impl ReaderCache {
         }
     }
 
-    fn clone_reader(&mut self, path: &Path) -> io::Result<File> {
+    fn clone_reader(&mut self, path: &Path) -> io::Result<SegmentReader> {
         if !self.files.contains_key(path) {
             while self.files.len() >= self.capacity {
                 if let Some(evicted) = self.order.pop_front() {
                     self.files.remove(&evicted);
                 }
             }
-            self.files.insert(path.to_path_buf(), File::open(path)?);
+            self.files.insert(
+                path.to_path_buf(),
+                Arc::new(CachedFile {
+                    file: File::open(path)?,
+                    #[cfg(any(not(unix), test))]
+                    seek_lock: Mutex::new(()),
+                }),
+            );
         }
         self.order.retain(|cached| cached != path);
         self.order.push_back(path.to_path_buf());
-        self.files.get(path).expect("reader inserted").try_clone()
+        Ok(SegmentReader {
+            source: self.files.get(path).expect("reader inserted").clone(),
+            position: 0,
+        })
     }
 
     fn remove(&mut self, path: &Path) {
@@ -701,7 +793,7 @@ impl PartitionLog {
             let frame_start = byte_pos;
             match decode_frame(&mut reader) {
                 Ok((_header, _payload)) => {
-                    if !self.meta.purged_offsets.contains(next_offset) {
+                    {
                         self.index.insert(
                             next_offset,
                             LogPosition {
@@ -811,7 +903,7 @@ impl PartitionLog {
                     };
                     return Err(self.quarantine(path, next_offset, error));
                 }
-                if !self.meta.purged_offsets.contains(next_offset) {
+                {
                     self.index.insert(
                         next_offset,
                         LogPosition {
@@ -996,6 +1088,7 @@ impl PartitionLog {
         }
 
         Ok(StoredMessage {
+            idempotency_key: header.idempotency_key,
             id: header.id,
             tenant_id: header.tenant_id,
             topic: header.topic,
@@ -1021,6 +1114,7 @@ impl PartitionLog {
             http_headers_json: header.http_headers_json.clone(),
             http_sign: header.http_sign,
             payload_ref_json: header.payload_ref_json.clone(),
+            dedup_inserted_at_ms: header.dedup_inserted_at_ms,
         })
     }
 
@@ -1076,6 +1170,7 @@ impl PartitionLog {
         }
 
         let stored = StoredMessage {
+            idempotency_key: header.idempotency_key,
             id: header.id,
             tenant_id: header.tenant_id,
             topic: header.topic,
@@ -1101,6 +1196,7 @@ impl PartitionLog {
             http_headers_json: header.http_headers_json.clone(),
             http_sign: header.http_sign,
             payload_ref_json: header.payload_ref_json.clone(),
+            dedup_inserted_at_ms: header.dedup_inserted_at_ms,
         };
         Ok((stored, frame))
     }
@@ -1162,6 +1258,7 @@ impl PartitionLog {
             ));
             byte_offset += frame.len() as u64;
             let stored = StoredMessage {
+                idempotency_key: header.idempotency_key,
                 id: header.id,
                 tenant_id: header.tenant_id,
                 topic: header.topic,
@@ -1187,6 +1284,7 @@ impl PartitionLog {
                 http_headers_json: header.http_headers_json.clone(),
                 http_sign: header.http_sign,
                 payload_ref_json: header.payload_ref_json.clone(),
+                dedup_inserted_at_ms: header.dedup_inserted_at_ms,
             };
             offset += 1;
             out.push((stored, frame));
@@ -1345,19 +1443,63 @@ impl PartitionLog {
         start_offset: u64,
         max_messages: usize,
     ) -> Result<Vec<StoredMessage>, LogError> {
+        self.read_range_inner(partition, start_offset, max_messages, ReadMode::Payload)
+    }
+
+    /// Verified delivery metadata with empty payloads, for internal indexing.
+    pub fn read_range_metadata(
+        &self,
+        partition: u32,
+        start_offset: u64,
+        max_messages: usize,
+    ) -> Result<Vec<StoredMessage>, LogError> {
+        self.read_range_inner(partition, start_offset, max_messages, ReadMode::Metadata)
+    }
+
+    /// Identity recovery includes tombstoned records while their raw bytes are
+    /// retained. Normal delivery/inspection continues to hide those records.
+    pub fn read_raw_metadata(
+        &self,
+        partition: u32,
+        start_offset: u64,
+        max_messages: usize,
+    ) -> Result<Vec<StoredMessage>, LogError> {
+        self.read_range_inner(partition, start_offset, max_messages, ReadMode::RawMetadata)
+    }
+
+    fn read_range_inner(
+        &self,
+        partition: u32,
+        start_offset: u64,
+        max_messages: usize,
+        mode: ReadMode,
+    ) -> Result<Vec<StoredMessage>, LogError> {
+        let keep_payload = mode == ReadMode::Payload;
+        let include_purged = mode == ReadMode::RawMetadata;
         let mut out = Vec::with_capacity(max_messages.min(256));
         // Skip collected offsets and a purged run (DLQ retention purges in
         // order) without decoding them.
         let mut start_offset = start_offset.max(self.meta.base_offset);
-        if let Some(end) = self.meta.purged_offsets.run_end_from(start_offset) {
+        if let Some(end) = self
+            .meta
+            .purged_offsets
+            .run_end_from(start_offset)
+            .filter(|_| !include_purged)
+        {
             start_offset = end;
         }
-        for segment in self
+        let first_segment = self
             .sealed_indexes
-            .iter()
-            .filter(|segment| segment.last_offset > start_offset)
-        {
-            self.read_sparse_segment(segment, partition, start_offset, max_messages, &mut out)?;
+            .partition_point(|segment| segment.last_offset <= start_offset);
+        for segment in &self.sealed_indexes[first_segment..] {
+            self.read_sparse_segment(
+                segment,
+                partition,
+                start_offset,
+                max_messages,
+                mode,
+                &mut out,
+            )?;
             if out.len() >= max_messages {
                 return Ok(out);
             }
@@ -1367,10 +1509,13 @@ impl PartitionLog {
             return Ok(out);
         }
         for (&offset, pos) in self.index.range(start_offset..end) {
+            if !include_purged && self.meta.purged_offsets.contains(offset) {
+                continue;
+            }
             if out.len() >= max_messages {
                 break;
             }
-            let (header, payload) = self.read_at(pos)?;
+            let (header, payload) = self.read_at(pos, keep_payload)?;
             out.push(stored_message(header, payload, partition, offset));
         }
         Ok(out)
@@ -1382,22 +1527,25 @@ impl PartitionLog {
         partition: u32,
         start_offset: u64,
         max_messages: usize,
+        mode: ReadMode,
         out: &mut Vec<StoredMessage>,
     ) -> Result<(), LogError> {
-        let point = segment
+        let keep_payload = mode == ReadMode::Payload;
+        let include_purged = mode == ReadMode::RawMetadata;
+        let point_index = segment
             .points
-            .iter()
-            .rev()
-            .find(|point| point.offset <= start_offset)
-            .unwrap_or(&segment.points[0]);
-        let mut file = self.cached_reader(&segment.path)?;
+            .partition_point(|point| point.offset <= start_offset);
+        let point = &segment.points[point_index.saturating_sub(1)];
+        let mut file = BufReader::new(self.cached_reader(&segment.path)?);
         file.seek(SeekFrom::Start(point.byte_offset))?;
         match self.manifest.wal_format_version {
             WAL_FORMAT_V1 => {
                 let mut offset = point.offset;
                 while offset < segment.last_offset && out.len() < max_messages {
-                    let (header, payload) = decode_frame(&mut file)?;
-                    if offset >= start_offset && !self.meta.purged_offsets.contains(offset) {
+                    let (header, payload) = read_dispatch_frame(&mut file, keep_payload)?;
+                    if offset >= start_offset
+                        && (include_purged || !self.meta.purged_offsets.contains(offset))
+                    {
                         out.push(stored_message(header, payload, partition, offset));
                     }
                     offset += 1;
@@ -1415,10 +1563,10 @@ impl PartitionLog {
                     }
                     let mut frames = Cursor::new(body);
                     for offset in epoch.first_offset..epoch.committed_hwm {
-                        let (header, payload) = decode_frame(&mut frames)?;
+                        let (header, payload) = read_dispatch_frame(&mut frames, keep_payload)?;
                         if offset >= start_offset
                             && offset < segment.last_offset
-                            && !self.meta.purged_offsets.contains(offset)
+                            && (include_purged || !self.meta.purged_offsets.contains(offset))
                         {
                             out.push(stored_message(header, payload, partition, offset));
                             if out.len() >= max_messages {
@@ -1688,9 +1836,9 @@ impl PartitionLog {
             self.meta.purged_offsets = previous;
             return Err(error.into());
         }
-        for offset in &purged {
-            self.index.remove(offset);
-        }
+        // Keep positions only for this bounded active segment until roll, so
+        // identity recovery can read purged headers without rescanning the WAL
+        // from zero on every page. All ordinary readers filter tombstones.
         Ok(purged.len())
     }
 
@@ -1816,13 +1964,17 @@ impl PartitionLog {
         Err(LogError::OffsetNotFound(offset))
     }
 
-    fn read_at(&self, pos: &LogPosition) -> Result<(LogRecord, Vec<u8>), LogError> {
-        let mut file = self.cached_reader(&pos.path)?;
+    fn read_at(
+        &self,
+        pos: &LogPosition,
+        keep_payload: bool,
+    ) -> Result<(LogRecord, Vec<u8>), LogError> {
+        let mut file = BufReader::new(self.cached_reader(&pos.path)?);
         file.seek(SeekFrom::Start(pos.byte_offset))?;
-        decode_frame(&mut file).map_err(LogError::from)
+        read_dispatch_frame(&mut file, keep_payload).map_err(LogError::from)
     }
 
-    fn cached_reader(&self, path: &Path) -> Result<File, LogError> {
+    fn cached_reader(&self, path: &Path) -> Result<SegmentReader, LogError> {
         let mut cache = self
             .reader_cache
             .lock()
@@ -2095,6 +2247,7 @@ fn stored_message(
     offset: u64,
 ) -> StoredMessage {
     StoredMessage {
+        idempotency_key: header.idempotency_key,
         id: header.id,
         tenant_id: header.tenant_id,
         topic: header.topic,
@@ -2120,6 +2273,7 @@ fn stored_message(
         http_headers_json: header.http_headers_json,
         http_sign: header.http_sign,
         payload_ref_json: header.payload_ref_json,
+        dedup_inserted_at_ms: header.dedup_inserted_at_ms,
     }
 }
 
@@ -2128,6 +2282,126 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    #[test]
+    fn cached_readers_do_not_share_seek_positions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("readers");
+        std::fs::write(&path, b"AAAABBBB").unwrap();
+        let mut cache = ReaderCache::new();
+        let mut first = cache.clone_reader(&path).unwrap();
+        let mut second = cache.clone_reader(&path).unwrap();
+        assert!(
+            Arc::ptr_eq(&first.source, &second.source),
+            "readers reuse the cached descriptor without another dup/open"
+        );
+        first.seek(SeekFrom::Start(0)).unwrap();
+        second.seek(SeekFrom::Start(4)).unwrap();
+        let mut bytes = [0u8; 4];
+        first.read_exact(&mut bytes).unwrap();
+        assert_eq!(
+            &bytes, b"AAAA",
+            "a cached clone must not change another reader's position"
+        );
+        second.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"BBBB");
+        assert_eq!(first.seek(SeekFrom::End(-2)).unwrap(), 6);
+        assert_eq!(first.seek(SeekFrom::Current(-2)).unwrap(), 4);
+        assert!(first.seek(SeekFrom::Current(-5)).is_err());
+        assert_eq!(
+            first.stream_position().unwrap(),
+            4,
+            "an invalid seek preserves the old position"
+        );
+        first.seek(SeekFrom::Start(u64::MAX)).unwrap();
+        assert!(first.seek(SeekFrom::Current(1)).is_err());
+        first.seek(SeekFrom::End(0)).unwrap();
+        assert_eq!(first.read(&mut bytes).unwrap(), 0);
+        cache.remove(&path);
+        // An evicted descriptor remains valid while an existing reader owns it.
+        second.seek(SeekFrom::Start(0)).unwrap();
+        second.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"AAAA");
+    }
+
+    #[test]
+    fn portable_cached_reader_fallback_serializes_seek_and_read() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("portable-readers");
+        std::fs::write(&path, b"AAAABBBB").unwrap();
+        let mut cache = ReaderCache::new();
+        let first = cache.clone_reader(&path).unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for n in 0..8 {
+                let source = &first.source;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let offset = if n % 2 == 0 { 0 } else { 4 };
+                    let expected = if offset == 0 { b"AAAA" } else { b"BBBB" };
+                    for _ in 0..128 {
+                        let mut bytes = [0; 4];
+                        assert_eq!(
+                            source.read_at_with_seek_lock(&mut bytes, offset).unwrap(),
+                            4
+                        );
+                        assert_eq!(&bytes, expected);
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn concurrent_partition_reads_keep_payload_and_metadata_at_the_requested_offsets() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            for sealed in [false, true] {
+                let dir = tempdir().unwrap();
+                let mut log = PartitionLog::open_for_shard(
+                    dir.path(),
+                    PartitionLogConfig::default(),
+                    0,
+                    format,
+                )
+                .unwrap();
+                let ids: Vec<_> = (0..64)
+                    .map(|n| {
+                        let record = sample_record("reads");
+                        let id = record.id;
+                        log.append(0, record, format!("body-{n}").into_bytes())
+                            .unwrap();
+                        id
+                    })
+                    .collect();
+                log.sync().unwrap();
+                if sealed {
+                    log.roll_segment().unwrap();
+                }
+                let barrier = std::sync::Barrier::new(8);
+                std::thread::scope(|scope| {
+                    for n in 0..8 {
+                        let log = &log;
+                        let ids = &ids;
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            barrier.wait();
+                            for step in 0..128 {
+                                let offset = ((step * 17 + n * 7) % 64) as u64;
+                                let payload = log.read_range(0, offset, 1).unwrap();
+                                assert_eq!(payload[0].offset, offset);
+                                assert_eq!(payload[0].id, ids[offset as usize]);
+                                assert_eq!(payload[0].payload, format!("body-{offset}").as_bytes());
+                                let metadata = log.read_range_metadata(0, offset, 1).unwrap();
+                                assert_eq!(metadata[0].id, ids[offset as usize]);
+                                assert!(metadata[0].payload.is_empty());
+                            }
+                        });
+                    }
+                });
+            }
+        }
+    }
 
     fn sample_record(topic: &str) -> LogRecord {
         LogRecord {
@@ -2154,6 +2428,7 @@ mod tests {
             http_headers_json: None,
             http_sign: None,
             payload_ref_json: None,
+            dedup_inserted_at_ms: None,
         }
     }
 
@@ -2538,6 +2813,34 @@ mod tests {
         let recovered = PartitionLog::open_for_shard(dir.path(), cfg, 4, WAL_FORMAT_V2).unwrap();
         assert!(recovered.resident_index_entries() < 20);
         assert_eq!(recovered.read_range(4, 995, 10).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn metadata_reads_match_full_reads_across_formats_rolls_and_restart() {
+        for format in [WAL_FORMAT_V1, WAL_FORMAT_V2] {
+            let dir = tempdir().unwrap();
+            let cfg = PartitionLogConfig {
+                segment_max_bytes: 16 * 1024,
+                ..PartitionLogConfig::default()
+            };
+            let mut log = PartitionLog::open_for_shard(dir.path(), cfg.clone(), 0, format).unwrap();
+            for _ in 0..40 {
+                log.append(0, sample_record("metadata"), vec![42; 1024])
+                    .unwrap();
+            }
+            log.sync().unwrap();
+            log.purge_offset(7).unwrap();
+            let full = log.read_range(0, 3, 100).unwrap();
+            let mut expected = full.clone();
+            for message in &mut expected {
+                message.payload.clear();
+            }
+            assert_eq!(log.read_range_metadata(0, 3, 100).unwrap(), expected);
+            drop(log);
+            let log = PartitionLog::open_for_shard(dir.path(), cfg, 0, format).unwrap();
+            assert_eq!(log.read_range_metadata(0, 3, 100).unwrap(), expected);
+            assert_eq!(log.read_range(0, 3, 100).unwrap(), full);
+        }
     }
 
     #[test]

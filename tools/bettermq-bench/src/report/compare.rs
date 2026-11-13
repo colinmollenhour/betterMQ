@@ -73,9 +73,15 @@ pub fn compare(a: &RunReport, b: &RunReport, threshold: f64) -> Comparison {
     let mut only_base = Vec::new();
     let mut only_cand = Vec::new();
     let mut hard: Vec<String> = Vec::new();
+    if b.meta.finished_at.is_empty() {
+        hard.push("candidate run is unfinished".into());
+    }
     for sa in &a.scenarios {
         match b.scenarios.iter().find(|s| s.id == sa.id) {
-            None => only_base.push(sa.id.clone()),
+            None => {
+                only_base.push(sa.id.clone());
+                hard.push(format!("{}: scenario is missing from the candidate", sa.id));
+            }
             Some(sb) => {
                 for ma in &sa.metrics {
                     if !sb.metrics.iter().any(|m| m.id == ma.id) && ma.value.is_finite() {
@@ -116,33 +122,24 @@ pub fn compare(a: &RunReport, b: &RunReport, threshold: f64) -> Comparison {
         }
         // Correctness regressions are judged on the candidate alone: a run that
         // loses messages or errors must fail the gate however fast it was.
-        let was_bad = a.scenarios.iter().find(|s| s.id == sb.id).map(|s| s.status);
         if matches!(sb.status, Status::Error) {
             hard.push(format!(
                 "{}: scenario errored ({})",
                 sb.id,
                 sb.error.clone().unwrap_or_default()
             ));
-        } else if sb.status == Status::Fail && was_bad != Some(Status::Fail) {
-            hard.push(format!("{}: scenario now FAILS correctness checks", sb.id));
+        } else if sb.status == Status::Fail {
+            hard.push(format!("{}: scenario FAILS correctness checks", sb.id));
         }
         for f in sb
             .findings
             .iter()
             .filter(|f| f.severity == Severity::Critical)
         {
-            let existed = a
-                .scenarios
-                .iter()
-                .filter(|s| s.id == sb.id)
-                .flat_map(|s| s.findings.iter())
-                .any(|g| g.title == f.title);
-            if !existed {
-                hard.push(format!(
-                    "{}: new critical finding: {} ({})",
-                    sb.id, f.title, f.detail
-                ));
-            }
+            hard.push(format!(
+                "{}: critical finding: {} ({})",
+                sb.id, f.title, f.detail
+            ));
         }
         if let Some(e) = &sb.error {
             if sb.status != Status::Error {
@@ -392,7 +389,10 @@ mod tests {
     fn report(status: Status, findings: Vec<Finding>, metric: f64) -> RunReport {
         RunReport {
             schema: SCHEMA_VERSION,
-            meta: RunMeta::default(),
+            meta: RunMeta {
+                finished_at: "2026-11-11T00:00:00Z".into(),
+                ..Default::default()
+            },
             env: EnvInfo::default(),
             calibration: None,
             scenarios: vec![ScenarioResult {
@@ -443,6 +443,37 @@ mod tests {
         let mut gone = report(Status::Pass, vec![], 1.0);
         gone.scenarios[0].metrics.clear();
         assert!(!compare(&base, &gone, 0.1).hard_failures.is_empty());
+    }
+
+    #[test]
+    fn an_existing_correctness_failure_is_not_a_passing_baseline() {
+        let critical = Finding {
+            severity: Severity::Critical,
+            scenario: "s".into(),
+            title: "Undelivered messages".into(),
+            detail: "still pending".into(),
+        };
+        let base = report(Status::Fail, vec![critical.clone()], 100.0);
+        let candidate = report(Status::Fail, vec![critical], 50.0);
+        assert!(!compare(&base, &candidate, 0.1).hard_failures.is_empty());
+    }
+
+    #[test]
+    fn unfinished_runs_and_missing_scenarios_fail_the_gate() {
+        let base = report(Status::Pass, vec![], 100.0);
+        let mut candidate = report(Status::Pass, vec![], 50.0);
+        assert!(compare(&base, &candidate, 0.1).hard_failures.is_empty());
+        candidate.meta.finished_at.clear();
+        assert!(compare(&base, &candidate, 0.1)
+            .hard_failures
+            .iter()
+            .any(|failure| failure.contains("unfinished")));
+        candidate.meta.finished_at = base.meta.finished_at.clone();
+        candidate.scenarios.clear();
+        assert!(compare(&base, &candidate, 0.1)
+            .hard_failures
+            .iter()
+            .any(|failure| failure.contains("scenario is missing")));
     }
 
     #[test]

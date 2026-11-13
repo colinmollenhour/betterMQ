@@ -177,6 +177,117 @@ mod tests {
     fn enormous_length_is_rejected_without_overflowing_admission() {
         assert!(reserve_admission(Some(Uuid::new_v4()), usize::MAX).is_err());
     }
+
+    #[tokio::test]
+    async fn cancelled_ingest_retains_byte_admission_and_shutdown_awaits_its_owned_work() {
+        cancellation_keeps_admission_and_drains(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_batch_retains_byte_admission_and_shutdown_awaits_its_owned_work() {
+        cancellation_keeps_admission_and_drains(true).await;
+    }
+
+    async fn cancellation_keeps_admission_and_drains(batch: bool) {
+        use broker_dispatch::{DispatchConfig, DispatchEngine, LeaseTable};
+        use broker_partition::{Broker, BrokerConfig, PublishRequest};
+        use broker_schedule::{CronRegistry, ScheduleQueue};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::open(BrokerConfig::new(dir.path().into())).unwrap();
+        let state = Arc::new(AppState {
+            broker: broker.clone(),
+            schedule: ScheduleQueue::open(dir.path()).unwrap(),
+            crons: CronRegistry::open(dir.path()).unwrap(),
+            dispatch: DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default()),
+            leases: LeaseTable::new(),
+            cluster: None,
+            local_auth: None,
+            fair_queue: Arc::new(broker_dispatch::TenantFairQueue::new()),
+            catalog_tombstones: crate::catalog_tombstones::CatalogTombstones::open(dir.path())
+                .unwrap(),
+            dispatch_fleet: false,
+            broker_only: true,
+            #[cfg(feature = "cloud")]
+            auth: None,
+            #[cfg(feature = "cloud")]
+            control_plane: None,
+        });
+        let request: PublishRequest = serde_json::from_value(serde_json::json!({
+            "url":"https://example.com/hook", "secret":"secret", "payload":"body",
+            "routing_key":"one-lane", "idempotency_key":"owned-admission"
+        }))
+        .unwrap();
+        // Hold only the key, not a native thread, while the admitted request
+        // waits. This places cancellation before append and shutdown before
+        // the request creates its nested durable completion.
+        let held = broker.prepare_publish_batch(vec![request.clone()]).unwrap();
+        let tenant = Uuid::new_v4();
+        let owned = state.clone();
+        let request = tokio::spawn(async move {
+            if batch {
+                crate::ingest::submit_batch(
+                    &owned,
+                    Some(crate::metering::IngestAuth { tenant_id: tenant }),
+                    crate::ingest::IngestBatch::from_requests(vec![request]).unwrap(),
+                )
+                .await;
+            } else {
+                let _ = crate::ingest::ingest_one_validated(
+                    &owned,
+                    request,
+                    Some(crate::metering::IngestMeter {
+                        tenant_id: tenant,
+                        body_bytes: 4,
+                    }),
+                )
+                .await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !TENANTS
+                .get_or_init(Default::default)
+                .lock()
+                .contains_key(&tenant)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        request.abort();
+        assert!(request.await.err().unwrap().is_cancelled());
+        {
+            let tenants = TENANTS.get().unwrap().lock();
+            let queued = tenants
+                .get(&tenant)
+                .expect("owned ingest retains tenant admission");
+            assert_eq!((queued.records, queued.bytes), (1, 4));
+        }
+        let mut draining = Box::pin(broker.close_and_drain_owned_completions());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut draining)
+                .await
+                .is_err()
+        );
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), draining)
+            .await
+            .unwrap();
+        assert!(!TENANTS.get().unwrap().lock().contains_key(&tenant));
+        assert_eq!(
+            broker
+                .list_topic_messages(broker_partition::DIRECT_TOPIC, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            broker.spawn_owned(async {}).is_err(),
+            "new work is refused after the drain fence"
+        );
+        state.dispatch.shutdown_background().await;
+    }
 }
 
 fn env_limit(name: &str, default: u64) -> u64 {

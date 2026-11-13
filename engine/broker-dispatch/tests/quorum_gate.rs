@@ -190,17 +190,20 @@ async fn takeover_clamps_cursors_to_the_verified_quorum_watermark() {
         .unwrap();
 
     let dispatch = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
-    dispatch.fence_partition(partition);
+    let epoch = dispatch.fence_partition(partition);
     assert!(dispatch.is_fenced(partition));
-    dispatch.set_recovery_targets(partition, vec![(topic.clone(), first + 3)]);
+    dispatch.set_recovery_targets(partition, epoch, vec![(topic.clone(), first + 3)]);
     assert!(
-        dispatch.complete_recovery(partition).is_err(),
+        dispatch.complete_recovery(partition, epoch).is_err(),
         "recovery waits until the takeover target is quorum-verified"
     );
     assert!(dispatch.is_fenced(partition));
 
-    dispatch.set_recovery_targets(partition, vec![(topic.clone(), first + 2)]);
-    assert_eq!(dispatch.complete_recovery(partition).unwrap(), 1);
+    dispatch.set_recovery_targets(partition, epoch, vec![(topic.clone(), first + 2)]);
+    assert_eq!(
+        dispatch.complete_recovery(partition, epoch).unwrap(),
+        Some(1)
+    );
     assert!(!dispatch.is_fenced(partition));
     assert_eq!(
         broker.dispatch_offset(&tenant, &lane, partition).unwrap(),

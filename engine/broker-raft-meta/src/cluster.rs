@@ -241,6 +241,13 @@ fn write_state_file(path: &Path, state: &ClusterStateFile) -> Result<(), Cluster
     Ok(())
 }
 
+struct RecoveryFence {
+    epoch: Uuid,
+    generation: u64,
+    verifying: bool,
+    serving: bool,
+}
+
 #[derive(Clone)]
 pub struct ClusterRuntime {
     config: ClusterConfig,
@@ -249,7 +256,7 @@ pub struct ClusterRuntime {
     state: Arc<Mutex<ClusterStateFile>>,
     epoch: Arc<Mutex<crate::epoch::ControllerEpoch>>,
     controller_confirmed_at_ms: Arc<AtomicI64>,
-    blocked_shards: Arc<Mutex<HashSet<u32>>>,
+    blocked_shards: Arc<Mutex<HashMap<u32, RecoveryFence>>>,
     controller: Option<OpenRaftController>,
     peer_ttl_ms: i64,
     /// When false (unit tests via `from_config_only`), skip disk/flock.
@@ -272,7 +279,7 @@ impl ClusterRuntime {
             state: Arc::new(Mutex::new(state)),
             epoch: Arc::new(Mutex::new(epoch)),
             controller_confirmed_at_ms: Arc::new(AtomicI64::new(0)),
-            blocked_shards: Arc::new(Mutex::new(HashSet::new())),
+            blocked_shards: Arc::new(Mutex::new(HashMap::new())),
             controller: None,
             peer_ttl_ms: DEFAULT_PEER_TTL_MS,
             durable: true,
@@ -287,7 +294,7 @@ impl ClusterRuntime {
             state: Arc::new(Mutex::new(ClusterStateFile::default())),
             epoch: Arc::new(Mutex::new(crate::epoch::ControllerEpoch::default())),
             controller_confirmed_at_ms: Arc::new(AtomicI64::new(Utc::now().timestamp_millis())),
-            blocked_shards: Arc::new(Mutex::new(HashSet::new())),
+            blocked_shards: Arc::new(Mutex::new(HashMap::new())),
             controller: None,
             peer_ttl_ms: DEFAULT_PEER_TTL_MS,
             durable: false,
@@ -503,8 +510,24 @@ impl ClusterRuntime {
     }
 
     pub fn is_leader_for_shard(&self, shard: u32) -> bool {
+        self.is_elected_leader_for_shard(shard) && self.shard_ready(shard)
+    }
+
+    /// Repair is authorized while serving, or after this exact takeover epoch
+    /// finishes catch-up. It must never race tail reconciliation itself.
+    pub fn is_recovery_leader_for_shard(&self, shard: u32) -> bool {
+        if !self.is_elected_leader_for_shard(shard) {
+            return false;
+        }
+        let generation = self.shard_generation(shard);
+        self.blocked_shards.lock().get(&shard).is_none_or(|fence| {
+            (fence.serving || fence.verifying) && fence.generation == generation
+        })
+    }
+
+    /// Lease-authorized elected ownership, independent of recovery phase.
+    pub fn is_elected_leader_for_shard(&self, shard: u32) -> bool {
         (!self.durable || self.has_controller_lease())
-            && !self.blocked_shards.lock().contains(&shard)
             && self.elect_leader_for_shard(shard) == Some(self.config.node_id)
     }
 
@@ -584,16 +607,86 @@ impl ClusterRuntime {
 
     /// Temporarily fence writes/dispatch while a newly acquired shard catches up.
     pub fn set_shard_ready(&self, shard: u32, ready: bool) {
+        let generation = self.shard_generation(shard);
         let mut blocked = self.blocked_shards.lock();
         if ready {
-            blocked.remove(&shard);
+            let fence = blocked.entry(shard).or_insert_with(|| RecoveryFence {
+                epoch: Uuid::new_v4(),
+                generation,
+                verifying: false,
+                serving: true,
+            });
+            fence.generation = generation;
+            fence.serving = true;
+            fence.verifying = false;
         } else {
-            blocked.insert(shard);
+            blocked.insert(
+                shard,
+                RecoveryFence {
+                    epoch: Uuid::new_v4(),
+                    generation,
+                    verifying: false,
+                    serving: false,
+                },
+            );
         }
     }
 
     pub fn shard_ready(&self, shard: u32) -> bool {
-        !self.blocked_shards.lock().contains(&shard)
+        let generation = self.shard_generation(shard);
+        self.blocked_shards
+            .lock()
+            .get(&shard)
+            .is_none_or(|fence| fence.serving && fence.generation == generation)
+    }
+
+    pub fn begin_shard_recovery(&self, shard: u32, epoch: Uuid, generation: u64) {
+        self.blocked_shards.lock().insert(
+            shard,
+            RecoveryFence {
+                epoch,
+                generation,
+                verifying: false,
+                serving: false,
+            },
+        );
+    }
+
+    pub fn mark_shard_verifying(&self, shard: u32, epoch: Uuid, generation: u64) -> bool {
+        if !self.is_elected_leader_for_shard(shard) || self.shard_generation(shard) != generation {
+            return false;
+        }
+        let mut blocked = self.blocked_shards.lock();
+        let Some(fence) = blocked
+            .get_mut(&shard)
+            .filter(|fence| fence.epoch == epoch && fence.generation == generation)
+        else {
+            return false;
+        };
+        fence.verifying = true;
+        true
+    }
+
+    pub fn finish_shard_recovery(&self, shard: u32, epoch: Uuid, generation: u64) -> bool {
+        if !self.is_elected_leader_for_shard(shard) || self.shard_generation(shard) != generation {
+            return false;
+        }
+        let mut blocked = self.blocked_shards.lock();
+        let Some(fence) = blocked.get_mut(&shard).filter(|fence| {
+            fence.epoch == epoch && fence.generation == generation && fence.verifying
+        }) else {
+            return false;
+        };
+        fence.serving = true;
+        true
+    }
+
+    /// Changes even for a new recovery incarnation in the same Raft term.
+    pub fn shard_incarnation(&self, shard: u32) -> Uuid {
+        self.blocked_shards
+            .lock()
+            .get(&shard)
+            .map_or(Uuid::nil(), |fence| fence.epoch)
     }
 
     pub fn leader_http_base_for_shard(&self, shard: u32) -> Option<String> {
@@ -1116,16 +1209,21 @@ impl ClusterRuntime {
         config: &ClusterConfig,
     ) -> Result<(), ClusterError> {
         let path = cluster_state_path(data_dir.as_ref());
-        if path.exists() {
-            return Ok(());
-        }
         if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent)?;
         }
-        let state = ClusterStateFile::default();
-        write_state_file(&path, &state)?;
+        // Several new nodes can initialize the same shared compatibility state
+        // at once. Use the same inode lock as every later state mutation before
+        // checking existence or writing the fixed-name atomic swap file.
+        let _lock = FileLock::exclusive(&path)?;
+        if !path.exists() {
+            write_state_file(&path, &ClusterStateFile::default())?;
+        }
         let cfg_path = data_dir.as_ref().join("cluster-config.json");
-        broker_proto::write_secret_atomic(&cfg_path, &serde_json::to_vec_pretty(config)?)?;
+        if !cfg_path.exists() {
+            fs::create_dir_all(data_dir.as_ref())?;
+            broker_proto::write_secret_atomic(&cfg_path, &serde_json::to_vec_pretty(config)?)?;
+        }
         Ok(())
     }
 
@@ -1148,6 +1246,55 @@ mod tests {
     /// move a concurrent test's `cluster.json` (and its scheduler lease) into
     /// the shared dir.
     static SHARED_META_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn concurrent_shared_initialization_serializes_state_and_writes_every_node_config() {
+        const CHILD: &str = "BETTERMQ_TEST_CONCURRENT_SHARED_INIT";
+        let Some(root) = std::env::var_os(CHILD) else {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "cluster::tests::concurrent_shared_initialization_serializes_state_and_writes_every_node_config", "--nocapture"])
+                .env(CHILD, root.path()).env("BETTERMQ_SHARED_META_DIR", root.path().join("shared")).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        let root = PathBuf::from(root);
+        let nodes: Vec<_> = (0..8)
+            .map(|n| NodeConfig {
+                id: Uuid::new_v4(),
+                addr: format!("http://node-{n}:8080"),
+                internal_url: None,
+            })
+            .collect();
+        let cluster_id = Uuid::new_v4();
+        let barrier = std::sync::Barrier::new(nodes.len());
+        std::thread::scope(|scope| {
+            for (n, node) in nodes.iter().enumerate() {
+                let root = &root;
+                let nodes = &nodes;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let dir = root.join(n.to_string());
+                    let config = ClusterConfig {
+                        cluster_id,
+                        node_id: node.id,
+                        nodes: nodes.clone(),
+                        generation: 1,
+                        hash_version: 1,
+                    };
+                    barrier.wait();
+                    ClusterRuntime::init_cluster_file(&dir, &config).unwrap();
+                    assert_eq!(ClusterRuntime::load_config(&dir).unwrap().node_id, node.id);
+                });
+            }
+        });
+        let _: ClusterStateFile =
+            serde_json::from_slice(&fs::read(cluster_state_path(&root)).unwrap()).unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn scheduler_holder_renews_only_after_half_the_lease() {

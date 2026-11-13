@@ -72,6 +72,8 @@ impl RocksStateIndex {
         std::fs::create_dir_all(path.as_ref())?;
         let mut options = Options::default();
         options.create_if_missing(true);
+        options.set_write_buffer_size(1024 * 1024);
+        options.set_max_write_buffer_number(2);
         Ok(Self {
             db: DB::open(&options, path)?,
         })

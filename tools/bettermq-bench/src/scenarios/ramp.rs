@@ -31,7 +31,7 @@ struct Spec {
 
 fn spec(id: &str, ctx: &RunCtx) -> Spec {
     let p = ctx.profile;
-    let steps = p.pick(8, 12, 15);
+    let steps = ctx.ramp_steps.map(usize::from).unwrap_or(p.pick(8, 12, 15));
     let step_secs = p.pick(6.0, 15.0, 25.0);
     let base = Spec {
         wire: Wire::Single,
@@ -134,6 +134,9 @@ struct Extra {
 pub async fn run(id: &str, ctx: Arc<RunCtx>, index: u32, seed: u64) -> anyhow::Result<TrialResult> {
     let sp = spec(id, &ctx);
     let mut trial = Trial::start(ctx.clone(), id, index, seed).await?;
+    if let Some(steps) = ctx.ramp_steps {
+        trial.note(format!("Diagnostic ramp limited to {steps} steps; a passing final step is a lower bound, not a measured saturation point."));
+    }
     let mut dest = DestCfg::instant("ramp");
     if sp.handler_ms > 0.0 {
         dest = dest.latency(sp.handler_ms, sp.handler_sigma);
@@ -446,4 +449,43 @@ pub async fn run(id: &str, ctx: Arc<RunCtx>, index: u32, seed: u64) -> anyhow::R
         .idle(ctx.secs(ctx.profile.pick(8.0, 25.0, 60.0)))
         .await;
     trial.finish().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trial::Profile;
+
+    #[test]
+    fn diagnostic_step_limit_is_reported_without_changing_profile_defaults() {
+        let mut ctx = RunCtx {
+            broker_bin: Default::default(),
+            data_root: Default::default(),
+            profile: Profile::Standard,
+            seed: 1,
+            fsync: "group".into(),
+            rust_log: "info".into(),
+            broker_cpus: None,
+            slo: Slo::default(),
+            keep_data: false,
+            rate_scale: 1.0,
+            time_scale: 1.0,
+            ramp_steps: None,
+            extra_env: Vec::new(),
+        };
+        for (profile, expected) in [
+            (Profile::Smoke, 8),
+            (Profile::Standard, 12),
+            (Profile::Full, 15),
+        ] {
+            ctx.profile = profile;
+            ctx.ramp_steps = None;
+            assert_eq!(spec("ingest-single", &ctx).steps, expected);
+            ctx.ramp_steps = Some(1);
+            for id in ["ingest-single", "ingest-batch", "ingest-large", "e2e-ramp"] {
+                assert_eq!(spec(id, &ctx).steps, 1);
+                assert_eq!(params(id, &ctx)["steps_max"], "1");
+            }
+        }
+    }
 }

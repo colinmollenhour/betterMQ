@@ -157,7 +157,6 @@ pub async fn run(
                 r = scenarios::run(id, ctx.clone(), t, seed) => r,
                 _ = tokio::signal::ctrl_c() => {
                     eprintln!("interrupted; writing partial results");
-                    report.meta.finished_at = chrono::Utc::now().to_rfc3339();
                     return Ok(report);
                 }
             };
@@ -227,6 +226,12 @@ fn headline_summary(t: &TrialResult) -> String {
 /// pooled (so per-invocation runs interleaved with another build become one
 /// multi-trial result), metrics re-aggregated, and findings re-derived.
 pub fn merge(reports: Vec<RunReport>) -> anyhow::Result<RunReport> {
+    anyhow::ensure!(
+        reports
+            .iter()
+            .all(|report| !report.meta.finished_at.is_empty()),
+        "cannot merge unfinished runs; rerun interrupted invocations first"
+    );
     let mut iter = reports.into_iter();
     let mut out = iter
         .next()
@@ -235,6 +240,10 @@ pub fn merge(reports: Vec<RunReport>) -> anyhow::Result<RunReport> {
     let mut by_id: std::collections::BTreeMap<String, ScenarioResult> =
         out.scenarios.drain(..).map(|s| (s.id.clone(), s)).collect();
     for r in iter {
+        anyhow::ensure!(
+            out.meta.broker_sha256 == r.meta.broker_sha256,
+            "cannot merge different broker fingerprints; pool each build separately"
+        );
         if out.calibration.is_none() {
             out.calibration = r.calibration.clone();
         }
@@ -252,6 +261,8 @@ pub fn merge(reports: Vec<RunReport>) -> anyhow::Result<RunReport> {
         for sc in r.scenarios {
             match by_id.get_mut(&sc.id) {
                 Some(existing) => {
+                    anyhow::ensure!(existing.params == sc.params,
+                        "cannot merge scenario {} with different parameters; pool matching workloads separately", sc.id);
                     existing.trials.extend(sc.trials);
                     if let Some(e) = sc.error {
                         existing.error = Some(match existing.error.take() {
@@ -520,7 +531,10 @@ mod tests {
         };
         RunReport {
             schema: SCHEMA_VERSION,
-            meta: RunMeta::default(),
+            meta: RunMeta {
+                finished_at: "2026-11-11T00:00:00Z".into(),
+                ..Default::default()
+            },
             env: EnvInfo::default(),
             calibration: None,
             scenarios: vec![ScenarioResult {
@@ -550,5 +564,34 @@ mod tests {
         assert_eq!(sc.metrics[0].value, 3.0);
         assert_eq!(sc.metrics[0].samples.len(), 3);
         assert_eq!(merged.meta.repeats, 3);
+    }
+
+    #[test]
+    fn merge_rejects_an_unfinished_input() {
+        let mut interrupted = rep(2.0);
+        interrupted.meta.finished_at.clear();
+        assert!(merge(vec![rep(1.0), interrupted]).is_err());
+    }
+
+    #[test]
+    fn merge_rejects_different_broker_fingerprints_and_diagnostic_step_limits() {
+        let mut a = rep(1.0);
+        let mut b = rep(2.0);
+        a.meta.broker_sha256 = "build-a".into();
+        b.meta.broker_sha256 = "build-b".into();
+        assert!(merge(vec![a, b])
+            .unwrap_err()
+            .to_string()
+            .contains("fingerprints"));
+        let mut a = rep(1.0);
+        let mut b = rep(2.0);
+        a.scenarios[0]
+            .params
+            .insert("steps_max".into(), "12".into());
+        b.scenarios[0].params.insert("steps_max".into(), "1".into());
+        assert!(merge(vec![a, b])
+            .unwrap_err()
+            .to_string()
+            .contains("different parameters"));
     }
 }

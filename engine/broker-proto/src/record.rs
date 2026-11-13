@@ -122,6 +122,10 @@ pub struct LogRecord {
     /// JSON `PayloadRef` when body stored in object store (CP3b).
     #[serde(default)]
     pub payload_ref_json: Option<String>,
+    /// Optional frame-header trailer for migrated producer TTLs. Skipped in
+    /// the historical bincode struct so older readers still decode all fields.
+    #[serde(skip)]
+    pub dedup_inserted_at_ms: Option<u64>,
 }
 
 /// Pre-priority on-disk header (read compatibility).
@@ -137,8 +141,19 @@ struct LogRecordLegacy {
 
 impl LogRecord {
     pub fn decode_bytes(bytes: &[u8]) -> Result<Self, bincode_next::error::DecodeError> {
-        match crate::codec::decode::<Self>(bytes) {
-            Ok(r) => Ok(r),
+        match bincode_next::serde::decode_from_slice::<Self, _>(
+            bytes,
+            bincode_next::config::legacy(),
+        ) {
+            Ok((mut r, used)) => {
+                if let Some(trailer) = bytes[used..].strip_prefix(b"BMQIDTTL") {
+                    r.dedup_inserted_at_ms =
+                        Some(u64::from_le_bytes(trailer.try_into().map_err(|_| {
+                            bincode_next::error::DecodeError::Other("invalid producer TTL trailer")
+                        })?));
+                }
+                Ok(r)
+            }
             Err(_) => {
                 let leg: LogRecordLegacy = crate::codec::decode(bytes)?;
                 Ok(Self {
@@ -165,6 +180,7 @@ impl LogRecord {
                     http_headers_json: None,
                     http_sign: None,
                     payload_ref_json: None,
+                    dedup_inserted_at_ms: None,
                 })
             }
         }
@@ -180,6 +196,12 @@ pub struct StoredMessage {
     pub partition: u32,
     pub offset: u64,
     pub routing_key: String,
+    /// WAL identity needed by replica catch-up and takeover dedup recovery.
+    /// Internal only: preserve the existing consumer JSON representation.
+    #[serde(skip)]
+    pub idempotency_key: Option<String>,
+    #[serde(skip)]
+    pub dedup_inserted_at_ms: Option<u64>,
     pub payload: Vec<u8>,
     pub published_at_ms: i64,
     pub priority: u8,
@@ -221,7 +243,11 @@ pub fn encode_frame(
     payload: &[u8],
     writer: &mut impl Write,
 ) -> Result<(), RecordError> {
-    let header_bytes = crate::codec::encode(header)?;
+    let mut header_bytes = crate::codec::encode(header)?;
+    if let Some(timestamp) = header.dedup_inserted_at_ms {
+        header_bytes.extend_from_slice(b"BMQIDTTL");
+        header_bytes.extend_from_slice(&timestamp.to_le_bytes());
+    }
     if header_bytes.len() > MAX_FRAME_HEADER_BYTES
         || payload.len() > max_frame_decode_payload_bytes()
     {
@@ -230,19 +256,36 @@ pub fn encode_frame(
             payload_len: payload.len(),
         });
     }
-    let mut body = Vec::with_capacity(12 + header_bytes.len() + payload.len());
-    body.extend_from_slice(&RECORD_MAGIC);
-    body.extend_from_slice(&(header_bytes.len() as u32).to_be_bytes());
-    body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    body.extend_from_slice(&header_bytes);
-    body.extend_from_slice(payload);
-    let checksum = crc32fast::hash(&body);
-    writer.write_all(&body)?;
+    let mut prefix = [0; 12];
+    prefix[..4].copy_from_slice(&RECORD_MAGIC);
+    prefix[4..8].copy_from_slice(&(header_bytes.len() as u32).to_be_bytes());
+    prefix[8..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&prefix);
+    crc.update(&header_bytes);
+    crc.update(payload);
+    let checksum = crc.finalize();
+    writer.write_all(&prefix)?;
+    writer.write_all(&header_bytes)?;
+    writer.write_all(payload)?;
     writer.write_all(&checksum.to_be_bytes())?;
     Ok(())
 }
 
-pub fn decode_frame(mut reader: impl Read) -> Result<(LogRecord, Vec<u8>), RecordError> {
+pub fn decode_frame(reader: impl Read) -> Result<(LogRecord, Vec<u8>), RecordError> {
+    decode_frame_inner(reader, true)
+}
+
+/// Decode and verify a complete frame without retaining its body. Dispatch
+/// indexes and cursor scans need metadata, not a second in-memory message log.
+pub fn decode_frame_metadata(reader: impl Read) -> Result<LogRecord, RecordError> {
+    decode_frame_inner(reader, false).map(|(header, _)| header)
+}
+
+fn decode_frame_inner(
+    mut reader: impl Read,
+    keep_payload: bool,
+) -> Result<(LogRecord, Vec<u8>), RecordError> {
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic)?;
     if magic != RECORD_MAGIC {
@@ -262,19 +305,32 @@ pub fn decode_frame(mut reader: impl Read) -> Result<(LogRecord, Vec<u8>), Recor
     }
 
     let header_bytes = read_exact_len(&mut reader, header_len)?;
-    let payload = read_exact_len(&mut reader, payload_len)?;
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&RECORD_MAGIC);
+    crc.update(&(header_len as u32).to_be_bytes());
+    crc.update(&(payload_len as u32).to_be_bytes());
+    crc.update(&header_bytes);
+    let payload = if keep_payload {
+        let payload = read_exact_len(&mut reader, payload_len)?;
+        crc.update(&payload);
+        payload
+    } else {
+        let mut remaining = payload_len;
+        let mut scratch = [0; 8192];
+        while remaining > 0 {
+            let count = remaining.min(scratch.len());
+            reader.read_exact(&mut scratch[..count])?;
+            crc.update(&scratch[..count]);
+            remaining -= count;
+        }
+        Vec::new()
+    };
 
     let mut checksum_bytes = [0u8; 4];
     reader.read_exact(&mut checksum_bytes)?;
     let expected = u32::from_be_bytes(checksum_bytes);
 
-    let mut body = Vec::with_capacity(12 + header_len + payload_len);
-    body.extend_from_slice(&RECORD_MAGIC);
-    body.extend_from_slice(&(header_len as u32).to_be_bytes());
-    body.extend_from_slice(&(payload_len as u32).to_be_bytes());
-    body.extend_from_slice(&header_bytes);
-    body.extend_from_slice(&payload);
-    if crc32fast::hash(&body) != expected {
+    if crc.finalize() != expected {
         return Err(RecordError::ChecksumMismatch);
     }
 
@@ -325,6 +381,7 @@ mod tests {
             http_headers_json: None,
             http_sign: None,
             payload_ref_json: None,
+            dedup_inserted_at_ms: None,
         }
     }
 
@@ -337,6 +394,33 @@ mod tests {
         let (h, p) = decode_frame(std::io::Cursor::new(buf)).unwrap();
         assert_eq!(h, header);
         assert_eq!(p, payload);
+    }
+
+    #[test]
+    fn migrated_producer_ttl_trailer_preserves_old_bincode_prefix_and_public_json() {
+        let mut header = sample_header();
+        let original = crate::codec::encode(&header).unwrap();
+        assert_eq!(LogRecord::decode_bytes(&original).unwrap(), header);
+        header.dedup_inserted_at_ms = Some(1_700_000_123_456);
+        // The old struct's binary prefix is byte-for-byte unchanged.
+        assert_eq!(crate::codec::encode(&header).unwrap(), original);
+        let frame = encode_frame_vec(&header, b"body").unwrap();
+        let (decoded, body) = decode_frame(std::io::Cursor::new(frame)).unwrap();
+        assert_eq!(decoded, header);
+        assert_eq!(body, b"body");
+        let mut legacy_readable = original;
+        legacy_readable.extend_from_slice(b"BMQIDTTL");
+        legacy_readable.extend_from_slice(&header.dedup_inserted_at_ms.unwrap().to_le_bytes());
+        let old: LogRecord = crate::codec::decode(&legacy_readable).unwrap();
+        assert_eq!(old.id, header.id);
+        assert_eq!(old.dedup_inserted_at_ms, None);
+        assert!(!serde_json::to_value(&header)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("dedup_inserted_at_ms"));
+        legacy_readable.pop();
+        assert!(LogRecord::decode_bytes(&legacy_readable).is_err());
     }
 
     #[test]
@@ -378,6 +462,29 @@ mod tests {
         buf.truncate(buf.len() - 6);
         let err = decode_frame(std::io::Cursor::new(buf)).unwrap_err();
         assert!(matches!(err, RecordError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn metadata_decode_checks_the_entire_body_and_preserves_frame_boundaries() {
+        let header = sample_header();
+        let payload = vec![42; 32 * 1024 + 3];
+        let frame = encode_frame_vec(&header, &payload).unwrap();
+        let mut both = frame.clone();
+        both.extend_from_slice(&frame);
+        let mut reader = std::io::Cursor::new(both);
+        assert_eq!(decode_frame_metadata(&mut reader).unwrap(), header);
+        assert_eq!(reader.position(), frame.len() as u64);
+        assert_eq!(decode_frame(&mut reader).unwrap().1, payload);
+        let mut damaged = frame.clone();
+        damaged[frame.len() - 5] ^= 1;
+        assert!(matches!(
+            decode_frame_metadata(damaged.as_slice()),
+            Err(RecordError::ChecksumMismatch)
+        ));
+        assert!(matches!(
+            decode_frame_metadata(&frame[..frame.len() - 5]),
+            Err(RecordError::Io(_))
+        ));
     }
 
     #[test]

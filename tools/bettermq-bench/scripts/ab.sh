@@ -47,17 +47,32 @@ for ((t = 0; t < TRIALS; t++)); do
     for side in "${order[@]}"; do
       bin="$A"; label="$LA"; [[ "$side" == b ]] && { bin="$B"; label="$LB"; }
       dir="$OUT/runs/$side/t$t-$sc"
-      if [[ -f "$dir/results.json" ]]; then continue; fi
+      if [[ -f "$dir/results.json" && -f "$dir/.ab-complete" ]]; then continue; fi
       echo "[$(date +%H:%M:%S)] trial $((t + 1))/$TRIALS $sc $side"
       "$BENCH" run --profile "$PROFILE" --repeats 1 --seed "$seed" --scenarios "$sc" \
-        --broker-bin "$bin" --label "$label" --out "$dir" --no-calibrate "$@" || echo "  (invocation failed; continuing)"
+        --broker-bin "$bin" --label "$label" --out "$dir" --no-calibrate "$@" \
+        && touch "$dir/.ab-complete" || echo "  (invocation failed; continuing)"
     done
   done
 done
 
 for side in a b; do
-  files=("$OUT"/runs/$side/*/results.json)
+  # Failed or interrupted invocations can leave partial results.json files;
+  # merge rejects unfinished runs, so pool only completed invocations.
+  files=()
+  for marker in "$OUT"/runs/$side/*/.ab-complete; do
+    [[ -e "$marker" ]] && files+=("$(dirname "$marker")/results.json")
+  done
+  if [[ ${#files[@]} -eq 0 ]]; then
+    echo "no completed invocations for side $side; rerun to resume" >&2
+    incomplete=1
+    continue
+  fi
   "$BENCH" merge "${files[@]}" --out "$OUT/$side"
 done
+if [[ -n "${incomplete:-}" ]]; then
+  echo "skipping comparison: a side has no completed invocations" >&2
+  exit 0
+fi
 "$BENCH" compare "$OUT/a" "$OUT/b" --out "$OUT/compare.md" || true
 echo "done: $OUT/compare.md"

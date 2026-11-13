@@ -48,7 +48,13 @@ pub use archive_checkpoint::ArchiveCheckpoint;
 pub use archive_source::ArchiveSource;
 pub use backend::{PartitionBackend, StorageMode, SLATE_SINGLE_BROKER};
 pub use flock::{FileFingerprint, FileLock};
-pub use indexes::{DedupEntry, DispatchCompletion, IndexError, MetadataStore, MetadataWriteBatch};
+mod producer_locks;
+pub use producer_locks::ProducerLocks;
+
+pub use indexes::{
+    DedupEntry, DedupPage, DedupRecord, DispatchCompletion, IndexError, MetadataStore,
+    MetadataValidator, MetadataWriteBatch, MetadataWriteReceipt,
+};
 pub use jsonl_journal::JsonlJournal;
 pub use log::{storage_faults, FsyncMode, LogError, PartitionLog, PartitionLogConfig};
 pub use manifest::{WalManifest, WAL_FORMAT_V1, WAL_FORMAT_V2};

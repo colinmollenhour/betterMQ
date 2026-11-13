@@ -41,5 +41,5 @@ pub use telemetry::{
 };
 pub use worker::{
     DeliveryJob, DeliveryPriority, DispatchConfig, DispatchEngine, DispatchError, DlqDurability,
-    LeasedFailure, DLQ_ENVELOPE_ALLOWANCE, DLQ_RECORD_MAGIC,
+    LeasedFailure, PartitionRecoveryTarget, DLQ_ENVELOPE_ALLOWANCE, DLQ_RECORD_MAGIC,
 };

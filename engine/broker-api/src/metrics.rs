@@ -994,7 +994,7 @@ fn append_dispatch_metrics(
         snapshot.defer_rejected
     );
     metric!(
-        "Queued or executing dispatch jobs",
+        "Owned dispatch jobs including ready and flow-waiting work; use active_http_deliveries for HTTP concurrency",
         "gauge",
         "bettermq_dispatch_in_flight_deliveries",
         snapshot.in_flight_deliveries

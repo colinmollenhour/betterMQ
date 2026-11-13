@@ -28,9 +28,6 @@ use uuid::Uuid;
 const REPAIR_PAGE_RECORDS: usize = 1024;
 /// Pages one repair run may send before giving up (the periodic wake retries).
 const REPAIR_MAX_PAGES: usize = 100_000;
-/// How far below the follower's log end the leader searches for the last
-/// record both logs agree on before failing closed.
-const DIVERGENCE_SCAN_LIMIT: u64 = 65_536;
 /// Failed repair runs retried before the task exits until the next wake.
 const REPAIR_RETRIES: u32 = 5;
 
@@ -70,6 +67,9 @@ pub struct ReplicateTruncateResponse {
 /// The leader's local log, as seen by repair.
 pub trait ReplicaLogSource: Send + Sync + 'static {
     fn tenant(&self) -> String;
+    fn shards(&self) -> Vec<u32> {
+        Vec::new()
+    }
     /// Replication streams that exist on `shard`: the V1 topics with data on
     /// that partition, or the single empty stream of a V2 physical shard.
     fn streams(&self, shard: u32) -> Vec<String>;
@@ -195,23 +195,48 @@ impl ReplicationClient {
         let Some(runtime) = self.runtime.clone() else {
             return;
         };
-        let lagging: Vec<_> = self
-            .replica_progress()
+        let Some(source) = self.repair.source.get() else {
+            return;
+        };
+        let progress = self.replica_progress();
+        // Unknown peers must be discovered too; absence is not evidence of an
+        // in-sync prefix and otherwise an idle shard would never repair them.
+        let shards: std::collections::BTreeSet<_> = source
+            .shards()
             .into_iter()
-            .filter(|entry| !entry.in_sync)
+            .chain(progress.iter().map(|entry| entry.partition))
+            .chain(runtime.controller().into_iter().flat_map(|controller| {
+                controller
+                    .state()
+                    .shards
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>()
+            }))
             .collect();
-        for entry in lagging {
-            if !runtime.is_leader_for_shard(entry.partition) {
+        for shard in shards {
+            if !runtime.is_recovery_leader_for_shard(shard) {
                 continue;
             }
-            let targets = self.targets_for_shard(entry.partition);
-            if let Some(peer) = targets
-                .replicas
-                .into_iter()
-                .chain(targets.learners)
-                .find(|peer| peer.id == entry.peer_id)
-            {
-                self.schedule_repair(&entry.topic, entry.partition, peer);
+            for stream in source.streams(shard) {
+                let Ok(end) = source.log_end(&stream, shard) else {
+                    continue;
+                };
+                if end == 0 {
+                    continue;
+                }
+                let targets = self.targets_for_shard(shard);
+                for peer in targets.replicas.into_iter().chain(targets.learners) {
+                    if !progress.iter().any(|entry| {
+                        entry.partition == shard
+                            && entry.topic == stream
+                            && entry.peer_id == peer.id
+                            && entry.in_sync
+                            && entry.durable_hwm >= end
+                    }) {
+                        self.schedule_repair(&stream, shard, peer);
+                    }
+                }
             }
         }
     }
@@ -231,11 +256,15 @@ impl ReplicationClient {
             return Ok(None);
         };
         let epoch = runtime.shard_generation(shard);
-        let still_leader =
-            || runtime.is_leader_for_shard(shard) && runtime.shard_generation(shard) == epoch;
+        let still_leader = || {
+            runtime.is_recovery_leader_for_shard(shard) && runtime.shard_generation(shard) == epoch
+        };
         if !still_leader() {
             return Ok(None);
         }
+        // Invalidate old maximum HWMs before probing or truncating. Every
+        // acknowledgement below is tied to this exact repair revision.
+        let session = self.begin_repair_progress(stream, shard, peer.id, epoch)?;
         let tenant = source.tenant();
         let mut follower_end = self.probe_follower(peer, &tenant, stream, shard).await?;
         let mut prefix_verified = false;
@@ -258,6 +287,10 @@ impl ReplicationClient {
                         leader_end,
                     )
                     .await?;
+                if !still_leader() || !self.progress_fence_current(stream, shard, peer.id, session)
+                {
+                    return Ok(None);
+                }
                 if common < follower_end {
                     follower_end = self
                         .truncate_follower(peer, &tenant, stream, shard, epoch, common)
@@ -271,7 +304,7 @@ impl ReplicationClient {
                 prefix_verified = true;
             }
             if follower_end >= leader_end {
-                if self.mark_repaired(stream, shard, peer.id, leader_end, follower_end) {
+                if self.mark_repaired(stream, shard, peer.id, leader_end, follower_end, session) {
                     info!(peer = %peer.addr, stream, shard, log_end = leader_end, "replica repaired");
                     return Ok(Some(follower_end));
                 }
@@ -310,14 +343,28 @@ impl ReplicationClient {
             let sent_end = request.end_offset()?;
             match self.send_repair_batch(peer, request).await? {
                 BatchResult::Ack(ack) => {
+                    if !still_leader()
+                        || !self.progress_fence_current(stream, shard, peer.id, session)
+                    {
+                        return Ok(None);
+                    }
                     if ack.durable_hwm < sent_end {
                         return Err(ReplicateError::InvalidEpoch(format!(
                             "follower acknowledged {} below the repaired range end {sent_end}",
                             ack.durable_hwm
                         )));
                     }
-                    follower_end = ack.durable_hwm;
-                    self.record_repair_progress(stream, shard, peer.id, leader_end, follower_end);
+                    // Only the range we sent is proven, never a follower's
+                    // potentially divergent larger reported maximum.
+                    follower_end = sent_end;
+                    self.record_repair_progress(
+                        stream,
+                        shard,
+                        peer.id,
+                        leader_end,
+                        follower_end,
+                        session,
+                    );
                 }
                 BatchResult::Conflict(conflict) => {
                     follower_end = conflict.log_end;
@@ -409,42 +456,59 @@ impl ReplicationClient {
         leader_end: u64,
     ) -> Result<u64, ReplicateError> {
         let top = follower_end.min(leader_end);
-        let mut window_end = top;
-        let floor = top.saturating_sub(DIVERGENCE_SCAN_LIMIT);
-        while window_end > floor {
-            let window_start = window_end.saturating_sub(64).max(floor);
-            let count = window_end - window_start;
-            let follower = self
-                .follower_ids(peer, tenant, stream, shard, window_start, count)
-                .await?;
-            let leader: BTreeMap<u64, Uuid> = source
-                .frames(stream, shard, window_start, count as usize)
-                .map_err(ReplicateError::InvalidEpoch)?
-                .into_iter()
-                .filter(|(offset, _)| *offset < window_end)
-                .filter_map(|(offset, bytes)| frame_id(&bytes).map(|id| (offset, id)))
-                .collect();
-            for (offset, leader_id) in leader.iter().rev() {
-                match follower.get(offset) {
-                    Some(follower_id) if follower_id == leader_id => {
-                        return Ok(if window_end == top { top } else { offset + 1 });
-                    }
-                    Some(_) => window_end = *offset,
-                    None => {}
-                }
-            }
-            if window_end == top && leader.keys().all(|offset| !follower.contains_key(offset)) {
-                // Nothing comparable at the top: no evidence of divergence.
+        let mut cursor = 0;
+        // A matching tail record is not proof of a matching prefix: a failed
+        // repair may have appended the same later UUID after divergent middle
+        // records. Inspect every retained comparable record, in bounded pages.
+        // This costs a full retained-prefix scan when repairing, not on ingest.
+        for _ in 0..REPAIR_MAX_PAGES {
+            if cursor >= top {
                 return Ok(top);
             }
-            window_end = window_end.min(window_start);
+            let leader: BTreeMap<u64, Uuid> = source
+                .frames(stream, shard, cursor, REPAIR_PAGE_RECORDS)
+                .map_err(ReplicateError::InvalidEpoch)?
+                .into_iter()
+                .take_while(|(offset, _)| *offset < top)
+                .map(|(offset, bytes)| {
+                    frame_id(&bytes).map(|id| (offset, id)).ok_or_else(|| {
+                        ReplicateError::InvalidEpoch(
+                            "invalid local frame during prefix verification".into(),
+                        )
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            let (Some((&first, _)), Some((&last, _))) =
+                (leader.first_key_value(), leader.last_key_value())
+            else {
+                return Ok(top);
+            };
+            if first < cursor {
+                return Err(ReplicateError::InvalidEpoch(
+                    "nonadvancing prefix scan".into(),
+                ));
+            }
+            let follower = self
+                .follower_ids(
+                    peer,
+                    tenant,
+                    stream,
+                    shard,
+                    first,
+                    last.saturating_add(1) - first,
+                )
+                .await?;
+            for (offset, leader_id) in leader {
+                if follower.get(&offset).is_some_and(|id| *id != leader_id) {
+                    return Ok(offset);
+                }
+            }
+            cursor = last.saturating_add(1);
         }
-        if floor == 0 {
-            return Ok(0);
-        }
-        Err(ReplicateError::InvalidEpoch(format!(
-            "no common record within {DIVERGENCE_SCAN_LIMIT} records below offset {top}; the replica must be reseeded"
-        )))
+        Err(ReplicateError::InvalidEpoch(
+            "prefix verification exceeded its bounded page budget; refusing unverified progress"
+                .into(),
+        ))
     }
 
     async fn truncate_follower(
@@ -596,8 +660,32 @@ impl FollowerFence {
         epoch: u64,
         durable_hwm: u64,
     ) -> std::io::Result<()> {
+        self.record_ack_checked(stream, partition, epoch, durable_hwm, || Ok(()))
+    }
+
+    /// Validate the original WAL incarnation under the same lock that protects
+    /// truncation. A cut cannot slip between validation and the durable ACK.
+    pub fn record_ack_checked(
+        &self,
+        stream: &str,
+        partition: u32,
+        epoch: u64,
+        durable_hwm: u64,
+        validate: impl FnOnce() -> Result<(), String>,
+    ) -> std::io::Result<()> {
         let key = fence_key(stream, partition);
         let mut state = self.lock();
+        validate().map_err(std::io::Error::other)?;
+        if state.epochs.get(&key).is_some_and(|stored| *stored > epoch)
+            || state
+                .acked
+                .get(&key)
+                .is_some_and(|(stored, _)| *stored > epoch)
+        {
+            return Err(std::io::Error::other(
+                "replica ACK belongs to an obsolete leader epoch",
+            ));
+        }
         let acked = state.acked.entry(key.clone()).or_insert((epoch, 0));
         if epoch > acked.0 {
             *acked = (epoch, durable_hwm);
@@ -611,14 +699,13 @@ impl FollowerFence {
         {
             return Ok(());
         }
-        state.epochs.insert(key, epoch);
         let Some(path) = self.path.get() else {
+            state.epochs.insert(key, epoch);
             return Ok(());
         };
-        let bytes = serde_json::to_vec(&FenceFile {
-            epochs: state.epochs.clone(),
-        })
-        .map_err(std::io::Error::other)?;
+        let mut epochs = state.epochs.clone();
+        epochs.insert(key.clone(), epoch);
+        let bytes = serde_json::to_vec(&FenceFile { epochs }).map_err(std::io::Error::other)?;
         let tmp = path.with_extension("json.tmp");
         {
             let mut file = std::fs::File::create(&tmp)?;
@@ -629,6 +716,9 @@ impl FollowerFence {
         if let Some(parent) = path.parent() {
             std::fs::File::open(parent)?.sync_all()?;
         }
+        // Do not let a failed persist turn the next retry into an in-memory
+        // no-op. Only a fully synced fence may satisfy the fast path above.
+        state.epochs.insert(key, epoch);
         Ok(())
     }
 
@@ -644,7 +734,52 @@ impl FollowerFence {
     ) -> Result<(), String> {
         let key = fence_key(stream, partition);
         let state = self.lock();
-        let (epoch, acked_hwm) = match (state.acked.get(&key), state.epochs.get(&key)) {
+        Self::check_truncate_locked(
+            &state,
+            &key,
+            stream,
+            partition,
+            leader_epoch,
+            to_offset,
+            local_end,
+        )
+    }
+
+    /// Keep the ACK/truncate fence locked through the actual WAL transaction,
+    /// not merely its preflight check.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_truncate<T, E>(
+        &self,
+        stream: &str,
+        partition: u32,
+        leader_epoch: u64,
+        to_offset: u64,
+        local_end: u64,
+        cut: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Result<T, E>, String> {
+        let state = self.lock();
+        Self::check_truncate_locked(
+            &state,
+            &fence_key(stream, partition),
+            stream,
+            partition,
+            leader_epoch,
+            to_offset,
+            local_end,
+        )?;
+        Ok(cut())
+    }
+
+    fn check_truncate_locked(
+        state: &FenceState,
+        key: &str,
+        stream: &str,
+        partition: u32,
+        leader_epoch: u64,
+        to_offset: u64,
+        local_end: u64,
+    ) -> Result<(), String> {
+        let (epoch, acked_hwm) = match (state.acked.get(key), state.epochs.get(key)) {
             (Some(acked), _) => *acked,
             (None, Some(epoch)) => (*epoch, local_end),
             (None, None) => return Ok(()),
@@ -698,6 +833,7 @@ mod tests {
             http_headers_json: None,
             http_sign: None,
             payload_ref_json: None,
+            dedup_inserted_at_ms: None,
         };
         broker_proto::encode_frame_vec(&record, b"payload").unwrap()
     }
@@ -814,6 +950,9 @@ mod tests {
     struct LeaderLog(Mutex<Vec<Vec<u8>>>);
 
     impl ReplicaLogSource for LeaderLog {
+        fn shards(&self) -> Vec<u32> {
+            vec![0]
+        }
         fn tenant(&self) -> String {
             "default".into()
         }
@@ -935,6 +1074,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn elected_leader_repairs_followers_while_takeover_ingest_is_fenced() {
+        let leader: Vec<_> = (0..8).map(|_| frame(Uuid::new_v4())).collect();
+        let harness = harness(leader.clone(), leader[..3].to_vec()).await;
+        let runtime = harness.client.runtime.as_ref().unwrap();
+        let epoch = Uuid::new_v4();
+        runtime.begin_shard_recovery(0, epoch, runtime.shard_generation(0));
+        assert!(
+            !runtime.is_recovery_leader_for_shard(0),
+            "repair cannot race catch-up truncation"
+        );
+        assert!(runtime.mark_shard_verifying(0, epoch, runtime.shard_generation(0)));
+        assert!(!runtime.is_leader_for_shard(0));
+        assert!(runtime.is_recovery_leader_for_shard(0));
+        harness
+            .client
+            .schedule_repair("orders", 0, harness.peer.clone());
+        settle(&harness).await;
+        assert_eq!(harness.follower.ids(), ids(&leader));
+        assert!(in_sync(&harness));
+        assert!(
+            !runtime.shard_ready(0),
+            "repair itself must not bypass the takeover barrier"
+        );
+    }
+
+    #[tokio::test]
     async fn out_of_order_epoch_converges_without_leadership_change() {
         let leader: Vec<_> = (0..10).map(|_| frame(Uuid::new_v4())).collect();
         let harness = harness(leader.clone(), leader[..5].to_vec()).await;
@@ -990,6 +1155,7 @@ mod tests {
         crate::append::update_progress(
             &harness.client.progress,
             ProgressUpdate {
+                fence: Default::default(),
                 stream: "orders",
                 partition: 0,
                 peer_id: harness.peer.id,
@@ -1041,6 +1207,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matching_tail_does_not_hide_a_divergent_middle_record() {
+        let leader: Vec<_> = (0..10).map(|_| frame(Uuid::new_v4())).collect();
+        let mut follower = leader.clone();
+        follower[3] = frame(Uuid::new_v4());
+        let harness = harness(leader.clone(), follower).await;
+        harness
+            .client
+            .schedule_repair("orders", 0, harness.peer.clone());
+        settle(&harness).await;
+        assert_eq!(harness.follower.ids(), ids(&leader));
+        assert_eq!(harness.follower.truncations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_idle_peer_is_not_presumed_in_sync_and_is_discovered() {
+        let leader: Vec<_> = (0..3).map(|_| frame(Uuid::new_v4())).collect();
+        let harness = harness(leader.clone(), Vec::new()).await;
+        assert!(!harness
+            .client
+            .counts_toward_quorum("orders", 0, harness.peer.id));
+        harness.client.wake_repairs();
+        settle(&harness).await;
+        assert_eq!(harness.follower.ids(), ids(&leader));
+        assert!(in_sync(&harness));
+    }
+
+    #[tokio::test]
+    async fn new_repair_revision_rejects_late_maximum_and_completion_from_old_session() {
+        let leader: Vec<_> = (0..3).map(|_| frame(Uuid::new_v4())).collect();
+        let harness = harness(leader.clone(), leader).await;
+        let old = harness
+            .client
+            .begin_repair_progress("orders", 0, harness.peer.id, 0)
+            .unwrap();
+        harness
+            .client
+            .record_repair_progress("orders", 0, harness.peer.id, 100, 100, old);
+        let current = harness
+            .client
+            .begin_repair_progress("orders", 0, harness.peer.id, 0)
+            .unwrap();
+        assert_ne!(old, current);
+        assert_eq!(harness.client.replica_progress()[0].durable_hwm, 0);
+        assert!(!harness
+            .client
+            .mark_repaired("orders", 0, harness.peer.id, 100, 100, old));
+        harness
+            .client
+            .record_repair_progress("orders", 0, harness.peer.id, 100, 100, old);
+        assert!(harness
+            .client
+            .mark_repaired("orders", 0, harness.peer.id, 3, 3, current));
+        let entry = &harness.client.replica_progress()[0];
+        assert_eq!(entry.durable_hwm, 3);
+        assert_eq!(entry.leader_hwm, 3);
+        // Even a numerically identical leader term has a new recovery identity.
+        let runtime = harness.client.runtime.as_ref().unwrap();
+        runtime.begin_shard_recovery(0, Uuid::new_v4(), 0);
+        assert_eq!(harness.client.replica_progress()[0].durable_hwm, 0);
+        assert!(!harness
+            .client
+            .mark_repaired("orders", 0, harness.peer.id, 100, 100, current));
+    }
+
+    #[test]
+    fn follower_cut_serializes_with_original_incarnation_ack_validation() {
+        let fence = Arc::new(FollowerFence::default());
+        let incarnation = Arc::new(AtomicUsize::new(0));
+        let (started, cutting) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let cut_fence = fence.clone();
+        let cut_incarnation = incarnation.clone();
+        let cut = std::thread::spawn(move || {
+            cut_fence
+                .with_truncate("orders", 0, 2, 0, 1, || {
+                    started.send(()).unwrap();
+                    blocked.recv().unwrap();
+                    cut_incarnation.store(1, Ordering::SeqCst);
+                    Ok::<_, ()>(())
+                })
+                .unwrap()
+                .unwrap();
+        });
+        cutting.recv().unwrap();
+        let ack_fence = fence.clone();
+        let ack = std::thread::spawn(move || {
+            ack_fence.record_ack_checked("orders", 0, 2, 1, || {
+                if incarnation.load(Ordering::SeqCst) == 0 {
+                    Ok(())
+                } else {
+                    Err("WAL rewritten".into())
+                }
+            })
+        });
+        release.send(()).unwrap();
+        cut.join().unwrap();
+        assert!(ack.join().unwrap().is_err(), "an ACK after the cut must validate the old append incarnation, not adopt the replacement");
+        fence.record_ack("orders", 0, 2, 1).unwrap();
+        assert!(fence
+            .with_truncate("orders", 0, 2, 0, 1, || Ok::<_, ()>(()))
+            .is_err());
+    }
+
+    #[test]
+    fn failed_fence_persistence_cannot_make_the_retry_skip_its_durability_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let fence = FollowerFence::default();
+        fence.open_dir(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("replica-fence.json.tmp")).unwrap();
+        for _ in 0..2 {
+            assert!(fence.record_ack("orders", 0, 7, 1).is_err());
+        }
+        assert!(!dir.path().join("replica-fence.json").exists());
+        std::fs::remove_dir(dir.path().join("replica-fence.json.tmp")).unwrap();
+        fence.record_ack("orders", 0, 7, 1).unwrap();
+        let restarted = FollowerFence::default();
+        restarted.open_dir(dir.path()).unwrap();
+        assert!(restarted.check_truncate("orders", 0, 7, 0, 1).is_err());
+        assert!(restarted.record_ack("orders", 0, 6, 1).is_err());
+    }
+
+    #[tokio::test]
     async fn learner_counts_as_caught_up_only_after_repair_copies_everything() {
         let leader: Vec<_> = (0..5).map(|_| frame(Uuid::new_v4())).collect();
         let harness = harness(leader.clone(), Vec::new()).await;
@@ -1052,6 +1340,7 @@ mod tests {
         crate::append::update_progress(
             &harness.client.progress,
             ProgressUpdate {
+                fence: Default::default(),
                 stream: "orders",
                 partition: 0,
                 peer_id: harness.peer.id,

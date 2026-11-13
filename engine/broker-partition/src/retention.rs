@@ -400,7 +400,8 @@ impl RetentionStore {
         log: &LogId,
         watermark: u64,
     ) -> Result<CollectReport, BrokerError> {
-        let target = watermark.min(broker.log_committed_hwm(log)?);
+        let lease = broker.begin_identity_gc(log, watermark)?;
+        let target = lease.target.min(broker.log_committed_hwm(log)?);
         let status = broker.log_retention_status(log, target)?;
         let boundary = status.gc_boundary;
         if boundary <= status.base_offset {
@@ -428,7 +429,7 @@ impl RetentionStore {
         }
         let blobs_tombstoned = references.len();
         self.tombstone_blobs(references)?;
-        let segments_deleted = broker.gc_log(log, boundary)?;
+        let segments_deleted = broker.gc_log(log, boundary, &lease)?;
         let base_offset = broker.log_retention_status(log, 0)?.base_offset;
         if let Some(state) = self.logs.lock().get_mut(log) {
             state.age_marks.retain(|mark| mark.end > base_offset);

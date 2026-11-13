@@ -121,6 +121,7 @@ jobs:
           python3 tests/test_internal_compose.py
           python3 tests/test_installers.py
           python3 ../scripts/test_load_test.py
+          python3 ../tools/bettermq-bench/scripts/test_ab.py
           bash tests/test_backup_restore.sh
 
   slate-minio:
@@ -170,7 +171,8 @@ jobs:
           cargo test -p broker-dispatch egress -- --nocapture
           cargo test -p broker-dispatch lease -- --nocapture
           cargo test -p broker-dispatch host_blocker -- --nocapture
-          cargo test -p broker-dispatch completion_race -- --nocapture
+          cargo test -p broker-dispatch --test completion_race -- --nocapture
+          cargo test -p broker-dispatch --test bounded_backlog -- --nocapture
           cargo test -p broker-storage group_commit -- --nocapture
           cargo test -p broker-raft-meta epoch -- --nocapture
 
@@ -179,7 +181,7 @@ jobs:
 
       - name: replicated HTTP ingest and SIGKILL failover gate
         timeout-minutes: 10
-        run: cargo test -p broker-server --test replicated_http -- --ignored --nocapture
+        run: cargo test -p broker-server --test replicated_http -- --ignored --nocapture --test-threads=1
 
       - name: ingest microbenches (smoke)
         run: cargo bench -p broker-proto --bench encode -- --sample-size 10

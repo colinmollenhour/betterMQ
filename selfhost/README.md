@@ -382,12 +382,12 @@ Background loops export these `/metrics` series: `bettermq_scheduler_failures_to
 |-----|----------|
 | `BETTERMQ_ALLOW_PRIVATE_DESTINATIONS` | Allow loopback/LAN webhook destinations |
 | `BETTERMQ_DISPATCH_MAX_IN_FLIGHT` | Concurrent outbound deliveries across direct, flow-controlled, and fleet paths per process (default `256`) |
-| `BETTERMQ_DISPATCH_QUEUE_CAP` | Ready-channel capacity and separate aggregate flow-work capacity (default `4096` each); overflow remains durable for backfill |
+| `BETTERMQ_DISPATCH_QUEUE_CAP` | Shared admitted-job budget across ready, hydration, flow waiting, and active work (default `4096`); also bounds ready/deferred channels and the deduplicated timer cache. Overflow remains durable for backfill |
 | `BETTERMQ_DISPATCH_GLOBAL_MAX` | Optional global in-flight delivery cap |
 | `BETTERMQ_DEFAULT_MAX_RETRIES` | Default webhook retries (default `3`) |
 | `BETTERMQ_HTTP_TIMEOUT_SECS` | Webhook HTTP timeout (default `300`; overrides config) |
 | `BETTERMQ_LONG_HTTP_TIMEOUT_SECS` | Long-payload webhook timeout (default `7200`; overrides config) |
-| `BETTERMQ_FLOW_WAITLIST_CAP` | Per-lane flow waitlist (default `8192`) |
+| `BETTERMQ_FLOW_WAITLIST_CAP` | Per-lane waiting-job ceiling (default `8192`), additionally bounded by the shared job budget and a look-ahead of `max(16, 2 × parallelism)` admitted jobs per lane |
 | `BETTERMQ_MEMORY_LIMIT_MB` | Pause dispatch fetches above this RSS (optional) |
 | `BETTERMQ_FAIRNESS_TENANT_SOFT_LIMIT` | Tenant fairness tracking soft cap (default `1024`) |
 
@@ -704,9 +704,13 @@ Dedup hits verify message identity and the visible committed prefix before retur
 
 Shared dedup/cursors use `meta-manifest.json`, an immutable `indexes.<generation>.snap`, and a checksummed append-only `indexes.<generation>.log`. Each broker replays only new journal bytes, reloading the snapshot after a generation change. One metadata batch takes one cell-wide exclusive lock and one append durability barrier. The shared volume is still **one failure domain** for dedup, cursors, leases, and catalogs. Its loss makes the cell unavailable and loses that metadata; RF=3 WAL copies do not replace it, even though acknowledged message records remain on the replicas. Back up the shared metadata with the cell.
 
+Replicated local-WAL cells retain tenant-wide acknowledged-key lookup in a shared committed-key directory, separate from each replica's producer index. Keyed publishers acquire fixed admission stripes only on the actual publishing leader, before appending; the directory becomes durable after quorum visibility and before the successful response. This adds shared-filesystem work for keyed publishes. A retry on a different topic, route, or replica set returns the original committed identity without requiring that node to retain the source payload. Legacy rows are adopted only after their canonical shard leader verifies them. A failed or interrupted publish without a successful acknowledgement has an unknown outcome and retains at-least-once behavior; it is not proof that no message was accepted or delivered. Never delete or replace `producer-admission-v1-4096/*.lock` while any broker is running.
+
 The filesystem must provide coherent cross-host `flock`, atomic rename, and file/directory fsync. Startup probes local lock exclusion and durability operations; these probes cannot certify a network filesystem's cross-host or power-loss behavior. A broker remembers the shared-store UUID in its own data directory and refuses a missing/replaced metadata store on restart. Storage errors or lock timeouts make readiness fail closed; uncertain persistence fences that handle until restart. Capacity exhaustion rejects writes, not existing lookups. Slow shared-storage fsync, including NFS latency, directly raises ingest p99 and serializes ingest with dispatch updates. **Shared-meta HA has not passed the throughput gates in [PRODUCTION.md](PRODUCTION.md)**; qualify the actual shared filesystem and mixed workload before deployment.
 
 Upgrading the legacy `indexes.json` format requires a coordinated restart of every broker. Linux migration uses atomic rename exchange to replace `indexes.json` with a directory barrier, retaining the original as `indexes.json.migrated`; old binaries then fail instead of overwriting the new store. The import is resumable after interruption. Do not remove that barrier or run old writers alongside new ones. Restore a consistent manifest/snapshot/log generation after corruption; `BETTERMQ_METADATA_RECOVER=empty` is an explicit data-loss recovery option, not automatic fallback.
+
+**Replica identity upgrade boundary:** replicated local-WAL nodes using shared metadata keep replica producer identities and GC coverage in each node's `--data-dir/replica-identities`. Delivery cursors and completion markers remain shared. Stop every broker before upgrading this storage behavior; do not run a mixed-version cell. Legacy shared producer rows are read-only migration evidence and are imported only when they match that replica's retained WAL. Shared GC checkpoints are not imported as local coverage. Back up each node's full data directory as well as the shared store. After new identities have been accepted, restoring only an older binary is not a supported rollback: it cannot see the new local indexes. A rollback requires a consistent pre-upgrade backup and loses work accepted since that backup. A missing local index after WAL GC keeps recovery and GC fenced rather than claiming that collected producer keys are recoverable from payload replication.
 
 ### Honesty
 

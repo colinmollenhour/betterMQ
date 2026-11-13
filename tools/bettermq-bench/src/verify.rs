@@ -11,6 +11,8 @@ pub const ACKED: u8 = 1;
 pub const DONE: u8 = 2;
 /// The sink permanently rejected this message on purpose (DLQ-bound).
 pub const PERM: u8 = 4;
+/// A matching record was read back from the broker's dead-letter queue.
+const DLQ: u8 = 8;
 
 pub struct Stream {
     pub id: u16,
@@ -134,8 +136,13 @@ impl Stream {
         }
     }
 
-    /// Acked messages that never reached DONE or PERM.
-    pub fn count_lost(&self) -> u64 {
+    /// Final accounting requires a successful delivery or a confirmed DLQ row;
+    /// a sink's permanent rejection alone is not proof of durable disposition.
+    pub fn count_unaccounted(&self) -> u64 {
+        self.count_missing(DONE | DLQ)
+    }
+
+    fn count_missing(&self, accounted: u8) -> u64 {
         if self.fanout > 1 {
             let n = self.fanout as usize;
             let mut missing = 0u64;
@@ -145,7 +152,7 @@ impl Stream {
                 }
                 for member in 0..n {
                     let v = self.fan_state[seq * n + member].load(Ordering::Relaxed);
-                    if v & (DONE | PERM) == 0 {
+                    if v & accounted == 0 {
                         missing += 1;
                     }
                 }
@@ -156,9 +163,37 @@ impl Stream {
             .iter()
             .filter(|s| {
                 let v = s.load(Ordering::Relaxed);
-                v & ACKED != 0 && v & (DONE | PERM) == 0
+                v & ACKED != 0 && v & accounted == 0
             })
             .count() as u64
+    }
+
+    fn confirm_dlq(&self, seq: u64, member: Option<usize>) -> anyhow::Result<()> {
+        let seq = usize::try_from(seq)?;
+        let source = self
+            .state
+            .get(seq)
+            .ok_or_else(|| anyhow::anyhow!("DLQ sequence out of range"))?;
+        let slot = if self.fanout > 1 {
+            let member = member.ok_or_else(|| anyhow::anyhow!("DLQ fan-out member is missing"))?;
+            anyhow::ensure!(
+                member < self.fanout as usize,
+                "DLQ fan-out member out of range"
+            );
+            &self.fan_state[seq * self.fanout as usize + member]
+        } else {
+            source
+        };
+        let previous = slot.fetch_or(DLQ, Ordering::Relaxed);
+        anyhow::ensure!(
+            previous & DLQ == 0,
+            "duplicate dead-letter record for one delivery"
+        );
+        anyhow::ensure!(
+            previous & DONE == 0,
+            "delivery was both successful and dead-lettered"
+        );
+        Ok(())
     }
 
     pub fn pending(&self) -> u64 {
@@ -173,6 +208,44 @@ pub struct Verifier {
 }
 
 impl Verifier {
+    /// Reconcile the source identity carried in a listed DLQ body. Unrelated or
+    /// duplicate records must never cancel out a different missing delivery.
+    pub fn confirm_dlq_message(&self, row: &serde_json::Value) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            row["body_encoding"].as_str() != Some("base64"),
+            "benchmark DLQ body unexpectedly changed from UTF-8 to binary"
+        );
+        let body = row["body"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("DLQ body is missing"))?;
+        let body: serde_json::Value = serde_json::from_str(body)?;
+        let fan = body["f"].as_u64();
+        let stream = fan
+            .or_else(|| body["s"].as_u64())
+            .ok_or_else(|| anyhow::anyhow!("DLQ stream is missing"))?;
+        let stream = self
+            .get(u16::try_from(stream)?)
+            .ok_or_else(|| anyhow::anyhow!("unknown DLQ stream"))?;
+        let seq = body["n"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("DLQ sequence is missing"))?;
+        let member = if fan.is_some() {
+            let destination = row["destination_url"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("DLQ destination is missing"))?;
+            let url = reqwest::Url::parse(destination)?;
+            Some(
+                url.path()
+                    .strip_prefix("/d/")
+                    .ok_or_else(|| anyhow::anyhow!("unknown DLQ destination"))?
+                    .parse::<usize>()?,
+            )
+        } else {
+            None
+        };
+        stream.confirm_dlq(seq, member)
+    }
+
     pub fn register(&self, _name: &str, cap: usize, keys: usize, keyed: bool) -> Arc<Stream> {
         self.register_fanout(_name, cap, keys, keyed, 1)
     }
@@ -259,10 +332,11 @@ mod tests {
         assert!(!s.mark_done(2, 0, 2, 2)); // key 0: q=2 after q=3 -> inversion, after a retry
         assert!(s.mark_done(1, 0, 3, 1)); // duplicate
         s.mark_perm(3);
+        s.confirm_dlq(3, None).unwrap();
         assert_eq!(s.inversions.load(Ordering::Relaxed), 1);
         assert_eq!(s.inversions_retry.load(Ordering::Relaxed), 1);
         assert_eq!(s.dups.load(Ordering::Relaxed), 1);
-        assert_eq!(s.count_lost(), 1); // seq 4 never delivered
+        assert_eq!(s.count_unaccounted(), 1); // seq 4 never delivered
         assert_eq!(s.pending(), 1);
     }
 
@@ -275,7 +349,7 @@ mod tests {
         s.mark_done(1, 0, 9, 1);
         s.mark_done(0, 0, 1, 1);
         assert_eq!(s.inversions.load(Ordering::Relaxed), 0);
-        assert_eq!(s.count_lost(), 0);
+        assert_eq!(s.count_unaccounted(), 0);
     }
 
     #[test]
@@ -289,13 +363,83 @@ mod tests {
         assert!(!s.mark_fanout_done(0, 1));
         assert!(s.mark_fanout_done(0, 1)); // member 1 got it twice
         s.mark_fanout_perm(0, 2);
+        s.confirm_dlq(0, Some(2)).unwrap();
         assert!(!s.mark_fanout_done(1, 0));
         // message 0 complete; message 1 still owes members 1 and 2.
-        assert_eq!(s.count_lost(), 2);
+        assert_eq!(s.count_unaccounted(), 2);
         assert_eq!(s.dups.load(Ordering::Relaxed), 1);
         assert_eq!(s.fan_attempt(1, 2), 1);
         assert_eq!(s.fan_attempt(1, 2), 2);
         assert_eq!(s.fan_attempt(1, 1), 1);
+    }
+
+    #[test]
+    fn permanent_rejection_is_not_proof_of_a_dead_letter() {
+        let v = Verifier::default();
+        let s = v.register("rejected", 4, 0, false);
+        s.mark_acked(0);
+        s.mark_acked(1);
+        s.mark_perm(0);
+        assert_eq!(
+            s.pending(),
+            1,
+            "live drain may stop retrying permanent failures"
+        );
+        assert_eq!(
+            s.count_unaccounted(),
+            2,
+            "final accounting must confirm the DLQ"
+        );
+        let row = serde_json::json!({"body": "{\"s\":0,\"n\":0}", "body_encoding": "utf8"});
+        v.confirm_dlq_message(&row).unwrap();
+        assert_eq!(s.count_unaccounted(), 1);
+        assert!(v
+            .confirm_dlq_message(&row)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+        assert_eq!(
+            s.count_unaccounted(),
+            1,
+            "duplicate DLQ rows cannot mask another missing message"
+        );
+    }
+
+    #[test]
+    fn dead_letter_accounting_matches_the_exact_fanout_member() {
+        let v = Verifier::default();
+        let s = v.register_fanout("fan", 2, 0, false, 3);
+        s.mark_acked(0);
+        s.mark_fanout_done(0, 0);
+        v.confirm_dlq_message(&serde_json::json!({
+            "body": "{\"f\":0,\"n\":0}", "destination_url": "http://127.0.0.1:1234/d/1"
+        }))
+        .unwrap();
+        assert_eq!(s.count_unaccounted(), 1);
+        assert!(
+            v.confirm_dlq_message(&serde_json::json!({
+                "body": "{\"f\":0,\"n\":0}", "destination_url": "http://127.0.0.1:1234/d/4"
+            }))
+            .is_err(),
+            "member IDs must not wrap modulo fanout"
+        );
+        assert_eq!(s.count_unaccounted(), 1);
+    }
+
+    #[test]
+    fn malformed_or_unrelated_dead_letters_do_not_prove_delivery() {
+        let v = Verifier::default();
+        let s = v.register("single", 2, 0, false);
+        s.mark_acked(0);
+        for row in [
+            serde_json::json!({"body":"not json"}),
+            serde_json::json!({"body":"{\"s\":99,\"n\":0}"}),
+            serde_json::json!({"body":"{\"s\":0,\"n\":9}"}),
+            serde_json::json!({"body":"{\"s\":0,\"n\":0}", "body_encoding":"base64"}),
+        ] {
+            assert!(v.confirm_dlq_message(&row).is_err());
+        }
+        assert_eq!(s.count_unaccounted(), 1);
     }
 
     #[test]

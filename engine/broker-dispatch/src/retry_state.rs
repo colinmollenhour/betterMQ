@@ -168,8 +168,36 @@ impl RetryState {
         self.maybe_compact()
     }
 
+    pub(crate) async fn schedule_async(&self, record: RetryRecord) -> Result<(), RetryStateError> {
+        let state = self.clone();
+        broker_partition::run_blocking_io(move || state.schedule(record))
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+    }
+
+    pub(crate) async fn clear_async(&self, key: &RetryKey) -> Result<(), RetryStateError> {
+        // A missing row is a no-op only after proving no writer is currently
+        // appending it. Never synchronously wait for that writer on the runtime.
+        {
+            if let Some(_guard) = self.io_lock.try_lock() {
+                if !self.state.lock().records.contains_key(key) {
+                    return Ok(());
+                }
+            }
+        }
+        let state = self.clone();
+        let key = key.clone();
+        broker_partition::run_blocking_io(move || state.clear(&key))
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+    }
+
     pub(crate) fn clear(&self, key: &RetryKey) -> Result<(), RetryStateError> {
         let _guard = self.io_lock.lock();
+        self.clear_locked(key)
+    }
+
+    fn clear_locked(&self, key: &RetryKey) -> Result<(), RetryStateError> {
         if !self.state.lock().records.contains_key(key) {
             return Ok(());
         }
@@ -188,6 +216,8 @@ impl RetryState {
         partition: u32,
         offset: u64,
     ) -> Result<(), RetryStateError> {
+        // Include writers whose append has not published its cached row yet.
+        let _guard = self.io_lock.lock();
         let keys: Vec<RetryKey> = self
             .state
             .lock()
@@ -197,9 +227,22 @@ impl RetryState {
             .cloned()
             .collect();
         for key in keys {
-            self.clear(&key)?;
+            self.clear_locked(&key)?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn clear_offset_async(
+        &self,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<(), RetryStateError> {
+        let state = self.clone();
+        let topic = topic.to_owned();
+        broker_partition::run_blocking_io(move || state.clear_offset(&topic, partition, offset))
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
     }
 
     fn append(&self, event: RetryEvent) -> Result<(), RetryStateError> {
@@ -216,15 +259,24 @@ impl RetryState {
     }
 
     fn maybe_compact(&self) -> Result<(), RetryStateError> {
-        let mut state = self.state.lock();
-        if state.journal_ops < RETRY_COMPACT_OPS {
-            return Ok(());
-        }
-        let bytes = serde_json::to_vec(&*state)?;
+        // The caller holds io_lock across append, publication and compaction.
+        // Readers need only a short state lock, never the snapshot's fsync.
+        let snapshot = {
+            let state = self.state.lock();
+            if state.journal_ops < RETRY_COMPACT_OPS {
+                return Ok(());
+            }
+            RetrySnapshot {
+                sequence: state.sequence,
+                records: state.records.clone(),
+                ..Default::default()
+            }
+        };
+        let bytes = serde_json::to_vec(&snapshot)?;
         broker_storage::atomic_write_file(&self.snapshot_path, &bytes)?;
         broker_storage::set_secret_file_mode(&self.snapshot_path);
         self.journal.reset()?;
-        state.journal_ops = 0;
+        self.state.lock().journal_ops = 0;
         Ok(())
     }
 }
@@ -281,6 +333,78 @@ fn rebuild_index(state: &mut RetrySnapshot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn async_cleanup_waits_for_the_writer_without_blocking_the_runtime() {
+        cleanup_waits_for_the_writer(false);
+    }
+
+    #[test]
+    fn async_cleanup_waits_for_the_offset_writer_without_blocking_the_runtime() {
+        cleanup_waits_for_the_writer(true);
+    }
+
+    fn cleanup_waits_for_the_writer(clear_offset: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = RetryState::open(dir.path()).unwrap();
+        let key = RetryKey {
+            topic: "orders".into(),
+            partition: 0,
+            offset: 1,
+            message_id: Uuid::new_v4(),
+        };
+        let record = RetryRecord {
+            key: key.clone(),
+            cursor_key: "lane".into(),
+            fifo_key: None,
+            attempts: 1,
+            due_at_ms: 42,
+            last_error: "HTTP 503".into(),
+        };
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = state.clone();
+        let thread = std::thread::spawn(move || {
+            let _guard = writer.io_lock.lock();
+            locked_tx.send(()).unwrap();
+            let released = release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok();
+            if released {
+                let event = RetryEvent::Upsert { record };
+                writer.append(event.clone()).unwrap();
+                apply_event(&mut writer.state.lock(), event);
+            }
+            released
+        });
+        locked_rx.recv().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut clear = Box::pin(async {
+                if clear_offset {
+                    state.clear_offset_async(&key.topic, key.partition, key.offset).await
+                } else {
+                    state.clear_async(&key).await
+                }
+            });
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut clear).await.is_err(),
+                "cleanup must await the in-progress writer without blocking the timer or treating its not-yet-visible row as absent");
+            release_tx.send(()).unwrap();
+            clear.await.unwrap();
+        });
+        assert!(
+            thread.join().unwrap(),
+            "cleanup blocked the only runtime worker"
+        );
+        assert!(state.get(&key).is_none());
+        assert!(
+            RetryState::open(dir.path()).unwrap().get(&key).is_none(),
+            "cleanup is durable"
+        );
+    }
 
     #[test]
     fn retry_deadline_and_attempt_survive_restart() {

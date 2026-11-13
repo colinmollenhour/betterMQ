@@ -502,6 +502,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
  "uuid",
@@ -532,6 +533,7 @@ dependencies = [
  "broker-proto",
  "broker-storage",
  "chrono",
+ "crc32fast",
  "object_store",
  "parking_lot",
  "serde",
@@ -539,6 +541,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

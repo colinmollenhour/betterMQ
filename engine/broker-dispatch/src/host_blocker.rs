@@ -188,12 +188,16 @@ impl HostBlocker {
     }
 
     pub fn is_blocked(&self, url: &str) -> bool {
-        self.maybe_reload_shared();
         let Some(key) = Self::host_key(url) else {
             return false;
         };
+        self.is_host_key_blocked(&key)
+    }
+
+    pub(crate) fn is_host_key_blocked(&self, key: &str) -> bool {
+        self.maybe_reload_shared();
         let hosts = self.hosts.lock();
-        let Some(state) = hosts.get(&key) else {
+        let Some(state) = hosts.get(key) else {
             return false;
         };
         state.blocked_until_ms.is_some_and(|until| now_ms() < until)
@@ -205,7 +209,7 @@ impl HostBlocker {
         {
             let this = self.clone();
             let url = url.to_owned();
-            return tokio::task::spawn_blocking(move || this.is_blocked(&url))
+            return broker_partition::run_blocking_io(move || this.is_blocked(&url))
                 .await
                 .unwrap_or(true);
         }
@@ -237,6 +241,12 @@ impl HostBlocker {
             });
             state.cleared = false;
             state.failures = state.failures.saturating_add(1);
+            // Requests already in flight when the circuit opened can all time
+            // out together. They are not failed recovery probes: extending the
+            // cooldown for each one turns a 30-second outage into 15 minutes.
+            if state.blocked_until_ms.is_some_and(|until| now_ms() < until) {
+                return;
+            }
             if state.failures >= self.cfg.failures_before_block {
                 let wait = state.cooldown_ms;
                 state.blocked_until_ms = Some(now_ms() + wait as i64);
@@ -329,7 +339,9 @@ impl HostBlocker {
         }
         let this = self.clone();
         let url = url.to_owned();
-        if let Err(error) = tokio::task::spawn_blocking(move || this.record_success(&url)).await {
+        if let Err(error) =
+            broker_partition::run_blocking_io(move || this.record_success(&url)).await
+        {
             tracing::error!(%error, "shared breaker success update failed");
         }
     }
@@ -342,7 +354,7 @@ impl HostBlocker {
         let this = self.clone();
         let url = url.to_owned();
         if let Err(error) =
-            tokio::task::spawn_blocking(move || this.record_transport_failure(&url)).await
+            broker_partition::run_blocking_io(move || this.record_transport_failure(&url)).await
         {
             tracing::error!(%error, "shared breaker failure update failed");
         }
@@ -455,6 +467,26 @@ mod tests {
             hb.hosts.lock().is_empty(),
             "local clears need no retained tombstone"
         );
+    }
+
+    #[test]
+    fn concurrent_failures_do_not_extend_an_open_circuit() {
+        let hb = HostBlocker::new(HostBlockerConfig::default());
+        let url = "https://example.com/hook";
+        for _ in 0..3 {
+            hb.record_transport_failure(url);
+        }
+        let key = HostBlocker::host_key(url).unwrap();
+        let opened = hb.hosts.lock()[&key].clone();
+        for _ in 0..256 {
+            hb.record_transport_failure(url);
+        }
+        let after = hb.hosts.lock()[&key].clone();
+        assert_eq!(after.blocked_until_ms, opened.blocked_until_ms);
+        assert_eq!(after.cooldown_ms, opened.cooldown_ms);
+        hb.hosts.lock().get_mut(&key).unwrap().blocked_until_ms = Some(now_ms() - 1);
+        hb.record_transport_failure(url);
+        assert_eq!(hb.hosts.lock()[&key].cooldown_ms, opened.cooldown_ms * 2);
     }
 
     #[test]

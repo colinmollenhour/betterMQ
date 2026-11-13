@@ -383,6 +383,7 @@ fn stored_from_header(
     payload: Vec<u8>,
 ) -> StoredMessage {
     StoredMessage {
+        idempotency_key: header.idempotency_key,
         id: header.id,
         tenant_id: header.tenant_id,
         topic: header.topic,
@@ -408,6 +409,7 @@ fn stored_from_header(
         http_headers_json: header.http_headers_json,
         http_sign: header.http_sign,
         payload_ref_json: header.payload_ref_json,
+        dedup_inserted_at_ms: header.dedup_inserted_at_ms,
     }
 }
 

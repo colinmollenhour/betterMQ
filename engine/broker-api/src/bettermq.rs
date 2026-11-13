@@ -807,6 +807,7 @@ async fn publish_to_group(
     }
     use futures_util::StreamExt;
     let mut attempts = futures_util::stream::iter(attempts).buffer_unordered(8);
+    let mut outcomes = Vec::new();
     while let Some((member_id, result)) = attempts.next().await {
         match result {
             Ok(inner) => {
@@ -816,23 +817,16 @@ async fn publish_to_group(
                     .map(|outcome| outcome.attempts)
                     .unwrap_or(0)
                     .saturating_add(1);
-                let updated = fanout_store
-                    .record_result_async(
-                        fanout_id,
-                        member_id,
-                        crate::fanout::FanoutMemberOutcome {
-                            response: Some(inner.clone()),
-                            error: None,
-                            attempts,
-                            next_attempt_at_ms: None,
-                            terminal: false,
-                        },
-                    )
-                    .await
-                    .map_err(fanout_store_error)?;
-                crate::fanout::update_authoritative(&state, &fanout_store, updated)
-                    .await
-                    .map_err(fanout_store_error)?;
+                outcomes.push((
+                    member_id,
+                    crate::fanout::FanoutMemberOutcome {
+                        response: Some(inner.clone()),
+                        error: None,
+                        attempts,
+                        next_attempt_at_ms: None,
+                        terminal: false,
+                    },
+                ));
                 deliveries.push(to_group_delivery_ref(member_id, &inner));
             }
             Err(error) => {
@@ -843,28 +837,20 @@ async fn publish_to_group(
                     .map(|outcome| outcome.attempts)
                     .unwrap_or(0)
                     .saturating_add(1);
-                let updated = fanout_store
-                    .record_result_async(
-                        fanout_id,
-                        member_id,
-                        crate::fanout::FanoutMemberOutcome {
-                            response: None,
-                            error: Some(error.clone()),
-                            attempts,
-                            next_attempt_at_ms: Some(
-                                chrono::Utc::now().timestamp_millis().saturating_add(
-                                    1_000i64
-                                        .saturating_mul(1i64 << attempts.saturating_sub(1).min(6)),
-                                ),
+                outcomes.push((
+                    member_id,
+                    crate::fanout::FanoutMemberOutcome {
+                        response: None,
+                        error: Some(error.clone()),
+                        attempts,
+                        next_attempt_at_ms: Some(
+                            chrono::Utc::now().timestamp_millis().saturating_add(
+                                1_000i64.saturating_mul(1i64 << attempts.saturating_sub(1).min(6)),
                             ),
-                            terminal: attempts >= fanout_max_attempts(),
-                        },
-                    )
-                    .await
-                    .map_err(fanout_store_error)?;
-                crate::fanout::update_authoritative(&state, &fanout_store, updated)
-                    .await
-                    .map_err(fanout_store_error)?;
+                        ),
+                        terminal: attempts >= fanout_max_attempts(),
+                    },
+                ));
                 deliveries.push(GroupDeliveryRef {
                     member_id,
                     accepted: false,
@@ -877,6 +863,18 @@ async fn publish_to_group(
                 });
             }
         }
+    }
+    // Keep polling sibling publishes while they acquire their WAL/metadata
+    // barriers. One bounded member cohort then shares a journal fsync and an
+    // authoritative progress update, rather than suspending peers per result.
+    if !outcomes.is_empty() {
+        let updated = fanout_store
+            .record_results_async(fanout_id, outcomes)
+            .await
+            .map_err(fanout_store_error)?;
+        crate::fanout::update_authoritative(&state, &fanout_store, updated)
+            .await
+            .map_err(fanout_store_error)?;
     }
     deliveries.sort_by_key(|delivery| delivery.member_id);
 
@@ -1060,6 +1058,7 @@ async fn replay_fanout_command(
     command: crate::fanout::FanoutCommand,
 ) -> Result<(), ApiError> {
     let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut pending = Vec::new();
     for member in &command.members {
         let existing = command.outcomes.get(&member.member_id);
         if existing.is_some_and(|outcome| outcome.response.is_some()) {
@@ -1078,31 +1077,43 @@ async fn replay_fanout_command(
             .map(|outcome| outcome.attempts)
             .unwrap_or(0)
             .saturating_add(1);
-        let outcome =
-            match crate::ingest::submit_one(state, command.request_for_attempt(member), None).await
-            {
-                Ok(response) => {
-                    crate::cluster::enqueue_dispatch_after_publish(state, &response);
-                    crate::fanout::FanoutMemberOutcome {
-                        response: Some(response),
-                        error: None,
-                        attempts,
-                        next_attempt_at_ms: None,
-                        terminal: false,
+        let command = &command;
+        pending.push(async move {
+            let outcome =
+                match crate::ingest::submit_one(state, command.request_for_attempt(member), None)
+                    .await
+                {
+                    Ok(response) => {
+                        crate::cluster::enqueue_dispatch_after_publish(state, &response);
+                        crate::fanout::FanoutMemberOutcome {
+                            response: Some(response),
+                            error: None,
+                            attempts,
+                            next_attempt_at_ms: None,
+                            terminal: false,
+                        }
                     }
-                }
-                Err(error) => crate::fanout::FanoutMemberOutcome {
-                    response: None,
-                    error: Some(error.to_string()),
-                    attempts,
-                    next_attempt_at_ms: Some(now_ms.saturating_add(
-                        1_000i64.saturating_mul(1i64 << attempts.saturating_sub(1).min(6)),
-                    )),
-                    terminal: attempts >= fanout_max_attempts(),
-                },
-            };
+                    Err(error) => crate::fanout::FanoutMemberOutcome {
+                        response: None,
+                        error: Some(error.to_string()),
+                        attempts,
+                        next_attempt_at_ms: Some(now_ms.saturating_add(
+                            1_000i64.saturating_mul(1i64 << attempts.saturating_sub(1).min(6)),
+                        )),
+                        terminal: attempts >= fanout_max_attempts(),
+                    },
+                };
+            (member.member_id, outcome)
+        });
+    }
+    use futures_util::StreamExt;
+    let outcomes: Vec<_> = futures_util::stream::iter(pending)
+        .buffer_unordered(8)
+        .collect()
+        .await;
+    if !outcomes.is_empty() {
         let updated = store
-            .record_result_async(command.id, member.member_id, outcome)
+            .record_results_async(command.id, outcomes)
             .await
             .map_err(fanout_store_error)?;
         crate::fanout::update_authoritative(state, store, updated)

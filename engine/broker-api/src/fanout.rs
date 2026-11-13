@@ -12,6 +12,8 @@ use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod writer;
+
 const FANOUT_STATE_VERSION: u16 = 1;
 const FANOUT_COMPACT_OPS: usize = 1024;
 const FANOUT_COMPACT_BYTES: u64 = 4 * 1024 * 1024;
@@ -229,6 +231,16 @@ struct CachedSnapshot {
     offset: u64,
     snapshot_stamp: Option<(u64, std::time::SystemTime)>,
     initialized: bool,
+    poisoned: bool,
+    #[cfg(test)]
+    gate: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+    #[cfg(test)]
+    fail_next_sync: bool,
+    #[cfg(test)]
+    commit_epochs: u64,
 }
 
 static FANOUT_CACHE: OnceLock<parking_lot::Mutex<HashMap<PathBuf, CachedSnapshot>>> =
@@ -251,11 +263,14 @@ impl Drop for FanoutExecutionGuard {
 }
 
 pub(crate) fn try_begin_execution(id: Uuid) -> Option<FanoutExecutionGuard> {
-    ACTIVE_FANOUTS
+    let acquired = ACTIVE_FANOUTS
         .get_or_init(Default::default)
         .lock()
-        .insert(id)
-        .then_some(FanoutExecutionGuard { id })
+        .insert(id);
+    // Construct a guard only for an acquired entry, and after releasing the
+    // registry lock. Eager `then_some` constructed/dropped a losing guard under
+    // that same lock, deadlocking live publishing against outbox replay.
+    acquired.then(|| FanoutExecutionGuard { id })
 }
 
 impl FanoutStore {
@@ -289,28 +304,38 @@ impl FanoutStore {
     }
 
     pub async fn get_async(&self, id: Uuid) -> Result<Option<FanoutCommand>, FanoutStoreError> {
-        self.blocking(move |store| store.get(id)).await
+        match writer::submit(self, writer::Operation::Get(id)).await? {
+            writer::Outcome::Found(command) => Ok(command),
+            _ => unreachable!("fanout get reply"),
+        }
     }
     pub async fn accept_async(
         &self,
         command: FanoutCommand,
     ) -> Result<(FanoutCommand, bool), FanoutStoreError> {
-        self.blocking(move |store| store.accept(command)).await
+        match writer::submit(self, writer::Operation::Accept(command)).await? {
+            writer::Outcome::Accepted(command, inserted) => Ok((command, inserted)),
+            _ => unreachable!("fanout accept reply"),
+        }
     }
     pub async fn replace_async(
         &self,
         command: FanoutCommand,
     ) -> Result<FanoutCommand, FanoutStoreError> {
-        self.blocking(move |store| store.replace(command)).await
+        match writer::submit(self, writer::Operation::Replace(command)).await? {
+            writer::Outcome::Updated(command) => Ok(command),
+            _ => unreachable!("fanout replace reply"),
+        }
     }
-    pub async fn record_result_async(
+    pub async fn record_results_async(
         &self,
         id: Uuid,
-        member: Uuid,
-        outcome: FanoutMemberOutcome,
+        results: Vec<(Uuid, FanoutMemberOutcome)>,
     ) -> Result<FanoutCommand, FanoutStoreError> {
-        self.blocking(move |store| store.record_result(id, member, outcome))
-            .await
+        match writer::submit(self, writer::Operation::Results(id, results)).await? {
+            writer::Outcome::Updated(command) => Ok(command),
+            _ => unreachable!("fanout results reply"),
+        }
     }
 
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, FanoutStoreError> {
@@ -326,55 +351,40 @@ impl FanoutStore {
         })
     }
 
+    #[cfg(test)]
     pub fn accept(&self, fanout: FanoutCommand) -> Result<(FanoutCommand, bool), FanoutStoreError> {
-        self.mutate(|state| {
-            if let Some(existing) = state.commands.get(&fanout.id) {
-                return Ok((existing.clone(), None));
-            }
-            Ok((
-                fanout.clone(),
-                Some(FanoutEvent::Accept {
-                    fanout: fanout.clone(),
-                }),
-            ))
-        })
+        match self
+            .execute_group(vec![writer::Operation::Accept(fanout)])?
+            .remove(0)?
+        {
+            writer::Outcome::Accepted(command, inserted) => Ok((command, inserted)),
+            _ => unreachable!("fanout accept reply"),
+        }
     }
 
+    #[cfg(test)]
     pub fn record_result(
         &self,
         fanout_id: Uuid,
         member_id: Uuid,
         outcome: FanoutMemberOutcome,
     ) -> Result<FanoutCommand, FanoutStoreError> {
-        self.mutate(|state| {
-            if !state.commands.contains_key(&fanout_id) {
-                return Err(FanoutStoreError::NotFound(fanout_id));
-            }
-            Ok((
-                (),
-                Some(FanoutEvent::RecordResult {
-                    fanout_id,
-                    member_id,
-                    outcome,
-                    updated_at_ms: chrono::Utc::now().timestamp_millis(),
-                }),
-            ))
-        })?;
-        self.get(fanout_id)?
-            .ok_or(FanoutStoreError::NotFound(fanout_id))
+        self.record_results(fanout_id, vec![(member_id, outcome)])
     }
 
-    pub fn replace(&self, fanout: FanoutCommand) -> Result<FanoutCommand, FanoutStoreError> {
-        self.mutate(|_| {
-            Ok((
-                fanout.clone(),
-                Some(FanoutEvent::Replace {
-                    fanout: fanout.clone(),
-                }),
-            ))
-        })?;
-        self.get(fanout.id)?
-            .ok_or(FanoutStoreError::NotFound(fanout.id))
+    #[cfg(test)]
+    pub fn record_results(
+        &self,
+        id: Uuid,
+        results: Vec<(Uuid, FanoutMemberOutcome)>,
+    ) -> Result<FanoutCommand, FanoutStoreError> {
+        match self
+            .execute_group(vec![writer::Operation::Results(id, results)])?
+            .remove(0)?
+        {
+            writer::Outcome::Updated(command) => Ok(command),
+            _ => unreachable!("fanout results reply"),
+        }
     }
 
     pub fn pending(&self, limit: usize) -> Result<Vec<FanoutCommand>, FanoutStoreError> {
@@ -428,11 +438,15 @@ impl FanoutStore {
         Ok(removed)
     }
 
+    #[cfg(test)]
     pub fn get(&self, fanout_id: Uuid) -> Result<Option<FanoutCommand>, FanoutStoreError> {
-        let _lock = broker_storage::FileLock::exclusive(&self.journal_path)?;
-        let mut cache = FANOUT_CACHE.get_or_init(Default::default).lock();
-        let state = self.load_state(cache.entry(self.journal_path.clone()).or_default())?;
-        Ok(state.commands.get(&fanout_id).cloned())
+        match self
+            .execute_group(vec![writer::Operation::Get(fanout_id)])?
+            .remove(0)?
+        {
+            writer::Outcome::Found(command) => Ok(command),
+            _ => unreachable!("fanout get reply"),
+        }
     }
 
     fn mutate<T>(
@@ -447,26 +461,7 @@ impl FanoutStore {
         let Some(event) = event else {
             return Ok((result, false));
         };
-        let sequence = state.sequence.saturating_add(1);
-        let record = FanoutJournalRecord {
-            version: FANOUT_STATE_VERSION,
-            sequence,
-            event: event.clone(),
-        };
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.journal_path)?;
-        serde_json::to_writer(&mut file, &record)?;
-        file.write_all(b"\n")?;
-        file.sync_data()?;
-        broker_storage::set_secret_file_mode(&self.journal_path);
-        state.sequence = sequence;
-        apply_event(state, event);
-        state.journal_ops += 1;
-        self.maybe_compact(state)?;
-        cached.offset = self.journal_path.metadata()?.len();
-        cached.snapshot_stamp = self.snapshot_stamp()?;
+        self.append_events(cached, vec![event])?;
         Ok((result, true))
     }
 
@@ -482,13 +477,20 @@ impl FanoutStore {
         &self,
         cached: &'a mut CachedSnapshot,
     ) -> Result<&'a mut FanoutSnapshot, FanoutStoreError> {
+        if cached.poisoned {
+            return Err(FanoutStoreError::Authority(
+                "fanout journal is fenced after an uncertain failure; restart to recover".into(),
+            ));
+        }
         let stamp = self.snapshot_stamp()?;
         let journal_len = self
             .journal_path
             .metadata()
             .map(|meta| meta.len())
             .unwrap_or(0);
-        if !cached.initialized || cached.snapshot_stamp != stamp || journal_len < cached.offset {
+        let reloading =
+            !cached.initialized || cached.snapshot_stamp != stamp || journal_len < cached.offset;
+        if reloading {
             cached.state = if stamp.is_some() {
                 serde_json::from_slice(&std::fs::read(&self.snapshot_path)?)?
             } else {
@@ -502,6 +504,11 @@ impl FanoutStore {
             return Ok(&mut cached.state);
         }
         let mut file = std::fs::File::open(&self.journal_path)?;
+        if reloading {
+            // Establish durability of recovered complete records before they
+            // can turn a previously failed acceptance into a successful retry.
+            file.sync_data()?;
+        }
         file.seek(SeekFrom::Start(cached.offset))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
@@ -783,15 +790,19 @@ pub async fn garbage_collect_authoritative(
 
 fn apply_event(state: &mut FanoutSnapshot, event: FanoutEvent) {
     match event {
-        FanoutEvent::Accept { fanout } => {
+        FanoutEvent::Accept { mut fanout } => {
+            strip_replication_frames(&mut fanout);
             state.commands.entry(fanout.id).or_insert(fanout);
         }
         FanoutEvent::RecordResult {
             fanout_id,
             member_id,
-            outcome,
+            mut outcome,
             updated_at_ms,
         } => {
+            if let Some(response) = &mut outcome.response {
+                response.replication_frame = None;
+            }
             if let Some(fanout) = state.commands.get_mut(&fanout_id) {
                 fanout.outcomes.insert(member_id, outcome);
                 fanout.updated_at_ms = updated_at_ms;
@@ -806,7 +817,8 @@ fn apply_event(state: &mut FanoutSnapshot, event: FanoutEvent) {
                 }
             }
         }
-        FanoutEvent::Replace { fanout } => {
+        FanoutEvent::Replace { mut fanout } => {
+            strip_replication_frames(&mut fanout);
             state.commands.insert(fanout.id, fanout);
         }
         FanoutEvent::GarbageCollect { ids } => {
@@ -815,9 +827,55 @@ fn apply_event(state: &mut FanoutSnapshot, event: FanoutEvent) {
     }
 }
 
+fn strip_replication_frames(command: &mut FanoutCommand) {
+    for outcome in command.outcomes.values_mut() {
+        if let Some(response) = &mut outcome.response {
+            response.replication_frame = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn execution_conflicts_do_not_drop_the_owners_guard_or_deadlock() {
+        const CHILD: &str = "BETTERMQ_TEST_FANOUT_GUARD_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let id = Uuid::new_v4();
+            let guard = try_begin_execution(id).unwrap();
+            for _ in 0..16 {
+                assert!(try_begin_execution(id).is_none());
+            }
+            let other = try_begin_execution(Uuid::new_v4()).unwrap();
+            drop(other);
+            assert!(try_begin_execution(id).is_none());
+            drop(guard);
+            let reacquired = try_begin_execution(id).unwrap();
+            assert!(try_begin_execution(id).is_none());
+            drop(reacquired);
+            return;
+        }
+
+        // Isolate a regression's synchronous deadlock so the timeout can stop
+        // it without wedging every test that shares the process-wide registry.
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "fanout::tests::execution_conflicts_do_not_drop_the_owners_guard_or_deadlock",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+            .await
+            .expect("conflicting fanout execution deadlocked")
+            .unwrap();
+        assert!(status.success());
+    }
 
     fn request() -> PublishRequest {
         PublishRequest {
@@ -887,6 +945,7 @@ mod tests {
                 member_id,
                 FanoutMemberOutcome {
                     response: Some(PublishResponse {
+                        publish_fence: None,
                         message_id: Some(Uuid::new_v4()),
                         topic: "__direct".into(),
                         partition: Some(0),
@@ -894,7 +953,7 @@ mod tests {
                         duplicate: false,
                         scheduled: None,
                         commit_epoch: Some(8),
-                        replication_frame: None,
+                        replication_frame: Some(vec![42; 128 * 1024]),
                     }),
                     error: None,
                     attempts: 1,
@@ -903,6 +962,15 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(
+            store.get(fanout_id).unwrap().unwrap().outcomes[&member_id]
+                .response
+                .as_ref()
+                .unwrap()
+                .replication_frame
+                .is_none(),
+            "cached fan-out outcomes must not retain payload-sized replication frames"
+        );
         store.evict_cached_state();
         drop(store);
 
@@ -1129,6 +1197,7 @@ mod tests {
                 member_id,
                 FanoutMemberOutcome {
                     response: Some(PublishResponse {
+                        publish_fence: None,
                         message_id: Some(Uuid::new_v4()),
                         topic: "__direct".into(),
                         partition: Some(0),

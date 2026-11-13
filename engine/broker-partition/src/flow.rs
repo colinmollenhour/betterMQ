@@ -174,6 +174,7 @@ mod tests {
 
     fn msg_with_flow_key(key: &str) -> StoredMessage {
         StoredMessage {
+            idempotency_key: None,
             id: Uuid::nil(),
             tenant_id: "t".into(),
             topic: "orders".into(),
@@ -199,6 +200,7 @@ mod tests {
             http_headers_json: None,
             http_sign: None,
             payload_ref_json: None,
+            dedup_inserted_at_ms: None,
         }
     }
 

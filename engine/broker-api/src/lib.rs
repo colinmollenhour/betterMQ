@@ -22,6 +22,7 @@ mod metering;
 mod metrics;
 mod ops;
 mod payload_repair;
+mod producer_admission;
 mod publish_path;
 mod rate_limit;
 mod replica_source;
@@ -317,6 +318,10 @@ fn internal_cluster_route_table() -> Router<Arc<AppState>> {
             axum::routing::post(cluster::internal_replicate_batch),
         )
         .route(
+            "/internal/v1/producer/resolve-legacy",
+            axum::routing::post(producer_admission::internal_resolve_legacy_producer),
+        )
+        .route(
             "/internal/v1/dispatch/cursors",
             axum::routing::post(cluster::internal_dispatch_cursors),
         )
@@ -494,7 +499,11 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_state(dir: &tempfile::TempDir) -> AppState {
-        let broker = Broker::open(BrokerConfig::new(dir.path().to_path_buf())).unwrap();
+        test_state_config(dir, BrokerConfig::new(dir.path().to_path_buf()))
+    }
+
+    fn test_state_config(dir: &tempfile::TempDir, config: BrokerConfig) -> AppState {
+        let broker = Broker::open(config).unwrap();
         let schedule = ScheduleQueue::open(dir.path()).unwrap();
         let crons = CronRegistry::open(dir.path()).unwrap();
         let dispatch = DispatchEngine::new_broker_only(broker.clone(), DispatchConfig::default());
@@ -516,6 +525,119 @@ mod tests {
             #[cfg(feature = "cloud")]
             control_plane: None,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shared_committed_keys_are_tenant_wide_across_nodes_routes_and_batch_admission() {
+        const CHILD: &str = "BETTERMQ_TEST_SHARED_PRODUCER_ADMISSION";
+        if std::env::var_os(CHILD).is_none() {
+            let shared = tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::shared_committed_keys_are_tenant_wide_across_nodes_routes_and_batch_admission", "--nocapture"])
+                .env(CHILD, "1").env("BETTERMQ_SHARED_META_DIR", shared.path()).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        fn node(dir: &tempfile::TempDir) -> Arc<AppState> {
+            let mut config = BrokerConfig::new(dir.path().to_owned());
+            config.local_replica_identities = true;
+            Arc::new(test_state_config(dir, config))
+        }
+        fn direct(key: &str, routing: &str) -> broker_partition::PublishRequest {
+            serde_json::from_value(serde_json::json!({"payload":"body", "idempotency_key":key, "routing_key":routing, "url":"http://127.0.0.1:1/hook", "secret":"secret"})).unwrap()
+        }
+        let (a_dir, b_dir, c_dir) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
+        let (a, b) = (node(&a_dir), node(&b_dir));
+        for state in [&a, &b] {
+            for topic in ["orders", "invoices"] {
+                state.broker.create_subscription(serde_json::from_value(serde_json::json!({"topic":topic, "url":"http://127.0.0.1:1/hook", "secret":"secret"})).unwrap()).unwrap();
+            }
+        }
+        let original = publish_with_cluster(&a, serde_json::from_value(serde_json::json!({"topic":"orders", "payload":"body", "routing_key":"first-route", "idempotency_key":"tenant-wide"})).unwrap(), None).await.unwrap();
+        let retry = publish_with_cluster(&b, serde_json::from_value(serde_json::json!({"topic":"invoices", "payload":"retry", "routing_key":"another-route", "idempotency_key":"tenant-wide"})).unwrap(), None).await.unwrap();
+        assert!(retry.duplicate);
+        assert_eq!(retry.message_id, original.message_id);
+        assert_eq!(retry.topic, original.topic);
+        assert!(
+            b.broker
+                .list_topic_messages("invoices", 100)
+                .unwrap()
+                .is_empty(),
+            "the retry's node has no source WAL, but must not append a new identity"
+        );
+
+        let (one, two) = tokio::join!(
+            publish_with_cluster(&a, direct("concurrent", "one"), None),
+            publish_with_cluster(&b, direct("concurrent", "two"), None)
+        );
+        let (one, two) = (one.unwrap(), two.unwrap());
+        assert_eq!(one.message_id, two.message_id);
+        assert_ne!(
+            one.duplicate, two.duplicate,
+            "one active cross-node writer appends, the other returns its committed identity"
+        );
+        let requests = vec![
+            direct("batch-one", "one"),
+            direct("batch-two", "two"),
+            direct("batch-one", "two"),
+        ];
+        let outcomes = ingest::submit_batch(
+            &a,
+            None,
+            ingest::IngestBatch::from_requests(requests.clone()).unwrap(),
+        )
+        .await;
+        let responses: Vec<_> = outcomes
+            .into_iter()
+            .map(|outcome| outcome.result.unwrap())
+            .collect();
+        assert_eq!(responses[0].message_id, responses[2].message_id);
+        assert!(responses[2].duplicate);
+        let before = b
+            .broker
+            .list_topic_messages(broker_partition::DIRECT_TOPIC, 100)
+            .unwrap()
+            .len();
+        let retries = ingest::submit_batch(
+            &b,
+            None,
+            ingest::IngestBatch::from_requests(requests).unwrap(),
+        )
+        .await;
+        for (outcome, original) in retries.into_iter().zip(&responses) {
+            let response = outcome.result.unwrap();
+            assert!(response.duplicate);
+            assert_eq!(response.message_id, original.message_id);
+        }
+        assert_eq!(
+            b.broker
+                .list_topic_messages(broker_partition::DIRECT_TOPIC, 100)
+                .unwrap()
+                .len(),
+            before
+        );
+        for state in [a, b] {
+            state.broker.close_and_drain_owned_completions().await;
+            state.dispatch.shutdown_background().await;
+        }
+        let c = node(&c_dir);
+        let persisted = publish_with_cluster(&c, direct("tenant-wide", "third-route"), None)
+            .await
+            .unwrap();
+        assert_eq!(persisted.message_id, original.message_id);
+        assert!(persisted.duplicate);
+        assert!(c
+            .broker
+            .list_topic_messages(broker_partition::DIRECT_TOPIC, 100)
+            .unwrap()
+            .is_empty());
+        c.broker.close_and_drain_owned_completions().await;
+        c.dispatch.shutdown_background().await;
     }
 
     #[tokio::test]
@@ -1379,6 +1501,7 @@ mod tests {
             http_headers_json: None,
             http_sign: None,
             payload_ref_json: None,
+            dedup_inserted_at_ms: None,
         };
         let mut frame = Vec::new();
         broker_proto::encode_frame(&header, b"hi", &mut frame).unwrap();
@@ -2288,6 +2411,7 @@ mod tests {
             http_headers_json: None,
             http_sign: None,
             payload_ref_json: None,
+            dedup_inserted_at_ms: None,
         }
     }
 }

@@ -16,6 +16,14 @@ Build from repo root:
 cargo build --release -p broker-server
 ```
 
+The server and reusable broker crates use the system allocator. Interleaved
+burst/idle measurements favored its lower absolute resident memory over
+mimalloc's lower retained-growth percentage; see the
+[allocator experiment](../tools/bettermq-bench/baselines/README.md#allocator-experiment).
+
+See [bounded dispatch and memory](PERFORMANCE.md) for the scheduling, ordering,
+recovery, and memory-accounting tradeoffs.
+
 Run locally:
 
 ```bash

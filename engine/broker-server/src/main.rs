@@ -628,6 +628,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     };
 
     let mut broker_cfg = BrokerConfig::new(settings.data_dir.clone());
+    broker_cfg.local_replica_identities = settings.cluster_enabled;
     broker_cfg.storage = match settings.storage {
         broker_config::StorageMode::Local => StorageMode::Local,
         broker_config::StorageMode::Slate => StorageMode::Slate,
@@ -671,6 +672,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         broker.enable_quorum_gating();
     }
     if let Some(ref c) = cluster {
+        if c.runtime.config().node_count() > 1 || storage == StorageMode::Slate {
+            for shard in 0..broker.shard_count() {
+                c.runtime.set_shard_ready(shard, false);
+            }
+        }
         c.attach_local_log(broker.clone(), &settings.data_dir)
             .context("open replica fence")?;
         if c.runtime.config().node_count() > 1 && storage == StorageMode::Local {
@@ -694,9 +700,12 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             );
         }
         let cluster = c.clone();
-        broker.set_shard_leader_check(Arc::new(move |p| {
+        broker.set_shard_authority_check(Arc::new(move |p| {
             if cluster.catalog_ready() && cluster.runtime.is_leader_for_shard(p) {
-                Some(cluster.runtime.shard_generation(p))
+                Some((
+                    cluster.runtime.shard_generation(p),
+                    cluster.runtime.shard_incarnation(p),
+                ))
             } else {
                 None
             }
@@ -710,26 +719,18 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let dispatch_cfg = dispatch_config(&settings);
     let leases = broker_dispatch::LeaseTable::new();
     let broker_only = settings.broker_only || settings.dispatch_fleet;
-    let mut dispatch = if broker_only {
-        DispatchEngine::new_broker_only(broker.clone(), dispatch_cfg)
-    } else {
-        DispatchEngine::new(broker.clone(), dispatch_cfg)
-    };
-    dispatch = dispatch.with_leases(leases.clone());
-    if let Some(ref c) = cluster {
+    let leader_check = cluster.as_ref().map(|c| {
         let cluster = c.clone();
-        dispatch = dispatch.with_shard_leader_check(Arc::new(move |p| {
-            cluster.catalog_ready() && cluster.runtime.is_leader_for_shard(p)
-        }));
-    }
-    if broker.quorum_gating() {
-        // After a restart every shard is a takeover: the health monitor
-        // catches it up, the quorum repair task verifies its tail and lifts
-        // the fence.
-        for shard in 0..broker.layout().shard_count {
-            dispatch.fence_partition(shard);
-        }
-    }
+        Arc::new(move |p| cluster.catalog_ready() && cluster.runtime.is_leader_for_shard(p))
+            as Arc<dyn Fn(u32) -> bool + Send + Sync>
+    });
+    let dispatch = DispatchEngine::new_with_controls(
+        broker.clone(),
+        dispatch_cfg,
+        !broker_only,
+        Some(leases.clone()),
+        leader_check,
+    );
     // One bounded pass at boot; the backfill loop continues if work remains.
     let boot_backfill_more = !broker_only && dispatch.backfill_pending();
 
@@ -923,6 +924,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
             }
         }
     }
+    drop(server);
 
     if let Some((fleet, delivery)) = &fleet {
         stop_fleet(fleet, delivery, shutdown_deadline).await;
@@ -937,6 +939,21 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         tracing::warn!("dispatch drain deadline exceeded; retry state remains durable");
     }
 
+    // Stop delivery producers before closing owned completion admission. Keep
+    // quorum repair alive while orphaned publishes finish their durability
+    // waits; stopping repair first could strand a verified-prefix waiter.
+    app_state.dispatch.shutdown_background().await;
+    match tokio::time::timeout(
+        Duration::from_secs(shutdown_deadline),
+        app_state.broker.close_and_drain_owned_completions(),
+    )
+    .await
+    {
+        Ok(()) => info!("owned ingest and completion drain complete"),
+        Err(_) => tracing::warn!("owned ingest and completion drain deadline exceeded"),
+    }
+    abort_and_join(bg_tasks, Duration::from_secs(shutdown_deadline.min(5))).await;
+
     let broker = app_state.broker.clone();
     match tokio::time::timeout(
         Duration::from_secs(shutdown_deadline),
@@ -949,8 +966,6 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         Ok(Err(error)) => tracing::warn!(%error, "WAL flush task failed"),
         Err(_) => tracing::warn!("WAL flush deadline exceeded"),
     }
-    abort_and_join(bg_tasks, Duration::from_secs(shutdown_deadline.min(5))).await;
-    app_state.dispatch.shutdown_background().await;
     drop(app_state);
     // Let reqwest/hyper drop timers before #[tokio::main] tears down the runtime.
     tokio::task::yield_now().await;
@@ -1268,7 +1283,14 @@ fn spawn_dispatch_backfill_loop(
             } else {
                 BACKFILL_INTERVAL
             };
-            tokio::time::sleep(wait).await;
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {},
+                _ = state.dispatch.backfill_notified() => {
+                    // Coalesce per-message notifications; never spin while a
+                    // lane is full or let dispatch compete with every ACK.
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                },
+            }
             let dispatch = state.dispatch.clone();
             // Storage scans and metadata lookups block; keep them off the
             // async workers that serve ingest and replication.
@@ -1376,40 +1398,79 @@ fn spawn_schedule_worker(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
 
 /// Fire due crons. Only the scheduler holder calls this.
 async fn fire_due_crons(state: &Arc<AppState>, now: i64) {
-    for job in state.crons.pop_due(now) {
-        tracing::info!(cron_id = %job.id, queue = %job.request.topic, "cron tick");
-        let mut req = job.request.clone();
-        // Per-firing key: a user key alone would dedupe every later tick.
-        req.idempotency_key = Some(job.fire_idempotency_key());
-        match fire_scheduled_publish(state, req).await {
-            Ok(()) => {
-                if let Err(e) = state.crons.commit_fire(job.id) {
-                    broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
-                    tracing::warn!(error = %e, cron_id = %job.id, "cron commit_fire failed");
-                }
-            }
-            Err(failure) => {
-                broker_api::record_scheduler_failure(broker_api::SchedulerFailure::CronFire);
-                match state.crons.fail_fire(&job, failure, now) {
-                    Ok(broker_schedule::FireRetry::Retry {
-                        attempt,
-                        retry_at_ms,
-                    }) => tracing::warn!(
-                        cron_id = %job.id,
-                        attempt,
-                        retry_in_ms = retry_at_ms - now,
-                        "cron fire failed; will retry"
-                    ),
-                    Ok(broker_schedule::FireRetry::GiveUp { attempt }) => tracing::error!(
-                        cron_id = %job.id,
-                        attempt,
-                        "cron occurrence skipped: publish failed permanently"
-                    ),
-                    Err(e) => {
-                        broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
-                        tracing::warn!(error = %e, cron_id = %job.id, "cron fail_fire failed")
+    let crons = state.crons.clone();
+    match broker_partition::run_blocking_io(move || {
+        crons.retry_pending_completions(SCHEDULE_COMPLETE_BATCH)
+    })
+    .await
+    {
+        Ok(Ok(_)) => {}
+        result => {
+            broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
+            tracing::warn!(?result, "cron completion retry failed");
+        }
+    }
+    let mut due = state.crons.pop_due(now).into_iter().peekable();
+    while due.peek().is_some() {
+        let limit = Arc::new(tokio::sync::Semaphore::new(SCHEDULE_FIRE_CONCURRENCY));
+        let mut firing = tokio::task::JoinSet::new();
+        for job in due.by_ref().take(SCHEDULE_COMPLETE_BATCH) {
+            let state = state.clone();
+            let limit = limit.clone();
+            firing.spawn(async move {
+                let _permit = limit.acquire_owned().await;
+                tracing::info!(cron_id = %job.id, queue = %job.request.topic, "cron tick");
+                let mut req = job.request.clone();
+                // Per-firing key: a user key alone would dedupe every later tick.
+                req.idempotency_key = Some(job.fire_idempotency_key());
+                let outcome = fire_scheduled_publish(&state, req).await;
+                (job, outcome)
+            });
+        }
+        let mut completed = Vec::new();
+        while let Some(joined) = firing.join_next().await {
+            match joined {
+                Ok((job, Ok(()))) => completed.push(job.id),
+                Ok((job, Err(failure))) => {
+                    broker_api::record_scheduler_failure(broker_api::SchedulerFailure::CronFire);
+                    match state.crons.fail_fire(&job, failure, now) {
+                        Ok(broker_schedule::FireRetry::Retry {
+                            attempt,
+                            retry_at_ms,
+                        }) => tracing::warn!(
+                            cron_id = %job.id,
+                            attempt,
+                            retry_in_ms = retry_at_ms - now,
+                            "cron fire failed; will retry"
+                        ),
+                        Ok(broker_schedule::FireRetry::GiveUp { attempt }) => tracing::error!(
+                            cron_id = %job.id,
+                            attempt,
+                            "cron occurrence skipped: publish failed permanently"
+                        ),
+                        Err(e) => {
+                            broker_api::record_scheduler_failure(
+                                broker_api::SchedulerFailure::Persist,
+                            );
+                            tracing::warn!(error = %e, cron_id = %job.id, "cron fail_fire failed")
+                        }
                     }
                 }
+                Err(error) => {
+                    broker_api::record_scheduler_failure(broker_api::SchedulerFailure::CronFire);
+                    tracing::warn!(%error, "cron fire task failed; durable occurrence retained for restart");
+                }
+            }
+        }
+        let crons = state.crons.clone();
+        match tokio::task::spawn_blocking(move || crons.commit_fires(&completed)).await {
+            Ok(Ok(())) => {}
+            result => {
+                broker_api::record_scheduler_failure(broker_api::SchedulerFailure::Persist);
+                tracing::warn!(
+                    ?result,
+                    "cron completion batch failed; completion retained for a later tick or restart"
+                );
             }
         }
     }

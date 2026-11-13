@@ -103,6 +103,42 @@ impl LifecycleStore {
         self.state.lock().transitions.values().cloned().collect()
     }
 
+    pub(crate) async fn prepare_async(
+        &self,
+        transition: DlqTransition,
+    ) -> Result<(), LifecycleError> {
+        let store = self.clone();
+        broker_partition::run_blocking_io(move || store.prepare(transition))
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+    }
+
+    pub(crate) async fn mark_dlq_committed_async(
+        &self,
+        source: &RetryKey,
+    ) -> Result<(), LifecycleError> {
+        let store = self.clone();
+        let source = source.clone();
+        broker_partition::run_blocking_io(move || store.mark_dlq_committed(&source))
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+    }
+
+    pub(crate) async fn clear_async(&self, source: &RetryKey) -> Result<(), LifecycleError> {
+        {
+            if let Some(_guard) = self.io_lock.try_lock() {
+                if !self.state.lock().transitions.contains_key(source) {
+                    return Ok(());
+                }
+            }
+        }
+        let store = self.clone();
+        let source = source.clone();
+        broker_partition::run_blocking_io(move || store.clear(&source))
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+    }
+
     pub(crate) fn prepare(&self, mut transition: DlqTransition) -> Result<(), LifecycleError> {
         let _guard = self.io_lock.lock();
         if self
@@ -159,14 +195,23 @@ impl LifecycleStore {
     }
 
     fn maybe_compact(&self) -> Result<(), LifecycleError> {
-        let mut state = self.state.lock();
-        if state.journal_ops < COMPACT_OPS {
-            return Ok(());
-        }
-        broker_storage::atomic_write_file(&self.snapshot_path, &serde_json::to_vec(&*state)?)?;
+        // io_lock still serializes writers, but cached readers must not wait
+        // for encoding, snapshot persistence or journal rotation.
+        let snapshot = {
+            let state = self.state.lock();
+            if state.journal_ops < COMPACT_OPS {
+                return Ok(());
+            }
+            Snapshot {
+                sequence: state.sequence,
+                transitions: state.transitions.clone(),
+                ..Default::default()
+            }
+        };
+        broker_storage::atomic_write_file(&self.snapshot_path, &serde_json::to_vec(&snapshot)?)?;
         broker_storage::set_secret_file_mode(&self.snapshot_path);
         self.journal.reset()?;
-        state.journal_ops = 0;
+        self.state.lock().journal_ops = 0;
         Ok(())
     }
 }
@@ -188,6 +233,58 @@ fn apply(state: &mut Snapshot, event: Event) {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    #[test]
+    fn async_cleanup_waits_for_preparation_without_blocking_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LifecycleStore::open(dir.path()).unwrap();
+        let transition = transition();
+        let source = transition.source.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = store.clone();
+        let thread = std::thread::spawn(move || {
+            let _guard = writer.io_lock.lock();
+            locked_tx.send(()).unwrap();
+            let released = release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok();
+            if released {
+                writer
+                    .write(Event::Upsert {
+                        transition: transition.clone(),
+                    })
+                    .unwrap();
+                writer
+                    .state
+                    .lock()
+                    .transitions
+                    .insert(transition.source.clone(), transition);
+            }
+            released
+        });
+        locked_rx.recv().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut clear = Box::pin(store.clear_async(&source));
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut clear).await.is_err(),
+                "cleanup must await an in-progress preparation without blocking the runtime or returning early");
+            release_tx.send(()).unwrap();
+            clear.await.unwrap();
+        });
+        assert!(
+            thread.join().unwrap(),
+            "lifecycle cleanup blocked the runtime"
+        );
+        assert!(store.pending().is_empty());
+        assert!(LifecycleStore::open(dir.path())
+            .unwrap()
+            .pending()
+            .is_empty());
+    }
 
     fn transition() -> DlqTransition {
         DlqTransition {

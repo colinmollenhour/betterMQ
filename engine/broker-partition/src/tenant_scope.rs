@@ -25,6 +25,22 @@ where
     REQUEST_TENANT.scope(tenant_id, fut).await
 }
 
+pub(crate) fn with_tenant<R>(tenant_id: &str, operation: impl FnOnce() -> R) -> R {
+    REQUEST_TENANT.sync_scope(tenant_id.to_owned(), operation)
+}
+
+/// Capture request identity before a future is handed to another task/thread.
+/// `sync_scope` restores the blocking thread's previous value on return/panic.
+pub(crate) fn inherit_request_tenant<R: Send + 'static>(
+    operation: impl FnOnce() -> R + Send + 'static,
+) -> impl FnOnce() -> R + Send + 'static {
+    let tenant = REQUEST_TENANT.try_with(Clone::clone).ok();
+    move || match tenant {
+        Some(tenant) => REQUEST_TENANT.sync_scope(tenant, operation),
+        None => operation(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,5 +54,34 @@ mod tests {
         .await;
         assert_eq!(got, "tenant-a");
         assert_eq!(effective_tenant("default").as_ref(), "default");
+    }
+
+    #[test]
+    fn blocking_io_preserves_request_scope_without_leaking_to_the_next_call() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for tenant in ["tenant-a", "tenant-b"] {
+                let mut work = None;
+                scope_tenant(tenant.into(), async {
+                    work = Some(crate::run_blocking_io(|| {
+                        effective_tenant("default").into_owned()
+                    }));
+                })
+                .await;
+                // The scope is gone before this future is spawned or polled.
+                let inherited = tokio::spawn(work.unwrap()).await.unwrap().unwrap();
+                assert_eq!(inherited, tenant);
+                assert_eq!(
+                    crate::run_blocking_io(|| effective_tenant("default").into_owned())
+                        .await
+                        .unwrap(),
+                    "default"
+                );
+            }
+        });
     }
 }

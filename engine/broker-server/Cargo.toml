@@ -9,9 +9,6 @@ description = "BetterMQ broker binary"
 name = "bettermq"
 path = "src/main.rs"
 
-[features]
-default = []
-
 [lints]
 workspace = true
 

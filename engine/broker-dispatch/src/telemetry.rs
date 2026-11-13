@@ -167,6 +167,10 @@ impl DispatchTelemetry {
             .ok();
     }
 
+    pub(crate) fn reset_queue(&self) {
+        self.queue_depth.store(0, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_queue_rejected(&self) {
         self.queue_rejected.fetch_add(1, Ordering::Relaxed);
     }

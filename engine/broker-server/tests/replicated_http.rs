@@ -14,6 +14,7 @@ struct Node {
     dir: PathBuf,
     config: PathBuf,
     base: String,
+    shared: Option<PathBuf>,
 }
 
 impl Node {
@@ -26,6 +27,9 @@ impl Node {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bettermq"));
         for (key, _) in std::env::vars().filter(|(key, _)| key.starts_with("BETTERMQ_")) {
             command.env_remove(key);
+        }
+        if let Some(shared) = &self.shared {
+            command.env("BETTERMQ_SHARED_META_DIR", shared);
         }
         self.child = Some(
             command
@@ -110,7 +114,42 @@ fn accepted_id(status: StatusCode, body: &Value) -> Uuid {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real three-process failover gate; run explicitly in CI"]
 async fn replicated_http_ingest_survives_sigkill_and_refuses_missing_quorum() {
+    replicated_http_gate(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real shared-metadata three-process failover gate; run explicitly in CI"]
+async fn replicated_http_shared_metadata_retains_global_keys_and_migrates_legacy_rows() {
+    const CHILD: &str = "BETTERMQ_TEST_SHARED_HTTP_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "replicated_http_shared_metadata_retains_global_keys_and_migrates_legacy_rows",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    replicated_http_gate(true).await;
+}
+
+async fn replicated_http_gate(shared: bool) {
     let root = tempfile::tempdir().unwrap();
+    let shared_dir = root.path().join("shared-metadata");
+    if shared {
+        std::fs::create_dir(&shared_dir).unwrap();
+        std::env::set_var("BETTERMQ_SHARED_META_DIR", &shared_dir);
+    }
     // Hold all ports until the child configurations have been written.
     let listeners: Vec<_> = (0..3)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -137,7 +176,7 @@ async fn replicated_http_ingest_survives_sigkill_and_refuses_missing_quorum() {
             "cluster":{"enabled":true,"id":cluster_id,"nodes":members},
         });
         std::fs::write(&config, serde_json::to_vec_pretty(&body).unwrap()).unwrap();
-        Node { child: None, dir, config, base: bases[index].clone() }
+        Node { child: None, dir, config, base: bases[index].clone(), shared: shared.then(|| shared_dir.clone()) }
     }).collect();
     drop(listeners);
     for node in &mut nodes {
@@ -245,7 +284,8 @@ async fn replicated_http_ingest_survives_sigkill_and_refuses_missing_quorum() {
 
     let publish = json!({"url":"https://example.com/hook", "secret":"delivery-secret", "body":"direct-single", "key":"failover-key", "idempotency_key":"publish-one"});
     let (status, body) = post(&client, &nodes[1], "/v1/publish", &publish).await;
-    acknowledged.insert(accepted_id(status, &body));
+    let old_leader_id = accepted_id(status, &body);
+    acknowledged.insert(old_leader_id);
     let shard = body["delivery"]["shard"].as_u64().unwrap();
     let batch = json!({"messages": (0..16).map(|index| json!({
         "topic":"http-test", "routing_key": if index % 2 == 0 { "" } else { "   " },
@@ -313,6 +353,20 @@ async fn replicated_http_ingest_survives_sigkill_and_refuses_missing_quorum() {
     .await;
     assert_eq!(accepted_id(status, &body), failover_id);
 
+    // The takeover also needs the original leader's durable producer keys,
+    // not only keys first created on the new leader after election.
+    let (status, body) = post(&client, &nodes[survivors[0]], "/v1/publish", &publish).await;
+    assert_eq!(accepted_id(status, &body), old_leader_id);
+    assert_eq!(body["duplicate"], true);
+
+    if shared {
+        let mut cross_route = publish.clone();
+        cross_route["key"] = json!("different-shard-after-failover");
+        let (status, body) = post(&client, &nodes[survivors[1]], "/v1/publish", &cross_route).await;
+        assert_eq!(accepted_id(status, &body), old_leader_id);
+        assert_eq!(body["duplicate"], true);
+    }
+
     nodes[survivors[0]].crash();
     let lone = survivors[1];
     let (status, body) = post(&client, &nodes[lone], "/v1/publish", &json!({
@@ -364,11 +418,43 @@ async fn replicated_http_ingest_survives_sigkill_and_refuses_missing_quorum() {
     );
     nodes[lone].crash();
 
+    if shared {
+        // Model a pre-directory shared row without changing its original TTL.
+        // Canonical-source verification, not a follower's offset, must adopt it
+        // after restart. The actual source remains in replica-local indexes.
+        let store =
+            broker_storage::MetadataStore::open(root.path().join("offline-shared-index")).unwrap();
+        let mut cursor = None;
+        let mut legacy = None;
+        loop {
+            let page = store.dedup_page(cursor).unwrap();
+            for row in page.records {
+                if row.key == "publish-one"
+                    && row.tenant_id.starts_with('\0')
+                    && row.entry.message_id == old_leader_id
+                {
+                    legacy = Some(row);
+                }
+            }
+            let Some(next) = page.next else {
+                break;
+            };
+            cursor = Some(next);
+        }
+        let row = legacy.expect("shared committed directory entry");
+        let mut batch = broker_storage::MetadataWriteBatch::default();
+        batch.put_dedup("default", &row.key, row.entry);
+        batch.delete_dedup(row.tenant_id, row.key);
+        store.write_batch(batch).unwrap();
+    }
+
     // With the old leader absent, the surviving replicas must contain every
     // acknowledged ID. Read real recovered WALs, not response mocks.
     let mut recovered = HashSet::new();
     for index in &survivors {
-        let broker = Broker::open(BrokerConfig::new(nodes[*index].dir.clone())).unwrap();
+        let mut config = BrokerConfig::new(nodes[*index].dir.clone());
+        config.local_replica_identities = shared;
+        let broker = Broker::open(config).unwrap();
         for topic in ["http-test", broker_partition::DIRECT_TOPIC] {
             for message in broker.list_topic_messages(topic, 1000).unwrap() {
                 recovered.insert(message.id);
@@ -389,6 +475,13 @@ async fn replicated_http_ingest_survives_sigkill_and_refuses_missing_quorum() {
     let (status, body) = post(&client, &nodes[2], "/v1/enqueue", &enqueue).await;
     assert_eq!(accepted_id(status, &body), enqueue_id);
     assert_eq!(body["duplicate"], true);
+    if shared {
+        let mut cross_route = publish.clone();
+        cross_route["key"] = json!("another-route-after-legacy-adoption");
+        let (status, body) = post(&client, &nodes[1], "/v1/publish", &cross_route).await;
+        assert_eq!(accepted_id(status, &body), old_leader_id);
+        assert_eq!(body["duplicate"], true);
+    }
     let response = client
         .post(format!("{}/v1/queues", nodes[1].base))
         .header("x-bettermq-operation-id", catalog_op.to_string())
