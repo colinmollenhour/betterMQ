@@ -2,6 +2,13 @@
 
 Slimmed `results.json` files (no time series) for `bettermq-bench compare`.
 
+The [issue #2 acceptance bundle](../evidence/issue-2-c129ba9/README.md) records the
+later 17-scenario × 3-repeat comparison, fixed-volume pressure checks, historical
+rejections, binary fingerprints, and limitations. Its evidence JSON is not a
+direct `compare` input. Ready-backlog RSS and drain improve substantially, but
+not every SLO or scheduled-work memory metric improves; the bundle retains those
+results rather than presenting a universal throughput win.
+
 | File | Build | Profile | Trials |
 |---|---|---|---|
 | `barry-main-8435438.json` | `main` @ 8435438 | standard | 3, interleaved with the other build |

@@ -1,0 +1,3898 @@
+{
+  "broker_sha256": "868ccfdd6602283f33b7a9541df2faab271f1b2f120e66a9b21452d3902b216b",
+  "candidate_source_commit": "c129ba9360e2b0bd09d14fcea02b7e666cd44333",
+  "harness_sha256": "f79a4fc1e1e8ef5d9383e4eeef8b5c25ad5ee7c7542d51a7126435400b2b518c",
+  "reports": {
+    "fifo-isolation-backlog": {
+      "environment": {
+        "cpu_model": "Intel(R) Core(TM) Ultra 9 285H",
+        "data_fs_type": "ext2/ext3",
+        "governor": "powersave",
+        "kernel": "7.0.0-38-generic",
+        "load_avg_start": 14.06,
+        "logical_cpus": 16,
+        "mem_total_mb": 62466,
+        "os": "linux",
+        "preflight_busy_bench_cpus_pct": 31.28205128205128,
+        "preflight_busy_broker_cpus_pct": 29.89864864864865,
+        "preflight_cpu_pressure_pct": 3.8,
+        "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)",
+        "swap_total_mb": 8191,
+        "warnings": [
+          "The CPUs reserved for the broker were already 30% busy with other work before the run started; results will include contention. Quiesce the host or pick idle cores with --broker-cpus.",
+          "CPU governor is `powersave`, not `performance`; clock speed will vary during the run (set it for tighter repeatability).",
+          "Host load average was 14.1 on 16 CPUs at start; other workloads may add noise.",
+          "8188 MB of swap is in use on the host; memory measurements may be distorted."
+        ]
+      },
+      "meta": {
+        "bench_cpus": "8-15",
+        "broker_cpus": "[0, 1, 2, 3, 4, 5, 6, 7]",
+        "broker_sha256": "868ccfdd6602283f33b7a9541df2faab271f1b2f120e66a9b21452d3902b216b",
+        "finished_at": "2026-11-12T19:16:17.721577783+00:00",
+        "fsync": "group",
+        "git_dirty": false,
+        "git_sha": "c129ba9360e2",
+        "label": "completion-c129ba9",
+        "profile": "standard",
+        "rate_scale": 1.0,
+        "repeats": 1,
+        "seed": 20275939,
+        "slo": {
+          "ack_p99_ms": 50.0,
+          "delivery_p99_ms": 1000.0,
+          "max_error_rate": 0.001,
+          "min_achieved_ratio": 0.97
+        },
+        "started_at": "2026-11-12T19:07:17.199176054+00:00",
+        "time_scale": 1.0
+      },
+      "raw_report_sha256": "6bad669ad1eacc164344629a1aff14813ffed4785ecc4680ae6bd0695452bcde",
+      "scenarios": [
+        {
+          "error": null,
+          "findings": [
+            {
+              "detail": "RSS rose from 35 MB to a 57 MB peak and was still 57 MB (99% of the growth) after 25s idle (26 MB anonymous, 30 MB file-backed). Anonymous memory that is retained usually points at allocator fragmentation or caches that never shrink.",
+              "scenario": "ordered-lanes",
+              "severity": "warn",
+              "title": "Memory is not fully released after load"
+            },
+            {
+              "detail": "Whole-host CPU averaged 52% busy with kernel CPU pressure 6%. Latency, throughput and CPU figures from this trial include interference from other workloads and are not a trustworthy baseline; re-run on a quiet machine (see --strict-env).",
+              "scenario": "ordered-lanes",
+              "severity": "warn",
+              "title": "Host was CPU-contended during this trial"
+            }
+          ],
+          "id": "ordered-lanes",
+          "metrics": [
+            {
+              "direction": "lower_better",
+              "group": "lifecycle",
+              "headline": false,
+              "id": "startup_s",
+              "label": "Broker cold start to ready",
+              "samples": [
+                0.115230127
+              ],
+              "unit": "s",
+              "value": 0.115230127
+            },
+            {
+              "direction": "higher_better",
+              "group": "throughput",
+              "headline": false,
+              "id": "lanes.many_lane_delivery_msgs_s",
+              "label": "Delivery rate across many lanes",
+              "samples": [
+                150.9532252132143
+              ],
+              "unit": "msg/s",
+              "value": 150.9532252132143
+            },
+            {
+              "direction": "lower_better",
+              "group": "latency",
+              "headline": true,
+              "id": "lanes.many_lane_delivery_p99_ms",
+              "label": "Delivery p99 across many lanes",
+              "samples": [
+                16.879
+              ],
+              "unit": "ms",
+              "value": 16.879
+            },
+            {
+              "direction": "lower_better",
+              "group": "latency",
+              "headline": false,
+              "id": "lanes.many_lane_ack_p99_ms",
+              "label": "ACK p99 across many lanes",
+              "samples": [
+                11.487
+              ],
+              "unit": "ms",
+              "value": 11.487
+            },
+            {
+              "direction": "higher_better",
+              "group": "throughput",
+              "headline": true,
+              "id": "lanes.hot_lane_msgs_s",
+              "label": "One lane's serial delivery rate",
+              "samples": [
+                161.61458742812727
+              ],
+              "unit": "msg/s",
+              "value": 161.61458742812727
+            },
+            {
+              "direction": "lower_better",
+              "group": "latency",
+              "headline": false,
+              "id": "lanes.hop_overhead_ms",
+              "label": "Broker overhead per message on one lane (1/rate - mean handler)",
+              "samples": [
+                3.049476688895745
+              ],
+              "unit": "ms",
+              "value": 3.049476688895745
+            },
+            {
+              "direction": "lower_better",
+              "group": "latency",
+              "headline": false,
+              "id": "lanes.hot_lane_ack_p99_ms",
+              "label": "ACK p99 on the hot lane",
+              "samples": [
+                7585.791
+              ],
+              "unit": "ms",
+              "value": 7585.791
+            },
+            {
+              "direction": "lower_better",
+              "group": "cpu",
+              "headline": false,
+              "id": "lanes.cpu_cores_many",
+              "label": "Broker CPU, many lanes",
+              "samples": [
+                0.170792334833181
+              ],
+              "unit": "cores",
+              "value": 0.170792334833181
+            },
+            {
+              "direction": "lower_better",
+              "group": "lifecycle",
+              "headline": false,
+              "id": "shutdown_s",
+              "label": "Graceful shutdown time",
+              "samples": [
+                0.011309258
+              ],
+              "unit": "s",
+              "value": 0.011309258
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": false,
+              "id": "mem.idle_mb",
+              "label": "RSS at idle (before load)",
+              "samples": [
+                34.849609375
+              ],
+              "unit": "MB",
+              "value": 34.849609375
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.peak_mb",
+              "label": "Peak RSS under load",
+              "samples": [
+                56.8515625
+              ],
+              "unit": "MB",
+              "value": 56.8515625
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.settled_mb",
+              "label": "RSS after settling idle",
+              "samples": [
+                56.646484375
+              ],
+              "unit": "MB",
+              "value": 56.646484375
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.retained_pct",
+              "label": "Memory still held after load (of the growth)",
+              "samples": [
+                99.06790945406125
+              ],
+              "unit": "%",
+              "value": 99.06790945406125
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": false,
+              "id": "disk.retained_pct",
+              "label": "Disk still held after load (of the growth)",
+              "samples": [
+                0.0
+              ],
+              "unit": "%",
+              "value": 0.0
+            },
+            {
+              "direction": "info",
+              "group": "resources",
+              "headline": false,
+              "id": "host.cpu_busy_pct",
+              "label": "Whole-host CPU busy during the trial (noise indicator)",
+              "samples": [
+                51.56559825020153
+              ],
+              "unit": "%",
+              "value": 51.56559825020153
+            },
+            {
+              "direction": "info",
+              "group": "resources",
+              "headline": false,
+              "id": "host.cpu_pressure_pct",
+              "label": "Kernel CPU pressure during the trial (noise indicator)",
+              "samples": [
+                5.743535353535349
+              ],
+              "unit": "%",
+              "value": 5.743535353535349
+            },
+            {
+              "direction": "lower_better",
+              "group": "resources",
+              "headline": false,
+              "id": "log.bytes",
+              "label": "Broker log volume",
+              "samples": [
+                2.3869075775146484
+              ],
+              "unit": "MB",
+              "value": 2.3869075775146484
+            }
+          ],
+          "params": {
+            "destination": "3 ms median handler",
+            "hot_lane": "one lane offered 400 msg/s for 15s (producer waits for each ACK, like a real client)",
+            "many_lanes": "150 msg/s across 5000 FIFO lanes for 25s"
+          },
+          "status": "warn",
+          "trials": [
+            {
+              "broker_log_errors": 0,
+              "broker_log_warnings": 0,
+              "duration_s": 95.356637844,
+              "final_counters": {
+                "bettermq_archive_admission_blocked": 0.0,
+                "bettermq_archive_backlog_bytes": 0.0,
+                "bettermq_archive_backlog_segments": 0.0,
+                "bettermq_archive_enabled": 0.0,
+                "bettermq_archive_failed_bytes_total": 0.0,
+                "bettermq_archive_failing_bytes": 0.0,
+                "bettermq_archive_failing_segments": 0.0,
+                "bettermq_archive_failures_total": 0.0,
+                "bettermq_archive_initialization_failed": 0.0,
+                "bettermq_archive_oldest_pending_age_seconds": 0.0,
+                "bettermq_archive_queue_capacity_segments": 0.0,
+                "bettermq_archive_queue_headroom_segments": 0.0,
+                "bettermq_dispatch_active_http_deliveries": 0.0,
+                "bettermq_dispatch_committed_ready_depth": 0.0,
+                "bettermq_dispatch_committed_ready_ranges_total": 9776.0,
+                "bettermq_dispatch_committed_ready_records_total": 9776.0,
+                "bettermq_dispatch_completion_gap_records": 0.0,
+                "bettermq_dispatch_completions_total": 9776.0,
+                "bettermq_dispatch_cursor_advanced_records_total": 9776.0,
+                "bettermq_dispatch_cursor_max_offset": 9776.0,
+                "bettermq_dispatch_cursor_min_offset": 9776.0,
+                "bettermq_dispatch_defer_rejected_total": 0.0,
+                "bettermq_dispatch_deferred_total": 0.0,
+                "bettermq_dispatch_delivery_outcomes_total": 9776.0,
+                "bettermq_dispatch_destination_current_failures": 0.0,
+                "bettermq_dispatch_destination_hosts_blocked": 0.0,
+                "bettermq_dispatch_destination_hosts_tracked": 0.0,
+                "bettermq_dispatch_destination_hosts_with_failures": 0.0,
+                "bettermq_dispatch_destination_max_failures": 0.0,
+                "bettermq_dispatch_dlq_committed_total": 0.0,
+                "bettermq_dispatch_dlq_failures_total": 0.0,
+                "bettermq_dispatch_dlq_pending_committed": 0.0,
+                "bettermq_dispatch_dlq_pending_prepared": 0.0,
+                "bettermq_dispatch_dlq_prepared_total": 0.0,
+                "bettermq_dispatch_drain_completed_total": 0.0,
+                "bettermq_dispatch_drain_started_total": 0.0,
+                "bettermq_dispatch_drain_timeouts_total": 0.0,
+                "bettermq_dispatch_draining": 0.0,
+                "bettermq_dispatch_dropped_cursor_lanes_total": 0.0,
+                "bettermq_dispatch_fairness_configured_weights": 0.0,
+                "bettermq_dispatch_fairness_saturated": 0.0,
+                "bettermq_dispatch_fairness_saturation_ratio": 0.0,
+                "bettermq_dispatch_fairness_soft_limit": 1024.0,
+                "bettermq_dispatch_fairness_tracked_tenants": 0.0,
+                "bettermq_dispatch_flow_errors_total": 0.0,
+                "bettermq_dispatch_in_flight_deliveries": 0.0,
+                "bettermq_dispatch_last_drain_duration_seconds": 0.0,
+                "bettermq_dispatch_oldest_pending_age_seconds": 0.0,
+                "bettermq_dispatch_queue_rejected_total": 0.0,
+                "bettermq_dispatch_retries_due_total": 0.0,
+                "bettermq_dispatch_retries_exhausted_total": 0.0,
+                "bettermq_dispatch_retries_pending": 0.0,
+                "bettermq_dispatch_retries_pending_due": 0.0,
+                "bettermq_dispatch_retries_scheduled_total": 0.0,
+                "bettermq_dispatch_tracked_cursor_lanes": 4.0,
+                "bettermq_dispatch_webhook_duration_seconds_count": 9776.0,
+                "bettermq_dispatch_webhook_duration_seconds_sum": 44.317069,
+                "bettermq_fleet_claim_failures_total": 0.0,
+                "bettermq_gc_watermark": 0.0,
+                "bettermq_ingest_accepted_total": 9776.0,
+                "bettermq_ingest_ack_latency_ms_count": 9776.0,
+                "bettermq_ingest_ack_latency_ms_sum": 21647.973,
+                "bettermq_ingest_duplicate_total": 0.0,
+                "bettermq_ingest_durable_commits_total": 9776.0,
+                "bettermq_ingest_rejected_total": 0.0,
+                "bettermq_ingest_single_rejected_total": 0.0,
+                "bettermq_ingest_stage_records_total": 9776.0,
+                "bettermq_legacy_payload_repaired_total": 0.0,
+                "bettermq_legacy_payload_unhashed_total": 0.0,
+                "bettermq_legacy_unverifiable_dedup_hits_total": 0.0,
+                "bettermq_payload_blob_delete_failures_total": 0.0,
+                "bettermq_payload_blob_tombstones_pending": 0.0,
+                "bettermq_payload_blobs_deleted_total": 0.0,
+                "bettermq_retention_errors_total": 0.0,
+                "bettermq_retention_frontier": 8120.0,
+                "bettermq_retention_safe_watermark": 0.0,
+                "bettermq_retention_segments_deleted_total": 0.0,
+                "bettermq_schedule_delayed_pending": 0.0,
+                "bettermq_schedule_legacy_delayed_pending": 0.0,
+                "bettermq_schedule_legacy_imported_total": 0.0,
+                "bettermq_scheduler_failures_total": 0.0,
+                "bettermq_shard_queue_bytes": 0.0,
+                "bettermq_shard_queue_dropped_shard_events_total": 0.0,
+                "bettermq_shard_queue_max_bytes": 2400.0,
+                "bettermq_shard_queue_max_records": 4.0,
+                "bettermq_shard_queue_records": 0.0,
+                "bettermq_shard_queue_rejected_total": 0.0,
+                "bettermq_shard_recovery_failures_total": 0.0,
+                "bettermq_shards_fenced": 0.0,
+                "bettermq_shared_metadata_compactions_total": 0.0,
+                "bettermq_shared_metadata_errors_total": 0.0,
+                "bettermq_shared_metadata_expired_entries_total": 0.0,
+                "bettermq_shared_metadata_fsync_seconds_count": 0.0,
+                "bettermq_shared_metadata_fsync_seconds_sum": 0.0,
+                "bettermq_shared_metadata_lock_wait_seconds_count": 0.0,
+                "bettermq_shared_metadata_lock_wait_seconds_sum": 0.0,
+                "bettermq_shared_metadata_replay_bytes_total": 0.0,
+                "bettermq_wal_base_offset": 0.0,
+                "bettermq_wal_epoch_bytes_total": 8310908.0,
+                "bettermq_wal_epoch_records_total": 9776.0,
+                "bettermq_wal_epoch_total": 9776.0,
+                "bettermq_wal_fence_events_total": 0.0,
+                "bettermq_wal_fsync_duration_seconds_count": 9574.0,
+                "bettermq_wal_fsync_duration_seconds_sum": 8.156371,
+                "bettermq_wal_fsync_failures_total": 0.0,
+                "bettermq_wal_fsync_records_total": 9776.0,
+                "bettermq_wal_fsync_total": 9574.0,
+                "bettermq_wal_last_epoch_bytes": 3406.0,
+                "bettermq_wal_last_epoch_records": 4.0,
+                "bettermq_wal_leader_epoch": 0.0,
+                "bettermq_wal_quarantine_events_total": 0.0,
+                "bettermq_wal_records_per_fsync": 4.1761858762597415,
+                "bettermq_wal_retained_bytes": 8310908.0,
+                "bettermq_wal_retained_bytes_total": 8310908.0,
+                "bettermq_wal_telemetry_dropped_shards_total": 0.0
+              },
+              "index": 0,
+              "integrity": {
+                "accepted": 9776,
+                "concurrency": [
+                  {
+                    "configured": 64,
+                    "dest": "lanes",
+                    "observed_max": 9
+                  }
+                ],
+                "concurrency_violations": 0,
+                "delivered_unique": 9776,
+                "duplicate_deliveries": 0,
+                "loss_expected_zero": true,
+                "lost": 0,
+                "malformed": 0,
+                "order_violations": 0,
+                "order_violations_after_retry": 0
+              },
+              "memory": {
+                "disk_idle_mb": 8.51953125,
+                "disk_peak_mb": 16.51171875,
+                "disk_retained_pct": 0.0,
+                "disk_settled_mb": 16.51171875,
+                "idle_start_mb": 34.849609375,
+                "peak_mb": 56.8515625,
+                "post_drain_mb": 56.8515625,
+                "retained_pct": 99.06790945406125,
+                "settle_secs": 25.005391175,
+                "settled_anon_mb": 26.208984375,
+                "settled_file_mb": 30.4375,
+                "settled_mb": 56.646484375
+              },
+              "metrics": [
+                {
+                  "direction": "lower_better",
+                  "group": "lifecycle",
+                  "headline": false,
+                  "id": "startup_s",
+                  "label": "Broker cold start to ready",
+                  "samples": [],
+                  "unit": "s",
+                  "value": 0.115230127
+                },
+                {
+                  "direction": "higher_better",
+                  "group": "throughput",
+                  "headline": false,
+                  "id": "lanes.many_lane_delivery_msgs_s",
+                  "label": "Delivery rate across many lanes",
+                  "samples": [],
+                  "unit": "msg/s",
+                  "value": 150.9532252132143
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "latency",
+                  "headline": true,
+                  "id": "lanes.many_lane_delivery_p99_ms",
+                  "label": "Delivery p99 across many lanes",
+                  "samples": [],
+                  "unit": "ms",
+                  "value": 16.879
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "latency",
+                  "headline": false,
+                  "id": "lanes.many_lane_ack_p99_ms",
+                  "label": "ACK p99 across many lanes",
+                  "samples": [],
+                  "unit": "ms",
+                  "value": 11.487
+                },
+                {
+                  "direction": "higher_better",
+                  "group": "throughput",
+                  "headline": true,
+                  "id": "lanes.hot_lane_msgs_s",
+                  "label": "One lane's serial delivery rate",
+                  "samples": [],
+                  "unit": "msg/s",
+                  "value": 161.61458742812727
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "latency",
+                  "headline": false,
+                  "id": "lanes.hop_overhead_ms",
+                  "label": "Broker overhead per message on one lane (1/rate - mean handler)",
+                  "samples": [],
+                  "unit": "ms",
+                  "value": 3.049476688895745
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "latency",
+                  "headline": false,
+                  "id": "lanes.hot_lane_ack_p99_ms",
+                  "label": "ACK p99 on the hot lane",
+                  "samples": [],
+                  "unit": "ms",
+                  "value": 7585.791
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "cpu",
+                  "headline": false,
+                  "id": "lanes.cpu_cores_many",
+                  "label": "Broker CPU, many lanes",
+                  "samples": [],
+                  "unit": "cores",
+                  "value": 0.170792334833181
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "lifecycle",
+                  "headline": false,
+                  "id": "shutdown_s",
+                  "label": "Graceful shutdown time",
+                  "samples": [],
+                  "unit": "s",
+                  "value": 0.011309258
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": false,
+                  "id": "mem.idle_mb",
+                  "label": "RSS at idle (before load)",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 34.849609375
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.peak_mb",
+                  "label": "Peak RSS under load",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 56.8515625
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.settled_mb",
+                  "label": "RSS after settling idle",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 56.646484375
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.retained_pct",
+                  "label": "Memory still held after load (of the growth)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 99.06790945406125
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": false,
+                  "id": "disk.retained_pct",
+                  "label": "Disk still held after load (of the growth)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 0.0
+                },
+                {
+                  "direction": "info",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "host.cpu_busy_pct",
+                  "label": "Whole-host CPU busy during the trial (noise indicator)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 51.56559825020153
+                },
+                {
+                  "direction": "info",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "host.cpu_pressure_pct",
+                  "label": "Kernel CPU pressure during the trial (noise indicator)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 5.743535353535349
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "log.bytes",
+                  "label": "Broker log volume",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 2.3869075775146484
+                }
+              ],
+              "notes": [
+                "0 dead-letter records were read back and matched to individual source deliveries."
+              ],
+              "phases": [
+                {
+                  "end_s": 8.012351704,
+                  "kind": "idle",
+                  "name": "baseline",
+                  "start_s": 0.006972083
+                },
+                {
+                  "end_s": 33.013475682,
+                  "kind": "measure",
+                  "name": "many-lanes",
+                  "start_s": 8.012353681
+                },
+                {
+                  "end_s": 55.874183736,
+                  "kind": "measure",
+                  "name": "hot-lane",
+                  "start_s": 33.222395303
+                },
+                {
+                  "end_s": 70.353963325,
+                  "kind": "drain",
+                  "name": "hot-drain",
+                  "start_s": 55.874202586
+                },
+                {
+                  "end_s": 95.359389311,
+                  "kind": "settle",
+                  "name": "settle",
+                  "start_s": 70.353998136
+                }
+              ],
+              "seed": 20275939,
+              "steps": [],
+              "tables": [
+                {
+                  "columns": [
+                    "Thread group",
+                    "CPU (cores)",
+                    "Share"
+                  ],
+                  "rows": [
+                    [
+                      "tokio-rt-worker",
+                      "0.12",
+                      "73%"
+                    ],
+                    [
+                      "bettermq-shard",
+                      "0.03",
+                      "16%"
+                    ],
+                    [
+                      "bettermq-meta-i",
+                      "0.02",
+                      "11%"
+                    ]
+                  ],
+                  "title": "Where broker CPU goes (many lanes)"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "error": null,
+          "findings": [
+            {
+              "detail": "RSS rose from 36 MB to a 70 MB peak and was still 70 MB (100% of the growth) after 25s idle (37 MB anonymous, 32 MB file-backed). Anonymous memory that is retained usually points at allocator fragmentation or caches that never shrink.",
+              "scenario": "noisy-neighbor",
+              "severity": "warn",
+              "title": "Memory is not fully released after load"
+            }
+          ],
+          "id": "noisy-neighbor",
+          "metrics": [
+            {
+              "direction": "lower_better",
+              "group": "lifecycle",
+              "headline": false,
+              "id": "startup_s",
+              "label": "Broker cold start to ready",
+              "samples": [
+                0.169184803
+              ],
+              "unit": "s",
+              "value": 0.169184803
+            },
+            {
+              "direction": "lower_better",
+              "group": "latency",
+              "headline": false,
+              "id": "iso.healthy_delivery_p99_calm_ms",
+              "label": "Healthy tenant delivery p99, calm",
+              "samples": [
+                40.543
+              ],
+              "unit": "ms",
+              "value": 40.543
+            },
+            {
+              "direction": "lower_better",
+              "group": "latency",
+              "headline": true,
+              "id": "iso.healthy_delivery_p99_storm_ms",
+              "label": "Healthy tenant delivery p99, neighbour hung",
+              "samples": [
+                32.511
+              ],
+              "unit": "ms",
+              "value": 32.511
+            },
+            {
+              "direction": "lower_better",
+              "group": "latency",
+              "headline": false,
+              "id": "iso.healthy_ack_p99_storm_ms",
+              "label": "Healthy tenant ACK p99, neighbour hung",
+              "samples": [
+                7.631
+              ],
+              "unit": "ms",
+              "value": 7.631
+            },
+            {
+              "direction": "lower_better",
+              "group": "latency",
+              "headline": true,
+              "id": "iso.degradation_x",
+              "label": "Healthy tenant delivery p99: storm / calm",
+              "samples": [
+                0.801889352045976
+              ],
+              "unit": "x",
+              "value": 0.801889352045976
+            },
+            {
+              "direction": "lower_better",
+              "group": "latency",
+              "headline": false,
+              "id": "iso.healthy_delivery_p99_after_ms",
+              "label": "Healthy tenant delivery p99, after",
+              "samples": [
+                31.135
+              ],
+              "unit": "ms",
+              "value": 31.135
+            },
+            {
+              "direction": "info",
+              "group": "latency",
+              "headline": false,
+              "id": "iso.noisy_backlog_peak",
+              "label": "Noisy tenant's peak backlog",
+              "samples": [
+                7370.0
+              ],
+              "unit": "msgs",
+              "value": 7370.0
+            },
+            {
+              "direction": "lower_better",
+              "group": "latency",
+              "headline": false,
+              "id": "iso.noisy_drain_s",
+              "label": "Noisy tenant backlog drained after recovery",
+              "samples": [
+                0.101425071
+              ],
+              "unit": "s",
+              "value": 0.101425071
+            },
+            {
+              "direction": "higher_better",
+              "group": "reliability",
+              "headline": false,
+              "id": "iso.noisy_drain_completed",
+              "label": "Noisy tenant backlog fully drained (1 = yes)",
+              "samples": [
+                1.0
+              ],
+              "unit": "",
+              "value": 1.0
+            },
+            {
+              "direction": "lower_better",
+              "group": "lifecycle",
+              "headline": false,
+              "id": "shutdown_s",
+              "label": "Graceful shutdown time",
+              "samples": [
+                0.00625731
+              ],
+              "unit": "s",
+              "value": 0.00625731
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": false,
+              "id": "mem.idle_mb",
+              "label": "RSS at idle (before load)",
+              "samples": [
+                35.98828125
+              ],
+              "unit": "MB",
+              "value": 35.98828125
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.peak_mb",
+              "label": "Peak RSS under load",
+              "samples": [
+                69.57421875
+              ],
+              "unit": "MB",
+              "value": 69.57421875
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.settled_mb",
+              "label": "RSS after settling idle",
+              "samples": [
+                69.57421875
+              ],
+              "unit": "MB",
+              "value": 69.57421875
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.retained_pct",
+              "label": "Memory still held after load (of the growth)",
+              "samples": [
+                100.0
+              ],
+              "unit": "%",
+              "value": 100.0
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": false,
+              "id": "disk.retained_pct",
+              "label": "Disk still held after load (of the growth)",
+              "samples": [
+                100.0
+              ],
+              "unit": "%",
+              "value": 100.0
+            },
+            {
+              "direction": "info",
+              "group": "resources",
+              "headline": false,
+              "id": "host.cpu_busy_pct",
+              "label": "Whole-host CPU busy during the trial (noise indicator)",
+              "samples": [
+                26.296667645309643
+              ],
+              "unit": "%",
+              "value": 26.296667645309643
+            },
+            {
+              "direction": "info",
+              "group": "resources",
+              "headline": false,
+              "id": "host.cpu_pressure_pct",
+              "label": "Kernel CPU pressure during the trial (noise indicator)",
+              "samples": [
+                1.3849090909090906
+              ],
+              "unit": "%",
+              "value": 1.3849090909090906
+            },
+            {
+              "direction": "lower_better",
+              "group": "resources",
+              "headline": false,
+              "id": "log.bytes",
+              "label": "Broker log volume",
+              "samples": [
+                5.931519508361816
+              ],
+              "unit": "MB",
+              "value": 5.931519508361816
+            }
+          ],
+          "params": {
+            "healthy_tenant": "100 msg/s, 10 ms handler, 32 parallel",
+            "noisy_tenant": "250 msg/s, 16 parallel; destination hangs during the storm phase",
+            "schedule": "20s calm, 30s storm, 20s after"
+          },
+          "status": "warn",
+          "trials": [
+            {
+              "broker_log_errors": 0,
+              "broker_log_warnings": 1,
+              "duration_s": 103.165860037,
+              "final_counters": {
+                "bettermq_archive_admission_blocked": 0.0,
+                "bettermq_archive_backlog_bytes": 0.0,
+                "bettermq_archive_backlog_segments": 0.0,
+                "bettermq_archive_enabled": 0.0,
+                "bettermq_archive_failed_bytes_total": 0.0,
+                "bettermq_archive_failing_bytes": 0.0,
+                "bettermq_archive_failing_segments": 0.0,
+                "bettermq_archive_failures_total": 0.0,
+                "bettermq_archive_initialization_failed": 0.0,
+                "bettermq_archive_oldest_pending_age_seconds": 0.0,
+                "bettermq_archive_queue_capacity_segments": 0.0,
+                "bettermq_archive_queue_headroom_segments": 0.0,
+                "bettermq_dispatch_active_http_deliveries": 0.0,
+                "bettermq_dispatch_committed_ready_depth": 1.0,
+                "bettermq_dispatch_committed_ready_ranges_total": 24372.0,
+                "bettermq_dispatch_committed_ready_records_total": 24372.0,
+                "bettermq_dispatch_completion_gap_records": 0.0,
+                "bettermq_dispatch_completions_total": 24372.0,
+                "bettermq_dispatch_cursor_advanced_records_total": 24372.0,
+                "bettermq_dispatch_cursor_max_offset": 17365.0,
+                "bettermq_dispatch_cursor_min_offset": 7007.0,
+                "bettermq_dispatch_defer_rejected_total": 0.0,
+                "bettermq_dispatch_deferred_total": 16.0,
+                "bettermq_dispatch_delivery_outcomes_total": 24388.0,
+                "bettermq_dispatch_destination_current_failures": 0.0,
+                "bettermq_dispatch_destination_hosts_blocked": 0.0,
+                "bettermq_dispatch_destination_hosts_tracked": 0.0,
+                "bettermq_dispatch_destination_hosts_with_failures": 0.0,
+                "bettermq_dispatch_destination_max_failures": 0.0,
+                "bettermq_dispatch_dlq_committed_total": 0.0,
+                "bettermq_dispatch_dlq_failures_total": 0.0,
+                "bettermq_dispatch_dlq_pending_committed": 0.0,
+                "bettermq_dispatch_dlq_pending_prepared": 0.0,
+                "bettermq_dispatch_dlq_prepared_total": 0.0,
+                "bettermq_dispatch_drain_completed_total": 0.0,
+                "bettermq_dispatch_drain_started_total": 0.0,
+                "bettermq_dispatch_drain_timeouts_total": 0.0,
+                "bettermq_dispatch_draining": 0.0,
+                "bettermq_dispatch_dropped_cursor_lanes_total": 0.0,
+                "bettermq_dispatch_fairness_configured_weights": 0.0,
+                "bettermq_dispatch_fairness_saturated": 0.0,
+                "bettermq_dispatch_fairness_saturation_ratio": 0.0,
+                "bettermq_dispatch_fairness_soft_limit": 1024.0,
+                "bettermq_dispatch_fairness_tracked_tenants": 0.0,
+                "bettermq_dispatch_flow_errors_total": 0.0,
+                "bettermq_dispatch_in_flight_deliveries": 0.0,
+                "bettermq_dispatch_last_drain_duration_seconds": 0.0,
+                "bettermq_dispatch_oldest_pending_age_seconds": 0.0,
+                "bettermq_dispatch_queue_rejected_total": 7951.0,
+                "bettermq_dispatch_retries_due_total": 16.0,
+                "bettermq_dispatch_retries_exhausted_total": 0.0,
+                "bettermq_dispatch_retries_pending": 0.0,
+                "bettermq_dispatch_retries_pending_due": 0.0,
+                "bettermq_dispatch_retries_scheduled_total": 16.0,
+                "bettermq_dispatch_tracked_cursor_lanes": 8.0,
+                "bettermq_dispatch_webhook_duration_seconds_count": 24388.0,
+                "bettermq_dispatch_webhook_duration_seconds_sum": 957.642832,
+                "bettermq_fleet_claim_failures_total": 0.0,
+                "bettermq_gc_watermark": 0.0,
+                "bettermq_ingest_accepted_total": 24372.0,
+                "bettermq_ingest_ack_latency_ms_count": 24372.0,
+                "bettermq_ingest_ack_latency_ms_sum": 65301.143,
+                "bettermq_ingest_duplicate_total": 0.0,
+                "bettermq_ingest_durable_commits_total": 24372.0,
+                "bettermq_ingest_rejected_total": 0.0,
+                "bettermq_ingest_single_rejected_total": 0.0,
+                "bettermq_ingest_stage_records_total": 24372.0,
+                "bettermq_legacy_payload_repaired_total": 0.0,
+                "bettermq_legacy_payload_unhashed_total": 0.0,
+                "bettermq_legacy_unverifiable_dedup_hits_total": 0.0,
+                "bettermq_payload_blob_delete_failures_total": 0.0,
+                "bettermq_payload_blob_tombstones_pending": 0.0,
+                "bettermq_payload_blobs_deleted_total": 0.0,
+                "bettermq_retention_errors_total": 0.0,
+                "bettermq_retention_frontier": 10854.0,
+                "bettermq_retention_safe_watermark": 0.0,
+                "bettermq_retention_segments_deleted_total": 0.0,
+                "bettermq_schedule_delayed_pending": 0.0,
+                "bettermq_schedule_legacy_delayed_pending": 0.0,
+                "bettermq_schedule_legacy_imported_total": 0.0,
+                "bettermq_scheduler_failures_total": 0.0,
+                "bettermq_shard_queue_bytes": 0.0,
+                "bettermq_shard_queue_dropped_shard_events_total": 0.0,
+                "bettermq_shard_queue_max_bytes": 4096.0,
+                "bettermq_shard_queue_max_records": 4.0,
+                "bettermq_shard_queue_records": 0.0,
+                "bettermq_shard_queue_rejected_total": 0.0,
+                "bettermq_shard_recovery_failures_total": 0.0,
+                "bettermq_shards_fenced": 0.0,
+                "bettermq_shared_metadata_compactions_total": 0.0,
+                "bettermq_shared_metadata_errors_total": 0.0,
+                "bettermq_shared_metadata_expired_entries_total": 0.0,
+                "bettermq_shared_metadata_fsync_seconds_count": 0.0,
+                "bettermq_shared_metadata_fsync_seconds_sum": 0.0,
+                "bettermq_shared_metadata_lock_wait_seconds_count": 0.0,
+                "bettermq_shared_metadata_lock_wait_seconds_sum": 0.0,
+                "bettermq_shared_metadata_replay_bytes_total": 0.0,
+                "bettermq_wal_base_offset": 0.0,
+                "bettermq_wal_epoch_bytes_total": 31053584.0,
+                "bettermq_wal_epoch_records_total": 24372.0,
+                "bettermq_wal_epoch_total": 24372.0,
+                "bettermq_wal_fence_events_total": 0.0,
+                "bettermq_wal_fsync_duration_seconds_count": 22674.0,
+                "bettermq_wal_fsync_duration_seconds_sum": 26.248671,
+                "bettermq_wal_fsync_failures_total": 0.0,
+                "bettermq_wal_fsync_records_total": 24372.0,
+                "bettermq_wal_fsync_total": 22674.0,
+                "bettermq_wal_last_epoch_bytes": 5104.0,
+                "bettermq_wal_last_epoch_records": 4.0,
+                "bettermq_wal_leader_epoch": 0.0,
+                "bettermq_wal_quarantine_events_total": 0.0,
+                "bettermq_wal_records_per_fsync": 4.29949998212548,
+                "bettermq_wal_retained_bytes": 22934840.0,
+                "bettermq_wal_retained_bytes_total": 22934840.0,
+                "bettermq_wal_telemetry_dropped_shards_total": 0.0
+              },
+              "index": 0,
+              "integrity": {
+                "accepted": 24372,
+                "concurrency": [
+                  {
+                    "configured": 32,
+                    "dest": "healthy",
+                    "observed_max": 9
+                  },
+                  {
+                    "configured": 16,
+                    "dest": "noisy",
+                    "observed_max": 16
+                  }
+                ],
+                "concurrency_violations": 0,
+                "delivered_unique": 24372,
+                "duplicate_deliveries": 0,
+                "loss_expected_zero": true,
+                "lost": 0,
+                "malformed": 0,
+                "order_violations": 0,
+                "order_violations_after_retry": 0
+              },
+              "memory": {
+                "disk_idle_mb": 8.51953125,
+                "disk_peak_mb": 38.65625,
+                "disk_retained_pct": 100.0,
+                "disk_settled_mb": 38.65625,
+                "idle_start_mb": 35.98828125,
+                "peak_mb": 69.57421875,
+                "post_drain_mb": 69.57421875,
+                "retained_pct": 100.0,
+                "settle_secs": 25.004557179999992,
+                "settled_anon_mb": 37.29296875,
+                "settled_file_mb": 32.28125,
+                "settled_mb": 69.57421875
+              },
+              "metrics": [
+                {
+                  "direction": "lower_better",
+                  "group": "lifecycle",
+                  "headline": false,
+                  "id": "startup_s",
+                  "label": "Broker cold start to ready",
+                  "samples": [],
+                  "unit": "s",
+                  "value": 0.169184803
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "latency",
+                  "headline": false,
+                  "id": "iso.healthy_delivery_p99_calm_ms",
+                  "label": "Healthy tenant delivery p99, calm",
+                  "samples": [],
+                  "unit": "ms",
+                  "value": 40.543
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "latency",
+                  "headline": true,
+                  "id": "iso.healthy_delivery_p99_storm_ms",
+                  "label": "Healthy tenant delivery p99, neighbour hung",
+                  "samples": [],
+                  "unit": "ms",
+                  "value": 32.511
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "latency",
+                  "headline": false,
+                  "id": "iso.healthy_ack_p99_storm_ms",
+                  "label": "Healthy tenant ACK p99, neighbour hung",
+                  "samples": [],
+                  "unit": "ms",
+                  "value": 7.631
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "latency",
+                  "headline": true,
+                  "id": "iso.degradation_x",
+                  "label": "Healthy tenant delivery p99: storm / calm",
+                  "samples": [],
+                  "unit": "x",
+                  "value": 0.801889352045976
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "latency",
+                  "headline": false,
+                  "id": "iso.healthy_delivery_p99_after_ms",
+                  "label": "Healthy tenant delivery p99, after",
+                  "samples": [],
+                  "unit": "ms",
+                  "value": 31.135
+                },
+                {
+                  "direction": "info",
+                  "group": "latency",
+                  "headline": false,
+                  "id": "iso.noisy_backlog_peak",
+                  "label": "Noisy tenant's peak backlog",
+                  "samples": [],
+                  "unit": "msgs",
+                  "value": 7370.0
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "latency",
+                  "headline": false,
+                  "id": "iso.noisy_drain_s",
+                  "label": "Noisy tenant backlog drained after recovery",
+                  "samples": [],
+                  "unit": "s",
+                  "value": 0.101425071
+                },
+                {
+                  "direction": "higher_better",
+                  "group": "reliability",
+                  "headline": false,
+                  "id": "iso.noisy_drain_completed",
+                  "label": "Noisy tenant backlog fully drained (1 = yes)",
+                  "samples": [],
+                  "unit": "",
+                  "value": 1.0
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "lifecycle",
+                  "headline": false,
+                  "id": "shutdown_s",
+                  "label": "Graceful shutdown time",
+                  "samples": [],
+                  "unit": "s",
+                  "value": 0.00625731
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": false,
+                  "id": "mem.idle_mb",
+                  "label": "RSS at idle (before load)",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 35.98828125
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.peak_mb",
+                  "label": "Peak RSS under load",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 69.57421875
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.settled_mb",
+                  "label": "RSS after settling idle",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 69.57421875
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.retained_pct",
+                  "label": "Memory still held after load (of the growth)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 100.0
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": false,
+                  "id": "disk.retained_pct",
+                  "label": "Disk still held after load (of the growth)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 100.0
+                },
+                {
+                  "direction": "info",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "host.cpu_busy_pct",
+                  "label": "Whole-host CPU busy during the trial (noise indicator)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 26.296667645309643
+                },
+                {
+                  "direction": "info",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "host.cpu_pressure_pct",
+                  "label": "Kernel CPU pressure during the trial (noise indicator)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 1.3849090909090906
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "log.bytes",
+                  "label": "Broker log volume",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 5.931519508361816
+                }
+              ],
+              "notes": [
+                "0 dead-letter records were read back and matched to individual source deliveries."
+              ],
+              "phases": [
+                {
+                  "end_s": 8.041336077,
+                  "kind": "idle",
+                  "name": "baseline",
+                  "start_s": 0.035229955
+                },
+                {
+                  "end_s": 28.046178237,
+                  "kind": "measure",
+                  "name": "calm",
+                  "start_s": 8.041338415
+                },
+                {
+                  "end_s": 58.052216793,
+                  "kind": "fault",
+                  "name": "storm",
+                  "start_s": 28.046179365
+                },
+                {
+                  "end_s": 78.057692141,
+                  "kind": "measure",
+                  "name": "after",
+                  "start_s": 58.052218116
+                },
+                {
+                  "end_s": 78.162744426,
+                  "kind": "drain",
+                  "name": "drain",
+                  "start_s": 78.057736119
+                },
+                {
+                  "end_s": 103.167306187,
+                  "kind": "settle",
+                  "name": "settle",
+                  "start_s": 78.162749007
+                }
+              ],
+              "seed": 20275939,
+              "steps": [],
+              "tables": [
+                {
+                  "columns": [
+                    "Thread group",
+                    "CPU (cores)",
+                    "Share"
+                  ],
+                  "rows": [
+                    [
+                      "tokio-rt-worker",
+                      "0.33",
+                      "63%"
+                    ],
+                    [
+                      "bettermq-meta-i",
+                      "0.11",
+                      "21%"
+                    ],
+                    [
+                      "bettermq-shard",
+                      "0.09",
+                      "16%"
+                    ]
+                  ],
+                  "title": "Where broker CPU goes (after)"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "error": null,
+          "findings": [
+            {
+              "detail": "RSS rose from 35 MB to a 96 MB peak and was still 96 MB (100% of the growth) after 25s idle (64 MB anonymous, 32 MB file-backed). Anonymous memory that is retained usually points at allocator fragmentation or caches that never shrink.",
+              "scenario": "backlog-depth",
+              "severity": "warn",
+              "title": "Memory is not fully released after load"
+            },
+            {
+              "detail": "Data directory grew from 9 MB to 156 MB and was still 156 MB (100% of the growth) after settling.",
+              "scenario": "backlog-depth",
+              "severity": "notice",
+              "title": "Disk space is slow to be reclaimed"
+            }
+          ],
+          "id": "backlog-depth",
+          "metrics": [
+            {
+              "direction": "lower_better",
+              "group": "lifecycle",
+              "headline": false,
+              "id": "startup_s",
+              "label": "Broker cold start to ready",
+              "samples": [
+                0.110343902
+              ],
+              "unit": "s",
+              "value": 0.110343902
+            },
+            {
+              "direction": "info",
+              "group": "throughput",
+              "headline": true,
+              "id": "backlog.max_depth",
+              "label": "Deepest backlog held",
+              "samples": [
+                120001.0
+              ],
+              "unit": "msgs",
+              "value": 120001.0
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "backlog.rss_bytes_per_msg",
+              "label": "Memory per queued message (slope of RSS vs depth)",
+              "samples": [
+                269.1599835051546
+              ],
+              "unit": "B",
+              "value": 269.1599835051546
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": false,
+              "id": "backlog.disk_bytes_per_msg",
+              "label": "Disk per queued message (slope of data dir vs depth)",
+              "samples": [
+                1275.9441154639176
+              ],
+              "unit": "B",
+              "value": 1275.9441154639176
+            },
+            {
+              "direction": "lower_better",
+              "group": "latency",
+              "headline": true,
+              "id": "backlog.ack_p99_at_max_ms",
+              "label": "ACK p99 while filling to the deepest backlog",
+              "samples": [
+                267.775
+              ],
+              "unit": "ms",
+              "value": 267.775
+            },
+            {
+              "direction": "lower_better",
+              "group": "cpu",
+              "headline": false,
+              "id": "backlog.cpu_filling_cores",
+              "label": "Broker CPU while filling the deepest tranche",
+              "samples": [
+                0.6141535335840499
+              ],
+              "unit": "cores",
+              "value": 0.6141535335840499
+            },
+            {
+              "direction": "lower_better",
+              "group": "cpu",
+              "headline": true,
+              "id": "backlog.cpu_holding_cores",
+              "label": "Broker CPU just holding the deepest backlog",
+              "samples": [
+                0.04551219174621121
+              ],
+              "unit": "cores",
+              "value": 0.04551219174621121
+            },
+            {
+              "direction": "higher_better",
+              "group": "throughput",
+              "headline": true,
+              "id": "backlog.drain_msgs_s",
+              "label": "Drain rate once the destination returned",
+              "samples": [
+                520.991994499353
+              ],
+              "unit": "msg/s",
+              "value": 520.991994499353
+            },
+            {
+              "direction": "lower_better",
+              "group": "cpu",
+              "headline": false,
+              "id": "backlog.drain_cpu_cores",
+              "label": "Broker CPU while draining",
+              "samples": [
+                0.8288795551924916
+              ],
+              "unit": "cores",
+              "value": 0.8288795551924916
+            },
+            {
+              "direction": "lower_better",
+              "group": "reliability",
+              "headline": false,
+              "id": "backlog.undelivered_after_drain",
+              "label": "Messages still pending after the drain window",
+              "samples": [
+                0.0
+              ],
+              "unit": "msgs",
+              "value": 0.0
+            },
+            {
+              "direction": "lower_better",
+              "group": "lifecycle",
+              "headline": false,
+              "id": "shutdown_s",
+              "label": "Graceful shutdown time",
+              "samples": [
+                0.015913111
+              ],
+              "unit": "s",
+              "value": 0.015913111
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": false,
+              "id": "mem.idle_mb",
+              "label": "RSS at idle (before load)",
+              "samples": [
+                34.966796875
+              ],
+              "unit": "MB",
+              "value": 34.966796875
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.peak_mb",
+              "label": "Peak RSS under load",
+              "samples": [
+                95.75390625
+              ],
+              "unit": "MB",
+              "value": 95.75390625
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.settled_mb",
+              "label": "RSS after settling idle",
+              "samples": [
+                95.75390625
+              ],
+              "unit": "MB",
+              "value": 95.75390625
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.retained_pct",
+              "label": "Memory still held after load (of the growth)",
+              "samples": [
+                100.0
+              ],
+              "unit": "%",
+              "value": 100.0
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": false,
+              "id": "disk.retained_pct",
+              "label": "Disk still held after load (of the growth)",
+              "samples": [
+                99.64039239535683
+              ],
+              "unit": "%",
+              "value": 99.64039239535683
+            },
+            {
+              "direction": "info",
+              "group": "resources",
+              "headline": false,
+              "id": "host.cpu_busy_pct",
+              "label": "Whole-host CPU busy during the trial (noise indicator)",
+              "samples": [
+                27.022811080534026
+              ],
+              "unit": "%",
+              "value": 27.022811080534026
+            },
+            {
+              "direction": "info",
+              "group": "resources",
+              "headline": false,
+              "id": "host.cpu_pressure_pct",
+              "label": "Kernel CPU pressure during the trial (noise indicator)",
+              "samples": [
+                2.2538328530259366
+              ],
+              "unit": "%",
+              "value": 2.2538328530259366
+            },
+            {
+              "direction": "lower_better",
+              "group": "resources",
+              "headline": false,
+              "id": "log.bytes",
+              "label": "Broker log volume",
+              "samples": [
+                29.5441312789917
+              ],
+              "unit": "MB",
+              "value": 29.5441312789917
+            }
+          ],
+          "params": {
+            "backlog_kind": "ready messages behind a hung destination (8 deliveries stuck)",
+            "depths": "[10000, 40000, 120000] messages",
+            "fill": "batches of 100 at 2000 msg/s",
+            "payload_bytes": "1024"
+          },
+          "status": "warn",
+          "trials": [
+            {
+              "broker_log_errors": 0,
+              "broker_log_warnings": 1,
+              "duration_s": 341.450984727,
+              "final_counters": {
+                "bettermq_archive_admission_blocked": 0.0,
+                "bettermq_archive_backlog_bytes": 0.0,
+                "bettermq_archive_backlog_segments": 0.0,
+                "bettermq_archive_enabled": 0.0,
+                "bettermq_archive_failed_bytes_total": 0.0,
+                "bettermq_archive_failing_bytes": 0.0,
+                "bettermq_archive_failing_segments": 0.0,
+                "bettermq_archive_failures_total": 0.0,
+                "bettermq_archive_initialization_failed": 0.0,
+                "bettermq_archive_oldest_pending_age_seconds": 0.0,
+                "bettermq_archive_queue_capacity_segments": 0.0,
+                "bettermq_archive_queue_headroom_segments": 0.0,
+                "bettermq_dispatch_active_http_deliveries": 0.0,
+                "bettermq_dispatch_committed_ready_depth": 1.0,
+                "bettermq_dispatch_committed_ready_ranges_total": 120001.0,
+                "bettermq_dispatch_committed_ready_records_total": 120001.0,
+                "bettermq_dispatch_completion_gap_records": 0.0,
+                "bettermq_dispatch_completions_total": 120001.0,
+                "bettermq_dispatch_cursor_advanced_records_total": 120001.0,
+                "bettermq_dispatch_cursor_max_offset": 120001.0,
+                "bettermq_dispatch_cursor_min_offset": 120001.0,
+                "bettermq_dispatch_defer_rejected_total": 0.0,
+                "bettermq_dispatch_deferred_total": 8.0,
+                "bettermq_dispatch_delivery_outcomes_total": 120009.0,
+                "bettermq_dispatch_destination_current_failures": 0.0,
+                "bettermq_dispatch_destination_hosts_blocked": 0.0,
+                "bettermq_dispatch_destination_hosts_tracked": 0.0,
+                "bettermq_dispatch_destination_hosts_with_failures": 0.0,
+                "bettermq_dispatch_destination_max_failures": 0.0,
+                "bettermq_dispatch_dlq_committed_total": 0.0,
+                "bettermq_dispatch_dlq_failures_total": 0.0,
+                "bettermq_dispatch_dlq_pending_committed": 0.0,
+                "bettermq_dispatch_dlq_pending_prepared": 0.0,
+                "bettermq_dispatch_dlq_prepared_total": 0.0,
+                "bettermq_dispatch_drain_completed_total": 0.0,
+                "bettermq_dispatch_drain_started_total": 0.0,
+                "bettermq_dispatch_drain_timeouts_total": 0.0,
+                "bettermq_dispatch_draining": 0.0,
+                "bettermq_dispatch_dropped_cursor_lanes_total": 0.0,
+                "bettermq_dispatch_fairness_configured_weights": 0.0,
+                "bettermq_dispatch_fairness_saturated": 0.0,
+                "bettermq_dispatch_fairness_saturation_ratio": 0.0,
+                "bettermq_dispatch_fairness_soft_limit": 1024.0,
+                "bettermq_dispatch_fairness_tracked_tenants": 0.0,
+                "bettermq_dispatch_flow_errors_total": 0.0,
+                "bettermq_dispatch_in_flight_deliveries": 0.0,
+                "bettermq_dispatch_last_drain_duration_seconds": 0.0,
+                "bettermq_dispatch_oldest_pending_age_seconds": 0.0,
+                "bettermq_dispatch_queue_rejected_total": 119985.0,
+                "bettermq_dispatch_retries_due_total": 8.0,
+                "bettermq_dispatch_retries_exhausted_total": 0.0,
+                "bettermq_dispatch_retries_pending": 0.0,
+                "bettermq_dispatch_retries_pending_due": 0.0,
+                "bettermq_dispatch_retries_scheduled_total": 8.0,
+                "bettermq_dispatch_tracked_cursor_lanes": 4.0,
+                "bettermq_dispatch_webhook_duration_seconds_count": 120009.0,
+                "bettermq_dispatch_webhook_duration_seconds_sum": 1406.479283,
+                "bettermq_fleet_claim_failures_total": 0.0,
+                "bettermq_gc_watermark": 0.0,
+                "bettermq_ingest_accepted_total": 120001.0,
+                "bettermq_ingest_ack_latency_ms_count": 120001.0,
+                "bettermq_ingest_ack_latency_ms_sum": 8934948.163,
+                "bettermq_ingest_duplicate_total": 0.0,
+                "bettermq_ingest_durable_commits_total": 120001.0,
+                "bettermq_ingest_rejected_total": 0.0,
+                "bettermq_ingest_single_rejected_total": 0.0,
+                "bettermq_ingest_stage_records_total": 120001.0,
+                "bettermq_legacy_payload_repaired_total": 0.0,
+                "bettermq_legacy_payload_unhashed_total": 0.0,
+                "bettermq_legacy_unverifiable_dedup_hits_total": 0.0,
+                "bettermq_payload_blob_delete_failures_total": 0.0,
+                "bettermq_payload_blob_tombstones_pending": 0.0,
+                "bettermq_payload_blobs_deleted_total": 0.0,
+                "bettermq_retention_errors_total": 0.0,
+                "bettermq_retention_frontier": 107704.0,
+                "bettermq_retention_safe_watermark": 0.0,
+                "bettermq_retention_segments_deleted_total": 0.0,
+                "bettermq_schedule_delayed_pending": 0.0,
+                "bettermq_schedule_legacy_delayed_pending": 0.0,
+                "bettermq_schedule_legacy_imported_total": 0.0,
+                "bettermq_scheduler_failures_total": 0.0,
+                "bettermq_shard_queue_bytes": 0.0,
+                "bettermq_shard_queue_dropped_shard_events_total": 0.0,
+                "bettermq_shard_queue_max_bytes": 122880.0,
+                "bettermq_shard_queue_max_records": 120.0,
+                "bettermq_shard_queue_records": 0.0,
+                "bettermq_shard_queue_rejected_total": 0.0,
+                "bettermq_shard_recovery_failures_total": 0.0,
+                "bettermq_shards_fenced": 0.0,
+                "bettermq_shared_metadata_compactions_total": 0.0,
+                "bettermq_shared_metadata_errors_total": 0.0,
+                "bettermq_shared_metadata_expired_entries_total": 0.0,
+                "bettermq_shared_metadata_fsync_seconds_count": 0.0,
+                "bettermq_shared_metadata_fsync_seconds_sum": 0.0,
+                "bettermq_shared_metadata_lock_wait_seconds_count": 0.0,
+                "bettermq_shared_metadata_lock_wait_seconds_sum": 0.0,
+                "bettermq_shared_metadata_replay_bytes_total": 0.0,
+                "bettermq_wal_base_offset": 0.0,
+                "bettermq_wal_epoch_bytes_total": 153001275.0,
+                "bettermq_wal_epoch_records_total": 120001.0,
+                "bettermq_wal_epoch_total": 60481.0,
+                "bettermq_wal_fence_events_total": 0.0,
+                "bettermq_wal_fsync_duration_seconds_count": 22953.0,
+                "bettermq_wal_fsync_duration_seconds_sum": 159.322432,
+                "bettermq_wal_fsync_failures_total": 0.0,
+                "bettermq_wal_fsync_records_total": 120001.0,
+                "bettermq_wal_fsync_total": 22953.0,
+                "bettermq_wal_last_epoch_bytes": 8925.0,
+                "bettermq_wal_last_epoch_records": 7.0,
+                "bettermq_wal_leader_epoch": 0.0,
+                "bettermq_wal_quarantine_events_total": 0.0,
+                "bettermq_wal_records_per_fsync": 20.912315011078796,
+                "bettermq_wal_retained_bytes": 153001275.0,
+                "bettermq_wal_retained_bytes_total": 153001275.0,
+                "bettermq_wal_telemetry_dropped_shards_total": 0.0
+              },
+              "index": 0,
+              "integrity": {
+                "accepted": 120001,
+                "concurrency": [
+                  {
+                    "configured": 8,
+                    "dest": "backlog",
+                    "observed_max": 8
+                  }
+                ],
+                "concurrency_violations": 0,
+                "delivered_unique": 120001,
+                "duplicate_deliveries": 0,
+                "loss_expected_zero": true,
+                "lost": 0,
+                "malformed": 0,
+                "order_violations": 0,
+                "order_violations_after_retry": 0
+              },
+              "memory": {
+                "disk_idle_mb": 8.51953125,
+                "disk_peak_mb": 156.25,
+                "disk_retained_pct": 99.64039239535683,
+                "disk_settled_mb": 155.71875,
+                "idle_start_mb": 34.966796875,
+                "peak_mb": 95.75390625,
+                "post_drain_mb": 95.75390625,
+                "retained_pct": 100.0,
+                "settle_secs": 25.00391681100001,
+                "settled_anon_mb": 64.078125,
+                "settled_file_mb": 31.67578125,
+                "settled_mb": 95.75390625
+              },
+              "metrics": [
+                {
+                  "direction": "lower_better",
+                  "group": "lifecycle",
+                  "headline": false,
+                  "id": "startup_s",
+                  "label": "Broker cold start to ready",
+                  "samples": [],
+                  "unit": "s",
+                  "value": 0.110343902
+                },
+                {
+                  "direction": "info",
+                  "group": "throughput",
+                  "headline": true,
+                  "id": "backlog.max_depth",
+                  "label": "Deepest backlog held",
+                  "samples": [],
+                  "unit": "msgs",
+                  "value": 120001.0
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "backlog.rss_bytes_per_msg",
+                  "label": "Memory per queued message (slope of RSS vs depth)",
+                  "samples": [],
+                  "unit": "B",
+                  "value": 269.1599835051546
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": false,
+                  "id": "backlog.disk_bytes_per_msg",
+                  "label": "Disk per queued message (slope of data dir vs depth)",
+                  "samples": [],
+                  "unit": "B",
+                  "value": 1275.9441154639176
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "latency",
+                  "headline": true,
+                  "id": "backlog.ack_p99_at_max_ms",
+                  "label": "ACK p99 while filling to the deepest backlog",
+                  "samples": [],
+                  "unit": "ms",
+                  "value": 267.775
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "cpu",
+                  "headline": false,
+                  "id": "backlog.cpu_filling_cores",
+                  "label": "Broker CPU while filling the deepest tranche",
+                  "samples": [],
+                  "unit": "cores",
+                  "value": 0.6141535335840499
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "cpu",
+                  "headline": true,
+                  "id": "backlog.cpu_holding_cores",
+                  "label": "Broker CPU just holding the deepest backlog",
+                  "samples": [],
+                  "unit": "cores",
+                  "value": 0.04551219174621121
+                },
+                {
+                  "direction": "higher_better",
+                  "group": "throughput",
+                  "headline": true,
+                  "id": "backlog.drain_msgs_s",
+                  "label": "Drain rate once the destination returned",
+                  "samples": [],
+                  "unit": "msg/s",
+                  "value": 520.991994499353
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "cpu",
+                  "headline": false,
+                  "id": "backlog.drain_cpu_cores",
+                  "label": "Broker CPU while draining",
+                  "samples": [],
+                  "unit": "cores",
+                  "value": 0.8288795551924916
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "reliability",
+                  "headline": false,
+                  "id": "backlog.undelivered_after_drain",
+                  "label": "Messages still pending after the drain window",
+                  "samples": [],
+                  "unit": "msgs",
+                  "value": 0.0
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "lifecycle",
+                  "headline": false,
+                  "id": "shutdown_s",
+                  "label": "Graceful shutdown time",
+                  "samples": [],
+                  "unit": "s",
+                  "value": 0.015913111
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": false,
+                  "id": "mem.idle_mb",
+                  "label": "RSS at idle (before load)",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 34.966796875
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.peak_mb",
+                  "label": "Peak RSS under load",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 95.75390625
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.settled_mb",
+                  "label": "RSS after settling idle",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 95.75390625
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.retained_pct",
+                  "label": "Memory still held after load (of the growth)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 100.0
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": false,
+                  "id": "disk.retained_pct",
+                  "label": "Disk still held after load (of the growth)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 99.64039239535683
+                },
+                {
+                  "direction": "info",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "host.cpu_busy_pct",
+                  "label": "Whole-host CPU busy during the trial (noise indicator)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 27.022811080534026
+                },
+                {
+                  "direction": "info",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "host.cpu_pressure_pct",
+                  "label": "Kernel CPU pressure during the trial (noise indicator)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 2.2538328530259366
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "log.bytes",
+                  "label": "Broker log volume",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 29.5441312789917
+                }
+              ],
+              "notes": [
+                "0 dead-letter records were read back and matched to individual source deliveries."
+              ],
+              "phases": [
+                {
+                  "end_s": 8.009959784,
+                  "kind": "idle",
+                  "name": "baseline",
+                  "start_s": 0.007459811
+                },
+                {
+                  "end_s": 13.020202797,
+                  "kind": "measure",
+                  "name": "fill-0",
+                  "start_s": 8.009960509
+                },
+                {
+                  "end_s": 19.021344722,
+                  "kind": "other",
+                  "name": "hold-0",
+                  "start_s": 13.020209323
+                },
+                {
+                  "end_s": 34.095771904,
+                  "kind": "measure",
+                  "name": "fill-1",
+                  "start_s": 19.022421571
+                },
+                {
+                  "end_s": 40.100390936,
+                  "kind": "other",
+                  "name": "hold-1",
+                  "start_s": 34.095774476
+                },
+                {
+                  "end_s": 80.10733497,
+                  "kind": "measure",
+                  "name": "fill-2",
+                  "start_s": 40.101052084
+                },
+                {
+                  "end_s": 86.11334479,
+                  "kind": "other",
+                  "name": "hold-2",
+                  "start_s": 80.107337254
+                },
+                {
+                  "end_s": 316.448429441,
+                  "kind": "drain",
+                  "name": "drain",
+                  "start_s": 86.113396077
+                },
+                {
+                  "end_s": 341.452350335,
+                  "kind": "settle",
+                  "name": "settle",
+                  "start_s": 316.448433524
+                }
+              ],
+              "seed": 20275939,
+              "steps": [],
+              "tables": [
+                {
+                  "columns": [
+                    "Depth",
+                    "Fill rate",
+                    "ACK p50",
+                    "ACK p99",
+                    "CPU filling (cores)",
+                    "CPU holding (cores)",
+                    "RSS (MB)",
+                    "Data dir (MB)",
+                    "In flight"
+                  ],
+                  "rows": [
+                    [
+                      "10001",
+                      "1996/s",
+                      "9.97 ms",
+                      "24 ms",
+                      "0.50",
+                      "0.02",
+                      "51",
+                      "21",
+                      "0"
+                    ],
+                    [
+                      "40001",
+                      "1990/s",
+                      "108 ms",
+                      "271 ms",
+                      "0.53",
+                      "0.03",
+                      "78",
+                      "57",
+                      "0"
+                    ],
+                    [
+                      "120001",
+                      "2000/s",
+                      "61 ms",
+                      "268 ms",
+                      "0.61",
+                      "0.05",
+                      "84",
+                      "155",
+                      "0"
+                    ]
+                  ],
+                  "title": "Cost of holding a backlog"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "t0-overload": {
+      "environment": {
+        "cpu_model": "Intel(R) Core(TM) Ultra 9 285H",
+        "data_fs_type": "ext2/ext3",
+        "governor": "powersave",
+        "kernel": "7.0.0-38-generic",
+        "load_avg_start": 24.4,
+        "logical_cpus": 16,
+        "mem_total_mb": 62466,
+        "os": "linux",
+        "preflight_busy_bench_cpus_pct": 19.59287531806616,
+        "preflight_busy_broker_cpus_pct": 35.708227311280744,
+        "preflight_cpu_pressure_pct": 10.66,
+        "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)",
+        "swap_total_mb": 8191,
+        "warnings": [
+          "The CPUs reserved for the broker were already 36% busy with other work before the run started; results will include contention. Quiesce the host or pick idle cores with --broker-cpus.",
+          "Kernel CPU pressure (PSI some/avg10) is 11%: runnable tasks are waiting for CPU on this host.",
+          "CPU governor is `powersave`, not `performance`; clock speed will vary during the run (set it for tighter repeatability).",
+          "Host load average was 24.4 on 16 CPUs at start; other workloads may add noise.",
+          "8191 MB of swap is in use on the host; memory measurements may be distorted."
+        ]
+      },
+      "meta": {
+        "bench_cpus": "8-15",
+        "broker_cpus": "[0, 1, 2, 3, 4, 5, 6, 7]",
+        "broker_sha256": "868ccfdd6602283f33b7a9541df2faab271f1b2f120e66a9b21452d3902b216b",
+        "finished_at": "2026-11-12T19:05:11.345638444+00:00",
+        "fsync": "group",
+        "git_dirty": false,
+        "git_sha": "c129ba9360e2",
+        "label": "completion-c129ba9-fixed-step",
+        "profile": "standard",
+        "rate_scale": 48.0,
+        "repeats": 1,
+        "seed": 20260101,
+        "slo": {
+          "ack_p99_ms": 50.0,
+          "delivery_p99_ms": 1000.0,
+          "max_error_rate": 0.001,
+          "min_achieved_ratio": 0.97
+        },
+        "started_at": "2026-11-12T19:03:41.714848586+00:00",
+        "time_scale": 1.0
+      },
+      "raw_report_sha256": "00af28f7d355520d26e249412dd6d440022864fed6fd16bdb646660f73f21778",
+      "scenarios": [
+        {
+          "error": null,
+          "findings": [
+            {
+              "detail": "RSS rose from 36 MB to a 186 MB peak and was still 186 MB (100% of the growth) after 25s idle (154 MB anonymous, 32 MB file-backed). Anonymous memory that is retained usually points at allocator fragmentation or caches that never shrink.",
+              "scenario": "ingest-single",
+              "severity": "warn",
+              "title": "Memory is not fully released after load"
+            },
+            {
+              "detail": "Whole-host CPU averaged 69% busy with kernel CPU pressure 25%. Latency, throughput and CPU figures from this trial include interference from other workloads and are not a trustworthy baseline; re-run on a quiet machine (see --strict-env).",
+              "scenario": "ingest-single",
+              "severity": "warn",
+              "title": "Host was CPU-contended during this trial"
+            },
+            {
+              "detail": "Data directory grew from 9 MB to 265 MB and was still 263 MB (99% of the growth) after settling.",
+              "scenario": "ingest-single",
+              "severity": "notice",
+              "title": "Disk space is slow to be reclaimed"
+            }
+          ],
+          "id": "ingest-single",
+          "metrics": [
+            {
+              "direction": "lower_better",
+              "group": "lifecycle",
+              "headline": false,
+              "id": "startup_s",
+              "label": "Broker cold start to ready",
+              "samples": [
+                0.106685289
+              ],
+              "unit": "s",
+              "value": 0.106685289
+            },
+            {
+              "direction": "higher_better",
+              "group": "throughput",
+              "headline": true,
+              "id": "ramp.sustained_msgs_s",
+              "label": "Sustained ingest at SLO",
+              "samples": [
+                0.0
+              ],
+              "unit": "msg/s",
+              "value": 0.0
+            },
+            {
+              "direction": "higher_better",
+              "group": "throughput",
+              "headline": false,
+              "id": "ramp.peak_msgs_s",
+              "label": "Peak achieved ingest (any step)",
+              "samples": [
+                11422.366618102445
+              ],
+              "unit": "msg/s",
+              "value": 11422.366618102445
+            },
+            {
+              "direction": "info",
+              "group": "throughput",
+              "headline": false,
+              "id": "ramp.breakdown_msgs_s",
+              "label": "Offered rate at first SLO failure",
+              "samples": [
+                12000.0
+              ],
+              "unit": "msg/s",
+              "value": 12000.0
+            },
+            {
+              "direction": "lower_better",
+              "group": "lifecycle",
+              "headline": false,
+              "id": "shutdown_s",
+              "label": "Graceful shutdown time",
+              "samples": [
+                0.023762405
+              ],
+              "unit": "s",
+              "value": 0.023762405
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": false,
+              "id": "mem.idle_mb",
+              "label": "RSS at idle (before load)",
+              "samples": [
+                35.91796875
+              ],
+              "unit": "MB",
+              "value": 35.91796875
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.peak_mb",
+              "label": "Peak RSS under load",
+              "samples": [
+                185.8203125
+              ],
+              "unit": "MB",
+              "value": 185.8203125
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.settled_mb",
+              "label": "RSS after settling idle",
+              "samples": [
+                185.8203125
+              ],
+              "unit": "MB",
+              "value": 185.8203125
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.retained_pct",
+              "label": "Memory still held after load (of the growth)",
+              "samples": [
+                100.0
+              ],
+              "unit": "%",
+              "value": 100.0
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": false,
+              "id": "disk.retained_pct",
+              "label": "Disk still held after load (of the growth)",
+              "samples": [
+                99.22541962777532
+              ],
+              "unit": "%",
+              "value": 99.22541962777532
+            },
+            {
+              "direction": "info",
+              "group": "resources",
+              "headline": false,
+              "id": "host.cpu_busy_pct",
+              "label": "Whole-host CPU busy during the trial (noise indicator)",
+              "samples": [
+                68.90409308580078
+              ],
+              "unit": "%",
+              "value": 68.90409308580078
+            },
+            {
+              "direction": "info",
+              "group": "resources",
+              "headline": false,
+              "id": "host.cpu_pressure_pct",
+              "label": "Kernel CPU pressure during the trial (noise indicator)",
+              "samples": [
+                25.412872340425537
+              ],
+              "unit": "%",
+              "value": 25.412872340425537
+            },
+            {
+              "direction": "lower_better",
+              "group": "resources",
+              "headline": false,
+              "id": "log.bytes",
+              "label": "Broker log volume",
+              "samples": [
+                50.17979907989502
+              ],
+              "unit": "MB",
+              "value": 50.17979907989502
+            }
+          ],
+          "params": {
+            "arrivals": "constant spacing, open loop",
+            "destination": "instant (0 ms)",
+            "payload_bytes": "1024",
+            "slo": "ACK p99 <= 50 ms, errors <= 0.1%, achieved >= 97% of offered",
+            "start_rate": "12000/s",
+            "step_factor": "x1.5",
+            "step_secs": "15",
+            "steps_max": "1",
+            "wire": "single request per message"
+          },
+          "status": "warn",
+          "trials": [
+            {
+              "broker_log_errors": 0,
+              "broker_log_warnings": 0,
+              "duration_s": 89.319038367,
+              "final_counters": {
+                "bettermq_archive_admission_blocked": 0.0,
+                "bettermq_archive_backlog_bytes": 0.0,
+                "bettermq_archive_backlog_segments": 0.0,
+                "bettermq_archive_enabled": 0.0,
+                "bettermq_archive_failed_bytes_total": 0.0,
+                "bettermq_archive_failing_bytes": 0.0,
+                "bettermq_archive_failing_segments": 0.0,
+                "bettermq_archive_failures_total": 0.0,
+                "bettermq_archive_initialization_failed": 0.0,
+                "bettermq_archive_oldest_pending_age_seconds": 0.0,
+                "bettermq_archive_queue_capacity_segments": 0.0,
+                "bettermq_archive_queue_headroom_segments": 0.0,
+                "bettermq_dispatch_active_http_deliveries": 0.0,
+                "bettermq_dispatch_committed_ready_depth": 1.0,
+                "bettermq_dispatch_committed_ready_ranges_total": 210001.0,
+                "bettermq_dispatch_committed_ready_records_total": 210001.0,
+                "bettermq_dispatch_completion_gap_records": 0.0,
+                "bettermq_dispatch_completions_total": 210001.0,
+                "bettermq_dispatch_cursor_advanced_records_total": 210001.0,
+                "bettermq_dispatch_cursor_max_offset": 210001.0,
+                "bettermq_dispatch_cursor_min_offset": 210001.0,
+                "bettermq_dispatch_defer_rejected_total": 0.0,
+                "bettermq_dispatch_deferred_total": 0.0,
+                "bettermq_dispatch_delivery_outcomes_total": 210001.0,
+                "bettermq_dispatch_destination_current_failures": 0.0,
+                "bettermq_dispatch_destination_hosts_blocked": 0.0,
+                "bettermq_dispatch_destination_hosts_tracked": 0.0,
+                "bettermq_dispatch_destination_hosts_with_failures": 0.0,
+                "bettermq_dispatch_destination_max_failures": 0.0,
+                "bettermq_dispatch_dlq_committed_total": 0.0,
+                "bettermq_dispatch_dlq_failures_total": 0.0,
+                "bettermq_dispatch_dlq_pending_committed": 0.0,
+                "bettermq_dispatch_dlq_pending_prepared": 0.0,
+                "bettermq_dispatch_dlq_prepared_total": 0.0,
+                "bettermq_dispatch_drain_completed_total": 0.0,
+                "bettermq_dispatch_drain_started_total": 0.0,
+                "bettermq_dispatch_drain_timeouts_total": 0.0,
+                "bettermq_dispatch_draining": 0.0,
+                "bettermq_dispatch_dropped_cursor_lanes_total": 0.0,
+                "bettermq_dispatch_fairness_configured_weights": 0.0,
+                "bettermq_dispatch_fairness_saturated": 0.0,
+                "bettermq_dispatch_fairness_saturation_ratio": 0.0,
+                "bettermq_dispatch_fairness_soft_limit": 1024.0,
+                "bettermq_dispatch_fairness_tracked_tenants": 0.0,
+                "bettermq_dispatch_flow_errors_total": 0.0,
+                "bettermq_dispatch_in_flight_deliveries": 0.0,
+                "bettermq_dispatch_last_drain_duration_seconds": 0.0,
+                "bettermq_dispatch_oldest_pending_age_seconds": 0.0,
+                "bettermq_dispatch_queue_rejected_total": 172434.0,
+                "bettermq_dispatch_retries_due_total": 0.0,
+                "bettermq_dispatch_retries_exhausted_total": 0.0,
+                "bettermq_dispatch_retries_pending": 0.0,
+                "bettermq_dispatch_retries_pending_due": 0.0,
+                "bettermq_dispatch_retries_scheduled_total": 0.0,
+                "bettermq_dispatch_tracked_cursor_lanes": 4.0,
+                "bettermq_dispatch_webhook_duration_seconds_count": 210001.0,
+                "bettermq_dispatch_webhook_duration_seconds_sum": 170.861102,
+                "bettermq_fleet_claim_failures_total": 0.0,
+                "bettermq_gc_watermark": 0.0,
+                "bettermq_ingest_accepted_total": 210001.0,
+                "bettermq_ingest_ack_latency_ms_count": 210001.0,
+                "bettermq_ingest_ack_latency_ms_sum": 4385417.802,
+                "bettermq_ingest_duplicate_total": 0.0,
+                "bettermq_ingest_durable_commits_total": 210001.0,
+                "bettermq_ingest_rejected_total": 0.0,
+                "bettermq_ingest_single_rejected_total": 0.0,
+                "bettermq_ingest_stage_records_total": 210001.0,
+                "bettermq_legacy_payload_repaired_total": 0.0,
+                "bettermq_legacy_payload_unhashed_total": 0.0,
+                "bettermq_legacy_unverifiable_dedup_hits_total": 0.0,
+                "bettermq_payload_blob_delete_failures_total": 0.0,
+                "bettermq_payload_blob_tombstones_pending": 0.0,
+                "bettermq_payload_blobs_deleted_total": 0.0,
+                "bettermq_retention_errors_total": 0.0,
+                "bettermq_retention_frontier": 184352.0,
+                "bettermq_retention_safe_watermark": 0.0,
+                "bettermq_retention_segments_deleted_total": 0.0,
+                "bettermq_schedule_delayed_pending": 0.0,
+                "bettermq_schedule_legacy_delayed_pending": 0.0,
+                "bettermq_schedule_legacy_imported_total": 0.0,
+                "bettermq_scheduler_failures_total": 0.0,
+                "bettermq_shard_queue_bytes": 0.0,
+                "bettermq_shard_queue_dropped_shard_events_total": 0.0,
+                "bettermq_shard_queue_max_bytes": 4096.0,
+                "bettermq_shard_queue_max_records": 4.0,
+                "bettermq_shard_queue_records": 0.0,
+                "bettermq_shard_queue_rejected_total": 0.0,
+                "bettermq_shard_recovery_failures_total": 0.0,
+                "bettermq_shards_fenced": 0.0,
+                "bettermq_shared_metadata_compactions_total": 0.0,
+                "bettermq_shared_metadata_errors_total": 0.0,
+                "bettermq_shared_metadata_expired_entries_total": 0.0,
+                "bettermq_shared_metadata_fsync_seconds_count": 0.0,
+                "bettermq_shared_metadata_fsync_seconds_sum": 0.0,
+                "bettermq_shared_metadata_lock_wait_seconds_count": 0.0,
+                "bettermq_shared_metadata_lock_wait_seconds_sum": 0.0,
+                "bettermq_shared_metadata_replay_bytes_total": 0.0,
+                "bettermq_wal_base_offset": 0.0,
+                "bettermq_wal_epoch_bytes_total": 266491269.0,
+                "bettermq_wal_epoch_records_total": 210001.0,
+                "bettermq_wal_epoch_total": 210001.0,
+                "bettermq_wal_fence_events_total": 0.0,
+                "bettermq_wal_fsync_duration_seconds_count": 25634.0,
+                "bettermq_wal_fsync_duration_seconds_sum": 40.746877999999995,
+                "bettermq_wal_fsync_failures_total": 0.0,
+                "bettermq_wal_fsync_records_total": 210001.0,
+                "bettermq_wal_fsync_total": 25634.0,
+                "bettermq_wal_last_epoch_bytes": 5076.0,
+                "bettermq_wal_last_epoch_records": 4.0,
+                "bettermq_wal_leader_epoch": 0.0,
+                "bettermq_wal_quarantine_events_total": 0.0,
+                "bettermq_wal_records_per_fsync": 32.76938082378381,
+                "bettermq_wal_retained_bytes": 266491269.0,
+                "bettermq_wal_retained_bytes_total": 266491269.0,
+                "bettermq_wal_telemetry_dropped_shards_total": 0.0
+              },
+              "index": 0,
+              "integrity": {
+                "accepted": 210001,
+                "concurrency": [
+                  {
+                    "configured": 256,
+                    "dest": "ramp",
+                    "observed_max": 6
+                  }
+                ],
+                "concurrency_violations": 0,
+                "delivered_unique": 210001,
+                "duplicate_deliveries": 0,
+                "loss_expected_zero": true,
+                "lost": 0,
+                "malformed": 0,
+                "order_violations": 0,
+                "order_violations_after_retry": 0
+              },
+              "memory": {
+                "disk_idle_mb": 8.51953125,
+                "disk_peak_mb": 265.2109375,
+                "disk_retained_pct": 99.22541962777532,
+                "disk_settled_mb": 263.22265625,
+                "idle_start_mb": 35.91796875,
+                "peak_mb": 185.8203125,
+                "post_drain_mb": 185.8203125,
+                "retained_pct": 100.0,
+                "settle_secs": 25.00677157599999,
+                "settled_anon_mb": 153.8046875,
+                "settled_file_mb": 32.015625,
+                "settled_mb": 185.8203125
+              },
+              "metrics": [
+                {
+                  "direction": "lower_better",
+                  "group": "lifecycle",
+                  "headline": false,
+                  "id": "startup_s",
+                  "label": "Broker cold start to ready",
+                  "samples": [],
+                  "unit": "s",
+                  "value": 0.106685289
+                },
+                {
+                  "direction": "higher_better",
+                  "group": "throughput",
+                  "headline": true,
+                  "id": "ramp.sustained_msgs_s",
+                  "label": "Sustained ingest at SLO",
+                  "samples": [],
+                  "unit": "msg/s",
+                  "value": 0.0
+                },
+                {
+                  "direction": "higher_better",
+                  "group": "throughput",
+                  "headline": false,
+                  "id": "ramp.peak_msgs_s",
+                  "label": "Peak achieved ingest (any step)",
+                  "samples": [],
+                  "unit": "msg/s",
+                  "value": 11422.366618102445
+                },
+                {
+                  "direction": "info",
+                  "group": "throughput",
+                  "headline": false,
+                  "id": "ramp.breakdown_msgs_s",
+                  "label": "Offered rate at first SLO failure",
+                  "samples": [],
+                  "unit": "msg/s",
+                  "value": 12000.0
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "lifecycle",
+                  "headline": false,
+                  "id": "shutdown_s",
+                  "label": "Graceful shutdown time",
+                  "samples": [],
+                  "unit": "s",
+                  "value": 0.023762405
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": false,
+                  "id": "mem.idle_mb",
+                  "label": "RSS at idle (before load)",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 35.91796875
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.peak_mb",
+                  "label": "Peak RSS under load",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 185.8203125
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.settled_mb",
+                  "label": "RSS after settling idle",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 185.8203125
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.retained_pct",
+                  "label": "Memory still held after load (of the growth)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 100.0
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": false,
+                  "id": "disk.retained_pct",
+                  "label": "Disk still held after load (of the growth)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 99.22541962777532
+                },
+                {
+                  "direction": "info",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "host.cpu_busy_pct",
+                  "label": "Whole-host CPU busy during the trial (noise indicator)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 68.90409308580078
+                },
+                {
+                  "direction": "info",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "host.cpu_pressure_pct",
+                  "label": "Kernel CPU pressure during the trial (noise indicator)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 25.412872340425537
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "log.bytes",
+                  "label": "Broker log volume",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 50.17979907989502
+                }
+              ],
+              "notes": [
+                "Diagnostic ramp limited to 1 steps; a passing final step is a lower bound, not a measured saturation point.",
+                "Even the first step violated the SLO; lower --rate-scale to find the ceiling.",
+                "0 dead-letter records were read back and matched to individual source deliveries."
+              ],
+              "phases": [
+                {
+                  "end_s": 8.008281057,
+                  "kind": "idle",
+                  "name": "baseline",
+                  "start_s": 0.007702473
+                },
+                {
+                  "end_s": 13.636014771,
+                  "kind": "warmup",
+                  "name": "warmup",
+                  "start_s": 8.008283349
+                },
+                {
+                  "end_s": 29.394659293,
+                  "kind": "measure",
+                  "name": "step-0",
+                  "start_s": 13.636016096
+                },
+                {
+                  "end_s": 89.321696581,
+                  "kind": "settle",
+                  "name": "settle",
+                  "start_s": 64.314925005
+                }
+              ],
+              "seed": 20260101,
+              "steps": [
+                {
+                  "achieved_msg_s": 11422.366618102445,
+                  "ack_max_ms": 754.175,
+                  "ack_p50_ms": 20.287,
+                  "ack_p999_ms": 740.351,
+                  "ack_p99_ms": 619.519,
+                  "backlog_growth_per_s": 10442.713750339124,
+                  "cpu_cores": 2.814963156754821,
+                  "delivered_msg_s": 979.6528677633211,
+                  "delivery_p99_ms": 11886.591,
+                  "duration_s": 15.758643197,
+                  "end_s": 29.394659293,
+                  "error_rate": 0.0,
+                  "fail_reasons": [
+                    "throughput 11422/s is 95% of the 12000/s offered",
+                    "ACK p99 620 ms exceeds 50 ms"
+                  ],
+                  "gen_lag_p99_ms": 26.559,
+                  "index": 0,
+                  "label": "step 1",
+                  "offered_msg_s": 12000.0,
+                  "passed": false,
+                  "rss_mb": 162.1328125,
+                  "start_s": 13.636016096
+                }
+              ],
+              "tables": [
+                {
+                  "columns": [
+                    "Thread group",
+                    "CPU (cores)",
+                    "Share"
+                  ],
+                  "rows": [
+                    [
+                      "tokio-rt-worker",
+                      "2.21",
+                      "81%"
+                    ],
+                    [
+                      "bettermq-shard",
+                      "0.48",
+                      "18%"
+                    ],
+                    [
+                      "bettermq-meta-i",
+                      "0.03",
+                      "1%"
+                    ]
+                  ],
+                  "title": "Where broker CPU goes (first step, 12.0k msg/s offered)"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "t1-overload": {
+      "environment": {
+        "cpu_model": "Intel(R) Core(TM) Ultra 9 285H",
+        "data_fs_type": "ext2/ext3",
+        "governor": "powersave",
+        "kernel": "7.0.0-38-generic",
+        "load_avg_start": 17.77,
+        "logical_cpus": 16,
+        "mem_total_mb": 62466,
+        "os": "linux",
+        "preflight_busy_bench_cpus_pct": 31.457800511508953,
+        "preflight_busy_broker_cpus_pct": 36.980491942324,
+        "preflight_cpu_pressure_pct": 5.37,
+        "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)",
+        "swap_total_mb": 8191,
+        "warnings": [
+          "The CPUs reserved for the broker were already 37% busy with other work before the run started; results will include contention. Quiesce the host or pick idle cores with --broker-cpus.",
+          "CPU governor is `powersave`, not `performance`; clock speed will vary during the run (set it for tighter repeatability).",
+          "Host load average was 17.8 on 16 CPUs at start; other workloads may add noise.",
+          "8191 MB of swap is in use on the host; memory measurements may be distorted."
+        ]
+      },
+      "meta": {
+        "bench_cpus": "8-15",
+        "broker_cpus": "[0, 1, 2, 3, 4, 5, 6, 7]",
+        "broker_sha256": "868ccfdd6602283f33b7a9541df2faab271f1b2f120e66a9b21452d3902b216b",
+        "finished_at": "2026-11-12T19:07:15.014068478+00:00",
+        "fsync": "group",
+        "git_dirty": false,
+        "git_sha": "c129ba9360e2",
+        "label": "completion-c129ba9-fixed-step",
+        "profile": "standard",
+        "rate_scale": 48.0,
+        "repeats": 1,
+        "seed": 20268020,
+        "slo": {
+          "ack_p99_ms": 50.0,
+          "delivery_p99_ms": 1000.0,
+          "max_error_rate": 0.001,
+          "min_achieved_ratio": 0.97
+        },
+        "started_at": "2026-11-12T19:05:13.501551990+00:00",
+        "time_scale": 1.0
+      },
+      "raw_report_sha256": "0c837922d999e6bfc9f0ef87c82e5e96f3cce8b42de4751702527c6f5775a623",
+      "scenarios": [
+        {
+          "error": null,
+          "findings": [
+            {
+              "detail": "RSS rose from 36 MB to a 187 MB peak and was still 186 MB (99% of the growth) after 25s idle (154 MB anonymous, 32 MB file-backed). Anonymous memory that is retained usually points at allocator fragmentation or caches that never shrink.",
+              "scenario": "ingest-single",
+              "severity": "warn",
+              "title": "Memory is not fully released after load"
+            },
+            {
+              "detail": "Whole-host CPU averaged 50% busy with kernel CPU pressure 13%. Latency, throughput and CPU figures from this trial include interference from other workloads and are not a trustworthy baseline; re-run on a quiet machine (see --strict-env).",
+              "scenario": "ingest-single",
+              "severity": "warn",
+              "title": "Host was CPU-contended during this trial"
+            },
+            {
+              "detail": "Data directory grew from 9 MB to 265 MB and was still 263 MB (99% of the growth) after settling.",
+              "scenario": "ingest-single",
+              "severity": "notice",
+              "title": "Disk space is slow to be reclaimed"
+            }
+          ],
+          "id": "ingest-single",
+          "metrics": [
+            {
+              "direction": "lower_better",
+              "group": "lifecycle",
+              "headline": false,
+              "id": "startup_s",
+              "label": "Broker cold start to ready",
+              "samples": [
+                0.205585849
+              ],
+              "unit": "s",
+              "value": 0.205585849
+            },
+            {
+              "direction": "higher_better",
+              "group": "throughput",
+              "headline": true,
+              "id": "ramp.sustained_msgs_s",
+              "label": "Sustained ingest at SLO",
+              "samples": [
+                0.0
+              ],
+              "unit": "msg/s",
+              "value": 0.0
+            },
+            {
+              "direction": "higher_better",
+              "group": "throughput",
+              "headline": false,
+              "id": "ramp.peak_msgs_s",
+              "label": "Peak achieved ingest (any step)",
+              "samples": [
+                4862.996262170788
+              ],
+              "unit": "msg/s",
+              "value": 4862.996262170788
+            },
+            {
+              "direction": "info",
+              "group": "throughput",
+              "headline": false,
+              "id": "ramp.breakdown_msgs_s",
+              "label": "Offered rate at first SLO failure",
+              "samples": [
+                12000.0
+              ],
+              "unit": "msg/s",
+              "value": 12000.0
+            },
+            {
+              "direction": "lower_better",
+              "group": "lifecycle",
+              "headline": false,
+              "id": "shutdown_s",
+              "label": "Graceful shutdown time",
+              "samples": [
+                0.017838138
+              ],
+              "unit": "s",
+              "value": 0.017838138
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": false,
+              "id": "mem.idle_mb",
+              "label": "RSS at idle (before load)",
+              "samples": [
+                35.755859375
+              ],
+              "unit": "MB",
+              "value": 35.755859375
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.peak_mb",
+              "label": "Peak RSS under load",
+              "samples": [
+                187.453125
+              ],
+              "unit": "MB",
+              "value": 187.453125
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.settled_mb",
+              "label": "RSS after settling idle",
+              "samples": [
+                185.83984375
+              ],
+              "unit": "MB",
+              "value": 185.83984375
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.retained_pct",
+              "label": "Memory still held after load (of the growth)",
+              "samples": [
+                98.9365126369594
+              ],
+              "unit": "%",
+              "value": 98.9365126369594
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": false,
+              "id": "disk.retained_pct",
+              "label": "Disk still held after load (of the growth)",
+              "samples": [
+                99.29006703229739
+              ],
+              "unit": "%",
+              "value": 99.29006703229739
+            },
+            {
+              "direction": "info",
+              "group": "resources",
+              "headline": false,
+              "id": "host.cpu_busy_pct",
+              "label": "Whole-host CPU busy during the trial (noise indicator)",
+              "samples": [
+                50.218685474977434
+              ],
+              "unit": "%",
+              "value": 50.218685474977434
+            },
+            {
+              "direction": "info",
+              "group": "resources",
+              "headline": false,
+              "id": "host.cpu_pressure_pct",
+              "label": "Kernel CPU pressure during the trial (noise indicator)",
+              "samples": [
+                13.372222222222222
+              ],
+              "unit": "%",
+              "value": 13.372222222222222
+            },
+            {
+              "direction": "lower_better",
+              "group": "resources",
+              "headline": false,
+              "id": "log.bytes",
+              "label": "Broker log volume",
+              "samples": [
+                50.18813991546631
+              ],
+              "unit": "MB",
+              "value": 50.18813991546631
+            }
+          ],
+          "params": {
+            "arrivals": "constant spacing, open loop",
+            "destination": "instant (0 ms)",
+            "payload_bytes": "1024",
+            "slo": "ACK p99 <= 50 ms, errors <= 0.1%, achieved >= 97% of offered",
+            "start_rate": "12000/s",
+            "step_factor": "x1.5",
+            "step_secs": "15",
+            "steps_max": "1",
+            "wire": "single request per message"
+          },
+          "status": "warn",
+          "trials": [
+            {
+              "broker_log_errors": 0,
+              "broker_log_warnings": 0,
+              "duration_s": 121.215290575,
+              "final_counters": {
+                "bettermq_archive_admission_blocked": 0.0,
+                "bettermq_archive_backlog_bytes": 0.0,
+                "bettermq_archive_backlog_segments": 0.0,
+                "bettermq_archive_enabled": 0.0,
+                "bettermq_archive_failed_bytes_total": 0.0,
+                "bettermq_archive_failing_bytes": 0.0,
+                "bettermq_archive_failing_segments": 0.0,
+                "bettermq_archive_failures_total": 0.0,
+                "bettermq_archive_initialization_failed": 0.0,
+                "bettermq_archive_oldest_pending_age_seconds": 0.0,
+                "bettermq_archive_queue_capacity_segments": 0.0,
+                "bettermq_archive_queue_headroom_segments": 0.0,
+                "bettermq_dispatch_active_http_deliveries": 0.0,
+                "bettermq_dispatch_committed_ready_depth": 1.0,
+                "bettermq_dispatch_committed_ready_ranges_total": 210001.0,
+                "bettermq_dispatch_committed_ready_records_total": 210001.0,
+                "bettermq_dispatch_completion_gap_records": 0.0,
+                "bettermq_dispatch_completions_total": 210001.0,
+                "bettermq_dispatch_cursor_advanced_records_total": 210001.0,
+                "bettermq_dispatch_cursor_max_offset": 210001.0,
+                "bettermq_dispatch_cursor_min_offset": 210001.0,
+                "bettermq_dispatch_defer_rejected_total": 0.0,
+                "bettermq_dispatch_deferred_total": 0.0,
+                "bettermq_dispatch_delivery_outcomes_total": 210001.0,
+                "bettermq_dispatch_destination_current_failures": 0.0,
+                "bettermq_dispatch_destination_hosts_blocked": 0.0,
+                "bettermq_dispatch_destination_hosts_tracked": 0.0,
+                "bettermq_dispatch_destination_hosts_with_failures": 0.0,
+                "bettermq_dispatch_destination_max_failures": 0.0,
+                "bettermq_dispatch_dlq_committed_total": 0.0,
+                "bettermq_dispatch_dlq_failures_total": 0.0,
+                "bettermq_dispatch_dlq_pending_committed": 0.0,
+                "bettermq_dispatch_dlq_pending_prepared": 0.0,
+                "bettermq_dispatch_dlq_prepared_total": 0.0,
+                "bettermq_dispatch_drain_completed_total": 0.0,
+                "bettermq_dispatch_drain_started_total": 0.0,
+                "bettermq_dispatch_drain_timeouts_total": 0.0,
+                "bettermq_dispatch_draining": 0.0,
+                "bettermq_dispatch_dropped_cursor_lanes_total": 0.0,
+                "bettermq_dispatch_fairness_configured_weights": 0.0,
+                "bettermq_dispatch_fairness_saturated": 0.0,
+                "bettermq_dispatch_fairness_saturation_ratio": 0.0,
+                "bettermq_dispatch_fairness_soft_limit": 1024.0,
+                "bettermq_dispatch_fairness_tracked_tenants": 0.0,
+                "bettermq_dispatch_flow_errors_total": 0.0,
+                "bettermq_dispatch_in_flight_deliveries": 0.0,
+                "bettermq_dispatch_last_drain_duration_seconds": 0.0,
+                "bettermq_dispatch_oldest_pending_age_seconds": 0.0,
+                "bettermq_dispatch_queue_rejected_total": 202698.0,
+                "bettermq_dispatch_retries_due_total": 0.0,
+                "bettermq_dispatch_retries_exhausted_total": 0.0,
+                "bettermq_dispatch_retries_pending": 0.0,
+                "bettermq_dispatch_retries_pending_due": 0.0,
+                "bettermq_dispatch_retries_scheduled_total": 0.0,
+                "bettermq_dispatch_tracked_cursor_lanes": 4.0,
+                "bettermq_dispatch_webhook_duration_seconds_count": 210001.0,
+                "bettermq_dispatch_webhook_duration_seconds_sum": 126.260086,
+                "bettermq_fleet_claim_failures_total": 0.0,
+                "bettermq_gc_watermark": 0.0,
+                "bettermq_ingest_accepted_total": 210001.0,
+                "bettermq_ingest_ack_latency_ms_count": 210001.0,
+                "bettermq_ingest_ack_latency_ms_sum": 24506486.029,
+                "bettermq_ingest_duplicate_total": 0.0,
+                "bettermq_ingest_durable_commits_total": 210001.0,
+                "bettermq_ingest_rejected_total": 0.0,
+                "bettermq_ingest_single_rejected_total": 0.0,
+                "bettermq_ingest_stage_records_total": 210001.0,
+                "bettermq_legacy_payload_repaired_total": 0.0,
+                "bettermq_legacy_payload_unhashed_total": 0.0,
+                "bettermq_legacy_unverifiable_dedup_hits_total": 0.0,
+                "bettermq_payload_blob_delete_failures_total": 0.0,
+                "bettermq_payload_blob_tombstones_pending": 0.0,
+                "bettermq_payload_blobs_deleted_total": 0.0,
+                "bettermq_retention_errors_total": 0.0,
+                "bettermq_retention_frontier": 210001.0,
+                "bettermq_retention_safe_watermark": 0.0,
+                "bettermq_retention_segments_deleted_total": 0.0,
+                "bettermq_schedule_delayed_pending": 0.0,
+                "bettermq_schedule_legacy_delayed_pending": 0.0,
+                "bettermq_schedule_legacy_imported_total": 0.0,
+                "bettermq_scheduler_failures_total": 0.0,
+                "bettermq_shard_queue_bytes": 0.0,
+                "bettermq_shard_queue_dropped_shard_events_total": 0.0,
+                "bettermq_shard_queue_max_bytes": 4096.0,
+                "bettermq_shard_queue_max_records": 4.0,
+                "bettermq_shard_queue_records": 0.0,
+                "bettermq_shard_queue_rejected_total": 0.0,
+                "bettermq_shard_recovery_failures_total": 0.0,
+                "bettermq_shards_fenced": 0.0,
+                "bettermq_shared_metadata_compactions_total": 0.0,
+                "bettermq_shared_metadata_errors_total": 0.0,
+                "bettermq_shared_metadata_expired_entries_total": 0.0,
+                "bettermq_shared_metadata_fsync_seconds_count": 0.0,
+                "bettermq_shared_metadata_fsync_seconds_sum": 0.0,
+                "bettermq_shared_metadata_lock_wait_seconds_count": 0.0,
+                "bettermq_shared_metadata_lock_wait_seconds_sum": 0.0,
+                "bettermq_shared_metadata_replay_bytes_total": 0.0,
+                "bettermq_wal_base_offset": 0.0,
+                "bettermq_wal_epoch_bytes_total": 266491269.0,
+                "bettermq_wal_epoch_records_total": 210001.0,
+                "bettermq_wal_epoch_total": 210001.0,
+                "bettermq_wal_fence_events_total": 0.0,
+                "bettermq_wal_fsync_duration_seconds_count": 19581.0,
+                "bettermq_wal_fsync_duration_seconds_sum": 160.61775,
+                "bettermq_wal_fsync_failures_total": 0.0,
+                "bettermq_wal_fsync_records_total": 210001.0,
+                "bettermq_wal_fsync_total": 19581.0,
+                "bettermq_wal_last_epoch_bytes": 5076.0,
+                "bettermq_wal_last_epoch_records": 4.0,
+                "bettermq_wal_leader_epoch": 0.0,
+                "bettermq_wal_quarantine_events_total": 0.0,
+                "bettermq_wal_records_per_fsync": 42.89896708838957,
+                "bettermq_wal_retained_bytes": 266491269.0,
+                "bettermq_wal_retained_bytes_total": 266491269.0,
+                "bettermq_wal_telemetry_dropped_shards_total": 0.0
+              },
+              "index": 0,
+              "integrity": {
+                "accepted": 210001,
+                "concurrency": [
+                  {
+                    "configured": 256,
+                    "dest": "ramp",
+                    "observed_max": 6
+                  }
+                ],
+                "concurrency_violations": 0,
+                "delivered_unique": 210001,
+                "duplicate_deliveries": 0,
+                "loss_expected_zero": true,
+                "lost": 0,
+                "malformed": 0,
+                "order_violations": 0,
+                "order_violations_after_retry": 0
+              },
+              "memory": {
+                "disk_idle_mb": 8.51953125,
+                "disk_peak_mb": 264.92578125,
+                "disk_retained_pct": 99.29006703229739,
+                "disk_settled_mb": 263.10546875,
+                "idle_start_mb": 35.755859375,
+                "peak_mb": 187.453125,
+                "post_drain_mb": 185.83984375,
+                "retained_pct": 98.9365126369594,
+                "settle_secs": 25.00721542000001,
+                "settled_anon_mb": 154.0234375,
+                "settled_file_mb": 31.81640625,
+                "settled_mb": 185.83984375
+              },
+              "metrics": [
+                {
+                  "direction": "lower_better",
+                  "group": "lifecycle",
+                  "headline": false,
+                  "id": "startup_s",
+                  "label": "Broker cold start to ready",
+                  "samples": [],
+                  "unit": "s",
+                  "value": 0.205585849
+                },
+                {
+                  "direction": "higher_better",
+                  "group": "throughput",
+                  "headline": true,
+                  "id": "ramp.sustained_msgs_s",
+                  "label": "Sustained ingest at SLO",
+                  "samples": [],
+                  "unit": "msg/s",
+                  "value": 0.0
+                },
+                {
+                  "direction": "higher_better",
+                  "group": "throughput",
+                  "headline": false,
+                  "id": "ramp.peak_msgs_s",
+                  "label": "Peak achieved ingest (any step)",
+                  "samples": [],
+                  "unit": "msg/s",
+                  "value": 4862.996262170788
+                },
+                {
+                  "direction": "info",
+                  "group": "throughput",
+                  "headline": false,
+                  "id": "ramp.breakdown_msgs_s",
+                  "label": "Offered rate at first SLO failure",
+                  "samples": [],
+                  "unit": "msg/s",
+                  "value": 12000.0
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "lifecycle",
+                  "headline": false,
+                  "id": "shutdown_s",
+                  "label": "Graceful shutdown time",
+                  "samples": [],
+                  "unit": "s",
+                  "value": 0.017838138
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": false,
+                  "id": "mem.idle_mb",
+                  "label": "RSS at idle (before load)",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 35.755859375
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.peak_mb",
+                  "label": "Peak RSS under load",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 187.453125
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.settled_mb",
+                  "label": "RSS after settling idle",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 185.83984375
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.retained_pct",
+                  "label": "Memory still held after load (of the growth)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 98.9365126369594
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": false,
+                  "id": "disk.retained_pct",
+                  "label": "Disk still held after load (of the growth)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 99.29006703229739
+                },
+                {
+                  "direction": "info",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "host.cpu_busy_pct",
+                  "label": "Whole-host CPU busy during the trial (noise indicator)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 50.218685474977434
+                },
+                {
+                  "direction": "info",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "host.cpu_pressure_pct",
+                  "label": "Kernel CPU pressure during the trial (noise indicator)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 13.372222222222222
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "log.bytes",
+                  "label": "Broker log volume",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 50.18813991546631
+                }
+              ],
+              "notes": [
+                "Diagnostic ramp limited to 1 steps; a passing final step is a lower bound, not a measured saturation point.",
+                "Even the first step violated the SLO; lower --rate-scale to find the ceiling.",
+                "0 dead-letter records were read back and matched to individual source deliveries."
+              ],
+              "phases": [
+                {
+                  "end_s": 8.010702099,
+                  "kind": "idle",
+                  "name": "baseline",
+                  "start_s": 0.009247779
+                },
+                {
+                  "end_s": 35.344627968,
+                  "kind": "warmup",
+                  "name": "warmup",
+                  "start_s": 8.010705943
+                },
+                {
+                  "end_s": 72.359052043,
+                  "kind": "measure",
+                  "name": "step-0",
+                  "start_s": 35.344629186
+                },
+                {
+                  "end_s": 121.216762755,
+                  "kind": "settle",
+                  "name": "settle",
+                  "start_s": 96.209547335
+                }
+              ],
+              "seed": 20268020,
+              "steps": [
+                {
+                  "achieved_msg_s": 4862.996262170788,
+                  "ack_max_ms": 22052.863,
+                  "ack_p50_ms": 21250.047,
+                  "ack_p999_ms": 22036.479,
+                  "ack_p99_ms": 22020.095,
+                  "backlog_growth_per_s": 4769.249021712499,
+                  "cpu_cores": 1.2162826413349308,
+                  "delivered_msg_s": 93.74724045828988,
+                  "delivery_p99_ms": 35618.815,
+                  "duration_s": 37.014422857,
+                  "end_s": 72.359052043,
+                  "error_rate": 0.0,
+                  "fail_reasons": [
+                    "throughput 4863/s is 41% of the 12000/s offered",
+                    "ACK p99 22.02 s exceeds 50 ms"
+                  ],
+                  "gen_lag_p99_ms": 17694.719,
+                  "index": 0,
+                  "label": "step 1",
+                  "offered_msg_s": 12000.0,
+                  "passed": false,
+                  "rss_mb": 169.94921875,
+                  "start_s": 35.344629186
+                }
+              ],
+              "tables": [
+                {
+                  "columns": [
+                    "Thread group",
+                    "CPU (cores)",
+                    "Share"
+                  ],
+                  "rows": [
+                    [
+                      "tokio-rt-worker",
+                      "1.05",
+                      "85%"
+                    ],
+                    [
+                      "bettermq-shard",
+                      "0.17",
+                      "14%"
+                    ],
+                    [
+                      "bettermq-meta-i",
+                      "0.01",
+                      "1%"
+                    ]
+                  ],
+                  "title": "Where broker CPU goes (first step, 12.0k msg/s offered)"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "t2-overload": {
+      "environment": {
+        "cpu_model": "Intel(R) Core(TM) Ultra 9 285H",
+        "data_fs_type": "ext2/ext3",
+        "governor": "powersave",
+        "kernel": "7.0.0-38-generic",
+        "load_avg_start": 25.57,
+        "logical_cpus": 16,
+        "mem_total_mb": 62466,
+        "os": "linux",
+        "preflight_busy_bench_cpus_pct": 55.75447570332481,
+        "preflight_busy_broker_cpus_pct": 97.48110831234257,
+        "preflight_cpu_pressure_pct": 30.55,
+        "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)",
+        "swap_total_mb": 8191,
+        "warnings": [
+          "The CPUs reserved for the broker were already 97% busy with other work before the run started; results will include contention. Quiesce the host or pick idle cores with --broker-cpus.",
+          "Kernel CPU pressure (PSI some/avg10) is 31%: runnable tasks are waiting for CPU on this host.",
+          "CPU governor is `powersave`, not `performance`; clock speed will vary during the run (set it for tighter repeatability).",
+          "Host load average was 25.6 on 16 CPUs at start; other workloads may add noise.",
+          "8191 MB of swap is in use on the host; memory measurements may be distorted."
+        ]
+      },
+      "meta": {
+        "bench_cpus": "8-15",
+        "broker_cpus": "[0, 1, 2, 3, 4, 5, 6, 7]",
+        "broker_sha256": "868ccfdd6602283f33b7a9541df2faab271f1b2f120e66a9b21452d3902b216b",
+        "finished_at": "2026-11-12T19:03:39.433526445+00:00",
+        "fsync": "group",
+        "git_dirty": false,
+        "git_sha": "c129ba9360e2",
+        "label": "completion-c129ba9-fixed-step",
+        "profile": "standard",
+        "rate_scale": 48.0,
+        "repeats": 1,
+        "seed": 20275939,
+        "slo": {
+          "ack_p99_ms": 50.0,
+          "delivery_p99_ms": 1000.0,
+          "max_error_rate": 0.001,
+          "min_achieved_ratio": 0.97
+        },
+        "started_at": "2026-11-12T19:02:02.500783279+00:00",
+        "time_scale": 1.0
+      },
+      "raw_report_sha256": "d43032cf6390075c53602260bf799197b1248aa07d61f1a8f4374752ca1d3a16",
+      "scenarios": [
+        {
+          "error": null,
+          "findings": [
+            {
+              "detail": "RSS rose from 37 MB to a 185 MB peak and was still 185 MB (100% of the growth) after 25s idle (157 MB anonymous, 28 MB file-backed). Anonymous memory that is retained usually points at allocator fragmentation or caches that never shrink.",
+              "scenario": "ingest-single",
+              "severity": "warn",
+              "title": "Memory is not fully released after load"
+            },
+            {
+              "detail": "Whole-host CPU averaged 72% busy with kernel CPU pressure 33%. Latency, throughput and CPU figures from this trial include interference from other workloads and are not a trustworthy baseline; re-run on a quiet machine (see --strict-env).",
+              "scenario": "ingest-single",
+              "severity": "warn",
+              "title": "Host was CPU-contended during this trial"
+            },
+            {
+              "detail": "Data directory grew from 9 MB to 269 MB and was still 263 MB (98% of the growth) after settling.",
+              "scenario": "ingest-single",
+              "severity": "notice",
+              "title": "Disk space is slow to be reclaimed"
+            }
+          ],
+          "id": "ingest-single",
+          "metrics": [
+            {
+              "direction": "lower_better",
+              "group": "lifecycle",
+              "headline": false,
+              "id": "startup_s",
+              "label": "Broker cold start to ready",
+              "samples": [
+                0.107208768
+              ],
+              "unit": "s",
+              "value": 0.107208768
+            },
+            {
+              "direction": "higher_better",
+              "group": "throughput",
+              "headline": true,
+              "id": "ramp.sustained_msgs_s",
+              "label": "Sustained ingest at SLO",
+              "samples": [
+                0.0
+              ],
+              "unit": "msg/s",
+              "value": 0.0
+            },
+            {
+              "direction": "higher_better",
+              "group": "throughput",
+              "headline": false,
+              "id": "ramp.peak_msgs_s",
+              "label": "Peak achieved ingest (any step)",
+              "samples": [
+                8778.873045451119
+              ],
+              "unit": "msg/s",
+              "value": 8778.873045451119
+            },
+            {
+              "direction": "info",
+              "group": "throughput",
+              "headline": false,
+              "id": "ramp.breakdown_msgs_s",
+              "label": "Offered rate at first SLO failure",
+              "samples": [
+                12000.0
+              ],
+              "unit": "msg/s",
+              "value": 12000.0
+            },
+            {
+              "direction": "lower_better",
+              "group": "lifecycle",
+              "headline": false,
+              "id": "shutdown_s",
+              "label": "Graceful shutdown time",
+              "samples": [
+                0.023423235
+              ],
+              "unit": "s",
+              "value": 0.023423235
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": false,
+              "id": "mem.idle_mb",
+              "label": "RSS at idle (before load)",
+              "samples": [
+                36.744140625
+              ],
+              "unit": "MB",
+              "value": 36.744140625
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.peak_mb",
+              "label": "Peak RSS under load",
+              "samples": [
+                185.078125
+              ],
+              "unit": "MB",
+              "value": 185.078125
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.settled_mb",
+              "label": "RSS after settling idle",
+              "samples": [
+                185.078125
+              ],
+              "unit": "MB",
+              "value": 185.078125
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": true,
+              "id": "mem.retained_pct",
+              "label": "Memory still held after load (of the growth)",
+              "samples": [
+                100.0
+              ],
+              "unit": "%",
+              "value": 100.0
+            },
+            {
+              "direction": "lower_better",
+              "group": "memory",
+              "headline": false,
+              "id": "disk.retained_pct",
+              "label": "Disk still held after load (of the growth)",
+              "samples": [
+                97.59270625926314
+              ],
+              "unit": "%",
+              "value": 97.59270625926314
+            },
+            {
+              "direction": "info",
+              "group": "resources",
+              "headline": false,
+              "id": "host.cpu_busy_pct",
+              "label": "Whole-host CPU busy during the trial (noise indicator)",
+              "samples": [
+                71.96535131736529
+              ],
+              "unit": "%",
+              "value": 71.96535131736529
+            },
+            {
+              "direction": "info",
+              "group": "resources",
+              "headline": false,
+              "id": "host.cpu_pressure_pct",
+              "label": "Kernel CPU pressure during the trial (noise indicator)",
+              "samples": [
+                32.53881188118811
+              ],
+              "unit": "%",
+              "value": 32.53881188118811
+            },
+            {
+              "direction": "lower_better",
+              "group": "resources",
+              "headline": false,
+              "id": "log.bytes",
+              "label": "Broker log volume",
+              "samples": [
+                50.16031455993652
+              ],
+              "unit": "MB",
+              "value": 50.16031455993652
+            }
+          ],
+          "params": {
+            "arrivals": "constant spacing, open loop",
+            "destination": "instant (0 ms)",
+            "payload_bytes": "1024",
+            "slo": "ACK p99 <= 50 ms, errors <= 0.1%, achieved >= 97% of offered",
+            "start_rate": "12000/s",
+            "step_factor": "x1.5",
+            "step_secs": "15",
+            "steps_max": "1",
+            "wire": "single request per message"
+          },
+          "status": "warn",
+          "trials": [
+            {
+              "broker_log_errors": 0,
+              "broker_log_warnings": 0,
+              "duration_s": 96.627095287,
+              "final_counters": {
+                "bettermq_archive_admission_blocked": 0.0,
+                "bettermq_archive_backlog_bytes": 0.0,
+                "bettermq_archive_backlog_segments": 0.0,
+                "bettermq_archive_enabled": 0.0,
+                "bettermq_archive_failed_bytes_total": 0.0,
+                "bettermq_archive_failing_bytes": 0.0,
+                "bettermq_archive_failing_segments": 0.0,
+                "bettermq_archive_failures_total": 0.0,
+                "bettermq_archive_initialization_failed": 0.0,
+                "bettermq_archive_oldest_pending_age_seconds": 0.0,
+                "bettermq_archive_queue_capacity_segments": 0.0,
+                "bettermq_archive_queue_headroom_segments": 0.0,
+                "bettermq_dispatch_active_http_deliveries": 0.0,
+                "bettermq_dispatch_committed_ready_depth": 1.0,
+                "bettermq_dispatch_committed_ready_ranges_total": 210001.0,
+                "bettermq_dispatch_committed_ready_records_total": 210001.0,
+                "bettermq_dispatch_completion_gap_records": 0.0,
+                "bettermq_dispatch_completions_total": 210001.0,
+                "bettermq_dispatch_cursor_advanced_records_total": 210001.0,
+                "bettermq_dispatch_cursor_max_offset": 210001.0,
+                "bettermq_dispatch_cursor_min_offset": 210001.0,
+                "bettermq_dispatch_defer_rejected_total": 0.0,
+                "bettermq_dispatch_deferred_total": 0.0,
+                "bettermq_dispatch_delivery_outcomes_total": 210001.0,
+                "bettermq_dispatch_destination_current_failures": 0.0,
+                "bettermq_dispatch_destination_hosts_blocked": 0.0,
+                "bettermq_dispatch_destination_hosts_tracked": 0.0,
+                "bettermq_dispatch_destination_hosts_with_failures": 0.0,
+                "bettermq_dispatch_destination_max_failures": 0.0,
+                "bettermq_dispatch_dlq_committed_total": 0.0,
+                "bettermq_dispatch_dlq_failures_total": 0.0,
+                "bettermq_dispatch_dlq_pending_committed": 0.0,
+                "bettermq_dispatch_dlq_pending_prepared": 0.0,
+                "bettermq_dispatch_dlq_prepared_total": 0.0,
+                "bettermq_dispatch_drain_completed_total": 0.0,
+                "bettermq_dispatch_drain_started_total": 0.0,
+                "bettermq_dispatch_drain_timeouts_total": 0.0,
+                "bettermq_dispatch_draining": 0.0,
+                "bettermq_dispatch_dropped_cursor_lanes_total": 0.0,
+                "bettermq_dispatch_fairness_configured_weights": 0.0,
+                "bettermq_dispatch_fairness_saturated": 0.0,
+                "bettermq_dispatch_fairness_saturation_ratio": 0.0,
+                "bettermq_dispatch_fairness_soft_limit": 1024.0,
+                "bettermq_dispatch_fairness_tracked_tenants": 0.0,
+                "bettermq_dispatch_flow_errors_total": 0.0,
+                "bettermq_dispatch_in_flight_deliveries": 0.0,
+                "bettermq_dispatch_last_drain_duration_seconds": 0.0,
+                "bettermq_dispatch_oldest_pending_age_seconds": 0.0,
+                "bettermq_dispatch_queue_rejected_total": 156235.0,
+                "bettermq_dispatch_retries_due_total": 0.0,
+                "bettermq_dispatch_retries_exhausted_total": 0.0,
+                "bettermq_dispatch_retries_pending": 0.0,
+                "bettermq_dispatch_retries_pending_due": 0.0,
+                "bettermq_dispatch_retries_scheduled_total": 0.0,
+                "bettermq_dispatch_tracked_cursor_lanes": 4.0,
+                "bettermq_dispatch_webhook_duration_seconds_count": 210001.0,
+                "bettermq_dispatch_webhook_duration_seconds_sum": 152.65774,
+                "bettermq_fleet_claim_failures_total": 0.0,
+                "bettermq_gc_watermark": 0.0,
+                "bettermq_ingest_accepted_total": 210001.0,
+                "bettermq_ingest_ack_latency_ms_count": 210001.0,
+                "bettermq_ingest_ack_latency_ms_sum": 8500717.824,
+                "bettermq_ingest_duplicate_total": 0.0,
+                "bettermq_ingest_durable_commits_total": 210001.0,
+                "bettermq_ingest_rejected_total": 0.0,
+                "bettermq_ingest_single_rejected_total": 0.0,
+                "bettermq_ingest_stage_records_total": 210001.0,
+                "bettermq_legacy_payload_repaired_total": 0.0,
+                "bettermq_legacy_payload_unhashed_total": 0.0,
+                "bettermq_legacy_unverifiable_dedup_hits_total": 0.0,
+                "bettermq_payload_blob_delete_failures_total": 0.0,
+                "bettermq_payload_blob_tombstones_pending": 0.0,
+                "bettermq_payload_blobs_deleted_total": 0.0,
+                "bettermq_retention_errors_total": 0.0,
+                "bettermq_retention_frontier": 122647.0,
+                "bettermq_retention_safe_watermark": 0.0,
+                "bettermq_retention_segments_deleted_total": 0.0,
+                "bettermq_schedule_delayed_pending": 0.0,
+                "bettermq_schedule_legacy_delayed_pending": 0.0,
+                "bettermq_schedule_legacy_imported_total": 0.0,
+                "bettermq_scheduler_failures_total": 0.0,
+                "bettermq_shard_queue_bytes": 0.0,
+                "bettermq_shard_queue_dropped_shard_events_total": 0.0,
+                "bettermq_shard_queue_max_bytes": 4096.0,
+                "bettermq_shard_queue_max_records": 4.0,
+                "bettermq_shard_queue_records": 0.0,
+                "bettermq_shard_queue_rejected_total": 0.0,
+                "bettermq_shard_recovery_failures_total": 0.0,
+                "bettermq_shards_fenced": 0.0,
+                "bettermq_shared_metadata_compactions_total": 0.0,
+                "bettermq_shared_metadata_errors_total": 0.0,
+                "bettermq_shared_metadata_expired_entries_total": 0.0,
+                "bettermq_shared_metadata_fsync_seconds_count": 0.0,
+                "bettermq_shared_metadata_fsync_seconds_sum": 0.0,
+                "bettermq_shared_metadata_lock_wait_seconds_count": 0.0,
+                "bettermq_shared_metadata_lock_wait_seconds_sum": 0.0,
+                "bettermq_shared_metadata_replay_bytes_total": 0.0,
+                "bettermq_wal_base_offset": 0.0,
+                "bettermq_wal_epoch_bytes_total": 266491269.0,
+                "bettermq_wal_epoch_records_total": 210001.0,
+                "bettermq_wal_epoch_total": 210001.0,
+                "bettermq_wal_fence_events_total": 0.0,
+                "bettermq_wal_fsync_duration_seconds_count": 28464.0,
+                "bettermq_wal_fsync_duration_seconds_sum": 52.048953,
+                "bettermq_wal_fsync_failures_total": 0.0,
+                "bettermq_wal_fsync_records_total": 210001.0,
+                "bettermq_wal_fsync_total": 28464.0,
+                "bettermq_wal_last_epoch_bytes": 5076.0,
+                "bettermq_wal_last_epoch_records": 4.0,
+                "bettermq_wal_leader_epoch": 0.0,
+                "bettermq_wal_quarantine_events_total": 0.0,
+                "bettermq_wal_records_per_fsync": 29.511399040471197,
+                "bettermq_wal_retained_bytes": 266491269.0,
+                "bettermq_wal_retained_bytes_total": 266491269.0,
+                "bettermq_wal_telemetry_dropped_shards_total": 0.0
+              },
+              "index": 0,
+              "integrity": {
+                "accepted": 210001,
+                "concurrency": [
+                  {
+                    "configured": 256,
+                    "dest": "ramp",
+                    "observed_max": 8
+                  }
+                ],
+                "concurrency_violations": 0,
+                "delivered_unique": 210001,
+                "duplicate_deliveries": 0,
+                "loss_expected_zero": true,
+                "lost": 0,
+                "malformed": 0,
+                "order_violations": 0,
+                "order_violations_after_retry": 0
+              },
+              "memory": {
+                "disk_idle_mb": 8.51953125,
+                "disk_peak_mb": 269.4453125,
+                "disk_retained_pct": 97.59270625926314,
+                "disk_settled_mb": 263.1640625,
+                "idle_start_mb": 36.744140625,
+                "peak_mb": 185.078125,
+                "post_drain_mb": 185.07421875,
+                "retained_pct": 100.0,
+                "settle_secs": 25.00588499700001,
+                "settled_anon_mb": 156.890625,
+                "settled_file_mb": 28.1875,
+                "settled_mb": 185.078125
+              },
+              "metrics": [
+                {
+                  "direction": "lower_better",
+                  "group": "lifecycle",
+                  "headline": false,
+                  "id": "startup_s",
+                  "label": "Broker cold start to ready",
+                  "samples": [],
+                  "unit": "s",
+                  "value": 0.107208768
+                },
+                {
+                  "direction": "higher_better",
+                  "group": "throughput",
+                  "headline": true,
+                  "id": "ramp.sustained_msgs_s",
+                  "label": "Sustained ingest at SLO",
+                  "samples": [],
+                  "unit": "msg/s",
+                  "value": 0.0
+                },
+                {
+                  "direction": "higher_better",
+                  "group": "throughput",
+                  "headline": false,
+                  "id": "ramp.peak_msgs_s",
+                  "label": "Peak achieved ingest (any step)",
+                  "samples": [],
+                  "unit": "msg/s",
+                  "value": 8778.873045451119
+                },
+                {
+                  "direction": "info",
+                  "group": "throughput",
+                  "headline": false,
+                  "id": "ramp.breakdown_msgs_s",
+                  "label": "Offered rate at first SLO failure",
+                  "samples": [],
+                  "unit": "msg/s",
+                  "value": 12000.0
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "lifecycle",
+                  "headline": false,
+                  "id": "shutdown_s",
+                  "label": "Graceful shutdown time",
+                  "samples": [],
+                  "unit": "s",
+                  "value": 0.023423235
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": false,
+                  "id": "mem.idle_mb",
+                  "label": "RSS at idle (before load)",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 36.744140625
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.peak_mb",
+                  "label": "Peak RSS under load",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 185.078125
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.settled_mb",
+                  "label": "RSS after settling idle",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 185.078125
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": true,
+                  "id": "mem.retained_pct",
+                  "label": "Memory still held after load (of the growth)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 100.0
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "memory",
+                  "headline": false,
+                  "id": "disk.retained_pct",
+                  "label": "Disk still held after load (of the growth)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 97.59270625926314
+                },
+                {
+                  "direction": "info",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "host.cpu_busy_pct",
+                  "label": "Whole-host CPU busy during the trial (noise indicator)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 71.96535131736529
+                },
+                {
+                  "direction": "info",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "host.cpu_pressure_pct",
+                  "label": "Kernel CPU pressure during the trial (noise indicator)",
+                  "samples": [],
+                  "unit": "%",
+                  "value": 32.53881188118811
+                },
+                {
+                  "direction": "lower_better",
+                  "group": "resources",
+                  "headline": false,
+                  "id": "log.bytes",
+                  "label": "Broker log volume",
+                  "samples": [],
+                  "unit": "MB",
+                  "value": 50.16031455993652
+                }
+              ],
+              "notes": [
+                "Diagnostic ramp limited to 1 steps; a passing final step is a lower bound, not a measured saturation point.",
+                "Even the first step violated the SLO; lower --rate-scale to find the ceiling.",
+                "0 dead-letter records were read back and matched to individual source deliveries."
+              ],
+              "phases": [
+                {
+                  "end_s": 8.011343584,
+                  "kind": "idle",
+                  "name": "baseline",
+                  "start_s": 0.010065397
+                },
+                {
+                  "end_s": 13.234915077,
+                  "kind": "warmup",
+                  "name": "warmup",
+                  "start_s": 8.01135018
+                },
+                {
+                  "end_s": 33.738801826,
+                  "kind": "measure",
+                  "name": "step-0",
+                  "start_s": 13.234917208
+                },
+                {
+                  "end_s": 96.628700264,
+                  "kind": "settle",
+                  "name": "settle",
+                  "start_s": 71.622815267
+                }
+              ],
+              "seed": 20275939,
+              "steps": [
+                {
+                  "achieved_msg_s": 8778.873045451119,
+                  "ack_max_ms": 6254.591,
+                  "ack_p50_ms": 2926.591,
+                  "ack_p999_ms": 6238.207,
+                  "ack_p99_ms": 6225.919,
+                  "backlog_growth_per_s": 7561.640288586606,
+                  "cpu_cores": 2.1659310334302817,
+                  "delivered_msg_s": 1217.2327568645119,
+                  "delivery_p99_ms": 13443.071,
+                  "duration_s": 20.503884618,
+                  "end_s": 33.738801826,
+                  "error_rate": 0.0,
+                  "fail_reasons": [
+                    "throughput 8779/s is 73% of the 12000/s offered",
+                    "ACK p99 6.23 s exceeds 50 ms"
+                  ],
+                  "gen_lag_p99_ms": 3055.615,
+                  "index": 0,
+                  "label": "step 1",
+                  "offered_msg_s": 12000.0,
+                  "passed": false,
+                  "rss_mb": 166.78515625,
+                  "start_s": 13.234917208
+                }
+              ],
+              "tables": [
+                {
+                  "columns": [
+                    "Thread group",
+                    "CPU (cores)",
+                    "Share"
+                  ],
+                  "rows": [
+                    [
+                      "tokio-rt-worker",
+                      "1.78",
+                      "82%"
+                    ],
+                    [
+                      "bettermq-shard",
+                      "0.34",
+                      "16%"
+                    ],
+                    [
+                      "bettermq-meta-i",
+                      "0.04",
+                      "2%"
+                    ]
+                  ],
+                  "title": "Where broker CPU goes (first step, 12.0k msg/s offered)"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "schema": "bettermq-targeted-evidence-v1"
+}
